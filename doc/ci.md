@@ -412,7 +412,10 @@ job or a shard needs runners to run it in parallel; otherwise it only queues.
 
 `openvmm-changes` lists the files that changed between the pull request's base
 and head, or between a push's previous and new commits, and
-`nvx.py classify-ci-changes` selects the suites from their paths:
+`nvx.py classify-ci-changes` selects the suites from their paths. The detector
+uses `git diff --name-only --no-renames -z` and the classifier's `--null` option
+so both sides of a rename and unquoted filenames, including embedded newlines,
+participate in the decision:
 
 - `run-workloads` is false only when every changed file is documentation,
   under `doc/` or ending in `.md`. It enables the guest artifacts, the OpenVMM
