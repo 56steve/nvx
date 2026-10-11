@@ -518,6 +518,10 @@ data. An `ro` mapping rejects link creation with `EROFS`. On Windows, links
 are WSL-style reparse points, which Windows path resolution never follows.
 Treat links in a writable share as untrusted when host software later reads
 the directory.
+On a Linux host, the guest can also swap two names in an `rw` mapping
+atomically with `renameat2(RENAME_EXCHANGE)`, as `exch` does, and a snapshot
+captured right after the swap keeps each name with its object. A Windows host
+rejects rename flags with `EINVAL` and changes neither name.
 By default, OpenVMM performs every guest operation on the mapping as its own
 user. On a Linux host, `--mount-owner caller` instead performs each one as the
 guest caller's UID and GID and squashes guest root to the owner of the shared
