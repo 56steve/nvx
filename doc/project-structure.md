@@ -122,6 +122,7 @@ nvx/
 |   |   |-- doctor.py            Time ABI host qualification
 |   |   |-- egress_policy.py     Egress policy compiler for OpenVMM's rule grammar
 |   |   |-- guests.py            Typed guest descriptors
+|   |   |-- host_telemetry.py    Benchmark host provenance and Windows capture storage telemetry
 |   |   |-- host_time_probe.rs   Host TSC probe that doctor builds and runs
 |   |   |-- managed_exec_tests.py Managed workload environment, directory, and timeout tests
 |   |   |-- microvm_test_scripts/ Guest workloads for the microVM tests
@@ -271,8 +272,12 @@ Alpine, and Ubuntu. The adversarial controller, typed broker, credential-free
 executor, watchdog, and tracked deterministic catalogs also live in
 `nvx_tools/`; `nvx_adversarial_executor.py` is the restricted protocol entry
 point used by local children and administrator-owned remote wrappers.
-`performance.py` collects, persists, and gates CI performance results, and the
-`test_*.py` files beside `nvx.py` are the tooling's unit tests.
+`performance.py` collects, persists, and gates CI performance results.
+`host_telemetry.py` records the benchmark host's provenance and, on Windows, the
+storage activity during profiled snapshot captures, as
+[Snapshot lifecycle profile](benchmarks.md#snapshot-lifecycle-profile) and
+[CI collection](benchmarks.md#ci-collection) describe. The `test_*.py` files
+beside `nvx.py` are the tooling's unit tests.
 
 The `setup/` scripts bootstrap development hosts and GitHub Actions runners
 with the tool versions that `setup/tool-versions.conf` pins;
