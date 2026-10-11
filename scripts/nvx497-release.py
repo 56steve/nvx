@@ -1,0 +1,1787 @@
+"""Source collection, verification, and release packaging workflows."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tarfile
+import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+import zipfile
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
+from typing import cast
+
+from .archive import create_reproducible_release_archive, create_reproducible_tar_gz
+from .azurelinux import input_sha256 as azurelinux_input_sha256
+from .azurelinux import package_lock_sha256 as azurelinux_package_lock_sha256
+from .build import (
+    assert_required_kernel_config,
+    build_docker_linux_source,
+    initramfs_provenance_inputs,
+    kernel_provenance_inputs,
+)
+from .build_config import DockerBuildConfig
+from .build_constants import (
+    AlpineBuildConstants,
+    AzureLinuxBuildConstants,
+    BuildConstants,
+    InitramfsBuildConstants,
+    KernelBuildConstants,
+    OpenVMMBuildConstants,
+    ReleaseBuildConstants,
+    UbuntuBuildConstants,
+)
+from .collect_alpine_sources import collect_alpine_sources
+from .collect_ubuntu_sources import collect_ubuntu_sources
+from .common import (
+    ScriptError,
+    VerifiedChecksumInventory,
+    artifact_path,
+    credential_safe_opener,
+    download,
+    git_output,
+    openvmm_binary_path,
+    openvmm_git_state,
+    require_file,
+    sha256_file,
+    verify_sha256_sums,
+    write_sha256_sums,
+)
+from .development_release import development_release_tag
+from .ubuntu import converter_input_sha256, customization_files, package_lock_sha256
+
+GITHUB_API_VERSION = "2022-11-28"
+# HEAD often has no release, as with CI's [skip ci] baseline commits. Each
+# commit searched costs one GitHub API request.
+_RELEASE_SEARCH_COMMITS = 20
+
+
+@dataclass(frozen=True)
+class _ReleaseAsset:
+    tag: str
+    name: str
+    url: str
+    size: int
+
+
+class _GitHubReleaseQueryError(ScriptError):
+    def __init__(self, status: int, message: str) -> None:
+        self.status = status
+        super().__init__(message)
+
+
+class _ReleaseRestoreError(ScriptError):
+    """Raised when release publication and restoration both fail."""
+
+
+def create_release_archive(source: Path, destination: Path) -> None:
+    if source.is_symlink():
+        raise ScriptError(f"release package directory must not be a symlink: {source}")
+    source = source.resolve()
+    destination = destination.resolve()
+    if destination == source or source in destination.parents:
+        raise ScriptError("release archive destination must be outside its source")
+    accepted_inventory = verify_sha256_sums(source)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    staging = destination.with_name(f".staging-{uuid.uuid4().hex}-{destination.name}")
+    snapshot_parent = Path(
+        tempfile.mkdtemp(
+            prefix=f".snapshot-{uuid.uuid4().hex}-",
+            dir=destination.parent,
+        )
+    )
+    snapshot_parent.chmod(0o700)
+    snapshot = snapshot_parent / source.name
+    try:
+        _capture_release_snapshot(source, snapshot, accepted_inventory)
+        create_reproducible_release_archive(snapshot, staging)
+        _verify_release_archive(staging, source.name, accepted_inventory)
+        staging.replace(destination)
+    finally:
+        staging.unlink(missing_ok=True)
+        shutil.rmtree(snapshot_parent, ignore_errors=True)
+    print(f">> archived {source} as {destination}")
+
+
+def _github_headers(token: str | None, accept: str) -> dict[str, str]:
+    headers = {
+        "Accept": accept,
+        "X-GitHub-Api-Version": GITHUB_API_VERSION,
+        "User-Agent": "nvx-release-downloader",
+    }
+    if token is not None:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def _github_error_message(error: urllib.error.HTTPError) -> str:
+    try:
+        payload = error.read().decode("utf-8", "replace").strip()
+    except (AttributeError, OSError, ValueError):
+        return ""
+    if not payload:
+        return ""
+    try:
+        document: object = json.loads(payload)
+    except json.JSONDecodeError:
+        return " ".join(payload.split())[:200]
+    if isinstance(document, dict):
+        message = cast(dict[str, object], document).get("message")
+        if isinstance(message, str):
+            return message
+    return ""
+
+
+def _github_error_hint(error: urllib.error.HTTPError, token: str | None) -> str:
+    if token is None and error.code in (401, 403, 404):
+        return "set GH_TOKEN to a token that can read the repository"
+    if error.code == 401:
+        return "the configured GitHub token was rejected; refresh or replace it"
+    if error.code == 403:
+        if error.headers.get("x-ratelimit-remaining") == "0":
+            return "the GitHub API rate limit is exhausted; retry later"
+        return (
+            "the configured GitHub token lacks access; grant it read access to "
+            "the repository contents and authorize it for organization single sign-on"
+        )
+    if error.code == 404:
+        return (
+            "verify --repository and that the configured GitHub token can read "
+            "that repository"
+        )
+    return ""
+
+
+def _github_json(
+    url: str,
+    token: str | None,
+    *,
+    missing_ok: bool = False,
+) -> object | None:
+    request = urllib.request.Request(
+        url,
+        headers=_github_headers(token, "application/vnd.github+json"),
+    )
+    try:
+        with credential_safe_opener().open(request) as response:
+            return json.load(response)
+    except urllib.error.HTTPError as error:
+        if missing_ok and error.code == 404:
+            return None
+        message = _github_error_message(error)
+        hint = _github_error_hint(error, token)
+        detail = f": {message.rstrip('.')}" if message else ""
+        advice = f"; {hint}" if hint else ""
+        raise _GitHubReleaseQueryError(
+            error.code,
+            f"GitHub release query failed with HTTP {error.code}{detail}{advice}",
+        ) from error
+    except (OSError, urllib.error.URLError) as error:
+        raise ScriptError(f"GitHub release query failed: {error}") from error
+
+
+def _first_parent_commits(limit: int) -> list[str]:
+    try:
+        output = git_output(
+            "rev-list", "--first-parent", f"--max-count={limit}", "HEAD"
+        )
+    except subprocess.CalledProcessError as error:
+        detail = str(error.stderr or "").strip() or str(error)
+        raise ScriptError(
+            f"download needs a Git checkout to find its release: {detail}"
+        ) from error
+    except (OSError, subprocess.SubprocessError) as error:
+        raise ScriptError(
+            f"download needs a Git checkout to find its release: {error}"
+        ) from error
+    return output.split()
+
+
+def _version_at(commit: str) -> str | None:
+    try:
+        return git_output("show", f"{commit}:VERSION") or None
+    except subprocess.CalledProcessError:
+        return None
+    except (OSError, subprocess.SubprocessError) as error:
+        raise ScriptError(
+            f"download failed to read VERSION at {commit}: {error}"
+        ) from error
+
+
+def _checkout_release_asset(
+    repository: str,
+    platform: str,
+    token: str | None,
+) -> _ReleaseAsset:
+    repository_parts = repository.split("/")
+    if len(repository_parts) != 2 or not all(repository_parts):
+        raise ScriptError("GitHub repository must be OWNER/REPOSITORY")
+    encoded_repository = "/".join(
+        urllib.parse.quote(part, safe="") for part in repository_parts
+    )
+    repository_url = f"https://api.github.com/repos/{encoded_repository}"
+
+    extension = ".zip" if platform.startswith("windows-") else ".tar.gz"
+    asset_pattern = re.compile(rf"^nvx-.+-{re.escape(platform)}{re.escape(extension)}$")
+    commits = _first_parent_commits(_RELEASE_SEARCH_COMMITS)
+    for distance, commit in enumerate(commits):
+        version = _version_at(commit)
+        if version is None:
+            continue
+        tag = development_release_tag(version, commit)
+        release = _github_json(
+            f"{repository_url}/releases/tags/{urllib.parse.quote(tag, safe='')}",
+            token,
+            missing_ok=True,
+        )
+        if release is None:
+            continue
+        if not isinstance(release, dict):
+            raise ScriptError("GitHub release query returned an invalid response")
+        release_document = cast(dict[str, object], release)
+        if release_document.get("draft") is True:
+            continue
+        assets = release_document.get("assets")
+        if not isinstance(assets, list):
+            continue
+        for asset_value in cast(list[object], assets):
+            if not isinstance(asset_value, dict):
+                continue
+            asset = cast(dict[str, object], asset_value)
+            name = asset.get("name")
+            asset_url = asset.get("url")
+            size = asset.get("size")
+            if (
+                isinstance(name, str)
+                and asset_pattern.fullmatch(name) is not None
+                and isinstance(asset_url, str)
+                and isinstance(size, int)
+                and not isinstance(size, bool)
+            ):
+                if distance:
+                    plural = "s" if distance > 1 else ""
+                    print(
+                        f">> no {platform} release for HEAD; using {tag}, "
+                        f"{distance} first-parent commit{plural} earlier"
+                    )
+                return _ReleaseAsset(tag, name, asset_url, size)
+    # GitHub also answers 404 for a repository that the caller cannot read, so
+    # query it to report that case with its usual hint.
+    _github_json(repository_url, token)
+    raise ScriptError(
+        f"no {repository} release with an NVX package for {platform} was built "
+        f"from HEAD or its first-parent ancestors ({len(commits)} commits "
+        "searched); check out a released commit or build the artifacts"
+    )
+
+
+def _checkout_release_asset_with_fallback(
+    repository: str,
+    platform: str,
+    token: str | None,
+) -> tuple[_ReleaseAsset, str | None]:
+    if token is None:
+        return _checkout_release_asset(repository, platform, None), None
+
+    try:
+        return _checkout_release_asset(repository, platform, token), token
+    except _GitHubReleaseQueryError as authenticated_error:
+        if authenticated_error.status not in (401, 403):
+            raise
+        print(
+            f">> {authenticated_error}; retrying without credentials",
+            file=sys.stderr,
+        )
+        try:
+            return _checkout_release_asset(repository, platform, None), None
+        except _GitHubReleaseQueryError as public_error:
+            raise authenticated_error from public_error
+
+
+def _same_file_identity(first: os.stat_result, second: os.stat_result) -> bool:
+    return first.st_dev == second.st_dev and first.st_ino == second.st_ino
+
+
+def _require_safe_source_parents(root: Path, relative: PurePosixPath) -> None:
+    root_metadata = root.lstat()
+    if stat.S_ISLNK(root_metadata.st_mode) or not stat.S_ISDIR(root_metadata.st_mode):
+        raise ScriptError(f"release snapshot source is not a directory: {root}")
+    current = root
+    for part in relative.parts[:-1]:
+        current /= part
+        metadata = current.lstat()
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+            raise ScriptError(
+                f"release snapshot source has an unsafe directory: {relative}"
+            )
+
+
+def _copy_pinned_regular_file(
+    source_root: Path,
+    snapshot_root: Path,
+    relative_name: str,
+    expected_sha256: str,
+) -> None:
+    relative = PurePosixPath(relative_name)
+    _require_safe_source_parents(source_root, relative)
+    source = source_root.joinpath(*relative.parts)
+    before = source.lstat()
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+        raise ScriptError(
+            f"release snapshot source is not a regular file: {relative_name}"
+        )
+
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(source, flags)
+    try:
+        opened = os.fstat(descriptor)
+        after_open = source.lstat()
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or not stat.S_ISREG(after_open.st_mode)
+            or not _same_file_identity(before, opened)
+            or not _same_file_identity(opened, after_open)
+        ):
+            raise ScriptError(
+                f"release snapshot source changed while opening: {relative_name}"
+            )
+
+        destination = snapshot_root.joinpath(*relative.parts)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        digest = hashlib.sha256()
+        with os.fdopen(descriptor, "rb", closefd=False) as source_file:
+            with destination.open("xb") as destination_file:
+                while chunk := source_file.read(1024 * 1024):
+                    destination_file.write(chunk)
+                    digest.update(chunk)
+            after_read = os.fstat(descriptor)
+        if not _same_file_identity(opened, after_read):
+            raise ScriptError(
+                f"release snapshot source changed while reading: {relative_name}"
+            )
+        actual_sha256 = digest.hexdigest()
+        if actual_sha256 != expected_sha256:
+            raise ScriptError(
+                f"release snapshot source changed for {relative_name}: "
+                f"{actual_sha256}, expected {expected_sha256}"
+            )
+        destination.chmod(
+            0o755 if relative.parts[0] == "bin" or before.st_mode & 0o111 else 0o644
+        )
+    finally:
+        os.close(descriptor)
+
+
+def _capture_release_snapshot(
+    source: Path,
+    snapshot: Path,
+    accepted: VerifiedChecksumInventory,
+) -> None:
+    snapshot.mkdir(mode=0o700)
+    expected_files = dict(accepted.files)
+    expected_files["SHA256SUMS"] = accepted.checksum_sha256
+    for relative_name, expected_sha256 in sorted(expected_files.items()):
+        _copy_pinned_regular_file(
+            source,
+            snapshot,
+            relative_name,
+            expected_sha256,
+        )
+    captured = verify_sha256_sums(snapshot)
+    if captured != accepted:
+        raise ScriptError(
+            "captured release snapshot does not match the accepted source inventory"
+        )
+
+
+def _canonical_archive_member(name: str, *, is_directory: bool) -> str:
+    normalized_name = name[:-1] if is_directory and name.endswith("/") else name
+    path = PurePosixPath(normalized_name)
+    if (
+        not normalized_name
+        or "\\" in normalized_name
+        or path.is_absolute()
+        or "." in path.parts
+        or ".." in path.parts
+        or any(":" in part for part in path.parts)
+        or path.as_posix() != normalized_name
+        or (not is_directory and name.endswith("/"))
+    ):
+        raise ScriptError(f"unsafe path in release archive: {name}")
+    return normalized_name
+
+
+def _validate_archive_layout(
+    entries: Sequence[tuple[str, bool]],
+    *,
+    expected_root: str | None = None,
+) -> tuple[str, dict[str, bool]]:
+    layout: dict[str, bool] = {}
+    for name, is_directory in entries:
+        canonical = _canonical_archive_member(name, is_directory=is_directory)
+        if canonical in layout:
+            raise ScriptError(f"duplicate path in release archive: {canonical}")
+        layout[canonical] = is_directory
+    roots = {PurePosixPath(name).parts[0] for name in layout}
+    if len(roots) != 1:
+        raise ScriptError("release archive must contain exactly one package root")
+    root = roots.pop()
+    if expected_root is not None and root != expected_root:
+        raise ScriptError(f"release archive root is {root}, expected {expected_root}")
+    if root in layout and layout[root] is not True:
+        raise ScriptError("release archive package root must be a directory")
+    if expected_root is not None:
+        if layout.get(root) is not True:
+            raise ScriptError("release archive omits its package root directory")
+        for name in layout:
+            parent = PurePosixPath(name).parent
+            while parent != PurePosixPath("."):
+                parent_name = parent.as_posix()
+                if layout.get(parent_name) is not True:
+                    raise ScriptError(
+                        f"release archive omits directory entry {parent_name}"
+                    )
+                parent = parent.parent
+    return root, layout
+
+
+def _release_archive_layout(
+    archive_path: Path,
+    *,
+    expected_root: str | None = None,
+) -> tuple[str, dict[str, bool]]:
+    try:
+        if archive_path.name.endswith(".tar.gz"):
+            with tarfile.open(archive_path, "r:gz") as archive:
+                entries: list[tuple[str, bool]] = []
+                for member in archive.getmembers():
+                    if not (member.isfile() or member.isdir()):
+                        raise ScriptError(
+                            f"unsupported entry in release archive: {member.name}"
+                        )
+                    entries.append((member.name, member.isdir()))
+            return _validate_archive_layout(entries, expected_root=expected_root)
+        if archive_path.suffix == ".zip":
+            with zipfile.ZipFile(archive_path) as archive:
+                entries = []
+                for member in archive.infolist():
+                    is_directory = member.is_dir()
+                    file_type = (member.external_attr >> 16) & 0o170000
+                    allowed_types = (
+                        (0, stat.S_IFDIR) if is_directory else (0, stat.S_IFREG)
+                    )
+                    if file_type not in allowed_types:
+                        raise ScriptError(
+                            f"unsupported entry in release archive: {member.filename}"
+                        )
+                    entries.append((member.filename, is_directory))
+            return _validate_archive_layout(entries, expected_root=expected_root)
+    except (tarfile.TarError, zipfile.BadZipFile) as error:
+        raise ScriptError(
+            f"invalid release archive {archive_path.name}: {error}"
+        ) from error
+    raise ScriptError(f"unsupported release archive: {archive_path.name}")
+
+
+def _extract_release_archive(archive_path: Path, destination: Path) -> None:
+    _release_archive_layout(archive_path)
+    try:
+        if archive_path.name.endswith(".tar.gz"):
+            with tarfile.open(archive_path, "r:gz") as archive:
+                for member in archive.getmembers():
+                    canonical = _canonical_archive_member(
+                        member.name,
+                        is_directory=member.isdir(),
+                    )
+                    target = destination.joinpath(*PurePosixPath(canonical).parts)
+                    if member.isdir():
+                        target.mkdir(parents=True, exist_ok=True)
+                        target.chmod(member.mode & 0o777)
+                        continue
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    source = archive.extractfile(member)
+                    if source is None:
+                        raise ScriptError(
+                            f"could not read release archive entry: {member.name}"
+                        )
+                    with source, target.open("xb") as output:
+                        shutil.copyfileobj(source, output, length=1024 * 1024)
+                    target.chmod(member.mode & 0o777)
+            return
+        if archive_path.suffix == ".zip":
+            with zipfile.ZipFile(archive_path) as archive:
+                for member in archive.infolist():
+                    is_directory = member.is_dir()
+                    canonical = _canonical_archive_member(
+                        member.filename,
+                        is_directory=is_directory,
+                    )
+                    target = destination.joinpath(*PurePosixPath(canonical).parts)
+                    mode = (member.external_attr >> 16) & 0o777
+                    if is_directory:
+                        target.mkdir(parents=True, exist_ok=True)
+                        if mode:
+                            target.chmod(mode)
+                        continue
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    with archive.open(member) as source, target.open("xb") as output:
+                        shutil.copyfileobj(source, output, length=1024 * 1024)
+                    if mode:
+                        target.chmod(mode)
+            return
+    except (tarfile.TarError, zipfile.BadZipFile) as error:
+        raise ScriptError(
+            f"invalid release archive {archive_path.name}: {error}"
+        ) from error
+    raise ScriptError(f"unsupported release archive: {archive_path.name}")
+
+
+def _filesystem_archive_layout(destination: Path) -> dict[str, bool]:
+    layout: dict[str, bool] = {}
+    for path in destination.rglob("*"):
+        metadata = path.lstat()
+        relative = path.relative_to(destination).as_posix()
+        if stat.S_ISLNK(metadata.st_mode):
+            raise ScriptError(f"release archive extracted a symlink: {relative}")
+        if stat.S_ISDIR(metadata.st_mode):
+            layout[relative] = True
+        elif stat.S_ISREG(metadata.st_mode):
+            layout[relative] = False
+        else:
+            raise ScriptError(f"release archive extracted a special file: {relative}")
+    return layout
+
+
+def _verify_release_archive(
+    archive_path: Path,
+    expected_root: str,
+    accepted: VerifiedChecksumInventory,
+) -> None:
+    root, archived_layout = _release_archive_layout(
+        archive_path,
+        expected_root=expected_root,
+    )
+    extraction = Path(
+        tempfile.mkdtemp(
+            prefix=f".{archive_path.name}.verify-",
+            dir=archive_path.parent,
+        )
+    )
+    try:
+        _extract_release_archive(archive_path, extraction)
+        extracted_layout = _filesystem_archive_layout(extraction)
+        if extracted_layout != archived_layout:
+            raise ScriptError(
+                "release archive extraction did not preserve its exact member layout"
+            )
+        archived = verify_sha256_sums(extraction / root)
+        if archived != accepted:
+            raise ScriptError(
+                "release archive does not match the accepted source inventory"
+            )
+    finally:
+        shutil.rmtree(extraction, ignore_errors=True)
+
+
+def _replace_runtime_file(source: Path, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f"{destination.name}.part")
+    temporary.unlink(missing_ok=True)
+    try:
+        shutil.copy2(source, temporary)
+        temporary.replace(destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _packaged_guest_artifact_names(package_root: Path) -> list[str]:
+    source_manifest = package_root / "SOURCE-MANIFEST.json"
+    if not source_manifest.exists():
+        return list(ReleaseBuildConstants.GUEST_ARTIFACT_NAMES)
+    manifest = _read_json_object(source_manifest, "packaged source manifest")
+    names: list[str] = []
+    if isinstance(manifest.get("linux"), dict):
+        names.extend(
+            (
+                KernelBuildConstants.BINARY_NAME,
+                KernelBuildConstants.CONFIG_NAME,
+            )
+        )
+    if isinstance(manifest.get("alpine"), dict):
+        names.extend(
+            (
+                AlpineBuildConstants.INITRAMFS_NAME,
+                AlpineBuildConstants.PACKAGE_MANIFEST_NAME,
+            )
+        )
+    if isinstance(manifest.get("ubuntu"), dict):
+        names.extend(
+            (
+                UbuntuBuildConstants.INITRAMFS_NAME,
+                UbuntuBuildConstants.PACKAGE_MANIFEST_NAME,
+                UbuntuBuildConstants.DISTRO_NAME,
+                UbuntuBuildConstants.DISTRO_MANIFEST_NAME,
+            )
+        )
+    if isinstance(manifest.get("azurelinux"), dict):
+        names.extend(ReleaseBuildConstants.AZURELINUX_ARTIFACT_NAMES)
+    if not names:
+        raise ScriptError("packaged source manifest does not declare guest artifacts")
+    return names
+
+
+def _install_release_archive(archive_path: Path) -> None:
+    with tempfile.TemporaryDirectory(prefix="nvx-release-") as temporary:
+        extraction_root = Path(temporary)
+        _extract_release_archive(archive_path, extraction_root)
+        checksum_files = list(extraction_root.glob("*/SHA256SUMS"))
+        if len(checksum_files) != 1:
+            raise ScriptError(
+                "release archive must contain one package root with SHA256SUMS"
+            )
+        package_root = checksum_files[0].parent
+        verify_sha256_sums(package_root)
+
+        binary_destination = openvmm_binary_path()
+        binary_source = require_file(
+            package_root / "bin" / binary_destination.name,
+            "packaged OpenVMM binary",
+        )
+        guest_sources = {
+            name: require_file(
+                package_root / "guest" / name,
+                f"packaged guest artifact {name}",
+            )
+            for name in _packaged_guest_artifact_names(package_root)
+        }
+        provenance_sources = {
+            name: require_file(
+                package_root / "provenance" / name,
+                f"packaged provenance artifact {name}",
+            )
+            for name in (
+                OpenVMMBuildConstants.PROVENANCE_NAME,
+                KernelBuildConstants.PROVENANCE_NAME,
+                InitramfsBuildConstants.PROVENANCE_NAME,
+            )
+        }
+        _replace_runtime_file(binary_source, binary_destination)
+        for name, source in guest_sources.items():
+            _replace_runtime_file(source, artifact_path(name))
+        for name in ReleaseBuildConstants.GUEST_ARTIFACT_NAMES:
+            if name not in guest_sources:
+                artifact_path(name).unlink(missing_ok=True)
+        for name, source in provenance_sources.items():
+            _replace_runtime_file(source, artifact_path(name))
+
+
+def download_checkout_release(repository: str, platform: str) -> None:
+    token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    asset, download_token = _checkout_release_asset_with_fallback(
+        repository,
+        platform,
+        token,
+    )
+    print(f">> downloading {asset.name} from {asset.tag}")
+    with tempfile.TemporaryDirectory(prefix="nvx-download-") as temporary:
+        archive_path = Path(temporary) / asset.name
+        download(
+            asset.url,
+            archive_path,
+            headers=_github_headers(download_token, "application/octet-stream"),
+            opener=credential_safe_opener(),
+        )
+        actual_size = archive_path.stat().st_size
+        if actual_size != asset.size:
+            raise ScriptError(
+                f"downloaded {asset.name} is {actual_size} bytes, expected {asset.size}"
+            )
+        _install_release_archive(archive_path)
+    print(f">> installed {asset.tag} for {platform}")
+
+
+def _copy_release_file(source: Path, destination: Path) -> None:
+    require_file(source, source.name)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, destination)
+
+
+def _validate_alpine_sources(package_manifests: list[Path]) -> frozenset[str]:
+    source_root = BuildConstants.SOURCE_DIR / AlpineBuildConstants.GUEST_NAME
+    source_manifest_path = require_file(
+        source_root / "manifest.json",
+        "collected Alpine source manifest",
+    )
+    source_manifest = _read_json_object(
+        source_manifest_path,
+        "collected Alpine source manifest",
+    )
+    if source_manifest.get("format") != AlpineBuildConstants.SOURCE_MANIFEST_FORMAT:
+        raise ScriptError(
+            "collected Alpine sources use an unsupported manifest format; "
+            "run collect-sources again"
+        )
+    recorded_executables = source_manifest.get("executables")
+    if not isinstance(recorded_executables, list) or not all(
+        isinstance(path, str) for path in cast(list[object], recorded_executables)
+    ):
+        raise ScriptError(
+            "collected Alpine source manifest has an invalid executables list"
+        )
+    executables = frozenset(cast(list[str], recorded_executables))
+    source_packages = cast(list[dict[str, str]], source_manifest["packages"])
+    collected = {
+        (package["package"], package["version"], package["commit"]): package
+        for package in source_packages
+    }
+    missing: list[str] = []
+    for manifest_path in package_manifests:
+        package_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        for package in package_manifest["packages"]:
+            key = (
+                package["name"],
+                package["version"],
+                package["aports_commit"],
+            )
+            if key not in collected:
+                missing.append(f"{key[0]}-{key[1]} ({key[2]})")
+    if missing:
+        raise ScriptError(
+            "collected Alpine sources do not cover packaged APKs: "
+            + ", ".join(sorted(missing))
+        )
+    for package in collected.values():
+        for field in ("recipe", "source_directory"):
+            path = source_root / package[field]
+            if not path.exists():
+                raise ScriptError(
+                    f"collected Alpine {field} is missing for "
+                    f"{package['package']}: {path}"
+                )
+    checksummed = dict(verify_sha256_sums(source_root).files)
+    for path in sorted(executables):
+        if path not in checksummed or not path.startswith("recipes/"):
+            raise ScriptError(
+                f"collected Alpine executable is not a checksummed recipe file: {path}"
+            )
+    return executables
+
+
+def _validate_ubuntu_sources(package_manifests: list[Path]) -> None:
+    source_root = BuildConstants.SOURCE_DIR / UbuntuBuildConstants.GUEST_NAME
+    source_manifest_path = require_file(
+        source_root / "manifest.json",
+        "collected Ubuntu source manifest",
+    )
+    source_manifest = json.loads(source_manifest_path.read_text(encoding="utf-8"))
+    collected = {
+        (package["source_name"], package["source_version"]): package
+        for package in source_manifest["packages"]
+    }
+    missing: list[str] = []
+    for manifest_path in package_manifests:
+        package_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        for package in package_manifest["packages"]:
+            key = (package["source_name"], package["source_version"])
+            if key not in collected:
+                missing.append(f"{key[0]}={key[1]}")
+    if missing:
+        raise ScriptError(
+            "collected Ubuntu sources do not cover packaged binaries: "
+            + ", ".join(sorted(set(missing)))
+        )
+    for package in collected.values():
+        dsc = source_root / package["dsc"]
+        require_file(dsc, f"Ubuntu source metadata for {package['source_name']}")
+        for source_file in package["files"]:
+            require_file(
+                source_root / source_file["path"],
+                f"Ubuntu source member {source_file['name']}",
+            )
+    verify_sha256_sums(source_root)
+
+
+def _create_source_archive(
+    output: Path,
+    inputs: list[tuple[Path, str]],
+    *,
+    mode: Callable[[tarfile.TarInfo], int] | None = None,
+) -> None:
+    print(f">> creating source archive {output}")
+    create_reproducible_tar_gz(output, inputs, mode=mode)
+
+
+def _project_source_archive(
+    output: Path,
+    version: str,
+    package_manifests: list[Path],
+) -> None:
+    root = f"nvx-project-source-{version}"
+    inputs = [
+        (BuildConstants.REPO_ROOT / relative, f"{root}/{relative}")
+        for relative in ReleaseBuildConstants.PROJECT_SOURCE_PATHS
+    ]
+    inputs.extend(
+        (
+            manifest,
+            f"{root}/build/{manifest.name}",
+        )
+        for manifest in package_manifests
+    )
+    inputs.append(
+        (
+            artifact_path(KernelBuildConstants.CONFIG_NAME),
+            f"{root}/{BuildConstants.BUILD_DIRECTORY_NAME}/{KernelBuildConstants.CONFIG_NAME}",
+        )
+    )
+    _create_source_archive(output, inputs)
+
+
+def _alpine_source_archive(
+    output: Path,
+    version: str,
+    package_manifests: list[Path],
+    executables: frozenset[str],
+) -> None:
+    root = f"nvx-alpine-source-{version}"
+    inputs = [
+        (BuildConstants.SOURCE_DIR / AlpineBuildConstants.GUEST_NAME, f"{root}/sources")
+    ]
+    inputs.extend(
+        (
+            manifest,
+            f"{root}/manifests/{manifest.name}",
+        )
+        for manifest in package_manifests
+    )
+    executable_members = {f"{root}/sources/{path}" for path in executables}
+
+    def mode(member: tarfile.TarInfo) -> int:
+        # Apply the recorded modes, which hosts such as Windows cannot store.
+        if member.isdir() or member.name in executable_members:
+            return 0o755
+        return 0o644
+
+    _create_source_archive(output, inputs, mode=mode)
+
+
+def _ubuntu_source_archive(
+    output: Path,
+    version: str,
+    package_manifests: list[Path],
+) -> None:
+    root = f"nvx-ubuntu-source-{version}"
+    inputs = [
+        (BuildConstants.SOURCE_DIR / UbuntuBuildConstants.GUEST_NAME, f"{root}/sources")
+    ]
+    inputs.extend(
+        (
+            manifest,
+            f"{root}/manifests/{manifest.name}",
+        )
+        for manifest in package_manifests
+    )
+    _create_source_archive(output, inputs)
+
+
+def _validate_linux_source_archive(path: Path) -> None:
+    expected_members = {
+        KernelBuildConstants.CONFIG_NAME: artifact_path(
+            KernelBuildConstants.CONFIG_NAME
+        ).read_bytes(),
+        "SOURCE-MANIFEST.json": (
+            BuildConstants.REPO_ROOT / "SOURCE-MANIFEST.json"
+        ).read_bytes(),
+    }
+    manifest = json.loads(expected_members["SOURCE-MANIFEST.json"])
+    expected_members.update(
+        {
+            patch: (BuildConstants.REPO_ROOT / patch).read_bytes()
+            for patch in manifest["linux"]["patches"]
+        }
+    )
+    with tarfile.open(path, "r:gz") as archive:
+        members = archive.getmembers()
+        names = [member.name for member in members]
+        if not any(
+            name.endswith(
+                f"{KernelBuildConstants.SOURCE_NAME}/drivers/tty/hvc/hvc_xe9.c"
+            )
+            for name in names
+        ):
+            raise ScriptError(f"{path} does not contain the patched xe9 HVC driver")
+        for suffix, expected in expected_members.items():
+            matches = [member for member in members if member.name.endswith(suffix)]
+            if len(matches) != 1:
+                raise ScriptError(
+                    f"{path} contains {len(matches)} members ending in {suffix}"
+                )
+            extracted = archive.extractfile(matches[0])
+            if extracted is None or extracted.read() != expected:
+                raise ScriptError(f"{path} has stale contents for {suffix}")
+
+
+def _validate_azurelinux_manifest(manifest_path: Path) -> None:
+    manifest = _read_json_object(manifest_path, "Azure Linux initramfs manifest")
+    initramfs = artifact_path(AzureLinuxBuildConstants.INITRAMFS_NAME)
+    if (
+        manifest.get("format") != AzureLinuxBuildConstants.PACKAGE_MANIFEST_VERSION
+        or manifest.get("guest") != AzureLinuxBuildConstants.GUEST_NAME
+        or manifest.get("artifact") != initramfs.name
+        or manifest.get("artifact_sha256") != sha256_file(initramfs)
+        or manifest.get("package_manifest_format")
+        != AzureLinuxBuildConstants.PACKAGE_MANIFEST_FORMAT
+        or manifest.get("image") != AzureLinuxBuildConstants.IMAGE
+    ):
+        raise ScriptError("Azure Linux initramfs manifest is invalid")
+    if manifest.get("input_sha256") != azurelinux_input_sha256():
+        raise ScriptError(
+            "Azure Linux initramfs manifest does not match the current build inputs"
+        )
+
+
+def _guest_release_inputs(
+    *,
+    include_azurelinux: bool,
+) -> tuple[list[str], list[Path], list[Path], list[Path]]:
+    guest_names = [
+        name
+        for name in ReleaseBuildConstants.GUEST_ARTIFACT_NAMES
+        if include_azurelinux
+        or name not in ReleaseBuildConstants.AZURELINUX_ARTIFACT_NAMES
+    ]
+    for name in guest_names:
+        require_file(artifact_path(name), f"required guest artifact {name}")
+    alpine_manifests = [artifact_path(AlpineBuildConstants.PACKAGE_MANIFEST_NAME)]
+    ubuntu_manifests = [
+        artifact_path(UbuntuBuildConstants.PACKAGE_MANIFEST_NAME),
+        artifact_path(UbuntuBuildConstants.DISTRO_MANIFEST_NAME),
+    ]
+    azurelinux_manifests: list[Path] = []
+    if include_azurelinux:
+        azurelinux_manifests.append(
+            artifact_path(AzureLinuxBuildConstants.PACKAGE_MANIFEST_NAME)
+        )
+        _validate_azurelinux_manifest(azurelinux_manifests[0])
+    expected_input_sha256 = converter_input_sha256(customization_files())
+    for artifact_name, manifest in zip(
+        (UbuntuBuildConstants.INITRAMFS_NAME, UbuntuBuildConstants.DISTRO_NAME),
+        ubuntu_manifests,
+        strict=True,
+    ):
+        artifact = artifact_path(artifact_name)
+        document = _read_json_object(manifest, f"{artifact_name} manifest")
+        if (
+            document.get("format") != UbuntuBuildConstants.PACKAGE_MANIFEST_VERSION
+            or document.get("guest") != UbuntuBuildConstants.GUEST_NAME
+            or document.get("artifact") != artifact.name
+            or document.get("artifact_sha256") != sha256_file(artifact)
+            or document.get("input_sha256") != expected_input_sha256
+        ):
+            raise ScriptError(
+                f"Ubuntu artifact manifest does not match {artifact_name}"
+            )
+    return guest_names, alpine_manifests, ubuntu_manifests, azurelinux_manifests
+
+
+def _read_json_object(path: Path, description: str) -> dict[str, object]:
+    try:
+        value: object = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as error:
+        raise ScriptError(f"invalid {description}: {error}") from error
+    if not isinstance(value, dict):
+        raise ScriptError(f"invalid {description}: expected a JSON object")
+    return cast(dict[str, object], value)
+
+
+def _validate_openvmm_provenance(
+    binary: Path,
+    provenance_path: Path,
+) -> dict[str, object]:
+    provenance = _read_json_object(provenance_path, "OpenVMM build provenance")
+    revision, source_clean = openvmm_git_state(OpenVMMBuildConstants.DIRECTORY)
+    if (
+        provenance.get("format") != OpenVMMBuildConstants.PROVENANCE_FORMAT
+        or provenance.get("source_revision") != revision
+        or provenance.get("source_clean") is not True
+        or not source_clean
+        or provenance.get("executable_sha256") != sha256_file(binary)
+    ):
+        raise ScriptError(
+            "OpenVMM build provenance does not match the current clean pinned "
+            "source and executable"
+        )
+    return provenance
+
+
+def _validate_kernel_provenance(
+    kernel: Path,
+    kernel_config: Path,
+    provenance_path: Path,
+) -> dict[str, object]:
+    provenance = _read_json_object(provenance_path, "kernel build provenance")
+    expected_inputs = kernel_provenance_inputs()
+    if (
+        provenance.get("format") != KernelBuildConstants.PROVENANCE_FORMAT
+        or provenance.get("source") != expected_inputs["source"]
+        or provenance.get("input_config") != expected_inputs["input_config"]
+        or provenance.get("kernel_sha256") != sha256_file(kernel)
+        or provenance.get("config_sha256") != sha256_file(kernel_config)
+    ):
+        raise ScriptError(
+            "kernel build provenance does not match the current source, config, "
+            "and vmlinux"
+        )
+    assert_required_kernel_config(kernel_config)
+    return provenance
+
+
+def _validate_initramfs_provenance(
+    initramfs: Path,
+    package_manifest: Path,
+    provenance_path: Path,
+) -> dict[str, object]:
+    provenance = _read_json_object(
+        provenance_path,
+        "initramfs build provenance",
+    )
+    if (
+        provenance.get("format") != InitramfsBuildConstants.PROVENANCE_FORMAT
+        or provenance.get("inputs") != initramfs_provenance_inputs()
+        or provenance.get("initramfs_sha256") != sha256_file(initramfs)
+        or provenance.get("package_manifest_sha256") != sha256_file(package_manifest)
+    ):
+        raise ScriptError(
+            "initramfs build provenance does not match the current source, "
+            "package manifest, and initramfs"
+        )
+    return provenance
+
+
+def _require_runtime_provenance_paths() -> tuple[Path, Path, Path]:
+    return (
+        require_file(
+            artifact_path(OpenVMMBuildConstants.PROVENANCE_NAME),
+            "OpenVMM build provenance",
+        ),
+        require_file(
+            artifact_path(KernelBuildConstants.PROVENANCE_NAME),
+            "kernel build provenance",
+        ),
+        require_file(
+            artifact_path(InitramfsBuildConstants.PROVENANCE_NAME),
+            "initramfs build provenance",
+        ),
+    )
+
+
+def validate_runtime_artifact_provenance() -> None:
+    binary = require_file(openvmm_binary_path(), "OpenVMM release binary")
+    kernel = require_file(
+        artifact_path(KernelBuildConstants.BINARY_NAME),
+        "required guest artifact vmlinux",
+    )
+    initramfs = require_file(
+        artifact_path(AlpineBuildConstants.INITRAMFS_NAME),
+        "required guest artifact initramfs.cpio.gz",
+    )
+    package_manifest = require_file(
+        artifact_path(AlpineBuildConstants.PACKAGE_MANIFEST_NAME),
+        "initramfs package manifest",
+    )
+    kernel_config = require_file(
+        artifact_path(KernelBuildConstants.CONFIG_NAME),
+        "required guest artifact vmlinux.config",
+    )
+    (
+        openvmm_provenance_path,
+        kernel_provenance_path,
+        initramfs_provenance_path,
+    ) = _require_runtime_provenance_paths()
+    _validate_openvmm_provenance(binary, openvmm_provenance_path)
+    _validate_kernel_provenance(kernel, kernel_config, kernel_provenance_path)
+    _validate_initramfs_provenance(
+        initramfs,
+        package_manifest,
+        initramfs_provenance_path,
+    )
+
+
+def _packaged_source_manifest(
+    root_manifest: dict[str, object],
+    release_version: str,
+    release_root: Path,
+    openvmm_provenance: dict[str, object],
+    binary_name: str,
+    *,
+    include_azurelinux: bool,
+) -> bytes:
+    distribution = root_manifest.get("distribution")
+    openvmm = root_manifest.get("openvmm")
+    linux = root_manifest.get("linux")
+    alpine = root_manifest.get("alpine")
+    ubuntu = root_manifest.get("ubuntu")
+    azurelinux = root_manifest.get("azurelinux")
+    if not all(
+        isinstance(section, dict)
+        for section in (distribution, openvmm, linux, alpine, ubuntu, azurelinux)
+    ):
+        raise ScriptError("SOURCE-MANIFEST.json is missing a required object")
+    distribution_section = cast(dict[str, object], distribution)
+    openvmm_section = cast(dict[str, object], openvmm)
+    linux_section = cast(dict[str, object], linux)
+    alpine_section = cast(dict[str, object], alpine)
+    ubuntu_section = cast(dict[str, object], ubuntu)
+    distribution_section["version"] = release_version
+    openvmm_section["source_revision"] = openvmm_provenance["source_revision"]
+    openvmm_section["executable_sha256"] = sha256_file(
+        release_root / "bin" / binary_name
+    )
+    linux_section["kernel_sha256"] = sha256_file(
+        release_root / "guest" / KernelBuildConstants.BINARY_NAME
+    )
+    linux_section["config_sha256"] = sha256_file(
+        release_root / "guest" / KernelBuildConstants.CONFIG_NAME
+    )
+    alpine_section["initramfs_sha256"] = sha256_file(
+        release_root / "guest" / AlpineBuildConstants.INITRAMFS_NAME
+    )
+    alpine_section["initramfs_package_manifest_sha256"] = sha256_file(
+        release_root / "guest" / AlpineBuildConstants.PACKAGE_MANIFEST_NAME
+    )
+    ubuntu_section["initramfs_sha256"] = sha256_file(
+        release_root / "guest" / UbuntuBuildConstants.INITRAMFS_NAME
+    )
+    ubuntu_section["initramfs_package_manifest_sha256"] = sha256_file(
+        release_root / "guest" / UbuntuBuildConstants.PACKAGE_MANIFEST_NAME
+    )
+    ubuntu_section["distro_layer_sha256"] = sha256_file(
+        release_root / "guest" / UbuntuBuildConstants.DISTRO_NAME
+    )
+    ubuntu_section["distro_layer_manifest_sha256"] = sha256_file(
+        release_root / "guest" / UbuntuBuildConstants.DISTRO_MANIFEST_NAME
+    )
+    if include_azurelinux:
+        azurelinux_section = cast(dict[str, object], azurelinux)
+        azurelinux_section["initramfs_sha256"] = sha256_file(
+            release_root / "guest" / AzureLinuxBuildConstants.INITRAMFS_NAME
+        )
+        azurelinux_section["initramfs_package_manifest_sha256"] = sha256_file(
+            release_root / "guest" / AzureLinuxBuildConstants.PACKAGE_MANIFEST_NAME
+        )
+    else:
+        del root_manifest["azurelinux"]
+    return (json.dumps(root_manifest, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+
+def _validate_root_manifest_contract(manifest: dict[str, object]) -> None:
+    distribution = manifest.get("distribution")
+    openvmm = manifest.get("openvmm")
+    if not isinstance(distribution, dict):
+        raise ScriptError("SOURCE-MANIFEST.json distribution must identify nvx")
+    distribution_section = cast(dict[str, object], distribution)
+    if distribution_section.get("name") != "nvx":
+        raise ScriptError("SOURCE-MANIFEST.json distribution must identify nvx")
+    expected_openvmm = {
+        "microvm_abi_version": OpenVMMBuildConstants.MICROVM_ABI_VERSION,
+        "control_session_protocol_version": OpenVMMBuildConstants.CONTROL_SESSION_PROTOCOL_VERSION,
+        "control_contract_revision": OpenVMMBuildConstants.CONTROL_CONTRACT_REVISION,
+    }
+    if not isinstance(openvmm, dict):
+        raise ScriptError(
+            "SOURCE-MANIFEST.json OpenVMM contract does not match the build contract"
+        )
+    openvmm_section = cast(dict[str, object], openvmm)
+    for field, expected in expected_openvmm.items():
+        if openvmm_section.get(field) != expected:
+            raise ScriptError(
+                "SOURCE-MANIFEST.json OpenVMM contract does not match the "
+                "build contract"
+            )
+    if "source_revision" in openvmm_section:
+        raise ScriptError(
+            "root SOURCE-MANIFEST.json must not duplicate the OpenVMM gitlink revision"
+        )
+    if "guest_agent" in manifest:
+        raise ScriptError(
+            "root SOURCE-MANIFEST.json must not contain product guest-agent metadata"
+        )
+
+
+def _validate_source_manifest_metadata(
+    manifest: dict[str, object],
+    kernel_inputs: dict[str, object],
+) -> list[str]:
+    _validate_root_manifest_contract(manifest)
+    if manifest.get("format") != ReleaseBuildConstants.SOURCE_MANIFEST_FORMAT:
+        raise ScriptError("SOURCE-MANIFEST.json format must be 1")
+    linux_value = manifest.get("linux")
+    alpine_value = manifest.get("alpine")
+    ubuntu_value = manifest.get("ubuntu")
+    azurelinux_value = manifest.get("azurelinux")
+    source_value = kernel_inputs.get("source")
+    config_value = kernel_inputs.get("input_config")
+    if not all(
+        isinstance(section, dict)
+        for section in (
+            linux_value,
+            alpine_value,
+            ubuntu_value,
+            azurelinux_value,
+            source_value,
+            config_value,
+        )
+    ):
+        raise ScriptError("SOURCE-MANIFEST.json is missing source metadata")
+    linux = cast(dict[str, object], linux_value)
+    alpine = cast(dict[str, object], alpine_value)
+    ubuntu = cast(dict[str, object], ubuntu_value)
+    azurelinux = cast(dict[str, object], azurelinux_value)
+    source = cast(dict[str, object], source_value)
+    input_config = cast(dict[str, object], config_value)
+    source_patches = source.get("patches")
+    if not isinstance(source_patches, list):
+        raise ScriptError("kernel provenance source patches must be a list")
+    patch_paths: list[str] = []
+    for patch_value in cast(list[object], source_patches):
+        if not isinstance(patch_value, dict):
+            raise ScriptError("kernel provenance source patch must be an object")
+        patch = cast(dict[str, object], patch_value)
+        path = patch.get("path")
+        if not isinstance(path, str):
+            raise ScriptError("kernel provenance source patch path must be a string")
+        patch_paths.append(path)
+    expected_linux: dict[str, object] = {
+        "version": KernelBuildConstants.VERSION,
+        "upstream_url": KernelBuildConstants.URL,
+        "upstream_archive_sha256": KernelBuildConstants.SHA256,
+        "source_cache": (
+            Path(BuildConstants.CACHE_DIRECTORY_NAME)
+            / KernelBuildConstants.SOURCE_DIRECTORY_NAME
+            / KernelBuildConstants.SOURCE_NAME
+        ).as_posix(),
+        "source_archive": (
+            BuildConstants.SOURCE_RELATIVE_DIRECTORY
+            / KernelBuildConstants.SOURCE_DIRECTORY_NAME
+            / KernelBuildConstants.SOURCE_ARCHIVE_NAME
+        ).as_posix(),
+        "generated_final_config": (
+            Path(BuildConstants.BUILD_DIRECTORY_NAME) / KernelBuildConstants.CONFIG_NAME
+        ).as_posix(),
+        "input_config": input_config.get("path"),
+        "patches": patch_paths,
+    }
+    for field, expected in expected_linux.items():
+        if linux.get(field) != expected:
+            raise ScriptError(
+                f"SOURCE-MANIFEST.json Linux {field} does not match the build pin"
+            )
+    expected_alpine: dict[str, object] = {
+        "version": AlpineBuildConstants.VERSION,
+        "branch": AlpineBuildConstants.BRANCH,
+        "architecture": AlpineBuildConstants.ARCHITECTURE,
+        "minirootfs_url": AlpineBuildConstants.MINIROOTFS_URL,
+        "minirootfs_sha256": AlpineBuildConstants.MINIROOTFS_SHA256,
+        "guest_sources": [
+            path.as_posix() for path in AlpineBuildConstants.GUEST_SOURCE_DIRECTORIES
+        ],
+        "package_manifests": [
+            (
+                Path(BuildConstants.BUILD_DIRECTORY_NAME)
+                / AlpineBuildConstants.PACKAGE_MANIFEST_NAME
+            ).as_posix()
+        ],
+        "source_output": (
+            BuildConstants.SOURCE_RELATIVE_DIRECTORY / AlpineBuildConstants.GUEST_NAME
+        ).as_posix(),
+    }
+    for field, expected in expected_alpine.items():
+        if alpine.get(field) != expected:
+            raise ScriptError(
+                f"SOURCE-MANIFEST.json Alpine {field} does not match the build pin"
+            )
+    expected_ubuntu: dict[str, object] = {
+        "distribution": UbuntuBuildConstants.DISTRIBUTION,
+        "version": UbuntuBuildConstants.VERSION,
+        "codename": UbuntuBuildConstants.CODENAME,
+        "architecture": UbuntuBuildConstants.ARCHITECTURE,
+        "base_url": UbuntuBuildConstants.BASE_URL,
+        "base_sha256": UbuntuBuildConstants.BASE_SHA256,
+        "archive_keyring_url": UbuntuBuildConstants.ARCHIVE_KEYRING_URL,
+        "archive_keyring_sha256": UbuntuBuildConstants.ARCHIVE_KEYRING_SHA256,
+        "package_lock": UbuntuBuildConstants.PACKAGE_LOCK_RELATIVE_PATH.as_posix(),
+        "package_lock_sha256": package_lock_sha256(),
+        "guest_sources": [
+            *(
+                path.as_posix()
+                for path in UbuntuBuildConstants.GUEST_SOURCE_DIRECTORIES
+            ),
+            UbuntuBuildConstants.PACKAGE_LOCK_RELATIVE_PATH.as_posix(),
+        ],
+        "package_manifests": [
+            (
+                Path(BuildConstants.BUILD_DIRECTORY_NAME)
+                / UbuntuBuildConstants.PACKAGE_MANIFEST_NAME
+            ).as_posix(),
+            (
+                Path(BuildConstants.BUILD_DIRECTORY_NAME)
+                / UbuntuBuildConstants.DISTRO_MANIFEST_NAME
+            ).as_posix(),
+        ],
+        "source_output": (
+            BuildConstants.SOURCE_RELATIVE_DIRECTORY / UbuntuBuildConstants.GUEST_NAME
+        ).as_posix(),
+        "erofs_converter_format": UbuntuBuildConstants.EROFS_FORMAT,
+    }
+    for field, expected in expected_ubuntu.items():
+        if ubuntu.get(field) != expected:
+            raise ScriptError(
+                f"SOURCE-MANIFEST.json Ubuntu {field} does not match the build pin"
+            )
+    expected_azurelinux: dict[str, object] = {
+        "distribution": AzureLinuxBuildConstants.DISTRIBUTION,
+        "version": AzureLinuxBuildConstants.VERSION,
+        "architecture": AzureLinuxBuildConstants.ARCHITECTURE,
+        "image": AzureLinuxBuildConstants.IMAGE,
+        "package_lock": AzureLinuxBuildConstants.PACKAGE_LOCK_RELATIVE_PATH.as_posix(),
+        "package_lock_sha256": azurelinux_package_lock_sha256(),
+        "guest_sources": [
+            *(
+                path.as_posix()
+                for path in AzureLinuxBuildConstants.GUEST_SOURCE_DIRECTORIES
+            ),
+            AzureLinuxBuildConstants.PACKAGE_LOCK_RELATIVE_PATH.as_posix(),
+        ],
+        "package_manifests": [
+            (
+                Path(BuildConstants.BUILD_DIRECTORY_NAME)
+                / AzureLinuxBuildConstants.PACKAGE_MANIFEST_NAME
+            ).as_posix()
+        ],
+    }
+    for field, expected in expected_azurelinux.items():
+        if azurelinux.get(field) != expected:
+            raise ScriptError(
+                f"SOURCE-MANIFEST.json Azure Linux {field} does not match the build pin"
+            )
+    return patch_paths
+
+
+def _validate_release_replacement(destination: Path, force: bool) -> None:
+    if not destination.exists():
+        return
+    if not force:
+        raise ScriptError(
+            f"release directory already exists: {destination}; "
+            "pass --force to replace it"
+        )
+    release_root = (
+        BuildConstants.REPO_ROOT / ReleaseBuildConstants.DIRECTORY_NAME
+    ).resolve()
+    if destination == release_root or release_root not in destination.parents:
+        raise ScriptError("--force may only replace a version directory below dist/")
+
+
+def _publish_release_directory(
+    staging: Path,
+    destination: Path,
+    *,
+    force: bool,
+) -> None:
+    backup = destination.with_name(f".{destination.name}.backup-{uuid.uuid4().hex}")
+    moved_prior = False
+    try:
+        _validate_release_replacement(destination, force)
+        if destination.exists():
+            destination.replace(backup)
+            moved_prior = True
+        staging.replace(destination)
+    except ScriptError:
+        shutil.rmtree(staging)
+        raise
+    except OSError as publish_error:
+        if moved_prior:
+            try:
+                backup.replace(destination)
+            except OSError as restore_error:
+                raise _ReleaseRestoreError(
+                    "failed to publish the staged release and restore the prior "
+                    f"release; prior release remains at {backup} and staged "
+                    f"release remains at {staging}: {restore_error}"
+                ) from publish_error
+        shutil.rmtree(staging, ignore_errors=True)
+        raise ScriptError(f"failed to publish staged release: {publish_error}") from (
+            publish_error
+        )
+    if moved_prior:
+        shutil.rmtree(backup)
+
+
+def collect_release_sources(config: DockerBuildConfig) -> None:
+    _guest_names, alpine_manifests, ubuntu_manifests, _azurelinux_manifests = (
+        _guest_release_inputs(include_azurelinux=False)
+    )
+    collect_alpine_sources(
+        alpine_manifests,
+        BuildConstants.SOURCE_DIR / AlpineBuildConstants.GUEST_NAME,
+        BuildConstants.REPO_ROOT
+        / BuildConstants.CACHE_DIRECTORY_NAME
+        / AlpineBuildConstants.APORTS_CACHE_DIRECTORY_NAME,
+    )
+    collect_ubuntu_sources(
+        ubuntu_manifests,
+        BuildConstants.SOURCE_DIR / UbuntuBuildConstants.GUEST_NAME,
+        BuildConstants.REPO_ROOT
+        / BuildConstants.CACHE_DIRECTORY_NAME
+        / UbuntuBuildConstants.SOURCE_CACHE_DIRECTORY_NAME,
+    )
+    build_docker_linux_source(config)
+    print(
+        "!! Azure Linux corresponding source is not collected: source-inclusive "
+        "packages omit the Azure Linux guest",
+        file=sys.stderr,
+    )
+    print(f">> collected release sources under {BuildConstants.SOURCE_DIR}")
+
+
+def package_release(
+    *,
+    version: str | None,
+    destination: Path | None,
+    include_source: bool,
+    force: bool,
+) -> None:
+    guest_names, alpine_manifests, ubuntu_manifests, azurelinux_manifests = (
+        _guest_release_inputs(include_azurelinux=not include_source)
+    )
+    linux_source_archive = (
+        BuildConstants.SOURCE_DIR
+        / KernelBuildConstants.SOURCE_DIRECTORY_NAME
+        / KernelBuildConstants.SOURCE_ARCHIVE_NAME
+    )
+    alpine_executables: frozenset[str] = frozenset()
+    if include_source:
+        alpine_executables = _validate_alpine_sources(alpine_manifests)
+        _validate_ubuntu_sources(ubuntu_manifests)
+        require_file(linux_source_archive, "Linux corresponding-source archive")
+        _validate_linux_source_archive(linux_source_archive)
+        print(
+            "!! source-inclusive package omits the Azure Linux guest: "
+            "collect-sources does not collect its corresponding source",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            "!! binary-only package: publish matching Linux, Alpine, Ubuntu, and "
+            "Azure Linux corresponding source separately",
+            file=sys.stderr,
+        )
+    package_manifests = [
+        *alpine_manifests,
+        *ubuntu_manifests,
+        *azurelinux_manifests,
+    ]
+
+    release_version = (
+        version
+        or (BuildConstants.REPO_ROOT / "VERSION").read_text(encoding="ascii").strip()
+    )
+    release_destination = (
+        destination
+        or BuildConstants.REPO_ROOT
+        / ReleaseBuildConstants.DIRECTORY_NAME
+        / release_version
+    ).resolve()
+    _validate_release_replacement(release_destination, force)
+    binary = require_file(openvmm_binary_path(), "OpenVMM release binary")
+    kernel = require_file(
+        artifact_path(KernelBuildConstants.BINARY_NAME),
+        "required guest artifact vmlinux",
+    )
+    kernel_config = require_file(
+        artifact_path(KernelBuildConstants.CONFIG_NAME),
+        "required guest artifact vmlinux.config",
+    )
+    initramfs = require_file(
+        artifact_path(AlpineBuildConstants.INITRAMFS_NAME),
+        "required guest artifact initramfs.cpio.gz",
+    )
+    package_manifest = require_file(
+        artifact_path(AlpineBuildConstants.PACKAGE_MANIFEST_NAME),
+        "initramfs package manifest",
+    )
+    (
+        openvmm_provenance_path,
+        kernel_provenance_path,
+        initramfs_provenance_path,
+    ) = _require_runtime_provenance_paths()
+    openvmm_provenance = _validate_openvmm_provenance(
+        binary,
+        openvmm_provenance_path,
+    )
+    kernel_provenance = _validate_kernel_provenance(
+        kernel,
+        kernel_config,
+        kernel_provenance_path,
+    )
+    initramfs_provenance = _validate_initramfs_provenance(
+        initramfs,
+        package_manifest,
+        initramfs_provenance_path,
+    )
+    root_manifest_path = require_file(
+        BuildConstants.REPO_ROOT / "SOURCE-MANIFEST.json",
+        "source manifest",
+    )
+    root_manifest = _read_json_object(root_manifest_path, "source manifest")
+    _validate_source_manifest_metadata(root_manifest, kernel_provenance)
+    for name in ("LICENSE", "README.md", "THIRD_PARTY_NOTICES.md"):
+        require_file(BuildConstants.REPO_ROOT / name, name)
+    require_file(OpenVMMBuildConstants.DIRECTORY / "LICENSE", "OpenVMM license")
+    require_file(
+        BuildConstants.REPO_ROOT / "kernel" / "COPYING-LINUX", "Linux copyright notice"
+    )
+
+    release_destination.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(
+        tempfile.mkdtemp(
+            prefix=f".{release_destination.name}.staging-",
+            dir=release_destination.parent,
+        )
+    )
+    preserve_staging = False
+    try:
+        _copy_release_file(binary, staging / "bin" / binary.name)
+        for name in guest_names:
+            _copy_release_file(artifact_path(name), staging / "guest" / name)
+        _copy_release_file(
+            openvmm_provenance_path,
+            staging / "provenance" / OpenVMMBuildConstants.PROVENANCE_NAME,
+        )
+        _copy_release_file(
+            kernel_provenance_path,
+            staging / "provenance" / KernelBuildConstants.PROVENANCE_NAME,
+        )
+        _copy_release_file(
+            initramfs_provenance_path,
+            staging / "provenance" / InitramfsBuildConstants.PROVENANCE_NAME,
+        )
+        for name in ("LICENSE", "README.md", "THIRD_PARTY_NOTICES.md"):
+            _copy_release_file(BuildConstants.REPO_ROOT / name, staging / name)
+        _copy_release_file(
+            OpenVMMBuildConstants.DIRECTORY / "LICENSE",
+            staging / "licenses" / "LICENSE-OPENVMM",
+        )
+        _copy_release_file(
+            BuildConstants.REPO_ROOT / "kernel" / "COPYING-LINUX",
+            staging / "licenses" / "COPYING-LINUX",
+        )
+        if include_source:
+            source_destination = staging / "source"
+            _copy_release_file(
+                linux_source_archive,
+                source_destination / linux_source_archive.name,
+            )
+            _project_source_archive(
+                source_destination / f"nvx-project-source-{release_version}.tar.gz",
+                release_version,
+                package_manifests,
+            )
+            _alpine_source_archive(
+                source_destination / f"nvx-alpine-source-{release_version}.tar.gz",
+                release_version,
+                alpine_manifests,
+                alpine_executables,
+            )
+            _ubuntu_source_archive(
+                source_destination / f"nvx-ubuntu-source-{release_version}.tar.gz",
+                release_version,
+                ubuntu_manifests,
+            )
+        packaged_binary = staging / "bin" / binary.name
+        packaged_kernel = staging / "guest" / KernelBuildConstants.BINARY_NAME
+        packaged_config = staging / "guest" / KernelBuildConstants.CONFIG_NAME
+        packaged_initramfs = staging / "guest" / AlpineBuildConstants.INITRAMFS_NAME
+        packaged_package_manifest = (
+            staging / "guest" / AlpineBuildConstants.PACKAGE_MANIFEST_NAME
+        )
+        packaged_openvmm_provenance = (
+            staging / "provenance" / OpenVMMBuildConstants.PROVENANCE_NAME
+        )
+        packaged_kernel_provenance = (
+            staging / "provenance" / KernelBuildConstants.PROVENANCE_NAME
+        )
+        packaged_initramfs_provenance = (
+            staging / "provenance" / InitramfsBuildConstants.PROVENANCE_NAME
+        )
+        if sha256_file(packaged_binary) != openvmm_provenance["executable_sha256"]:
+            raise ScriptError(
+                "packaged OpenVMM executable does not match its build provenance"
+            )
+        if sha256_file(packaged_kernel) != kernel_provenance["kernel_sha256"]:
+            raise ScriptError("packaged kernel does not match its build provenance")
+        if sha256_file(packaged_config) != kernel_provenance["config_sha256"]:
+            raise ScriptError(
+                "packaged kernel config does not match its build provenance"
+            )
+        if (
+            sha256_file(packaged_initramfs) != initramfs_provenance["initramfs_sha256"]
+            or sha256_file(packaged_package_manifest)
+            != initramfs_provenance["package_manifest_sha256"]
+        ):
+            raise ScriptError(
+                "packaged initramfs artifacts do not match their build provenance"
+            )
+        if (
+            _read_json_object(
+                packaged_openvmm_provenance,
+                "packaged OpenVMM build provenance",
+            )
+            != openvmm_provenance
+        ):
+            raise ScriptError("packaged OpenVMM provenance changed while staging")
+        if (
+            _read_json_object(
+                packaged_kernel_provenance,
+                "packaged kernel build provenance",
+            )
+            != kernel_provenance
+        ):
+            raise ScriptError("packaged kernel provenance changed while staging")
+        if (
+            _read_json_object(
+                packaged_initramfs_provenance,
+                "packaged initramfs build provenance",
+            )
+            != initramfs_provenance
+        ):
+            raise ScriptError("packaged initramfs provenance changed while staging")
+        (staging / "SOURCE-MANIFEST.json").write_bytes(
+            _packaged_source_manifest(
+                root_manifest,
+                release_version,
+                staging,
+                openvmm_provenance,
+                binary.name,
+                include_azurelinux=not include_source,
+            )
+        )
+        write_sha256_sums(staging)
+        verify_sha256_sums(staging)
+        _publish_release_directory(staging, release_destination, force=force)
+    except _ReleaseRestoreError:
+        preserve_staging = True
+        raise
+    finally:
+        if staging.exists() and not preserve_staging:
+            shutil.rmtree(staging)
+    print(f">> packaged {release_destination}")
+
+
+def verify_source_tree() -> None:
+    manifest = _read_json_object(
+        BuildConstants.REPO_ROOT / "SOURCE-MANIFEST.json",
+        "source manifest",
+    )
+    patch_paths = _validate_source_manifest_metadata(
+        manifest,
+        kernel_provenance_inputs(),
+    )
+    required = {
+        BuildConstants.REPO_ROOT
+        / "kernel"
+        / "config-microvm": "kernel build configuration",
+        BuildConstants.REPO_ROOT
+        / "kernel"
+        / "patches"
+        / "0001-microvm-xe9-earlycon.patch": "xe9 early console patch",
+        BuildConstants.REPO_ROOT
+        / "kernel"
+        / "patches"
+        / "0002-microvm-hvc-xe9.patch": "xe9 HVC patch",
+        BuildConstants.REPO_ROOT / "kernel" / "COPYING-LINUX": "Linux copyright notice",
+        BuildConstants.REPO_ROOT / "guest" / "common" / "init": "common guest init",
+        BuildConstants.REPO_ROOT
+        / "guest"
+        / "alpine"
+        / "nvx-container-enter": "Alpine sandbox container helper",
+        UbuntuBuildConstants.PACKAGE_LOCK: "Ubuntu supplemental package lock",
+        OpenVMMBuildConstants.DIRECTORY / "Cargo.toml": "initialized OpenVMM submodule",
+    }
+    required.update(
+        {
+            BuildConstants.REPO_ROOT / patch: f"kernel patch {patch}"
+            for patch in patch_paths
+        }
+    )
+    for path, description in required.items():
+        require_file(path, description)
+    forbidden = (
+        BuildConstants.REPO_ROOT / "third_party" / "linux",
+        BuildConstants.REPO_ROOT / "third_party" / "alpine-sources",
+        BuildConstants.REPO_ROOT / "third_party" / "ubuntu-sources",
+    )
+    present = [str(path) for path in forbidden if path.exists()]
+    if present:
+        raise ScriptError(
+            "generated third-party sources must not be checked out here: "
+            + ", ".join(present)
+        )
+    config_path = BuildConstants.REPO_ROOT / "kernel" / "config-microvm"
+    config = config_path.read_text(encoding="utf-8")
+    for setting in (
+        *KernelBuildConstants.REQUIRED_DIRECT_BOOT_CONFIG,
+        "CONFIG_HVC_XE9=y",
+        "CONFIG_VIRTIO_FS=y",
+        "CONFIG_FUSE_FS=y",
+        *KernelBuildConstants.REQUIRED_SANDBOX_CONFIG,
+        *KernelBuildConstants.REQUIRED_NETWORK_CONFIG,
+        *KernelBuildConstants.REQUIRED_TIME_ABI_CONFIG,
+        *KernelBuildConstants.REQUIRED_HARDENING_CONFIG,
+    ):
+        if setting not in config.splitlines():
+            raise ScriptError(f"{config_path} is missing {setting}")
+    hvc_patch_text = (
+        BuildConstants.REPO_ROOT / "kernel" / "patches" / "0002-microvm-hvc-xe9.patch"
+    ).read_text(encoding="utf-8")
+    for marker in ("config HVC_XE9", "hvc_xe9.o", "hvc_xe9.c"):
+        if marker not in hvc_patch_text:
+            raise ScriptError(f"xe9 HVC patch is missing {marker}")
+    generated_config = artifact_path(KernelBuildConstants.CONFIG_NAME)
+    if generated_config.is_file():
+        generated = generated_config.read_text(encoding="utf-8").splitlines()
+        for setting in (
+            *KernelBuildConstants.REQUIRED_DIRECT_BOOT_CONFIG,
+            "CONFIG_HVC_XE9=y",
+            *KernelBuildConstants.REQUIRED_SANDBOX_CONFIG,
+            *KernelBuildConstants.REQUIRED_NETWORK_CONFIG,
+        ):
+            if setting not in generated:
+                raise ScriptError(f"{generated_config} is missing {setting}")
+    head = subprocess.run(
+        ["git", "-C", OpenVMMBuildConstants.DIRECTORY, "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    expected = subprocess.run(
+        ["git", "-C", BuildConstants.REPO_ROOT, "rev-parse", ":openvmm"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    if head != expected:
+        raise ScriptError(f"OpenVMM submodule is at {head}, expected {expected}")
+    print(">> source tree and submodule metadata are consistent")
