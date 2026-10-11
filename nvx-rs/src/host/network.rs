@@ -157,7 +157,8 @@ impl EgressRules {
 ///
 /// A connection matching a `deny` rule is blocked. Otherwise a connection matching an `allow`
 /// rule is permitted, and any other connection follows the `egress` default. OpenVMM's portable
-/// profile denies ingress and the guest's access to host loopback services.
+/// profile denies the guest's access to host loopback services, and the host's own access to the
+/// guest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkPolicy {
     /// Default policy for guest-initiated connections.
@@ -166,8 +167,11 @@ pub struct NetworkPolicy {
     pub allow: EgressRules,
     /// Destinations blocked despite an `allow` default or an `allow` rule.
     pub deny: EgressRules,
-    /// Default policy for host-initiated connections, which OpenVMM's portable profile can only
-    /// deny; [`openvmm_arguments`] refuses [`Access::Allow`].
+    /// Default policy for connections that clients initiate to the guest. With [`Access::Allow`],
+    /// OpenVMM listens on every host address at the TCP and UDP ports where the guest listens,
+    /// and admits clients on the host's private networks, whose addresses are not globally
+    /// reachable, but not clients inside the guest network, IPv6 link-local clients, or the host
+    /// itself; replies to their connections pass whatever the egress policy.
     pub ingress: Access,
 }
 
@@ -200,13 +204,13 @@ impl NetworkPolicy {
 
 /// Returns the OpenVMM options that enforce `policy` for a guest at `guest_network`.
 ///
-/// Without a policy, or when egress is denied without allow rules, no network device is
-/// attached. Otherwise the portable profile applies the egress posture with ingress and host
-/// loopback denied.
+/// Without a policy, or when egress is denied without allow rules and ingress is denied, no
+/// network device is attached. Otherwise the portable profile applies the egress posture and the
+/// ingress default with host loopback denied.
 ///
-/// Fails with [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported) when the policy allows
-/// ingress, which the portable profile cannot express, when a rule cannot be expressed exactly,
-/// or when the rules of one action expand to more than [`MAX_RULES`] OpenVMM rules.
+/// Fails with [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported) when a rule cannot be
+/// expressed exactly, or when the rules of one action expand to more than [`MAX_RULES`] OpenVMM
+/// rules.
 pub fn openvmm_arguments(
     policy: Option<&NetworkPolicy>,
     guest_network: &str,
@@ -214,13 +218,10 @@ pub fn openvmm_arguments(
     let Some(policy) = policy else {
         return Ok(Vec::new());
     };
-    if policy.ingress != Access::Deny {
-        return Err(Error::unsupported(
-            "ingress must be denied; OpenVMM's portable network profile cannot admit \
-             host-initiated connections",
-        ));
-    }
-    if policy.egress == Access::Deny && policy.allow.rules.is_empty() {
+    if policy.egress == Access::Deny
+        && policy.allow.rules.is_empty()
+        && policy.ingress == Access::Deny
+    {
         return Ok(Vec::new());
     }
     let mut arguments: Vec<String> = [
@@ -231,7 +232,7 @@ pub fn openvmm_arguments(
         "--network-egress",
         policy.egress.as_str(),
         "--network-ingress",
-        "deny",
+        policy.ingress.as_str(),
         "--host-loopback",
         "deny",
     ]
@@ -403,13 +404,25 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        // The portable profile denies ingress, so a policy that allows it is refused rather than
-        // tightened.
+        // Ingress needs the device even when egress is denied, and host loopback stays denied.
         for egress in [Access::Deny, Access::Allow] {
             let mut ingress = NetworkPolicy::new(egress);
             ingress.ingress = Access::Allow;
-            let error = openvmm_arguments(Some(&ingress), "10.0.0.2/24").unwrap_err();
-            assert_eq!(error.kind(), crate::ErrorKind::Unsupported, "{error}");
+            assert_eq!(
+                openvmm_arguments(Some(&ingress), "10.0.0.2/24").unwrap(),
+                [
+                    "--net",
+                    "10.0.0.2/24",
+                    "--network-profile",
+                    "portable",
+                    "--network-egress",
+                    egress.as_str(),
+                    "--network-ingress",
+                    "allow",
+                    "--host-loopback",
+                    "deny",
+                ]
+            );
         }
     }
 
