@@ -51,6 +51,14 @@ snapshots are also supported and do not use sandbox tier metadata. The
 management RPC constructs only blockless microVMs without a NIC or control
 console; it can attach portb, the boot console, and one HostFs export.
 
+Host filesystem sharing uses the fixed `fs:microvm0` slot instead of adding
+devices. The [host-filesystem attachment layer](../../openvmm/openvmm/openvmm_entry/src/microvm/filesystem.rs)
+accepts either `--mount` for one host directory or `--mount-aggregate` with
+`--mount-child` for named directory or regular-file children. Each child has
+its own access mode, and the aggregate root is read-only. The
+[filesystem contract](machine-and-device-abi.md#filesystem) defines the
+option syntax, export restrictions, and snapshot compatibility rules.
+
 The microVM rejects UEFI, PCAT, IGVM, caller-supplied ACPI, SMBIOS, device
 tree, PCI/PCIe, VPCI, VMBus, ISA DMA, IDE, floppy, VMGS, graphics, VGA
 firmware, debugger resources, and devices outside the profile. The profile
@@ -69,7 +77,8 @@ identity and a live, authenticated control console.
 
 Restore is stricter than cold boot. Guest-visible configuration is read from
 the snapshot's machine contract. Restore-time input may select the same backend
-kind recorded by the snapshot, supply required attachments, and select
+kind recorded by the snapshot, supply required attachments, bind a new directory
+export to a [captured dormant filesystem slot](machine-and-device-abi.md#filesystem), and select
 processor and RAM activation targets explicitly allowed by the contract. Those
 process-local targets do not change processor capacity, RAM capacity, command
 line, device placement, feature masks, or filesystem and network identity.
