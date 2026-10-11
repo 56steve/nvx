@@ -38,8 +38,8 @@ across capture and a capture right after the guest swaps two files and two
 directories with `RENAME_EXCHANGE`, which Linux hosts perform and Windows hosts
 reject without changing either name. Directional network coverage verifies an
 egress request and response with ingress denied, denial of a host connection
-to an active guest listener, complete egress denial, and pre-boot rejection of
-unsupported ingress on KVM, MSHV, and WHP. L3/L4 coverage verifies TCP and UDP
+to an active guest listener, and complete egress denial on KVM, MSHV, and WHP.
+L3/L4 coverage verifies TCP and UDP
 port rules, overlapping deny precedence, default-deny behavior, and pre-boot
 rejection of malformed or incomplete rules. Protocol coverage verifies that
 TCP, UDP, and ICMP rules without a port, `any` with a port, and `any` alone
