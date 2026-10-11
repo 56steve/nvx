@@ -21,14 +21,14 @@ contracts between them.
 | Virtio transport, shared interrupt status, and device-private saved state | OpenVMM virtio transport and device models |
 | Control-session protocol, authenticated broker, and local peer identity | OpenVMM virtio-console broker and serial socket and named-pipe backends |
 | Portable networking, egress policy, and endpoint quiesce | OpenVMM Consomme endpoint, egress policy, and virtio-net device |
-| HostFs profile on the single virtio-fs slot: one host directory, or a read-only, root-only aggregate of named host directories, each with its own mode and denied, allowed, and writable paths; and filesystem saved state | OpenVMM microVM virtio-fs profile and virtio-fs aggregate |
+| HostFs profile on the single virtio-fs slot: one host directory, or named directory or regular-file children under a read-only synthetic root; per-child access modes, directory-only denied, allowed, and writable paths, file exports that exclude their parent directories, and filesystem saved state | [OpenVMM microVM virtio-fs profile](../../openvmm/vm/devices/virtio/virtiofs/src/microvm/) and [virtio-fs aggregate](../../openvmm/vm/devices/virtio/virtiofs/src/aggregate.rs) |
 | State-unit quiesce, start, rollback, inventory, and downtime advance | OpenVMM state-unit framework |
 | Snapshot format, machine contract, publication, and artifact validation | OpenVMM snapshot helpers and platform file primitives |
 | Backend CPU contracts and snapshot clocks | KVM, MSHV, and WHP backends |
 | Guest-visible CPU profiles: the pinned catalog, `--cpu-profile` selection, host profiles and the `auto` fallback, backend support and restore checks, and CPU fingerprints | OpenVMM CPU-profile catalog, with the shared time-ABI layer that builds each VM's effective CPUID |
 | Layered sandbox launch and kernel features | NVX sandbox launcher and microVM kernel configuration |
 | Managed `sandbox` lifecycle of the NVX CLI: per-sandbox state, fail-closed provision, start, stop, and deprovision transitions that take effect one at a time per sandbox while `exec` runs beside them, the control capability that each start generates and hands to OpenVMM, and identification of the running OpenVMM process | NVX managed sandbox lifecycle and its control-session client |
-| Host shares of `run` and `sandbox`: one share attached directly or several as aggregate children, their pre-launch checks, and the `nvx_share=` tokens that place each child in the guest | NVX launcher |
+| Host shares of `run` and `sandbox`: one directory attached directly, or an aggregate for multiple shares or a single regular file; pre-launch checks and the `nvx_share=` tokens that place each child in the guest | [NVX launcher](../../scripts/nvx_tools/sandbox.py) |
 | Structured egress-policy files and their translation to OpenVMM egress rules | NVX launcher's egress-policy compiler |
 | Edge sandbox lifecycle API, request validation, backend capabilities, and the serializable contract model | NVX `aci_edge_sandboxes` crate and its data-model crate |
 | Blockless managed launch, durable sandbox records, OpenVMM process reconciliation, host-path export as aggregate children and their access policy, delivery of the host-mapping table, and egress-rule translation | `aci_edge_sandboxes` default OpenVMM backend |
