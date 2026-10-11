@@ -3354,6 +3354,132 @@ class CiConfigurationTests(unittest.TestCase):
             self.assertTrue(text.startswith("before\n### "))
             self.assertIn("### OpenVMM VMM tests: run\n", text)
 
+    def test_classify_ci_changes_command_reads_null_delimited_paths(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            changed_files = root / "changed-files"
+            changed_files.write_bytes(
+                "doc/notes.md\0kernel/patches/é\r\n.patch\0".encode()
+            )
+            args = nvx.parse_args(
+                [
+                    "classify-ci-changes",
+                    "--event-name",
+                    "pull_request",
+                    "--changed-files",
+                    os.fspath(changed_files),
+                    "--null",
+                    "--summary",
+                    os.fspath(root / "summary"),
+                ]
+            )
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                args.handler(args)
+            self.assertEqual(
+                stdout.getvalue().splitlines(),
+                [
+                    "run-tests=true",
+                    "run-workloads=true",
+                    "run-openvmm-unit-tests=false",
+                    "run-openvmm-vmm-tests=true",
+                ],
+            )
+            summary = (root / "summary").read_bytes().decode("utf-8")
+            self.assertIn("kernel/patches/é\r\n.patch", summary)
+
+    @unittest.skipUnless(os.name == "posix", "requires bash and POSIX filenames")
+    def test_ci_change_detector_classifies_real_git_paths(self):
+        workflow = (
+            BuildConstants.REPO_ROOT / ".github" / "workflows" / "ci.yml"
+        ).read_text(encoding="utf-8")
+        step = _workflow_step(workflow, "openvmm-changes", "Detect relevant changes")
+        lines = step.splitlines()
+        start = lines.index("        run: |") + 1
+        script = "\n".join(line[10:] for line in lines[start:])
+        classifier = BuildConstants.REPO_ROOT / "scripts" / "nvx.py"
+        shim = (
+            f"python3() {{ {shlex.quote(sys.executable)} "
+            f'{shlex.quote(os.fspath(classifier))} "${{@:2}}"; }}\n'
+        )
+        cases = (
+            ("rename", "doc/input.patch", True),
+            ("delete", None, True),
+            ("unicode", "kernel/patches/é.patch", True),
+            ("newline", "kernel/patches/line\nbreak.patch", True),
+            ("documentation", "doc/notes.md", False),
+        )
+        for name, destination, test_input in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+
+                def git(*arguments: str, directory: Path = root) -> str:
+                    result = subprocess.run(
+                        ["git", *arguments],
+                        cwd=directory,
+                        capture_output=True,
+                        text=True,
+                        check=True,
+                    )
+                    return result.stdout.strip()
+
+                git("init", "--quiet")
+                git("config", "user.name", "Reproduction")
+                git("config", "user.email", "repro@example.invalid")
+                git("config", "commit.gpgsign", "false")
+                source = root / "kernel" / "patches" / "input.patch"
+                source.parent.mkdir(parents=True)
+                source.write_text("suite input\n", encoding="utf-8")
+                git("add", ".")
+                git("commit", "--quiet", "-m", "baseline")
+                base = git("rev-parse", "HEAD")
+                if name == "delete":
+                    source.unlink()
+                else:
+                    assert destination is not None
+                    target = root / destination
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    if name == "rename":
+                        source.rename(target)
+                    else:
+                        target.write_text("new input\n", encoding="utf-8")
+                git("add", "--all")
+                git("commit", "--quiet", "-m", "changed paths")
+                for event in ("pull_request", "push"):
+                    with self.subTest(event=event):
+                        output = root / f"output-{event}"
+                        environment = os.environ.copy()
+                        environment.update(
+                            EVENT_NAME=event,
+                            BASE_SHA=base,
+                            HEAD_SHA=git("rev-parse", "HEAD"),
+                            GITHUB_OUTPUT=os.fspath(output),
+                            GITHUB_STEP_SUMMARY=os.fspath(root / "summary"),
+                            RUNNER_TEMP=temporary,
+                        )
+                        result = subprocess.run(
+                            ["bash", "-c", shim + script],
+                            cwd=root,
+                            env=environment,
+                            capture_output=True,
+                            text=True,
+                            check=False,
+                        )
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        actual = dict(
+                            line.split("=", 1)
+                            for line in output.read_text(encoding="utf-8").splitlines()
+                        )
+                        expected = {
+                            "run-tests": str(test_input).lower(),
+                            "run-workloads": str(test_input).lower(),
+                            "run-openvmm-unit-tests": str(
+                                test_input and event == "push"
+                            ).lower(),
+                            "run-openvmm-vmm-tests": str(test_input).lower(),
+                        }
+                        self.assertEqual(actual, expected)
+
     @unittest.skipUnless(os.name == "posix", "requires bash")
     def test_ci_change_detector_runs_the_full_matrix_unless_classified(self):
         workflow = (
@@ -3368,7 +3494,7 @@ git() {
     case "$1" in
     cat-file) return "${GIT_CAT_FILE_STATUS}" ;;
     diff)
-        printf '%s' "${CHANGED_FILES}"
+        printf '%b' "${CHANGED_FILES}"
         return "${GIT_DIFF_STATUS}"
         ;;
     esac
@@ -3425,7 +3551,7 @@ python3() {
                 "real classifier",
                 {
                     "CLASSIFIER": sys.executable,
-                    "CHANGED_FILES": "scripts/nvx_tools/microvm_tests.py\n",
+                    "CHANGED_FILES": "scripts/nvx_tools/microvm_tests.py\\0",
                 },
                 classified,
             ),
@@ -3444,7 +3570,7 @@ python3() {
                         "RUNNER_TEMP": temporary,
                         "GIT_CAT_FILE_STATUS": "0",
                         "GIT_DIFF_STATUS": "0",
-                        "CHANGED_FILES": "openvmm\n",
+                        "CHANGED_FILES": "openvmm\\0",
                         "CLASSIFICATION": complete,
                         "CLASSIFIER_STATUS": "0",
                     }

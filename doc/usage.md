@@ -86,10 +86,13 @@ Installs the GNU tar and zstd tools used by GitHub Actions cross-OS caches.
 python3 scripts/nvx.py classify-ci-changes
     --event-name {pull_request,push}
     --changed-files PATH
+    [--null]
     [--summary PATH]
 ```
 
-Reads one changed repository path per line and prints the change detector's
+Reads one changed repository path per line by default, or NUL-delimited paths
+with `--null`, and prints
+the change detector's
 `run-tests`, `run-workloads`, `run-openvmm-unit-tests`, and
 `run-openvmm-vmm-tests` outputs as `name=true` or `name=false` lines. Only
 documentation changes skip the workloads, and only test inputs run the NVX

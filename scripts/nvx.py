@@ -351,10 +351,11 @@ def command_setup_cross_os_cache(_: argparse.Namespace) -> None:
 
 
 def command_classify_ci_changes(args: argparse.Namespace) -> None:
-    changed_files = args.changed_files.read_text(encoding="utf-8").splitlines()
+    contents = args.changed_files.read_bytes().decode("utf-8")
+    changed_files = contents.split("\0") if args.null else contents.splitlines()
     changes = classify_ci_changes(args.event_name, changed_files)
     if args.summary is not None:
-        with args.summary.open("a", encoding="utf-8") as summary:
+        with args.summary.open("a", encoding="utf-8", newline="") as summary:
             summary.write(describe_ci_changes(args.event_name, changed_files, changes))
     for name, selected in changes.outputs().items():
         print(f"{name}={str(selected).lower()}")
@@ -1026,6 +1027,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=Path,
         required=True,
         help="file listing one changed repository path per line",
+    )
+    classify_changes.add_argument(
+        "--null",
+        action="store_true",
+        help="read NUL-delimited paths, as emitted by git diff --name-only -z",
     )
     classify_changes.add_argument(
         "--summary",
