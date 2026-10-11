@@ -319,8 +319,9 @@ Restore proceeds in the opposite direction from capture:
    partition's effective CPUID against the snapshot's record;
 7. restore VM time, chipset and virtio state, partition state, and vCPU state,
    then set every VP's TSC at one host instant with read-back, advance the
-   LAPIC timers, VM time, RTC, and PIT by the downtime, and seal the restore
-   packet's time fields;
+   LAPIC timers by the downtime and VM time, the RTC, and the PIT by the
+   downtime plus the interval by which VM time stopped before the capture
+   anchor, and seal the restore packet's time fields;
 8. finish reconnecting host resources;
 9. start the state units, with external input gated first when tier policy,
    processor activation, or nonempty RAM expansion requires guest repair, and

@@ -5,7 +5,7 @@
 - OpenVMM fork base: `e1cdbd916d3aacb216309c8e7779b832546759a1`.
 - Mapped fork tip: `2728f33ea9a44d2d0fb956d9f01768ae2100fb62`, position 166. The graph, PR
   summary, and commit mapping below cover positions 001-166.
-- NVX's pinned OpenVMM revision: `70dde4c65b16de084744b0fa85aeb581f0b5c6cd`, 143 commits past the
+- NVX's pinned OpenVMM revision: `d43dd87d5b9c27109c71100accb5b2790416acb4`, 145 commits past the
   mapped tip on the same first-parent chain. These commits are not yet assigned to PRs; see
   [Commits after the mapped tip](#commits-after-the-mapped-tip).
 - Upstream main: `1fd455b19e7c69c72a2d375d0ed1cb35d901c688` (2026-10-01), 18 commits past
@@ -199,7 +199,7 @@ e1cdbd916
   -> PR18/PR23 split [162]
   -> PR18 fixup [163] -> PR25 fixup [164] -> PR27 [165-166]
   -> 2728f33ea (mapped tip)
-  -> unassigned [167-309] -> 70dde4c65 (NVX pin)
+  -> unassigned [167-311] -> d43dd87d5 (NVX pin)
 ```
 
 For upstream review, PR01-PR08 and PR14 can be rebased independently onto current upstream main.
@@ -215,7 +215,7 @@ can be submitted independently if preferred.
 
 ## Commits after the mapped tip
 
-The NVX pin extends the chain past position 166 without merges. The 143 later commits are not
+The NVX pin extends the chain past position 166 without merges. The 145 later commits are not
 yet classified or assigned to PRs. This table groups them by topic in chain order; ranges are
 inclusive, as in the [PR summary](#pr-summary).
 
@@ -236,6 +236,7 @@ inclusive, as in the [PR summary](#pr-summary).
 | 302-305 | `3072d7a91..7bf0ee28b` | 4 | Several host directories on one virtio-fs slot, their snapshot, and their path policy |
 | 306-308 | `be5297817..2130f24b5` | 3 | Single host files as aggregate virtio-fs children, their saved kinds, and the `file` flag that requests one |
 | 309 | `70dde4c65` | 1 | Partition halt state across snapshots |
+| 310-311 | `9b2073ded..d43dd87d5` | 2 | Restore advances VM time and the RTC by the downtime plus the recorded interval from their stop at capture to the capture anchor |
 
 Some of these commits change mapped work rather than add to it. Positions 255-259 remove the
 legacy microVM clock paths and change files that PR10 and PR17 also change. Position 261 makes

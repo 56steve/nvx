@@ -19,6 +19,7 @@ Notation:
 | `C` | VP capacity of the machine (1, 2, 4, or 8) |
 | `D` | Snapshot downtime in nanoseconds |
 | `T_c` | Guest TSC of VP 0 at the capture anchor |
+| `Q` | Host monotonic time in nanoseconds from the VM-time cut, where VM time and the RTC stop at quiesce, to the capture anchor |
 | `g` | Restore generation counter of a VM process |
 
 "Reject" means fail with the named error code and never fall back to another
@@ -911,6 +912,20 @@ path, a UTC delta that differs from `D` by more than 1 s is logged as a host
 wall-clock step and does not change `D`. The packet reports the source, so
 the guest and tests can tell the two paths apart.
 
+VM time, the clock of OpenVMM's emulated devices, and the RTC stop with the
+state units at quiesce, before the capture anchor. VM time's keeper reads the
+host monotonic clock that the anchor samples at the instant VM time stops and
+saves the reading with VM time's state, and capture records `Q`, the host
+monotonic time from that VM-time cut to the capture anchor, so a host
+wall-clock step cannot enter it. Restore advances VM time and the RTC by
+`D + Q`, so that they resume in step with the guest TSC, which kept running
+through `Q`; the TSC, the LAPIC timers, and the restore packet still use `D`.
+`D + Q` must be at most 30 days (`E_DOWNTIME_EXCESSIVE`). `Q` is best effort:
+capture omits it, with a warning, when the saved VM-time state lacks its stop
+sample or `Q` would be negative or above 30 days, and the snapshot stays
+usable. A snapshot without `Q`, including every snapshot that predates it,
+restores with `Q = 0`, and OpenVMM logs a warning.
+
 The restore anchor is the instant of the synchronized TSC set, and the guest
 TSC runs from that instant on every backend: KVM never stops it, and MSHV and
 WHP resume partition time right after a successful read-back, inside the
@@ -958,7 +973,8 @@ Before worker construction:
    is 1, `tsc_tolerance_ppm` is 250, `F_s` is plausible, `L_s` is a backend
    constant, identities are 16 bytes, `capture_generation < 2^32 - 1`, the
    profile digest is 32 bytes, and the effective CPUID record is whole,
-   well-formed entries (`E_MANIFEST_TIME`). Validation computes no digest.
+   well-formed entries (`E_MANIFEST_TIME`). A recorded `Q` above 30 days is
+   rejected (`E_DOWNTIME_EXCESSIVE`). Validation computes no digest.
 3. Require the destination backend to equal `source_hypervisor`
    (`E_BACKEND_MISMATCH`).
 4. Require a pinned profile with the recorded ID and digest, whose canonical
@@ -966,8 +982,8 @@ Before worker construction:
    `E_PROFILE_DIGEST`), both compared with the build's precomputed record,
    and the host's CPU generation to be in it (`E_CPU_GENERATION`).
 5. Preflight the downtime: sample the host clocks, select the source, and
-   check the bounds (`E_DOWNTIME_*`, `E_HOST_IDENTITY`). The authoritative
-   `D` is measured again in step 12.
+   check the bounds of `D` and `D + Q` (`E_DOWNTIME_*`, `E_HOST_IDENTITY`).
+   The authoritative `D` is measured again in step 12.
 6. Validate the rest of the machine contract as today (topology, devices,
    attachments, command line, blocks). The command line must not contain
    `tsc_early_khz=` or `lapic_timer_hz=` (`E_CMDLINE_CLOCK_TOKEN`).
@@ -1029,11 +1045,14 @@ In the worker, with every VP stopped:
     state is set. The same pass rejects an armed periodic or TSC-deadline
     timer (`E_LAPIC_PERIODIC`, `E_LAPIC_TSC_DEADLINE`) before any VP runs,
     so restore takes no separate pass over the VPs to check them.
-15. Advance VM time by `D` and the RTC's UTC by `D` (milliseconds). The PIT
-    catches up from its saved VM-time cursor; it is idle. Steps 14 and 15
-    touch disjoint state, because no time ABI LAPIC reads VM time (see the
-    LAPIC rate row of [Backend obligations](#backend-obligations)), so
-    OpenVMM runs them concurrently and waits for both before step 16.
+15. Advance VM time by `D + Q` and the RTC's UTC by `D + Q` (milliseconds),
+    with `Q = 0` for a snapshot that does not record it; a `D + Q` above 30
+    days rejects the restore before steps 14 and 15 start
+    (`E_DOWNTIME_EXCESSIVE`). The PIT catches up from its saved VM-time
+    cursor; it is idle. Steps 14 and 15 touch disjoint state, because no time
+    ABI LAPIC reads VM time (see the LAPIC rate row of
+    [Backend obligations](#backend-obligations)), so OpenVMM runs them
+    concurrently and waits for both before step 16.
 16. Seal the time fields of the restore packet: `D`, its source, the rate
     deviation, `g`, and the test-hook flag.
 17. Start the state units, with host input gated when the restore requires an
@@ -1080,14 +1099,18 @@ state units are quiesced, capture:
    `E_LAPIC_TSC_DEADLINE`, `E_PIT_ACTIVE`);
 2. takes the capture anchor: VP 0's TSC paired with a host time sample taken
    within 100 µs of it, keeping the tightest of at most 64 samples
-   (`E_TSC_ANCHOR`), plus the host identities (`E_HOST_IDENTITY`); and
+   (`E_TSC_ANCHOR`), plus the host identities (`E_HOST_IDENTITY`);
 3. records the declared rates, the CPU profile, the effective CPUID, and the
    process's generation counter. The CPU profile record is the pinned
    profile's precomputed digest and canonical encoding, copied, and the
    effective CPUID is a packed binary record: capture encodes no document and
-   computes no digest.
+   computes no digest; and
+4. after saving the state units, records `Q` from VM time's saved stop sample
+   and the anchor's host monotonic time (see
+   [Downtime semantics](#downtime-semantics-and-source-selection)).
 
-Each of these failures is a rollback-safe capture failure.
+Each failure of steps 1 to 3 is a rollback-safe capture failure. Step 4 never
+fails a capture: where it cannot derive `Q`, it logs a warning and omits it.
 
 No backend stops guest time for a capture: the guest TSC keeps running while
 the VPs are stopped. So a capture that rolls back leaves the guest's clocks
@@ -1124,6 +1147,7 @@ reused. It adds two required fields:
 | 9 | `host_id` | `bytes` | 16-byte host identity |
 | 10 | `host_boot_id` | `bytes` | 16-byte host boot identity |
 | 11 | `capture_generation` | `u32` | `g` of the captured process |
+| 12 | `vm_time_cut_to_anchor_ns` | optional `u64` | `Q`; absent where capture could not derive it and in snapshots that predate it |
 
 `SnapshotCpuProfile` (package `openvmm.snapshot`):
 
@@ -1788,7 +1812,7 @@ code.
 | `E_LAPIC_RATE_MISMATCH` | `L` is not the backend constant, or `L_d` differs from `L_s` | Cold boot, restore |
 | `E_HOST_IDENTITY` | Host identity, boot identity, or clocks unavailable | Capture, restore |
 | `E_DOWNTIME_NEGATIVE` | Downtime below zero | Restore |
-| `E_DOWNTIME_EXCESSIVE` | Downtime above 30 days | Restore |
+| `E_DOWNTIME_EXCESSIVE` | Downtime above 30 days, or a recorded `Q` or `D + Q` above 30 days | Restore |
 | `E_TSC_ANCHOR` | An anchor is unavailable, or none of at most 64 samples pairs within 100 µs | Capture, restore |
 | `E_TSC_TARGET_OVERFLOW` | `TSC_target` exceeds 64 bits | Restore |
 | `E_TSC_SYNC_READBACK` | A VP does not hold the synchronized value | Restore |
@@ -2420,10 +2444,12 @@ Migration impact:
 The OpenVMM Guide documents the user-facing contract in
 `Guide/src/user_guide/openvmm/snapshots.md`:
 
-- **Overview:** the time contract and CPU profile in microVM manifests, and
+- **Overview:** the time contract and CPU profile in microVM manifests, the
+  contract's interval from the VM-time cut to the capture anchor, and
   manifest version 6 as the only accepted version.
 - **Restoring a snapshot:** restore packet v4, the time sample at `0xeb`, the
-  generation ID, and the synchronized TSC set with its read-back.
+  generation ID, the synchronized TSC set with its read-back, and the VM-time
+  and RTC advance by the downtime plus the VM-time cut interval.
 - **Time and CPU compatibility:** the identity, the CPU profile and
   `--cpu-profile`, including host profiles and `auto`'s fallback to them with
   its warning, the 250 ppm rate rule, the exact LAPIC rule, the downtime
