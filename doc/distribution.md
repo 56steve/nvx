@@ -94,10 +94,17 @@ python3 scripts/nvx.py archive-release \
 it writes a `.tar.gz` or `.zip` archive outside the staged directory; see
 [`archive-release`](usage.md#archive-release).
 
-CI follows the binary-only path. On `dev` pushes, the `linux-kvm`,
-`linux-mshv`, and `windows-whp` platform jobs each stage
-`dist/nvx-<version>-<platform>` with `--binary-only`, then archive it as
-`.tar.gz` on Linux and `.zip` on Windows through the
+CI follows the binary-only path. On a `dev` push that changes more than
+documentation, the `linux-kvm`, `linux-mshv`, and `windows-whp` platform jobs
+each stage `dist/nvx-<version>-<platform>` with `--binary-only`, then archive
+it as `.tar.gz` on Linux and `.zip` on Windows through the
 [`package-release`](../.github/actions/package-release/action.yml) action.
 [Continuous integration](ci.md) describes the jobs that gate and publish the
 resulting development release.
+
+A documentation-only push, in which every changed path is under `doc/` or ends
+in `.md`, skips the platform jobs, as
+[Change classification](ci.md#change-classification) describes. Such a commit
+gets no packages and no development release, so
+[`download`](usage.md#download) installs the package of its nearest released
+first-parent ancestor.
