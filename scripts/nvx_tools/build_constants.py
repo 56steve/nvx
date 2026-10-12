@@ -410,7 +410,6 @@ class ReleaseBuildConstants:
         "data/windows-whp-virtual-machine.csv",
         "docker",
         "kernel",
-        "licenses",
         "scripts",
         ".dockerignore",
         ".gitattributes",

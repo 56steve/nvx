@@ -6015,6 +6015,19 @@ class BuildConstantsTests(unittest.TestCase):
             ).is_file()
         )
 
+    def test_project_source_paths_exist_and_are_tracked(self):
+        for relative in ReleaseBuildConstants.PROJECT_SOURCE_PATHS:
+            with self.subTest(path=relative):
+                self.assertTrue((BuildConstants.REPO_ROOT / relative).exists())
+                tracked = subprocess.run(
+                    ["git", "ls-files", "--error-unmatch", "--", relative],
+                    cwd=BuildConstants.REPO_ROOT,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(tracked.returncode, 0, tracked.stderr)
+
     def test_constants_consumers_import_in_either_order(self):
         modules = (
             "nvx_tools.build_constants",
