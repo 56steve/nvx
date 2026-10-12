@@ -78,8 +78,9 @@ identity and a live, authenticated control console.
 Restore is stricter than cold boot. Guest-visible configuration is read from
 the snapshot's machine contract. Restore-time input may select the same backend
 kind recorded by the snapshot, supply required attachments, bind a new directory
-export to a [captured dormant filesystem slot](machine-and-device-abi.md#filesystem), and select
-processor and RAM activation targets explicitly allowed by the contract. Those
+export to a [captured dormant filesystem slot](machine-and-device-abi.md#filesystem) only when
+the snapshot records that restore-attachment capability, and select processor
+and RAM activation targets explicitly allowed by the contract. Those
 process-local targets do not change processor capacity, RAM capacity, command
 line, device placement, feature masks, or filesystem and network identity.
 Restore always uses the snapshot's CPU profile, never falls back, and requires
