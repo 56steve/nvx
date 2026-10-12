@@ -501,6 +501,50 @@ class CliTests(unittest.TestCase):
                         set(option.findall(usage_of(*command))),
                     )
 
+    def test_check_required_ci_rejects_malformed_run_flags(self):
+        # microsoft/nvx#496: an empty or malformed --run-* value must not be
+        # silently accepted as false, which would let required-status checking
+        # pass with required jobs skipped.
+        base = [
+            "check-required-ci",
+            "--event-name",
+            "pull_request",
+            "--same-repository",
+            "true",
+            "--run-tests",
+            "true",
+            "--run-workloads",
+            "true",
+            "--run-openvmm-unit-tests",
+            "true",
+            "--run-openvmm-vmm-tests",
+            "true",
+        ]
+        flags = (
+            "--run-tests",
+            "--run-workloads",
+            "--run-openvmm-unit-tests",
+            "--run-openvmm-vmm-tests",
+        )
+        for flag in flags:
+            for bad in ("", "tru", "TRUE", "1", "yes"):
+                argv = list(base)
+                argv[argv.index(flag) + 1] = bad
+                with self.subTest(flag=flag, value=bad):
+                    with (
+                        patch("sys.stderr", new_callable=io.StringIO),
+                        self.assertRaises(SystemExit) as exit_context,
+                    ):
+                        nvx.parse_args(argv)
+                    self.assertEqual(exit_context.exception.code, 2)
+        for value in ("true", "false"):
+            argv = list(base)
+            for flag in flags:
+                argv[argv.index(flag) + 1] = value
+            args = nvx.parse_args(argv)
+            for flag in flags:
+                self.assertEqual(getattr(args, flag[2:].replace("-", "_")), value)
+
     def test_guest_selection_includes_azure_linux(self):
         args = nvx.parse_args(["build-initramfs", "--guest", "azurelinux"])
         self.assertEqual(args.guest, "azurelinux")

@@ -1072,10 +1072,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         choices=("false", "true"),
         required=True,
     )
-    required_ci.add_argument("--run-tests", required=True)
-    required_ci.add_argument("--run-workloads", required=True)
-    required_ci.add_argument("--run-openvmm-unit-tests", required=True)
-    required_ci.add_argument("--run-openvmm-vmm-tests", required=True)
+    required_ci.add_argument("--run-tests", choices=("false", "true"), required=True)
+    required_ci.add_argument(
+        "--run-workloads", choices=("false", "true"), required=True
+    )
+    required_ci.add_argument(
+        "--run-openvmm-unit-tests", choices=("false", "true"), required=True
+    )
+    required_ci.add_argument(
+        "--run-openvmm-vmm-tests", choices=("false", "true"), required=True
+    )
     required_ci.set_defaults(handler=command_check_required_ci)
 
     openvmm_unit_tests = subparsers.add_parser(
