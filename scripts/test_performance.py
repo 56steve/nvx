@@ -1253,6 +1253,48 @@ class PerformanceTests(unittest.TestCase):
                 expected_runs=2,
             )
 
+    def test_collect_skips_stale_device_io_log_for_other_suites(self):
+        # Regression test for https://github.com/microsoft/nvx/issues/499:
+        # a device-io.log left over from an earlier device-io run must not
+        # contaminate collection of a different suite sharing the output dir.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            logs = root / "logs"
+            logs.mkdir()
+            (logs / "cold-start.log").write_text(COLD_START_LOG, encoding="utf-8")
+            (logs / "virtfs.log").write_text(VIRTFS_LOG, encoding="utf-8")
+            (logs / "device-io.log").write_text(
+                device_io_log(warmups=1, runs=2), encoding="utf-8"
+            )
+            (logs / performance.BENCHMARK_METADATA_FILENAME).write_text(
+                json.dumps(
+                    {
+                        "suite": "performance",
+                        "platform": "linux-mshv-baremetal",
+                        "backend": "mshv",
+                        "microvm_abi_version": 1,
+                        "processors": 1,
+                        "warmups": 1,
+                        "measured_runs": 2,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            result_path = performance.collect_results(
+                "linux-mshv-baremetal",
+                "abc123",
+                logs,
+                root / "results",
+            )
+            results = performance.read_results(result_path)
+
+            self.assertFalse(
+                {result.metric for result in results}
+                & set(performance.DEVICE_IO_METRIC_NAMES),
+                "stale device-io metrics leaked into the performance suite results",
+            )
+
     def test_collects_device_io_metrics_with_abi_dimension(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

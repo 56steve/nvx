@@ -1767,6 +1767,9 @@ def collect_results(
                 raise PerformanceError(f"required benchmark log not found: {path}")
             print(f"SKIP: optional benchmark log not found: {path}")
             continue
+        if filename == "device-io.log" and not device_io_suite:
+            print(f"SKIP: device-io log belongs to another suite: {path}")
+            continue
         if filename == "device-io.log" and device_io_suite:
             assert workload_metadata is not None
             warmups = workload_metadata.get("warmups")
