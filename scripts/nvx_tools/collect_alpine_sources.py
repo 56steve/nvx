@@ -361,6 +361,11 @@ done
             "--rm",
             "--volume",
             f"{output.resolve()}:/bundle",
+            "--env",
+            (
+                "DISTFILES_MIRROR=https://distfiles.alpinelinux.org/"
+                f"distfiles/v{alpine_version}"
+            ),
             f"alpine:{alpine_version}",
             "sh",
             "-c",

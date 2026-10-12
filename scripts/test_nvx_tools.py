@@ -6590,7 +6590,7 @@ class AlpineSourceCollectionTests(unittest.TestCase):
                     )
                 self.assertEqual(kept.read_bytes(), b"kept")
 
-    def test_upstream_fetch_restores_bundle_ownership_on_exit(self):
+    def test_upstream_fetch_uses_mirror_and_restores_bundle_ownership(self):
         with (
             tempfile.TemporaryDirectory() as temporary,
             patch.object(collect_alpine_sources, "_run") as run,
@@ -6599,6 +6599,14 @@ class AlpineSourceCollectionTests(unittest.TestCase):
 
         command = run.call_args.args[0]
         self.assertEqual(command[:4], ["docker", "run", "--rm", "--volume"])
+        self.assertEqual(
+            command[5:7],
+            [
+                "--env",
+                "DISTFILES_MIRROR=https://distfiles.alpinelinux.org/distfiles/v3.24",
+            ],
+        )
+        self.assertEqual(command[7], "alpine:3.24")
         script = command[-1]
         self.assertIn("owner=$(stat -c '%u:%g' /bundle)", script)
         self.assertIn('chown -R "$owner" /bundle/upstream', script)
