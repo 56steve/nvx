@@ -220,10 +220,13 @@ emulating the MMIO access. Either path wakes the device's I/O worker.
 
 The worker reads requests directly from guest memory and services several
 concurrently. It translates each request's virtio sector address to the
-backing store's block geometry, rejects transfers that are not aligned to that
-geometry, and submits asynchronous scatter-gather I/O that targets guest
-buffers directly when their layout permits. Individual writes are not forced
-to stable storage; a guest flush becomes a backend cache flush.
+backing store's logical blocks and rejects a read or write that does not start
+on a logical-block boundary or whose length is not a whole number of logical
+blocks. It does not require alignment to the reported physical block size,
+which is only an alignment hint for the guest. Accepted reads and writes
+become asynchronous scatter-gather I/O that targets guest buffers directly
+when their layout permits. Individual writes are not forced to stable
+storage; a guest flush becomes a backend cache flush.
 
 On completion, the device stores a success, I/O-error, or unsupported status in
 the request, publishes one used-ring entry, and, unless the guest suppressed
