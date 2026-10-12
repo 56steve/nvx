@@ -14,7 +14,8 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
-use aci_edge_sandboxes::openvmm::{Hypervisor, OpenVmmConfig};
+use aci_edge_sandboxes::nvx::Hypervisor;
+use aci_edge_sandboxes::openvmm::OpenVmmConfig;
 use aci_edge_sandboxes::{
     Access, AciEdgeSandbox, EgressPolicy, ErrorCode, ExecFailure, ExecOutcome, ExecOutput,
     ExecRequest, FilesystemPolicy, NetworkPolicy, NetworkPort, NetworkRule, ProcessSpec, Protocol,

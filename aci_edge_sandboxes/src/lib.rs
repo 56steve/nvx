@@ -55,6 +55,8 @@
 #[cfg(feature = "openvmm")]
 pub(crate) use aci_edge_sandboxes_model::cidr;
 pub(crate) use aci_edge_sandboxes_model::{capabilities, error, id, model, spec, validate};
+/// The NVX mechanics that the `openvmm` backend builds on.
+pub use nvx;
 
 mod backend;
 mod client;

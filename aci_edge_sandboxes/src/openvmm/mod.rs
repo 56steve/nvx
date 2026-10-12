@@ -114,7 +114,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 pub use self::artifacts::Artifacts;
-pub use self::config::{Hypervisor, OpenVmmConfig};
+pub use self::config::OpenVmmConfig;
 pub use self::filesystem::{guest_path, resolve_guest_path};
 use self::protocol::{
     CAPABILITY_LEN, ExitCategory, GuestFeatures, MAX_ARGUMENT_BYTES, MAX_CWD_BYTES,

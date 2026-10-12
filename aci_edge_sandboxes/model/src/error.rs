@@ -182,6 +182,26 @@ impl Error {
     }
 }
 
+/// Classifies an error of NVX: [`nvx::ErrorKind::Unavailable`] becomes
+/// [`ErrorCode::BackendUnavailable`], [`nvx::ErrorKind::Unsupported`] becomes
+/// [`ErrorCode::PolicyValidation`], and every other kind becomes [`ErrorCode::BackendError`]. The
+/// message and the cause stay the same.
+impl From<nvx::Error> for Error {
+    fn from(error: nvx::Error) -> Self {
+        let (kind, message, source) = error.into_parts();
+        let code = match kind {
+            nvx::ErrorKind::Unavailable => ErrorCode::BackendUnavailable,
+            nvx::ErrorKind::Unsupported => ErrorCode::PolicyValidation,
+            _ => ErrorCode::BackendError,
+        };
+        Self {
+            code,
+            message,
+            source,
+        }
+    }
+}
+
 /// Serializable error body: `{ "code": ..., "message": ... }`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ErrorBody {
@@ -223,6 +243,26 @@ mod tests {
             serde_json::to_string(&body).unwrap(),
             r#"{"code":"backend_error","message":"cancellation is not supported"}"#
         );
+    }
+
+    #[test]
+    fn nvx_errors_keep_their_message_and_cause() {
+        for (kind, code) in [
+            (nvx::ErrorKind::Unavailable, ErrorCode::BackendUnavailable),
+            (nvx::ErrorKind::Unsupported, ErrorCode::PolicyValidation),
+            (nvx::ErrorKind::Exited, ErrorCode::BackendError),
+            (nvx::ErrorKind::Io, ErrorCode::BackendError),
+            (nvx::ErrorKind::Protocol, ErrorCode::BackendError),
+            (nvx::ErrorKind::TimedOut, ErrorCode::BackendError),
+            (nvx::ErrorKind::Other, ErrorCode::BackendError),
+        ] {
+            let cause = std::io::Error::other("disk full");
+            let error = Error::from(nvx::Error::new(kind, "cannot write state").with_source(cause));
+            assert_eq!(error.code(), code, "{kind}");
+            assert_eq!(error.message(), "cannot write state");
+            let source = std::error::Error::source(&error).unwrap();
+            assert_eq!(source.to_string(), "disk full");
+        }
     }
 
     #[test]

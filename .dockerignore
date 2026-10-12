@@ -6,6 +6,7 @@ build
 data
 dist
 aci_edge_sandboxes
+nvx-rs/target
 openvmm
 third_party
 **/__pycache__

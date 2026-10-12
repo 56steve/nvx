@@ -155,7 +155,7 @@ mod tests {
     use std::sync::mpsc;
 
     use super::*;
-    use crate::openvmm::Hypervisor;
+    use nvx::Hypervisor;
 
     /// Spawns a long-running child while this process holds an inheritable pipe writer, as a
     /// descriptor that the caller's parent or native code left without close-on-exec would be.

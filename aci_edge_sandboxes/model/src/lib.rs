@@ -7,7 +7,6 @@
 //! crate directly.
 
 pub mod capabilities;
-pub mod cidr;
 pub mod error;
 pub mod hex;
 pub mod id;
@@ -18,6 +17,8 @@ pub mod setup;
 pub mod spec;
 pub mod validate;
 pub mod wire;
+
+pub use nvx::net::cidr;
 
 pub use capabilities::{
     Capabilities, ExecCapabilities, FilesystemCapabilities, NetworkCapabilities, SpecCapabilities,

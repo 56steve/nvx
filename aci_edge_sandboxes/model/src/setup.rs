@@ -4,9 +4,7 @@
 //! defaults that every sandbox inherits unless its [`SandboxSpec`](crate::SandboxSpec) overrides
 //! them. Nothing here is specific to one sandbox.
 
-use std::fmt;
 use std::path::PathBuf;
-use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
@@ -15,96 +13,8 @@ use crate::hex;
 use crate::image::ImageDigest;
 use crate::spec::{ImageSource, Resources};
 
-/// Hypervisor that runs the sandbox VMs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Hypervisor {
-    /// Linux KVM through `/dev/kvm`.
-    Kvm,
-    /// Linux Microsoft Hypervisor through `/dev/mshv`.
-    Mshv,
-    /// Windows Hypervisor Platform.
-    Whp,
-}
-
-impl Hypervisor {
-    /// Environment variable that overrides [`Hypervisor::from_env_or_default`]: `kvm`, `mshv`, or
-    /// `whp`.
-    pub const ENV: &'static str = "NVX_HYPERVISOR";
-
-    /// Returns the OpenVMM spelling of this hypervisor.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Kvm => "kvm",
-            Self::Mshv => "mshv",
-            Self::Whp => "whp",
-        }
-    }
-
-    /// Returns the hypervisor named by [`Hypervisor::ENV`], or the
-    /// [platform default](Self::platform_default) when the variable is unset.
-    ///
-    /// Fails with [`ErrorCode::BackendUnavailable`](crate::ErrorCode::BackendUnavailable) when the
-    /// variable names an unknown hypervisor or the host has no default.
-    pub fn from_env_or_default() -> Result<Self> {
-        match std::env::var(Self::ENV) {
-            Ok(value) if !value.is_empty() => value.parse(),
-            Ok(_) | Err(std::env::VarError::NotPresent) => {
-                Self::platform_default().ok_or_else(|| {
-                    Error::backend_unavailable(format!(
-                        "this host has no default hypervisor; set {}",
-                        Self::ENV
-                    ))
-                })
-            }
-            Err(error) => Err(Error::backend_unavailable(format!(
-                "{} is not valid Unicode",
-                Self::ENV
-            ))
-            .with_source(error)),
-        }
-    }
-
-    /// Returns the conventional hypervisor for this host: KVM on Linux and WHP on Windows.
-    pub fn platform_default() -> Option<Self> {
-        if cfg!(target_os = "linux") {
-            Some(Self::Kvm)
-        } else if cfg!(windows) {
-            Some(Self::Whp)
-        } else {
-            None
-        }
-    }
-
-    /// Returns whether this hypervisor can exist on the current host's operating system.
-    pub fn supported_on_host(self) -> bool {
-        match self {
-            Self::Kvm | Self::Mshv => cfg!(target_os = "linux"),
-            Self::Whp => cfg!(windows),
-        }
-    }
-}
-
-impl fmt::Display for Hypervisor {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
-    }
-}
-
-impl FromStr for Hypervisor {
-    type Err = Error;
-
-    fn from_str(value: &str) -> Result<Self> {
-        match value {
-            "kvm" => Ok(Self::Kvm),
-            "mshv" => Ok(Self::Mshv),
-            "whp" => Ok(Self::Whp),
-            _ => Err(Error::backend_unavailable(format!(
-                "unknown hypervisor {value:?}; choose kvm, mshv, or whp"
-            ))),
-        }
-    }
-}
+/// Hypervisor that runs the sandbox VMs: NVX's, whose serde form is its OpenVMM spelling.
+pub use nvx::Hypervisor;
 
 /// Configuration that a native host takes once, when it opens.
 ///
@@ -800,20 +710,21 @@ mod tests {
     }
 
     #[test]
-    fn hypervisors_parse_their_openvmm_spelling() {
+    fn hypervisors_keep_their_json_and_error_codes() {
         for hypervisor in [Hypervisor::Kvm, Hypervisor::Mshv, Hypervisor::Whp] {
             assert_eq!(
-                hypervisor.as_str().parse::<Hypervisor>().unwrap(),
-                hypervisor
-            );
-            assert_eq!(
                 serde_json::to_string(&hypervisor).unwrap(),
-                format!("\"{hypervisor}\"")
+                format!("\"{}\"", hypervisor.as_str())
             );
+            let config = SetupConfig::new("/var/lib/nvx", files()).with_hypervisor(hypervisor);
+            let json = serde_json::to_value(&config).unwrap();
+            assert_eq!(json["hypervisor"], hypervisor.as_str());
         }
+        let error = Error::from("hyperv".parse::<Hypervisor>().unwrap_err());
+        assert_eq!(error.code(), ErrorCode::BackendUnavailable);
         assert_eq!(
-            "hyperv".parse::<Hypervisor>().unwrap_err().code(),
-            ErrorCode::BackendUnavailable
+            error.message(),
+            "unknown hypervisor \"hyperv\"; choose kvm, mshv, or whp"
         );
     }
 }

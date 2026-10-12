@@ -11,7 +11,8 @@
 use std::io::Write;
 use std::process::ExitCode;
 
-use aci_edge_sandboxes::openvmm::{Artifacts, Hypervisor, OpenVmmConfig};
+use aci_edge_sandboxes::nvx::Hypervisor;
+use aci_edge_sandboxes::openvmm::{Artifacts, OpenVmmConfig};
 use aci_edge_sandboxes::{AciEdgeSandbox, ExecRequest, ProvisionRequest};
 
 fn main() -> ExitCode {
@@ -39,7 +40,9 @@ fn run() -> Result<ExitCode, String> {
         match argument.as_str() {
             "--release-dir" => release_dir = Some(value()?),
             "--repo" => repo = Some(value()?),
-            "--hypervisor" => hypervisor = Some(value()?.parse().map_err(describe)?),
+            "--hypervisor" => {
+                hypervisor = Some(value()?.parse::<Hypervisor>().map_err(describe)?);
+            }
             "--" => {
                 command_line = Some(arguments.by_ref().collect::<Vec<_>>().join(" "));
             }
@@ -86,6 +89,7 @@ fn run() -> Result<ExitCode, String> {
     }
 }
 
-fn describe(error: aci_edge_sandboxes::Error) -> String {
-    error.to_string()
+/// Describes an error of the crate or of NVX, with the crate's error code.
+fn describe(error: impl Into<aci_edge_sandboxes::Error>) -> String {
+    error.into().to_string()
 }

@@ -7,7 +7,7 @@ use super::artifacts::{Artifacts, absolute};
 use super::launch;
 use crate::error::{Error, Result};
 
-pub use aci_edge_sandboxes_model::setup::Hypervisor;
+pub(crate) use nvx::Hypervisor;
 
 /// Configuration of the [`OpenVmmBackend`](super::OpenVmmBackend).
 ///
