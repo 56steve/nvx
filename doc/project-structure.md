@@ -140,7 +140,7 @@ nvx/
 |   |   |-- setup-linux-mshv.sh   Linux/MSHV development-host bootstrap
 |   |   |-- setup-linux-runner.sh Linux/KVM or Linux/MSHV Actions runner bootstrap
 |   |   |-- setup-windows-whp.ps1 Windows/WHP development-host and Actions runner bootstrap
-|   |   `-- tool-versions.conf   Shared tool release and checksum pins
+|   |   `-- tool-versions.conf    Shared tool release and checksum pins
 |   |-- nvx-hosts.example.json   Template for the ignored .nvx-hosts.json
 |   |-- nvx.py                   Supported command-line entry point
 |   |-- nvx_adversarial_executor.py Restricted adversarial executor entry point
