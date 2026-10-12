@@ -80,14 +80,16 @@ def _network(value: object, description: str) -> _Network:
     if not isinstance(value, str):
         raise ScriptError(f"{description} must be an IPv4 or IPv6 CIDR string")
     try:
-        parsed = ipaddress.ip_network(value, strict=False)
+        # Clearing host bits rebuilds the network address without its IPv6
+        # scope, so parse an interface, which keeps the address as written.
+        interface = ipaddress.ip_interface(value)
     except ValueError as error:
         raise ScriptError(
             f"{description} is not a valid IPv4 or IPv6 CIDR: {value}"
         ) from error
-    if isinstance(parsed, ipaddress.IPv6Network) and parsed.network_address.scope_id:
+    if isinstance(interface, ipaddress.IPv6Interface) and interface.scope_id:
         raise ScriptError(f"{description} must not name an IPv6 scope: {value}")
-    return parsed
+    return interface.network
 
 
 def _contains(parent: _Network, child: _Network) -> bool:
