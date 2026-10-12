@@ -20924,6 +20924,7 @@ class ReleaseTests(unittest.TestCase):
             for name in (
                 OpenVMMBuildConstants.PROVENANCE_NAME,
                 KernelBuildConstants.PROVENANCE_NAME,
+                InitramfsBuildConstants.PROVENANCE_NAME,
             ):
                 provenance = package_root / "provenance" / name
                 provenance.parent.mkdir(parents=True, exist_ok=True)
@@ -20971,6 +20972,7 @@ class ReleaseTests(unittest.TestCase):
             for name in (
                 OpenVMMBuildConstants.PROVENANCE_NAME,
                 KernelBuildConstants.PROVENANCE_NAME,
+                InitramfsBuildConstants.PROVENANCE_NAME,
             ):
                 self.assertEqual(
                     (build_dir / name).read_bytes(),
@@ -20994,6 +20996,7 @@ class ReleaseTests(unittest.TestCase):
             for name in (
                 OpenVMMBuildConstants.PROVENANCE_NAME,
                 KernelBuildConstants.PROVENANCE_NAME,
+                InitramfsBuildConstants.PROVENANCE_NAME,
             ):
                 provenance = package_root / "provenance" / name
                 provenance.parent.mkdir(parents=True, exist_ok=True)

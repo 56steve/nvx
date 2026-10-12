@@ -674,6 +674,7 @@ def _install_release_archive(archive_path: Path) -> None:
             for name in (
                 OpenVMMBuildConstants.PROVENANCE_NAME,
                 KernelBuildConstants.PROVENANCE_NAME,
+                InitramfsBuildConstants.PROVENANCE_NAME,
             )
         }
         _replace_runtime_file(binary_source, binary_destination)
