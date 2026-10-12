@@ -563,6 +563,10 @@ pub struct ReferenceSettings {
     /// a pull that takes longer.
     #[serde(default = "default_pull_timeout_ms")]
     pub pull_timeout_ms: u64,
+    /// Host-side Docker-compatible JSON credentials file. `None` keeps anonymous pulls.
+    /// The host reads it only when it must pull a reference, not for local or cached images.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_file: Option<PathBuf>,
 }
 
 /// Default limit on materializing one reference: 30 minutes.
@@ -576,6 +580,7 @@ impl Default for ReferenceSettings {
     fn default() -> Self {
         Self {
             pull_timeout_ms: default_pull_timeout_ms(),
+            auth_file: None,
         }
     }
 }
@@ -585,6 +590,13 @@ impl ReferenceSettings {
     #[must_use]
     pub fn with_pull_timeout_ms(mut self, pull_timeout_ms: u64) -> Self {
         self.pull_timeout_ms = pull_timeout_ms;
+        self
+    }
+
+    /// Selects the host-side registry credentials file.
+    #[must_use]
+    pub fn with_auth_file(mut self, auth_file: impl Into<PathBuf>) -> Self {
+        self.auth_file = Some(auth_file.into());
         self
     }
 
@@ -598,6 +610,15 @@ impl ReferenceSettings {
                 "setup images.references.pullTimeoutMs must be between 1 and {}",
                 Timeouts::MAX_MS
             )));
+        }
+        if self
+            .auth_file
+            .as_ref()
+            .is_some_and(|path| path.as_os_str().is_empty())
+        {
+            return Err(Error::malformed_request(
+                "setup images.references.authFile is empty",
+            ));
         }
         Ok(())
     }
@@ -701,6 +722,7 @@ mod tests {
             config.images.references.pull_timeout_ms,
             DEFAULT_PULL_TIMEOUT_MS
         );
+        assert!(config.images.references.auth_file.is_none());
         config.validate().unwrap();
     }
 
@@ -709,6 +731,7 @@ mod tests {
         let config = SetupConfig::new("/var/lib/nvx", files());
         let json = serde_json::to_string(&config).unwrap();
         assert!(!json.contains("references"), "{json}");
+        assert!(!json.contains("authFile"), "{json}");
 
         let config = config.with_images(
             ImageSettings::default()
@@ -721,6 +744,26 @@ mod tests {
         );
         assert_eq!(serde_json::from_str::<SetupConfig>(&json).unwrap(), config);
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn registry_auth_file_round_trips_without_inline_credentials() {
+        let config = SetupConfig::new("/var/lib/nvx", files())
+            .with_images(ImageSettings::default().with_references(
+                ReferenceSettings::default().with_auth_file("registry-auth.json"),
+            ));
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(
+            json.contains(r#""authFile":"registry-auth.json""#),
+            "{json}"
+        );
+        assert!(!json.contains("password"), "{json}");
+        assert_eq!(serde_json::from_str::<SetupConfig>(&json).unwrap(), config);
+        config.validate().unwrap();
+
+        let old: ReferenceSettings = serde_json::from_str(r#"{"pullTimeoutMs":60000}"#).unwrap();
+        assert_eq!(old.pull_timeout_ms, 60_000);
+        assert!(old.auth_file.is_none());
     }
 
     #[test]
@@ -770,6 +813,7 @@ mod tests {
         for references in [
             ReferenceSettings::default().with_pull_timeout_ms(0),
             ReferenceSettings::default().with_pull_timeout_ms(Timeouts::MAX_MS + 1),
+            ReferenceSettings::default().with_auth_file(""),
         ] {
             bad.push(
                 SetupConfig::new("/var/lib/nvx", files())

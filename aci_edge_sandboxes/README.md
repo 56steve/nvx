@@ -175,6 +175,41 @@ such as `latest` keeps naming the content that was first pulled: use a version t
 (`repository@sha256:…`) to control what a sandbox boots. `images.references.pullTimeoutMs`
 limits each pull (30 minutes by default).
 
+For private registries, set `images.references.authFile` to a host-side
+Docker-compatible JSON credentials file, or use
+`ReferenceSettings::with_auth_file`. The setup carries only its path:
+
+```json
+{
+  "images": {
+    "references": {
+      "authFile": "C:\\edge-secrets\\registry-auth.json"
+    }
+  }
+}
+```
+
+The file's `auths` entries are keyed by the registry host, including its port
+when present. Entries support `auth` (base64 of `username:password`),
+`username` with `password`, or `registrytoken` for an already issued registry
+bearer token. Base64 is **not encryption**; protect the file with host
+permissions or ACLs. Credential helpers (`credHelpers` and `credsStore`) and
+identity/refresh tokens are not supported and fail explicitly. The host does
+not search the user's Docker configuration or other credential files.
+
+The host selects credentials only for the requested registry, and rereads
+the file on each actual pull so it can be replaced to rotate credentials.
+An unrelated registry is pulled anonymously; a malformed or unreadable
+selected file fails the pull. Local and cached images do not read it. The
+existing state root remains the cache's trust boundary; credentials do not
+restrict access to an image already cached there.
+
+The native host passes credentials through the image tool's existing
+password/token command-line options. They are visible to users who can
+inspect that process, even though the client receives only the file path.
+Do not map the credential file into a guest; the host rejects mappings that
+would expose it.
+
 - **Loading.** `AgentBackend::new` checks the library's SHA-256 and sandbox ABI version and
   loads it once per process; it stays loaded until the process exits. It loads the bytes that it
   checked. On Linux it loads them from a sealed in-memory copy, and fails if the kernel refuses
@@ -239,12 +274,14 @@ to whole milliseconds, can be up to an hour, and ends the command as `TimedOut`.
 before the outcome arrives, `wait` closes the output streams, as cancellation does, so that a
 stream that the caller holds without reading cannot delay the outcome; an execution that loses
 output that way ends as `TimedOut`.
-Snapshot/restore and image pulls are not part of this profile.
+Snapshot/restore and guest-side image pulls are not part of this profile.
 
 [`examples/agent_lifecycle.rs`](examples/agent_lifecycle.rs) runs one lifecycle. It needs
-`--host-library`, `--host-sha256`, `--state-root`, `--image`, and either `--openvmm`, `--kernel`,
+`--host-library`, `--host-sha256`, `--state-root`, either `--image` or `--image-ref`, and either `--openvmm`, `--kernel`,
 and `--initrd` or `--bundle` and `--bundle-sha256`, and the command after `--`. `--image-sha256`
-requires the image's digest when it is registered, and `--hypervisor`, `--cpu-profile auto|host`,
+requires a local image's digest when it is registered. `--image-ref` requires a bundle;
+`--registry-auth-file PATH` selects its credentials file and `--pull-timeout-ms` sets its pull
+deadline. `--hypervisor`, `--cpu-profile auto|host`,
 `--memory-mib`, and `--guest-debug` adjust the setup. The repeatable `--readonly`,
 `--readwrite`, and `--denied` options map host paths, and `--egress allow|deny` with the
 repeatable `--egress-allow` and `--egress-deny` options, each taking `CIDR` or
@@ -273,6 +310,18 @@ $stateRoot = 'C:\nvx-edge-state'
 
 cargo run --release --locked --features agent --example agent_lifecycle -- `
     --openvmm $openvmm --kernel $kernel --initrd $initrd --image $image `
+    --host-library $hostLibrary --host-sha256 $approvedHostSha256 `
+    --state-root $stateRoot -- 'printf READY'
+```
+
+To pull a private image through the library instead, use the verified bundle
+and replace `--image` with `--image-ref`:
+
+```powershell
+cargo run --release --locked --no-default-features --features agent --example agent_lifecycle -- `
+    --bundle 'C:\path\to\edge-bundle' --bundle-sha256 '<approved manifest SHA-256>' `
+    --image-ref 'registry.example:5443/team/image:1' `
+    --registry-auth-file 'C:\edge-secrets\registry-auth.json' --pull-timeout-ms 120000 `
     --host-library $hostLibrary --host-sha256 $approvedHostSha256 `
     --state-root $stateRoot -- 'printf READY'
 ```
