@@ -1647,6 +1647,37 @@ class GuestSymlinkTests(unittest.TestCase):
             microvm_tests.assert_guest_symlink(followable, str(self.target))
 
 
+class LiveExchangeTests(unittest.TestCase):
+    @staticmethod
+    def _layout(root: Path, files: tuple[str, str], entries: tuple[str, str]) -> Path:
+        root.mkdir()
+        for name, marker in zip(("exchange-a", "exchange-b"), files, strict=True):
+            (root / name).write_bytes(f"NVX-EXCHANGE-{marker}".encode())
+        for name, marker in zip(
+            ("exchange-dir-a", "exchange-dir-b"), entries, strict=True
+        ):
+            (root / name).mkdir()
+            (root / name / "entry").write_bytes(f"NVX-EXCHANGE-DIR-{marker}".encode())
+        return root
+
+    def test_each_host_requires_the_outcome_of_its_platform(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            swapped = self._layout(root / "swapped", ("B", "A"), ("B", "A"))
+            kept = self._layout(root / "kept", ("A", "B"), ("A", "B"))
+            # Only the files traded names.
+            files_only = self._layout(root / "files-only", ("B", "A"), ("A", "B"))
+            if sys.platform == "linux":
+                expected, other, wrong = swapped, kept, "exchange-dir-a/entry"
+            else:
+                expected, other, wrong = kept, swapped, "exchange-a"
+            microvm_tests.assert_live_exchange(expected)
+            with self.assertRaisesRegex(RuntimeError, "left exchange-a with"):
+                microvm_tests.assert_live_exchange(other)
+            with self.assertRaisesRegex(RuntimeError, f"left {wrong} with"):
+                microvm_tests.assert_live_exchange(files_only)
+
+
 class FilesystemOwnerTests(unittest.TestCase):
     def test_identity_capabilities_come_from_ambient_or_bounding_sets(self):
         def status(ambient: int, bounding: int) -> str:

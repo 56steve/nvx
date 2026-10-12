@@ -412,8 +412,11 @@ Windows, guest-created links are WSL-style reparse points that path resolution
 never follows, and ancestor components that are links or reparse points are
 rejected. A read-write mapping lets the guest create symbolic links with
 exact targets, which only the guest resolves; a read-only mapping rejects
-them. Bounded inode, alias, and handle tables fail an operation rather than
-create untracked host state.
+them. On a Linux host, a rename passes its flags to `renameat2`, so the guest
+can swap two names with `RENAME_EXCHANGE`, and the device swaps the names that
+it tracks for both objects; a Windows host rejects every rename flag with
+`EINVAL` before changing anything. Bounded inode, alias, and handle tables
+fail an operation rather than create untracked host state.
 Read-only mode, of a share or of an aggregate child, rejects mutation in the
 host device before invoking host filesystem operations; read-write mode exposes
 only the supported common host contract.

@@ -34,7 +34,9 @@ restore downtime, fresh
 generation IDs, `getrandom()` output, kernel UUIDs, temporary-file identifiers,
 entropy reseed, active console RX/TX, network policy and HTTP traffic, and live
 virtio-fs attachment revalidation, including a guest-created symbolic link held
-across capture. Directional network coverage verifies an
+across capture and a capture right after the guest swaps two files and two
+directories with `RENAME_EXCHANGE`, which Linux hosts perform and Windows hosts
+reject without changing either name. Directional network coverage verifies an
 egress request and response with ingress denied, denial of a host connection
 to an active guest listener, complete egress denial, and pre-boot rejection of
 unsupported ingress on KVM, MSHV, and WHP. L3/L4 coverage verifies TCP and UDP

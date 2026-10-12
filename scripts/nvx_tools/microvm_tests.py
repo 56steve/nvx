@@ -3627,6 +3627,30 @@ def assert_guest_symlink(path: Path, target: str) -> None:
         raise RuntimeError(f"guest symbolic link {path} does not point to {target!r}")
 
 
+def assert_live_exchange(root: Path) -> None:
+    """Check the two files and two directories that the live filesystem stage
+    swapped with `RENAME_EXCHANGE` right before its capture.
+
+    Linux hosts pass the flag to `renameat2`, so each pair traded names.
+    Windows hosts reject every rename flag with `EINVAL` before changing
+    anything, so each name still holds what the guest created there.
+    """
+    at_a, at_b = ("B", "A") if sys.platform == "linux" else ("A", "B")
+    expected = {
+        "exchange-a": f"NVX-EXCHANGE-{at_a}",
+        "exchange-b": f"NVX-EXCHANGE-{at_b}",
+        "exchange-dir-a/entry": f"NVX-EXCHANGE-DIR-{at_a}",
+        "exchange-dir-b/entry": f"NVX-EXCHANGE-DIR-{at_b}",
+    }
+    for name, contents in expected.items():
+        actual = (root / name).read_bytes()
+        if actual != contents.encode():
+            raise RuntimeError(
+                f"live filesystem exchange left {name} with {actual!r}, "
+                f"expected {contents}"
+            )
+
+
 def run_denied_filesystem_paths(
     executable: Path,
     kernel: Path,
@@ -5335,6 +5359,7 @@ def run_filesystem_snapshot(
         if open_handle.read_bytes() != b"NVX-HANDLE-BEFORE":
             raise RuntimeError("live filesystem source completed a post-capture write")
         assert_guest_symlink(live_root / "handle-link", "open-handle")
+        assert_live_exchange(live_root)
         live_fingerprint = _snapshot_fingerprint(live_snapshot)
 
         _expect_process_failure(
