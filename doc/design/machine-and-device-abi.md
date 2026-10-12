@@ -128,7 +128,7 @@ KVM, MSHV, or WHP.
 | `distro` virtio-blk | `blk:sandbox:distro` | `0xd0003000..0xd0003fff` | 4 | Optional read-only role |
 | `runtime` virtio-blk | `blk:sandbox:runtime` | `0xd0004000..0xd0004fff` | 12 | Optional read-only role |
 | `custom` virtio-blk | `blk:sandbox:custom` | `0xd0005000..0xd0005fff` | 9 | Optional read-only role |
-| `scratch` virtio-blk | `blk:sandbox:scratch` | `0xd0006000..0xd0006fff` | 11 | Required writable final role when blocks are present |
+| `scratch` virtio-blk | `blk:sandbox:scratch` | `0xd0006000..0xd0006fff` | 11 | Writable final role; required with blocks except in the RAM-backed overlay layout |
 | Control virtio-console | `console:microvm-control0` | `0xd0007000..0xd0007fff` | 3 | Optional authenticated local endpoint |
 
 Explicit placement metadata bypasses the standard sequential MMIO allocator.
@@ -146,9 +146,10 @@ role rather than option order:
 | `scratch` | `0xd0006000..0xd0006fff` | 11 | Writable |
 
 Roles must be unique and supplied in fixed order; omitted lower-layer roles
-leave their slots empty, and any nonempty topology ends with scratch. All four
-block IRQs use active-high edge delivery. IRQ 12 avoids the RTC's exclusive
-IRQ 8.
+leave their slots empty. A nonempty topology ends with scratch unless the
+[RAM-backed overlay layout](cold-boot.md#effective-command-line) selects exactly
+one read-only `distro` block. All four block IRQs use active-high edge
+delivery. IRQ 12 avoids the RTC's exclusive IRQ 8.
 
 The microVM keeps every fixed MMIO address and IRQ number and uses active-high edge
 delivery for dedicated virtio IRQs. One little-endian, naturally aligned `u32`
@@ -179,20 +180,93 @@ mode, page GPA, and page size.
 ### Block
 
 Block devices are routed directly to virtio-mmio rather than VPCI. Packed rings
-are unavailable. Each block has a stable role, MMIO address, IRQ, access mode, and
-fixed feature mask. Its snapshot contract records the role, read-only flag,
-logical length, logical and physical block sizes, and identity policy. Each
-consumed block uses either whole-file SHA-256 or the caller-authenticated
-immutable storage generation supplied at capture. Generation mode requires all
-bound roles to carry the same nonzero generation and avoids content scans; the
-storage controller remains responsible for binding that generation to the
-exact immutable files. Platform-tier layers are recorded as unbound because
-image binding has not been consumed; restore may supply different
-same-geometry layers. Writable scratch uses one of two artifact policies:
+are unavailable. Each block has a stable role, MMIO address, IRQ, access mode,
+and fixed feature mask.
+
+#### Construction and discovery
+
+Each role-bearing attachment must use its role's access mode. OpenVMM opens the
+host storage through its generic disk interface and creates one single-queue
+virtio-blk device per role at the role's fixed virtio-mmio slot. No PCI bus or
+PCI enumeration is involved.
+
+OpenVMM adds one profile-owned discovery token per block to the kernel command
+line. The guest kernel creates the virtio-mmio device from that token,
+negotiates features within the role's fixed set, and places the split
+virtqueue in guest RAM. Guest device names are not role identities. The sandbox
+launcher instead passes each role's MMIO address on the kernel command line,
+and the guest agent maps that address to its block device. The agent mounts
+lower roles read-only as EROFS and scratch read-write as ext4, then assembles
+the [overlay root](sandbox-filesystem-and-agent-architecture.md#implemented-filesystem-bootstrap).
+
+#### Guest-visible capabilities
+
+Each role offers a fixed capability set: virtio 1.0 split rings with indirect
+descriptors and event-index notification suppression, a per-request segment
+limit, block-size and topology reporting, and a write-back cache with explicit
+flush. Lower roles are also advertised as read-only. Discard is never offered,
+even when the host storage could deallocate blocks. The device reports the
+backing store's capacity and its logical and physical block sizes.
+
+#### Request and completion path
+
+The MMIO window is a control plane for device configuration and queue
+notifications; block data never crosses it. A request is a descriptor chain in
+guest RAM that holds a header with the operation and starting sector, any data
+buffers, and a status byte. The guest publishes the chain and, unless the
+device has suppressed notifications, notifies the queue. OpenVMM receives that
+notification through a hypervisor doorbell when available and otherwise by
+emulating the MMIO access. Either path wakes the device's I/O worker.
+
+The worker reads requests directly from guest memory and services several
+concurrently. It translates each request's virtio sector address to the
+backing store's block geometry, rejects transfers that are not aligned to that
+geometry, and submits asynchronous scatter-gather I/O that targets guest
+buffers directly when their layout permits. Individual writes are not forced
+to stable storage; a guest flush becomes a backend cache flush.
+
+On completion, the device stores a success, I/O-error, or unsupported status in
+the request, publishes one used-ring entry, and, unless the guest suppressed
+the notification, signals the guest through the role's
+[shared-status word and edge IRQ](#fixed-virtio-mmio-transport). The guest
+driver therefore completes block I/O without reading or acknowledging
+interrupt status through MMIO.
+
+#### Host storage and access enforcement
+
+Because the device depends only on OpenVMM's generic disk interface, its
+guest-visible behavior is independent of the host storage type. The backend
+sees block offsets and buffers; filesystem semantics remain entirely in the
+guest. Without snapshot support, a role accepts any disk backend that OpenVMM
+can open. Raw files use asynchronous kernel I/O on Linux, which can transfer
+aligned buffers directly to and from guest memory, and positional file I/O on
+worker threads on Windows, which copies through an intermediate buffer.
+
+Read-only access is enforced at three layers: the guest is told that the device
+is read-only, the device rejects write and discard requests, and OpenVMM opens
+an existing host file without write access. Scratch is the only writable role.
+
+A snapshot destination or restore makes every block snapshot-capable. Each
+must then be a nonempty, 512-byte-aligned raw regular file that uses cached I/O
+and is not reached through a final symbolic link. OpenVMM keeps that opened
+file for identity hashing, flushing, and paired-scratch publication.
+
+#### Snapshot contract and quiesce
+
+The snapshot contract records the role, read-only flag, logical length,
+logical and physical block sizes, and identity policy. Each consumed block uses
+either whole-file SHA-256 or the caller-authenticated immutable storage
+generation supplied at capture. Generation mode requires all bound roles to
+carry the same nonzero generation and avoids content scans; the storage
+controller remains responsible for binding that generation to the exact
+immutable files. Platform-tier layers are recorded as unbound because image
+binding has not been consumed; restore may supply different same-geometry
+layers. Writable scratch uses one of two artifact policies:
 
 - **paired**: capture publishes `scratch.img` with its exact length and selected
-   identity. Restore uses the recorded `private-copy`, reflink-only
-   `copy-on-write`, or single-use `direct-claimed` materialization policy;
+   identity. Restore rejects a caller-supplied scratch block and attaches the
+   file materialized by the recorded `private-copy`, reflink-only
+   `copy-on-write`, or single-use `direct-claimed` policy;
 - **fresh**: capture occurs before scratch is mounted, publishes no scratch
    artifact, and restore requires a new writable file with matching geometry.
 
