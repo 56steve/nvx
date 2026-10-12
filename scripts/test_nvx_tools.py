@@ -1513,6 +1513,59 @@ class CliTests(unittest.TestCase):
                     nvx.command_sandbox(args)
                 validated.assert_not_called()
 
+    def test_policy_file_rejects_scoped_ipv6_before_launch_or_provision(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            policy = root / "policy.json"
+            policy.write_text(
+                json.dumps({"allow": [{"to": [{"cidr": "fe80::1%eth0/64"}]}]}),
+                encoding="utf-8",
+            )
+            options = [
+                "--network-egress",
+                "deny",
+                "--network-egress-policy-file",
+                str(policy),
+            ]
+            message = (
+                r"^allow\[0\]\.to\[0\]\.cidr must not name an IPv6 scope: "
+                r"fe80::1%eth0/64$"
+            )
+            args = nvx.parse_args(["run", "--dry-run", *options])
+            with (
+                patch.object(nvx, "require_file") as require,
+                self.assertRaisesRegex(common.ScriptError, message),
+            ):
+                nvx.command_run(args)
+            require.assert_not_called()
+
+            state = root / "state"
+            operations: tuple[tuple[str, list[str]], ...] = (
+                ("run", []),
+                ("provision", ["--state-dir", str(state)]),
+            )
+            for operation, extra in operations:
+                with self.subTest(operation=operation):
+                    args = nvx.parse_args(
+                        [
+                            "sandbox",
+                            operation,
+                            *extra,
+                            "--layer",
+                            "distro,absent.erofs,00000000-0000-4000-8000-000000000001",
+                            "--scratch",
+                            "absent.ext4",
+                            *options,
+                        ]
+                    )
+                    with (
+                        patch.object(nvx.SandboxLaunch, "validated") as validated,
+                        self.assertRaisesRegex(common.ScriptError, message),
+                    ):
+                        nvx.command_sandbox(args)
+                    validated.assert_not_called()
+            self.assertFalse(state.exists())
+
     def test_managed_provision_persists_lowered_policy_not_source_path(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

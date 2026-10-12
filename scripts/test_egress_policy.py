@@ -3,6 +3,7 @@
 
 import ipaddress
 import json
+import re
 import sys
 import tempfile
 import unittest
@@ -374,8 +375,10 @@ class EgressPolicyTests(unittest.TestCase):
             self.compile({"deny": [*address_only[:-1], any_range]})
 
     def test_normalizes_host_bits_like_the_native_cidr_parser(self):
-        compiled = self.compile({"allow": [{"cidr": "10.0.0.5/24"}]})
-        self.assertEqual(compiled.allow, ("10.0.0.0/24",))
+        compiled = self.compile(
+            {"allow": [{"cidr": "10.0.0.5/24"}, {"cidr": "fe80::1/64"}]}
+        )
+        self.assertEqual(compiled.allow, ("10.0.0.0/24", "fe80::/64"))
 
     def test_subtracts_rule_local_cidr_exclusions(self):
         compiled = self.compile(
@@ -655,12 +658,31 @@ class EgressPolicyTests(unittest.TestCase):
         self.assertEqual(len(compiled.deny), 16)
 
     def test_rejects_ipv6_scopes(self):
-        for cidr in ("fe80::%eth0/64", "fe80::1%1"):
-            with (
-                self.subTest(cidr=cidr),
-                self.assertRaisesRegex(ScriptError, "scope"),
-            ):
-                self.compile({"allow": [{"to": [{"cidr": cidr}]}]})
+        # Clearing host bits also clears the scope of the network address, so
+        # the scoped addresses with host bits must not compile as unscoped.
+        cidrs = (
+            "fe80::%eth0/64",
+            "fe80::1%1",
+            "fe80::1%eth0/64",
+            "fe80::1%1/64",
+            "::ffff:192.0.2.1%eth0/120",
+        )
+        for category in ("allow", "deny"):
+            for cidr in cidrs:
+                for field, rule in (
+                    ("to[0].cidr", {"to": [{"cidr": cidr}]}),
+                    ("to[0].except[0]", {"to": [{"cidr": "::/0", "except": [cidr]}]}),
+                    ("cidr", {"cidr": cidr}),
+                    ("except[0]", {"cidr": "::/0", "except": [cidr]}),
+                ):
+                    message = (
+                        f"{category}[0].{field} must not name an IPv6 scope: {cidr}"
+                    )
+                    with (
+                        self.subTest(category=category, rule=rule),
+                        self.assertRaisesRegex(ScriptError, f"^{re.escape(message)}$"),
+                    ):
+                        self.compile({category: [rule]})
 
     def test_both_families_share_the_native_rule_budget(self):
         # Ports that are not adjacent cannot form one range, so each lowers to

@@ -274,7 +274,8 @@ every IPv4 and IPv6 destination. Each `to` entry requires one IPv4 or IPv6
 that parent, and the entries of each family lower to native rules of that
 family. Host bits are normalized like the native CIDR syntax: `10.0.0.5/24`
 means `10.0.0.0/24`, not one host. Use `/32` to select one IPv4 address and
-`/128` to select one IPv6 address; IPv6 scope IDs are rejected.
+`/128` to select one IPv6 address. IPv6 scope IDs are rejected before host
+bits are normalized, so `fe80::1%eth0/64` is an error, not `fe80::/64`.
 
 Omitting `ports` matches every transport supported by the native rule. Each
 port selector follows MXC: `protocol` defaults to `any`. Without `port`, `tcp`
