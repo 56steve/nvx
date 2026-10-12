@@ -718,7 +718,13 @@ def _window_rate(points: Sequence[tuple[int, int, float]], clock_hz: int) -> flo
 def check_rate(context: DoctorContext) -> CheckResult:
     clocksource = ""
     if not host_is_windows():
-        clocksource = host_clocksource()
+        try:
+            clocksource = host_clocksource()
+        except OSError as error:
+            # The host clocksource is recorded as evidence only; an
+            # unreadable file must not fail the check. Record it explicitly
+            # and still run the TSC rate/stability measurements below.
+            clocksource = f"unknown ({error})"
         context.facts["host_clocksource"] = clocksource
     schedule = context.schedule
     # The probe sleeps between samples for the whole window, 120 s on the

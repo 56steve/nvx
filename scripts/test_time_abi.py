@@ -2631,6 +2631,62 @@ class DoctorTests(unittest.TestCase):
         self.assertTrue(standalone.passed, standalone.detail)
         self.assertIn("not compared with the backend's rate", standalone.detail)
 
+    def test_rate_check_continues_when_the_clocksource_is_unreadable(self):
+        # #507: the host clocksource is evidence only, so an unreadable
+        # sysfs file must not fail H4; the native probe still runs and the
+        # verdict depends on the measurements alone.
+        def records(gaps: tuple[int, int]) -> list[tuple[str, dict[str, str]]]:
+            result: list[tuple[str, dict[str, str]]] = [
+                (
+                    "clock",
+                    {
+                        "role": role,
+                        "name": name,
+                        "hz": "1000000000",
+                        "resolution_ns": "1.000",
+                    },
+                )
+                for role, name in (
+                    ("rate", "CLOCK_MONOTONIC"),
+                    ("stability", "CLOCK_MONOTONIC_RAW"),
+                )
+            ]
+            tsc = 0
+            for index in range(3):
+                sample = {"index": str(index)}
+                for role in ("rate", "stability"):
+                    sample[f"{role}_tsc"] = str(tsc)
+                    sample[f"{role}_clock"] = str(index * 1_000_000_000)
+                    sample[f"{role}_bracket"] = "20"
+                tsc += gaps[min(index, 1)]
+                result.append(("sample", sample))
+            return result
+
+        error = FileNotFoundError(2, "No such file or directory", "/sys/fake")
+        for gaps, passed, marker in (
+            ((3_000_000_000, 3_000_000_000), True, "host clocksource unknown"),
+            ((3_000_000_000, 3_100_000_000), False, "interval rates differ"),
+        ):
+            with self.subTest(passed=passed):
+                context = doctor_context(self.root)
+                context.schedule = doctor.CI_SCHEDULE
+                with (
+                    patch.object(
+                        doctor, "run_probe", return_value=records(gaps)
+                    ) as run,
+                    patch.object(doctor, "host_clocksource", side_effect=error),
+                    patch.object(doctor, "host_is_windows", return_value=False),
+                ):
+                    result = doctor.check_rate(context)
+                self.assertTrue(run.called)
+                self.assertEqual(result.passed, passed, result.detail)
+                self.assertIn(marker, result.detail)
+                self.assertIn("evidence", result.detail)
+                self.assertEqual(
+                    context.facts["host_clocksource"],
+                    f"unknown ({error})",
+                )
+
     def test_host_skew_check_applies_the_bound(self):
         summary = {
             "pairs": "28",
