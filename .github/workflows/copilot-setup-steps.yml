@@ -17,10 +17,12 @@ on:
       - .github/workflows/copilot-setup-steps.yml
       - .github/actions/build-guest-artifacts/action.yml
       - .github/actions/check-aci-edge-sandboxes/action.yml
+      - .github/actions/check-nvx-rs/action.yml
       - .github/actions/check-quality/action.yml
       - .gitmodules
       - SOURCE-MANIFEST.json
       - aci_edge_sandboxes/Cargo.toml
+      - nvx-rs/Cargo.toml
       - openvmm
       - requirements-dev.txt
       - rust-toolchain.toml
@@ -104,7 +106,9 @@ jobs:
         run: |
           set -euo pipefail
           rust_toolchain=$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml)
-          crate_msrv=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' aci_edge_sandboxes/Cargo.toml)
+          # The distinct minimum supported Rust versions of the crates, space-separated.
+          crate_msrv=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' \
+            aci_edge_sandboxes/Cargo.toml nvx-rs/Cargo.toml | sort -u | xargs)
           nextest=$(sed -n 's/^cargo_nextest\.version=//p' scripts/setup/tool-versions.conf)
           {
             echo "rust-toolchain=${rust_toolchain}"
@@ -114,10 +118,10 @@ jobs:
           test -n "${rust_toolchain}" && test -n "${crate_msrv}" && test -n "${nextest}"
 
       # The toolchain that rust-toolchain.toml pins builds OpenVMM with its
-      # guest, UEFI, and musl targets and runs the aci_edge_sandboxes checks,
-      # which also need a macOS target and the crate MSRV. OpenVMM keeps full
-      # debug info in release builds, so the session limits debug info and
-      # disables incremental artifacts to save disk space and link time.
+      # guest, UEFI, and musl targets and runs the aci_edge_sandboxes and nvx-rs
+      # checks, which also need a macOS target and the crates' MSRVs. OpenVMM
+      # keeps full debug info in release builds, so the session limits debug
+      # info and disables incremental artifacts to save disk space and link time.
       - name: Install Rust toolchains
         id: rust
         continue-on-error: true
@@ -136,7 +140,9 @@ jobs:
             --component clippy,rustfmt \
             --target x86_64-unknown-linux-musl,x86_64-unknown-none,x86_64-unknown-uefi,aarch64-apple-darwin
           rustup default "${RUST_TOOLCHAIN}"
-          rustup toolchain install "${CRATE_MSRV}" --profile minimal
+          for msrv in ${CRATE_MSRV}; do
+            rustup toolchain install "${msrv}" --profile minimal
+          done
           rustup toolchain list
 
       - name: Install cargo-nextest

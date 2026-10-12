@@ -31,6 +31,7 @@ OPENVMM_TEST_BACKENDS = ("kvm", "mshv", "whp")
 REQUIRED_CI_RESULT_ENVIRONMENTS = {
     "quality": "QUALITY_RESULT",
     "aci-edge-sandboxes": "ACI_EDGE_SANDBOXES_RESULT",
+    "nvx-rs": "NVX_RS_RESULT",
     "nvx-cli-linux": "NVX_CLI_LINUX_RESULT",
     "nvx-cli-windows": "NVX_CLI_WINDOWS_RESULT",
     "openvmm-changes": "CHANGES_RESULT",
@@ -106,9 +107,10 @@ CI_CHANGE_OUTPUTS = (
 )
 CI_DOCUMENTATION_PATHS = re.compile(r"^(doc/|.*\.md$)", re.IGNORECASE)
 # Inputs of the hypervisor test suites: OpenVMM, the guests that the microVM
-# tests boot, the CLI and workflows that drive the suites, and the runners.
+# tests boot, the Rust crates that test-aci-edge-sandboxes runs, the CLI and
+# workflows that drive the suites, and the runners.
 CI_TEST_INPUT_PATHS = re.compile(
-    r"^(openvmm($|/)|aci_edge_sandboxes/|azurelinux/|"
+    r"^(openvmm($|/)|aci_edge_sandboxes/|nvx-rs/|azurelinux/|"
     r"\.github/workflows/"
     r"(ci|build-openvmm-binary|run-nvx-microvm-tests|run-platform)\.yml$|"
     r"\.github/actions/(build-guest-artifacts|build-openvmm|checkout-openvmm|"
@@ -266,6 +268,7 @@ def required_ci_expected_results(
     expected = {
         "quality": "success",
         "aci-edge-sandboxes": "success",
+        "nvx-rs": "success",
         "openvmm-changes": "success",
         REQUIRED_CI_ARTIFACT_JOB: "success" if run_workloads else "skipped",
         REQUIRED_CI_DEBUG_KERNEL_JOB: "success" if run_workloads else "skipped",
