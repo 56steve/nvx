@@ -137,6 +137,10 @@ nvx/
 |   |   |-- time_abi.py          Time ABI harness checks and CPU profile guidance
 |   |   `-- ubuntu.py            Verified Ubuntu rootfs and EROFS preparation
 |   |-- setup/                   Host and Actions runner bootstrap scripts
+|   |   |-- setup-linux-mshv.sh   Linux/MSHV development-host bootstrap
+|   |   |-- setup-linux-runner.sh Linux/KVM or Linux/MSHV Actions runner bootstrap
+|   |   |-- setup-windows-whp.ps1 Windows/WHP development-host and Actions runner bootstrap
+|   |   `-- tool-versions.conf   Shared tool release and checksum pins
 |   |-- nvx-hosts.example.json   Template for the ignored .nvx-hosts.json
 |   |-- nvx.py                   Supported command-line entry point
 |   |-- nvx_adversarial_executor.py Restricted adversarial executor entry point
@@ -280,7 +284,7 @@ storage activity during profiled snapshot captures, as
 beside `nvx.py` are the tooling's unit tests.
 
 The `setup/` scripts bootstrap development hosts and GitHub Actions runners
-with the tool versions that `setup/tool-versions.conf` pins;
+using the [tool manifest](../scripts/setup/tool-versions.conf);
 see [Automated environment bootstrap](setup.md#automated-environment-bootstrap).
 `nvx-hosts.example.json` is the template for the
 [remote agent host](setup.md#remote-agent-hosts) inventory, and CI runs
