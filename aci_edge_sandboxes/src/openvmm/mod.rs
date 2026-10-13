@@ -93,7 +93,6 @@
 //! dies, the guest kills the workload as soon as it notices that the control session is gone.
 
 mod config;
-mod launch;
 mod state;
 
 use std::fs;
@@ -105,6 +104,7 @@ use std::time::{Duration, Instant};
 
 use nvx::Artifacts;
 use nvx::host::filesystem::{self, ExportPlan, ExportRequest, PathList};
+use nvx::host::launch::{LaunchSpec, WorkloadIdentity};
 use nvx::host::session::{self, ControlSession, ExecEvent, SessionError};
 use nvx::host::{network, platform, process};
 use nvx::protocol::{
@@ -315,6 +315,28 @@ impl OpenVmmBackend {
         );
         Error::backend_unavailable(self.abort_start(sandbox_id, runtime, &reason).message())
     }
+
+    /// Returns the launch specification of a provisioned sandbox.
+    fn launch_spec(&self, record: &SandboxRecord) -> LaunchSpec {
+        LaunchSpec {
+            openvmm: self.config.openvmm.clone(),
+            kernel: self.config.kernel.clone(),
+            initrd: self.config.initrd.clone(),
+            hypervisor: self.config.hypervisor,
+            memory_mib: record.memory_mib,
+            identity: WorkloadIdentity {
+                uid: record.workload_uid,
+                gid: record.workload_gid,
+                create_account: record.create_workload_account,
+            },
+            hostname: record.hostname.clone(),
+            kernel_parameters: self.config.kernel_command_line.clone(),
+            guest_network: self.config.guest_network.clone(),
+            network: record.network.as_ref().map(network_policy),
+            filesystem: record.filesystem.clone(),
+            breakaway_from_job: self.config.breakaway_from_job,
+        }
+    }
 }
 
 /// Converts the contract's network section into NVX's network posture, under the contract's
@@ -452,22 +474,6 @@ fn prepare_exec(process: &ProcessSpec) -> Result<Workload<'_>> {
     Ok(workload)
 }
 
-/// Returns the calling user's IDs when workloads that map host paths should use them; see
-/// [`OpenVmmConfig::map_host_identity`].
-fn host_identity(config: &OpenVmmConfig, maps_host_paths: bool) -> Option<(u32, u32)> {
-    if !(maps_host_paths && config.map_host_identity) {
-        return None;
-    }
-    #[cfg(unix)]
-    {
-        // SAFETY: geteuid and getegid have no preconditions.
-        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
-        (uid != 0 && gid != 0).then_some((uid, gid))
-    }
-    #[cfg(not(unix))]
-    None
-}
-
 /// Explains why a launch did not become ready.
 fn readiness_failure(error: &SessionError, runs_as_host_user: bool) -> String {
     let mut reason = error.to_string();
@@ -575,35 +581,32 @@ impl Backend for OpenVmmBackend {
             Some(policy) => export_plan(policy)?,
             None => None,
         };
-        let (workload_uid, workload_gid, create_workload_account) =
-            match host_identity(&self.config, filesystem.is_some()) {
-                Some((uid, gid)) => (uid, gid, true),
-                None => (self.config.workload_uid, self.config.workload_gid, false),
-            };
+        let identity = WorkloadIdentity::select(
+            self.config.workload_uid,
+            self.config.workload_gid,
+            self.config.map_host_identity,
+            filesystem.is_some(),
+        );
         let record = SandboxRecord {
             format: STATE_FORMAT,
             backend: BACKEND_KEY.to_owned(),
             network: request.network.clone(),
             filesystem,
             memory_mib,
-            workload_uid,
-            workload_gid,
-            create_workload_account,
+            workload_uid: identity.uid,
+            workload_gid: identity.gid,
+            create_workload_account: identity.create_account,
             hostname: self.config.hostname.clone(),
         };
-        launch::kernel_command_line(&self.config.kernel_command_line, &record)?;
+        let spec = self.launch_spec(&record);
+        spec.kernel_command_line()?;
         let sandbox_id = SandboxId::generate()?;
         // Windows names each start's control pipe afresh, but every name has the same length.
         let endpoint =
             platform::control_endpoint(&self.store.socket_path(&sandbox_id)).map_err(|error| {
                 Error::backend_error("cannot choose a control endpoint").with_source(error)
             })?;
-        launch::check_process_command_line(
-            &self.config,
-            &record,
-            &endpoint,
-            &self.store.outcome_path(&sandbox_id),
-        )?;
+        spec.check_process_command_line(&endpoint, &self.store.outcome_path(&sandbox_id))?;
         self.store.create(&sandbox_id, &record)?;
         Ok(ProvisionResult {
             sandbox_id,
@@ -636,7 +639,9 @@ impl Backend for OpenVmmBackend {
         })?;
         let report = self.store.outcome_path(sandbox_id);
         state::remove_if_present(&report)?;
-        let arguments = launch::openvmm_arguments(&self.config, &record, &endpoint, &report)?;
+        let arguments = self
+            .launch_spec(&record)
+            .openvmm_arguments(&endpoint, &report)?;
 
         self.store.write_capability(sandbox_id, &capability)?;
         let log = self.store.create_log(sandbox_id)?;

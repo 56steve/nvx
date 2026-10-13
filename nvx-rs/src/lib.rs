@@ -10,10 +10,11 @@
 //!   test doubles share it.
 //! - [`contract`]: the control-contract versions that this crate speaks, and the compatibility of
 //!   NVX releases with them.
-//! - [`net`]: IP networks in CIDR notation and their subtraction.
+//! - [`net`]: IP networks in CIDR notation and their subtraction, and the forms of a VM's
+//!   hostname and guest network address.
 //! - [`Hypervisor`]: the hypervisors that run the VMs.
-//! - [`host`] (feature `host`): artifact discovery, the lowering of network and filesystem
-//!   policies, control sessions, and process and platform primitives.
+//! - [`host`] (feature `host`): artifact discovery, the OpenVMM command line, the lowering of
+//!   network and filesystem policies, control sessions, and process and platform primitives.
 //!
 //! # Features
 //!
