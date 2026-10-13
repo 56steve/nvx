@@ -303,65 +303,250 @@ guest agent; see
 
 ### Network
 
-The optional NIC has one RX/TX queue pair and an exact feature mask:
-the MAC-address feature and virtio version 1.
+#### Architecture and device creation
+
+Networking is a guest virtio-net NIC backed by the in-process Consomme
+userspace network stack in OpenVMM. Consomme translates guest traffic into
+ordinary host socket operations; it does not attach the guest to a physical
+NIC, TAP interface, bridge, or host virtual switch. The host does not need a
+network interface assigned the guest's gateway address.
+
+The optional NIC occupies the fixed virtio-mmio slot at `0xd0000000`, has one
+RX/TX queue pair, and advertises an exact feature mask: the MAC-address feature
+and virtio version 1. OpenVMM constructs the virtual device and its Consomme
+endpoint, binds the network identity and egress policy to them, and configures
+any explicit host port forwards. The guest discovers the device through the
+`virtio_mmio.device=` kernel command-line token.
+
 `--net IPv4/prefix --network-profile portable` accepts prefixes `/1` through
 `/30`, derives the first usable address as the gateway, and derives
 deterministic guest and gateway MAC addresses from the final three IPv4
 octets. The profile is mandatory and selects the same in-process Consomme data
 plane on KVM, MSHV, and WHP; TAP attachments are rejected for this profile.
+
+```mermaid
+%%{init: {"theme": "base", "themeVariables": {"background": "#ffffff"}}}%%
+flowchart TB
+   Guest["Guest application and Linux TCP/IP stack"]
+   Driver["Guest virtio-net driver"]
+   Queues["TX/RX virtqueues in guest RAM<br/>MMIO notifications and interrupts"]
+   Device["OpenVMM virtio-net device<br/>guest TX header prefilter"]
+   Endpoint["In-process Consomme endpoint<br/>final guest TX authorization"]
+   Host["Host sockets and DNS resolver"]
+   Network["Host OS routing, firewall, and network"]
+   Peer["Remote server or permitted host-local service"]
+
+   Guest <--> Driver
+   Driver <--> Queues
+   Queues <--> Device
+   Device <--> Endpoint
+   Endpoint <--> Host
+   Host <--> Network
+   Network <--> Peer
+```
+
+#### Guest addressing and bootstrap
+
+OpenVMM supplies the static IPv4 address, netmask, and gateway through the
+`virtnet_ip=`, `virtnet_mask=`, and `virtnet_gw=` kernel command-line tokens.
+The [guest initialization code](../../guest/common/init) configures the
+interface and its default route from those tokens rather than using DHCP.
+
 The NIC is dual-stack: its static IPv6 identity embeds the guest and gateway
 IPv4 addresses in `fd00::/96`, with a prefix of 96 plus the IPv4 prefix, so
 `10.0.0.2/24` becomes `fd00::a00:2/120` behind `fd00::a00:1`. The gateway
 shares the IPv4 gateway's MAC address, and the guest configures the identity
 from the `virtnet_ip6=` and `virtnet_gw6=` tokens without router
 advertisements, autoconfiguration from them, or duplicate address detection.
+For example:
+
+| Setting | Value |
+| --- | --- |
+| Guest IPv4 address | `10.0.0.2/24` |
+| IPv4 gateway | `10.0.0.1` |
+| Guest IPv6 address | `fd00::a00:2/120` |
+| IPv6 gateway | `fd00::a00:1` |
+
 The guest kernel's EUI-64 link-local address is its only other IPv6 address,
 and egress rules admit it only as the source of Neighbor Solicitations.
-The `virtnet_dns=` token names the IPv4 gateway when the egress policy permits
-DNS to it, and otherwise the IPv6 gateway when the policy permits DNS to that
-one. The static identity advertises no routable IPv6 prefix. The snapshot records
-the IPv6 identity; a snapshot whose network predates it restores IPv4-only.
+The static identity advertises no routable IPv6 prefix. External reachability
+depends on the host's routes and address-family support; configuring this
+private IPv6 identity does not give an IPv4-only host IPv6 Internet access.
 
-The portable profile provides gateway DNS over UDP and TCP, ICMP and ICMPv6
-echo, outbound TCP and UDP over IPv4 and IPv6, deterministic rejection of
-fragmented IPv4 packets, IPv6 extension headers, and IPv4-mapped IPv6
-destinations, and bounded flow, DNS, buffer, and packet-queue state. At most
-128 TCP, 256 UDP, and 16 ICMP guest flows are active at once, and excess flows
-are rejected before a host socket is created. It applies one canonical egress
-policy before externally visible transmission:
+#### Packet forwarding
 
-- allow only listed IPv4 hosts or CIDRs;
-- allow IPv4 except listed hosts or CIDRs; or
-- allow only exact IPv4 TCP endpoints; or
+Guest transmission follows this path:
+
+1. The guest Linux stack constructs an Ethernet frame, and the virtio-net
+   driver places its buffers in the TX virtqueue in guest RAM.
+2. The driver notifies the virtual device through MMIO. OpenVMM reads the
+   descriptors and prefilters the frame headers against the egress policy.
+3. The endpoint copies the complete frame into an owned buffer, authorizes
+   those exact bytes, and passes an allowed frame to the Consomme stack.
+4. For an allowed new TCP connection, Consomme creates a host TCP socket and
+   connects it to the destination. For UDP, it sends the guest's datagram
+   payload through a host UDP socket.
+
+TCP forwarding is socket proxying, not simply rewriting the original TCP
+packet. Consomme implements the guest-facing TCP connection, while the host
+kernel implements the remote-facing connection. Payload bytes move between
+them with separate sequencing, acknowledgments, and buffering. A remote server
+normally sees the host's network identity, not the guest's private address.
+Host routing, VPN configuration, and applicable host firewall rules still
+govern the host sockets; host kernel IP forwarding is not required.
+
+When data arrives on a host socket, Consomme associates it with the
+guest-facing flow and constructs the corresponding Ethernet/IP/TCP or UDP
+packets. The endpoint writes them into buffers that the guest has posted on
+the RX virtqueue. OpenVMM completes the descriptors and signals the guest
+through the virtio interrupt mechanism; the guest driver passes the received
+packets into Linux.
+
+ARP and IPv6 Neighbor Discovery are handled locally by the backend, not
+broadcast onto the physical LAN. The portable profile provides outbound TCP and
+UDP over IPv4 and IPv6. The backend answers echo requests to the IPv4 or IPv6
+gateway itself and sends other IPv4 echo requests through a host ICMP socket;
+it does not relay ICMPv6 echo to other destinations. It deterministically
+rejects fragmented IPv4 packets, IPv6 extension headers, and IPv4-mapped IPv6
+destinations rather than forwarding unsupported packet constructions.
+
+#### Egress policy and enforcement
+
+By default, guest egress is allowed and general host ingress is denied. One
+canonical egress policy applies before externally visible transmission:
+
+- allow all traffic, the default;
+- deny all traffic with `--network-egress deny` and no rules;
+- allow only listed IPv4 hosts or CIDRs with `--allow-host`;
+- allow IPv4 except listed hosts or CIDRs with `--block-host`;
+- allow only exact IPv4 TCP endpoints with `--allow-endpoint`; or
 - combine canonical IPv4 or IPv6 CIDR allow and deny rules with an optional
   TCP, UDP, or ICMP selector, optional TCP or UDP destination ports, and deny
   precedence.
 
-The legacy modes deny all IPv6 traffic. In the generic rule mode, a rule
-matches only destinations of its own address family, and the IPv6 gateway's
-Neighbor Discovery is authorized like the IPv4 gateway's ARP. A policy bound to
-an IPv6 identity uses canonical encoding version 4, while one restored from a
-snapshot that predates IPv6 keeps version 3 and its recorded digest.
+The legacy `--allow-host`, `--block-host`, and `--allow-endpoint` modes are
+mutually exclusive, cannot be combined with generic rules, and deny all IPv6
+traffic. The generic rule mode requires an explicit `--network-egress allow`
+or `--network-egress deny` default action and accepts at most 256 allow and
+256 deny rules through `--network-egress-allow` and `--network-egress-deny`.
+Rules select destinations by address or CIDR, with an optional transport and
+TCP or UDP destination port or inclusive port range. Evaluation is independent
+of rule order:
 
-The legacy modes are mutually exclusive. The generic rule mode requires an
-explicit default action, accepts at most 256 allow and 256 deny rules, and
-fails closed for malformed or fragmented port-specific traffic. The virtio-net
-device installs the bound policy on the endpoint and prefilters frame headers,
-but the endpoint makes the final decision on the exact bytes it transmits, so
-a guest cannot rewrite a frame after the check. The snapshot records the
-profile, network identity, and policy digest. Restore reconstructs a fresh
-endpoint and requires the profile and policy again; native sockets, DNS
-requests, and flow objects are never serialized.
+1. A matching deny rule denies the packet.
+2. Otherwise, a matching allow rule allows it.
+3. Otherwise, the default action decides.
+
+A rule matches only destinations of its own address family. The IPv6 gateway's
+Neighbor Discovery is authorized like the IPv4 gateway's ARP. Filtering is
+inactive only when the policy allows all traffic: in the default mode, or with
+generic rules that have an allow default and no deny rules. When filtering is
+active, packet checks enforce the bound guest MAC and IP identity and validate
+the headers, not just the destination. Port-specific traffic fails closed
+when malformed or fragmented.
+
+The virtio-net device validates the bound policy, installs it on the endpoint,
+and performs the early header check. That check alone is insufficient because
+guest RAM remains mutable. The endpoint therefore repeats authorization on
+the complete owned frame before passing it to Consomme, so a guest cannot
+rewrite a checked frame into a different transmitted destination. Denied
+frames are dropped and their TX descriptors completed without host
+transmission.
+
+These are destination-based L3/L4 rules, not hostname or HTTP-content filters.
+They apply to every frame that the guest transmits, including replies on
+explicitly forwarded connections, but they are not an independent RX firewall
+or host-wide firewall. Responses arriving through the host sockets use the RX
+path.
+
+#### Host-local access and ingress
 
 By default, and subject to the egress policy, the gateway maps guest TCP and
-UDP flows onto host loopback. The portable NAT cannot offer generic
-bidirectional host-loopback connectivity, so an explicit host-loopback allow is
-accepted only with explicit localhost TCP or UDP port forwards into the guest,
-at most 64 of them. Forwards are process-local attachments, and snapshot
-capture and restore reject them. Host-loopback deny blocks gateway and
-host-local destinations and every forward. One exact gateway TCP proxy endpoint
-may remain available under deny and is bound into the policy digest.
+UDP flows onto host loopback. The IPv4 gateway maps to `127.0.0.1`, and the
+static IPv6 gateway maps to `::1`. For example, a guest connection to
+`10.0.0.1:8080` reaches a host service on `127.0.0.1:8080`. The guest's own
+`127.0.0.1` still means guest loopback, not host loopback. Guest flows to
+other host-local-only destinations, such as link-local addresses, also reach
+host sockets unless host loopback is denied.
+
+`--host-loopback deny` disables the general gateway-to-host-loopback mappings,
+blocks loopback, unspecified, and link-local destinations, and disallows every
+forward. One exact IPv4 gateway TCP proxy endpoint may remain available under
+deny through `--network-proxy`; it is bound into the policy digest, and
+OpenVMM translates it to the same port on host `127.0.0.1`, where the
+launcher, not OpenVMM, supplies the proxy service. The egress policy admits
+TCP frames to that endpoint before evaluating its mode. Gateway DNS is a
+separate backend service governed by the egress policy, not by the general
+host-loopback mapping.
+
+An outbound connection does not make guest services reachable from the host
+or LAN. General `--network-ingress allow` is unsupported and rejected before
+launch. Deliberate host-to-guest publishing instead requires explicit
+localhost TCP or UDP port forwards, at most 64 of them. For example:
+
+```text
+--host-loopback allow
+--host-loopback-forward tcp:8080:80
+```
+
+This binds a real host listener on `127.0.0.1:8080` and forwards connections
+to guest port `80`; it does not bind a LAN-facing listener. Each forward
+requires explicit `--host-loopback allow`, and omitting `--host-loopback`
+keeps the default gateway mapping without publishing guest ports. The portable
+NAT cannot offer generic bidirectional host-loopback connectivity, so an
+explicit `--host-loopback allow` is accepted only with explicit
+`--host-loopback-forward` attachments. For host-loopback peers, the backend
+uses synthetic peer addresses so the guest routes replies through its NIC
+rather than its own loopback, and reverse-translates those addresses on TX.
+
+#### DNS
+
+The gateway provides a DNS proxy over UDP and TCP port 53. The
+`virtnet_dns=` token names the IPv4 gateway when the egress policy permits
+DNS to it, and otherwise the IPv6 gateway when generic rules permit DNS to
+that one. Exact-endpoint policies never name a gateway. If no gateway is
+named, the token is omitted. The guest initialization code writes the
+selected server into `/etc/resolv.conf`.
+
+A guest query to the gateway passes the normal TX egress checks before
+Consomme handles it as a DNS request. Upstream resolution uses the host
+resolver. The glibc build that NVX uses with KVM calls the reentrant
+`res_nsend` and forces TCP upstream for queries that arrived over TCP. The
+statically linked musl build that NVX uses with MSHV calls `res_send`, which
+selects its own transport. Both read the host's `/etc/resolv.conf`. Windows
+calls `DnsQueryRaw` with the query's transport and the host DNS
+configuration. Consomme relays the resolver's response from the gateway
+through the guest RX path.
+
+The host resolver's upstream DNS servers are not guest packet destinations,
+so the guest's CIDR rules do not check them. Direct guest queries to an
+external DNS server instead use the ordinary outbound socket path and require
+permission for that server's address and port.
+
+DNS permission and connection permission are separate: resolving a hostname
+does not authorize a connection to the returned address, and the egress
+policy does not filter domain names. Normal DNS behavior should permit both
+UDP and TCP port 53 to the chosen gateway. Denying host-loopback access does
+not by itself disable gateway DNS that the egress policy permits.
+
+#### Bounded state, snapshots, and restore
+
+Flow, DNS, buffer, and packet-queue state are bounded. At most 128 TCP, 256 UDP,
+and 16 ICMP guest flows are active at once, and excess flows are rejected
+before a host socket is created. At most 256 DNS requests may be pending.
+A resolver failure produces a `SERVFAIL` response. At the pending-request
+limit, a further UDP query receives `SERVFAIL`, and a further TCP query resets
+its connection.
+
+The snapshot records the profile, network identity, and policy digest. A
+policy bound to an IPv6 identity uses canonical encoding version 4, while one
+restored from a snapshot that predates IPv6 keeps version 3 and its recorded
+digest. The snapshot records the IPv6 identity; a snapshot whose network
+predates it restores IPv4-only. Restore reconstructs a fresh endpoint and
+requires the profile and policy again; native sockets, DNS requests, and flow
+objects are never serialized. Explicit localhost forwards are process-local
+attachments, and snapshot capture and restore reject them.
+
 Capture quiesces the endpoint, drains completion ownership, and requires the
 saved queues to contain no unrepresented RX or TX packets. It then saves the
 queue lifecycle, negotiated features, link state, and endpoint generation.
