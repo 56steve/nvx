@@ -16,6 +16,8 @@
 //! - [`host`] (feature `host`): artifact discovery, the OpenVMM command line, the lowering of
 //!   network and filesystem policies, control sessions, process and platform primitives, and the
 //!   supervision of VM instances: starting, reconciling, executing workloads, and stopping.
+//! - `testing` (feature `testing`): a fake OpenVMM that serves the control console without
+//!   running a VM.
 //!
 //! # Example
 //!
@@ -70,6 +72,7 @@
 //! - `bundled`: stages the OpenVMM executable, guest kernel, and control initramfs at build time;
 //!   see `Artifacts::bundled`. The build script downloads the release that `artifacts.json` pins,
 //!   or copies the release directory that `NVX_BUNDLE_DIR` names.
+//! - `testing`: the fake OpenVMM of `testing::fake_openvmm` and its `nvx-fake-openvmm` binary.
 //! - `serde`: the serde form of [`Hypervisor`].
 
 pub mod contract;
@@ -80,6 +83,8 @@ pub mod protocol;
 
 #[cfg(feature = "host")]
 pub mod host;
+#[cfg(feature = "testing")]
+pub mod testing;
 
 pub use error::{Error, ErrorKind, Result};
 #[cfg(feature = "host")]

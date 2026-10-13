@@ -27,11 +27,10 @@ async = ["dep:tokio"]
 # A thin client of an explicitly supplied native agent library that owns the sandbox lifecycle.
 agent = ["dep:libloading", "dep:sha2"]
 # Test doubles: an in-memory `MockBackend` and the `aci-edge-sandboxes-fake-openvmm` binary.
-testing = []
+testing = ["nvx-rs/testing"]
 
 [dependencies]
 aci_edge_sandboxes_model = { path = "model", version = "0.1.0" }
-getrandom = "0.4"
 nvx-rs = { path = "../nvx-rs", version = "0.1.0", default-features = false }
 libloading = { version = "0.8", optional = true }
 sha2 = { version = "0.10", optional = true }

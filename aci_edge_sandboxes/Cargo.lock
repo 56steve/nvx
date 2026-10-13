@@ -7,7 +7,6 @@ name = "aci_edge_sandboxes"
 version = "0.1.0"
 dependencies = [
  "aci_edge_sandboxes_model",
- "getrandom",
  "libc",
  "libloading",
  "nvx-rs",

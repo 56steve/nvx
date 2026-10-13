@@ -25,6 +25,8 @@ host = ["serde", "dep:getrandom", "dep:serde_json", "dep:libc", "dep:windows-sys
 # `Artifacts::bundled`. The build script downloads the release pinned in `artifacts.json`, or
 # copies the release directory named by `NVX_BUNDLE_DIR`.
 bundled = ["host", "dep:sha2"]
+# Test doubles: the fake OpenVMM of `testing::fake_openvmm` and its `nvx-fake-openvmm` binary.
+testing = ["dep:getrandom", "dep:serde", "dep:serde_json", "dep:libc", "dep:windows-sys"]
 # The serde form of `Hypervisor`. The `host` feature enables it.
 serde = ["dep:serde"]
 
@@ -55,6 +57,12 @@ sha2 = { version = "0.10", optional = true }
 [dev-dependencies]
 serde_json = "1.0.120"
 tempfile = "3.10"
+
+[[bin]]
+name = "nvx-fake-openvmm"
+path = "src/bin/nvx-fake-openvmm.rs"
+required-features = ["testing"]
+doc = false
 
 [lints.rust]
 missing_docs = "warn"

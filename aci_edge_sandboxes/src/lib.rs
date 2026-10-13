@@ -50,7 +50,8 @@
 //! - `async`: Tokio wrappers ([`AsyncAciEdgeSandbox`], [`AsyncExecution`]) around the synchronous core.
 //! - `agent`: the [`agent`] backend, a thin client of a separately supplied native library
 //!   that owns the sandbox lifecycle.
-//! - `testing`: an in-memory [`testing::MockBackend`] for consumers' own tests.
+//! - `testing`: an in-memory [`testing::MockBackend`] for consumers' own tests, and the fake
+//!   OpenVMM of `nvx::testing`.
 
 // The data model lives in `aci_edge_sandboxes_model`; these keep its modules at their crate paths.
 pub(crate) use aci_edge_sandboxes_model::{capabilities, error, id, model, spec, validate};
