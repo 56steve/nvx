@@ -7,9 +7,11 @@ import http.client
 import json
 import os
 import platform
+import socket
 import struct
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import urllib.request
@@ -340,6 +342,47 @@ class AzureProvenanceTests(unittest.TestCase):
         ):
             host_telemetry.read_azure_compute_metadata(timeout=0.1)
         self.assertLess(time.monotonic() - started, 0.5)
+
+    def test_metadata_request_is_aborted_at_the_deadline(self):
+        server = socket.create_server(("127.0.0.1", 0))
+        self.addCleanup(server.close)
+        aborted = threading.Event()
+
+        def trickle_headers() -> None:
+            # Each header line arrives within the socket timeout, and no blank
+            # line ends the header block, so the client stays in opener.open().
+            connection, _ = server.accept()
+            with connection:
+                connection.sendall(b"HTTP/1.1 200 OK\r\n")
+                try:
+                    for _ in range(100):
+                        connection.sendall(b"X-Pad: 0123456789\r\n")
+                        time.sleep(0.05)
+                except OSError:
+                    aborted.set()
+
+        threading.Thread(target=trickle_headers, daemon=True).start()
+        url = f"http://127.0.0.1:{server.getsockname()[1]}/metadata"
+        # Workers left running by earlier tests are not this request's worker.
+        earlier = set(threading.enumerate())
+        started = time.monotonic()
+        with (
+            patch.object(host_telemetry, "AZURE_IMDS_URL", url),
+            self.assertRaises(TimeoutError),
+        ):
+            host_telemetry.read_azure_compute_metadata(timeout=0.2)
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertTrue(aborted.wait(2), "the metadata connection was left open")
+        workers = [
+            t
+            for t in threading.enumerate()
+            if t.name == "azure-imds" and t not in earlier and t.is_alive()
+        ]
+        self.assertEqual(
+            workers,
+            [],
+            "the metadata worker is still running after the request was aborted",
+        )
 
 
 class HostProvenanceTests(unittest.TestCase):
