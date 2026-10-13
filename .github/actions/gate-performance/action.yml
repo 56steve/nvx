@@ -59,6 +59,15 @@ runs:
             echo "::notice::No ${filename} performance history on ${BASE_REF}; warming up the baseline"
           fi
         done
+        # The base branch's expected hosts tell the gate which series a change
+        # moves to a new host.
+        while IFS= read -r path; do
+          case "${path}" in
+            data/*-host.json)
+              git show "FETCH_HEAD:${path}" > "data/baseline/${path#data/}"
+              ;;
+          esac
+        done < <(git ls-tree --name-only FETCH_HEAD data/)
 
     - name: Gate on performance regressions
       shell: bash

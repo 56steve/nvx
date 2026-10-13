@@ -27,7 +27,8 @@ runs:
           git checkout -B performance-persist "origin/${TARGET_BRANCH}"
           python3 scripts/nvx.py performance persist \
             --source-dir data/results \
-            --history-dir data
+            --history-dir data \
+            --require-host
           git add data/*.csv
 
           unexpected_paths="$(

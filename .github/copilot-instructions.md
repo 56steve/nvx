@@ -104,4 +104,6 @@
   failed or unexpectedly cancelled runs.
 - Pull-request runs must not publish development releases or persist performance
   history. Successful `dev` pushes own those operations. Do not manually edit
-  `data/*.csv` unless the task explicitly concerns baseline maintenance.
+  `data/*.csv` unless the task explicitly concerns baseline maintenance, and change
+  an expected benchmark host, `data/*-host.json`, only to accept a new host
+  together with a reset of its series' history.

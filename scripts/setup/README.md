@@ -53,6 +53,15 @@ moving it to another runner changes the series; see
 [CI collection](../../doc/benchmarks.md#ci-collection). Provision the benchmark
 runner with the switch, and pass it when checking that runner: a label that was
 only added through the API is lost when provisioning replaces the registration.
+Each series also names its benchmark runner's host in `data/<platform>-host.json`,
+and its platform job fails before it measures on a runner whose CPU, processors,
+memory, VM size, OS build, or benchmark disks and volumes differ from it. After
+maintenance that can change them, such as a redeploy, resize, reimage, or OS
+update, check the runner's next platform job. If its host check fails, accept the
+new host and reset the series' history in one pull request, as
+[Expected benchmark hosts](../../doc/benchmarks.md#expected-benchmark-hosts)
+describes; moving the label to another runner takes the same pull request unless
+that runner's host matches.
 On Linux, omit `--runner-name` to prepare host dependencies without reconciling
 an existing runner's service or cache directory. Pass its name in a subsequent
 invocation to update the service; `--check-only` still validates runner state.
@@ -83,8 +92,9 @@ CI places benchmark snapshots and guest RAM backing files there so their
 flushes avoid the burst-limited system disk. Check mode requires the directory
 when a data volume exists. Changing the storage behind benchmark scratch or the
 runner workspace is a performance-platform change: apply it to every Windows
-runner at once and reset the affected history, as
-[CI collection](../../doc/benchmarks.md#ci-collection) describes.
+runner at once, and accept the benchmark runner's new host and reset its series'
+history, as [Expected benchmark hosts](../../doc/benchmarks.md#expected-benchmark-hosts)
+describes.
 Persistent runners do not have Docker access. Guest artifacts are built with
 Docker on a GitHub-hosted runner instead.
 Linux provisioning runs through the SSH administrator, but the listener and

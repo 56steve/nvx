@@ -9,7 +9,10 @@ can execute them. This allows the backend lanes to execute concurrently without
 binding a workload to a specific host. The platform benchmark jobs are the
 exception: each also requires the `benchmark` label, which one runner of each
 pool carries, so that every run measures its performance series on the same VM
-(see [Benchmarks](benchmarks.md#ci-collection)). `openvmm-vmm-tests` downloads the NVX
+(see [Benchmarks](benchmarks.md#ci-collection)). Before it measures, each
+platform job also checks that its runner is still the host that the series'
+history comes from (see
+[Expected benchmark hosts](benchmarks.md#expected-benchmark-hosts)). `openvmm-vmm-tests` downloads the NVX
 guest artifacts and uses the Linux-direct kernel and Alpine initramfs to
 exercise OpenVMM's Linux MP-table lifecycle, TTRPC, and snapshot contracts on
 each backend. `openvmm-unit-tests` runs the OpenVMM unit and documentation

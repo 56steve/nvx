@@ -5376,6 +5376,88 @@ Write-Output (Get-ActionsRunnerLabels)
                 artifact = name.replace("${{ inputs.platform }}", platform)
                 self.assertIn(f"        name: {artifact}", prepare)
 
+    def test_benchmarks_check_the_expected_host_before_measuring(self):
+        # A series' history comes from the host in data/<platform>-host.json,
+        # so a platform job refuses another host before it measures (#526).
+        action = (
+            BuildConstants.REPO_ROOT
+            / ".github"
+            / "actions"
+            / "run-benchmark"
+            / "action.yml"
+        ).read_text(encoding="utf-8")
+        steps = re.findall(r"^    - name: (.+)$", action, re.MULTILINE)
+        output = (
+            '--output "data/runs/${{ inputs.platform }}/'
+            '${{ inputs.platform }}-host.json"'
+        )
+
+        self.assertEqual(steps[0], "Check Linux benchmark host")
+        self.assertLess(
+            steps.index("Prepare Windows benchmark scratch"),
+            steps.index("Check Windows benchmark host"),
+        )
+        for operating_system, condition in (
+            ("Linux", "runner.os != 'Windows'"),
+            ("Windows", "runner.os == 'Windows'"),
+        ):
+            check = f"Check {operating_system} benchmark host"
+            with self.subTest(step=check):
+                self.assertIn(
+                    f"      if: {condition}", _composite_action_step(action, check)
+                )
+                script = _composite_action_script(action, check)
+                self.assertEqual(script.count("performance check-host"), 1)
+                self.assertIn('--platform "${{ inputs.platform }}"', script)
+                self.assertIn("--history-dir data", script)
+                self.assertIn(output, script)
+                self.assertIn("--summary", script)
+                measuring = [
+                    step
+                    for step in steps
+                    if step.startswith(f"Run {operating_system} ")
+                ]
+                self.assertTrue(measuring)
+                for step in measuring:
+                    self.assertLess(steps.index(check), steps.index(step))
+        windows = _composite_action_script(action, "Check Windows benchmark host")
+        self.assertIn(
+            '$ScratchArgs = @("--scratch-dir", $env:NVX_BENCHMARK_SCRATCH_DIR)',
+            windows,
+        )
+        self.assertIn("@ScratchArgs", windows)
+        self.assertTrue(
+            windows.rstrip().endswith("if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }")
+        )
+        self.assertIn(
+            "set -euo pipefail",
+            _composite_action_script(action, "Check Linux benchmark host"),
+        )
+
+    def test_performance_history_tracks_the_expected_hosts(self):
+        actions = BuildConstants.REPO_ROOT / ".github" / "actions"
+        persist = (actions / "persist-performance-results" / "action.yml").read_text(
+            encoding="utf-8"
+        )
+        gate = (actions / "gate-performance" / "action.yml").read_text(encoding="utf-8")
+
+        # dev refuses results whose recorded host differs from data/.
+        self.assertIn(
+            "            --history-dir data \\\n            --require-host\n",
+            _composite_action_step(persist, "Persist results"),
+        )
+        # The gate compares the pull request's expected hosts with the base
+        # branch's, so that a new host must reset its series.
+        load = _composite_action_script(gate, "Load base branch performance history")
+        self.assertIn("done < <(git ls-tree --name-only FETCH_HEAD data/)", load)
+        self.assertIn("data/*-host.json)", load)
+        self.assertIn(
+            'git show "FETCH_HEAD:${path}" > "data/baseline/${path#data/}"', load
+        )
+        command = _composite_action_step(gate, "Gate on performance regressions")
+        self.assertIn("--baseline-dir data/baseline", command)
+        self.assertIn("--history-reset-dir data", command)
+
     def test_ci_remeasures_only_unstable_lifecycle_results(self):
         action = (
             BuildConstants.REPO_ROOT
