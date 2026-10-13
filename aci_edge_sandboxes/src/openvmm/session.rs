@@ -56,7 +56,7 @@ impl std::error::Error for SessionError {}
 
 impl From<ProtocolError> for SessionError {
     fn from(error: ProtocolError) -> Self {
-        Self::Protocol(error.0)
+        Self::Protocol(error.into_message())
     }
 }
 

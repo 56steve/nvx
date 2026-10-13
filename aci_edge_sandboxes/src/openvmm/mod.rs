@@ -100,7 +100,6 @@ mod launch;
 mod network;
 mod platform;
 mod process;
-mod protocol;
 mod session;
 mod state;
 
@@ -111,15 +110,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use nvx::protocol::{
+    self, CAPABILITY_LEN, ExitCategory, GuestFeatures, MAX_ARGUMENT_BYTES, MAX_CWD_BYTES,
+    MAX_OUTPUT_BYTES, MAX_TIMEOUT_MS, Workload, WorkloadEnvironment,
+};
 use serde_json::Value;
 
 pub use self::artifacts::Artifacts;
 pub use self::config::OpenVmmConfig;
 pub use self::filesystem::{guest_path, resolve_guest_path};
-use self::protocol::{
-    CAPABILITY_LEN, ExitCategory, GuestFeatures, MAX_ARGUMENT_BYTES, MAX_CWD_BYTES,
-    MAX_OUTPUT_BYTES, MAX_TIMEOUT_MS, Workload, WorkloadEnvironment,
-};
 use self::session::{ControlSession, ExecEvent, SessionError};
 use self::state::{
     BACKEND_KEY, LaunchRecord, ProcessIdentity, RuntimeRecord, STATE_FORMAT, SandboxRecord,
@@ -389,7 +388,8 @@ fn prepare_exec(process: &ProcessSpec) -> Result<Workload<'_>> {
         cwd: process.cwd.as_deref(),
         environment,
     };
-    protocol::encode_exec_payload(&workload).map_err(|error| Error::policy_validation(error.0))?;
+    protocol::encode_exec_payload(&workload)
+        .map_err(|error| Error::policy_validation(error.into_message()))?;
     Ok(workload)
 }
 

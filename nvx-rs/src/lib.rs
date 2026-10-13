@@ -5,6 +5,9 @@
 //! starts a managed agent, which runs workloads that the host sends it over an authenticated
 //! control console. This crate holds everything it takes to drive one:
 //!
+//! - [`protocol`]: the codec of the control console, the `NVXS` records that OpenVMM brokers and
+//!   the `NVXC` frames of the guest agent. It has no dependencies, so the host, the guest, and
+//!   test doubles share it.
 //! - [`net`]: IP networks in CIDR notation and their subtraction.
 //! - [`Hypervisor`]: the hypervisors that run the VMs.
 //!
@@ -15,6 +18,7 @@
 mod error;
 mod hypervisor;
 pub mod net;
+pub mod protocol;
 
 pub use error::{Error, ErrorKind, Result};
 pub use hypervisor::Hypervisor;
