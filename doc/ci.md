@@ -6,7 +6,10 @@ runners labeled by operating system, backend, and `virtual-machine`; see
 [Job graph and runner capacity](#job-graph-and-runner-capacity) for their
 sizes. Jobs target the shared backend labels so any available matching runner
 can execute them. This allows the backend lanes to execute concurrently without
-binding a workload to a specific host. `openvmm-vmm-tests` downloads the NVX
+binding a workload to a specific host. The platform benchmark jobs are the
+exception: each also requires the `benchmark` label, which one runner of each
+pool carries, so that every run measures its performance series on the same VM
+(see [Benchmarks](benchmarks.md#ci-collection)). `openvmm-vmm-tests` downloads the NVX
 guest artifacts and uses the Linux-direct kernel and Alpine initramfs to
 exercise OpenVMM's Linux MP-table lifecycle, TTRPC, and snapshot contracts on
 each backend. `openvmm-unit-tests` runs the OpenVMM unit and documentation
@@ -350,8 +353,8 @@ hash.
 The producer handoff uses one-day workflow artifacts rather than caches. Each
 consumer downloads both the normalized executable and its build provenance,
 then restores executable permissions on Linux. Once the required artifacts are
-ready, benchmarks run in parallel with the NVX test layer and use any available
-runner in the matching backend pool. All three use virtual-machine performance
+ready, benchmarks run in parallel with the NVX test layer, each on its backend's
+benchmark runner. All three use virtual-machine performance
 series and the constrained eight-CPU affinity policy. Development releases and
 performance baseline updates still require every applicable test and benchmark
 lane to pass.
@@ -414,8 +417,11 @@ The WHP pool has five runners, the KVM pool six, and the MSHV pool nine. Jobs
 wait seconds for a runner when one run is in flight, but the WHP jobs are the
 longest: the OpenVMM VMM and unit tests compile OpenVMM on Windows for about 15
 and 13 minutes before testing. A full run occupies the WHP pool for most of its
-duration, so overlapping pull requests queue there first. A change that adds a
-job or a shard needs runners to run it in parallel; otherwise it only queues.
+duration, so overlapping pull requests queue there first. Each platform job
+waits for its backend's benchmark runner, which also takes other jobs of its
+pool, so the platform jobs of overlapping runs measure one after another. A
+change that adds a job or a shard needs runners to run it in parallel;
+otherwise it only queues.
 
 ## Change classification
 

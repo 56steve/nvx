@@ -9,6 +9,7 @@ tool_manifest=${script_directory}/tool-versions.conf
 tool_platform=linux-x86_64
 
 backend=
+benchmark_runner=false
 check_only=false
 configure_runner=false
 repository_url=https://github.com/microsoft/nvx
@@ -35,6 +36,8 @@ Bootstrap a Linux Azure VM for NVX GitHub Actions jobs.
 Options:
     --backend BACKEND       Virtualization backend: kvm or mshv
     --runner-name NAME      Register a runner with this unique name
+    --benchmark-runner      Also label the runner as its backend's one
+                            benchmark runner; requires --runner-name
     --repository-url URL    Runner repository URL (default: ${repository_url})
     --runner-directory PATH Runner installation path (default: ${runner_directory})
     --runner-token-stdin    Read a short-lived registration token from stdin
@@ -909,6 +912,10 @@ while [ "$#" -gt 0 ]; do
             configure_runner=true
             shift 2
             ;;
+        --benchmark-runner)
+            benchmark_runner=true
+            shift
+            ;;
         --repository-url)
             [ "$#" -ge 2 ] || die "--repository-url requires a value"
             repository_url=$2
@@ -953,10 +960,17 @@ if [ "$configure_runner" = true ]; then
     [ -n "$runner_name" ] || die "--runner-name is required to configure a runner"
     validate_runner_name "$runner_name"
 fi
+[ "$benchmark_runner" = false ] || [ -n "$runner_name" ] ||
+    die "--benchmark-runner requires --runner-name"
 runner_cargo_home=${runner_directory}/_work/_temp/cargo-home
 runner_sccache_dir=${runner_directory}/_work/_sccache
 runner_labels_file=${runner_directory}/.nvx-labels
 expected_runner_labels=linux,${backend},virtual-machine
+# CI's platform jobs require the benchmark label, which exactly one runner of
+# each backend's pool carries.
+if [ "$benchmark_runner" = true ]; then
+    expected_runner_labels=${expected_runner_labels},benchmark
+fi
 
 if [ "$check_only" = false ]; then
     install_packages

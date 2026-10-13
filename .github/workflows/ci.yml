@@ -1053,6 +1053,11 @@ jobs:
     secrets:
       OPENVMM_DEPLOY_KEY: ${{ secrets.OPENVMM_DEPLOY_KEY }}
 
+  # The platform jobs measure the performance series that the regression gate
+  # and the history compare. Each runs on the one runner of its backend's pool
+  # that also carries the `benchmark` label, so that every workflow run
+  # measures its series on the same VM: the pools mix CPU generations and VMs
+  # whose results differ by more than the run-to-run noise (#383, #415).
   platform-kvm:
     name: Platform / Linux / KVM / Virtual machine
     needs: [artifacts, build-openvmm-linux-gnu, nvx-cli-linux, openvmm-changes]
@@ -1079,7 +1084,7 @@ jobs:
     uses: ./.github/workflows/run-platform.yml
     with:
       display-name: Linux / KVM / Virtual machine
-      runner: '["self-hosted", "linux", "kvm", "virtual-machine"]'
+      runner: '["self-hosted", "linux", "kvm", "virtual-machine", "benchmark"]'
       backend: kvm
       release-platform: linux-kvm
       benchmark-platform: linux-kvm-virtual-machine
@@ -1118,7 +1123,7 @@ jobs:
     uses: ./.github/workflows/run-platform.yml
     with:
       display-name: Linux / MSHV / Virtual machine
-      runner: '["self-hosted", "linux", "mshv", "virtual-machine"]'
+      runner: '["self-hosted", "linux", "mshv", "virtual-machine", "benchmark"]'
       backend: mshv
       release-platform: linux-mshv
       benchmark-platform: linux-mshv-virtual-machine
@@ -1157,7 +1162,7 @@ jobs:
     uses: ./.github/workflows/run-platform.yml
     with:
       display-name: Windows / WHP / Virtual machine
-      runner: '["self-hosted", "windows", "whp", "virtual-machine"]'
+      runner: '["self-hosted", "windows", "whp", "virtual-machine", "benchmark"]'
       backend: whp
       release-platform: windows-whp
       benchmark-platform: windows-whp-virtual-machine
