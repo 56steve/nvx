@@ -1865,6 +1865,21 @@ class RunnerWiringTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "no time ABI monitor"):
             openvmm_process.TcpConsole(unmonitored).wait_for_time_abi_status(1.0)
 
+    def test_tcp_console_status_query_consumed_with_restore_milestone(self):
+        connection, peer = socket.socketpair()
+        monitor = TimeAbiMonitor(MSHV_RESTORE)
+        console = openvmm_process.TcpConsole(connection, monitor)
+        restore = RESTORE_LINE.replace("lapic_hz=1000000000", "lapic_hz=200000000")
+        peer.sendall(
+            ("NVX-SNAPSHOT-TIER-RELEASED\n" + restore + RUNTIME_LINE + STATUS_OK).encode()
+        )
+        console.wait_for(b"NVX-SNAPSHOT-TIER-RELEASED", 1.0)
+        console.wait_for_time_abi_status(0.2)
+        self.assertEqual(monitor.status_queries, 1)
+        self.assertEqual(len(monitor.restores), 1)
+        console.close()
+        peer.close()
+
     def test_tcp_console_queries_only_cold_boots_that_ask(self):
         for command, enabled in (
             (MSHV_RESTORE, True),

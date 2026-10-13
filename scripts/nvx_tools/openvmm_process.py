@@ -465,9 +465,10 @@ class TcpConsole:
         """
         if self._monitor is None:
             raise ValueError("TCP console has no time ABI monitor")
-        before = self._monitor.status_queries
+        if self._monitor.status_queries:
+            return
         deadline = time.monotonic() + timeout
-        while self._monitor.status_queries == before:
+        while self._monitor.status_queries == 0:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError(
