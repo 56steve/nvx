@@ -257,6 +257,12 @@ class AzureProvenanceTests(unittest.TestCase):
             def read(self, _size: int) -> bytes:
                 return b'{"vmSize": "Standard_D4s_v5"}'
 
+            payload = b'{"vmSize": "Standard_D4s_v5"}'
+
+            def read1(self, _size: int) -> bytes:
+                chunk, self.payload = self.payload, b""
+                return chunk
+
         opener = MagicMock()
         opener.open.return_value = Response()
         with patch.object(
@@ -273,6 +279,38 @@ class AzureProvenanceTests(unittest.TestCase):
         self.assertEqual(request.get_header("Metadata"), "true")
         self.assertEqual(opener.open.call_args.kwargs, {"timeout": 1.5})
         self.assertEqual(document, {"vmSize": "Standard_D4s_v5"})
+
+    def test_metadata_read_gives_up_at_the_deadline_on_a_trickling_response(self):
+        body = b'{"vmSize": "Standard_D4s_v5", "pad": "' + b"x" * 400 + b'"}'
+
+        class TrickleResponse:
+            # Each piece arrives within the socket timeout, so only an
+            # end-to-end deadline can stop the read.
+            def __enter__(self) -> "TrickleResponse":
+                return self
+
+            def __exit__(self, *_: object) -> None:
+                return None
+
+            def read(self, _size: int) -> bytes:
+                time.sleep(0.02)
+                return body
+
+            def read1(self, _size: int) -> bytes:
+                time.sleep(0.02)
+                return body[:1]
+
+        opener = MagicMock()
+        opener.open.return_value = TrickleResponse()
+        started = time.monotonic()
+        with (
+            patch.object(
+                host_telemetry.urllib.request, "build_opener", return_value=opener
+            ),
+            self.assertRaises(TimeoutError),
+        ):
+            host_telemetry.read_azure_compute_metadata(timeout=0.1)
+        self.assertLess(time.monotonic() - started, 1.0)
 
 
 class HostProvenanceTests(unittest.TestCase):

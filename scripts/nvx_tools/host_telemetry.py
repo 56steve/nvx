@@ -292,8 +292,19 @@ def read_azure_compute_metadata(
     request = urllib.request.Request(AZURE_IMDS_URL, headers={"Metadata": "true"})
     # The link-local metadata service must never be reached through a proxy.
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    # The socket timeout only bounds each wait, so a trickling peer could
+    # otherwise hold the read open indefinitely; check an end-to-end deadline.
+    deadline = time.monotonic() + timeout
     with opener.open(request, timeout=timeout) as response:
-        return json.loads(response.read(MIB).decode("utf-8"))
+        body = bytearray()
+        while len(body) < MIB:
+            if time.monotonic() >= deadline:
+                raise TimeoutError("metadata response did not finish in time")
+            chunk = response.read1(MIB - len(body))
+            if not chunk:
+                break
+            body += chunk
+        return json.loads(body.decode("utf-8"))
 
 
 def azure_compute_provenance(compute: object) -> dict[str, object]:
