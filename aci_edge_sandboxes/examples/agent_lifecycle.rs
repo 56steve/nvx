@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use aci_edge_sandboxes::agent::{
     AgentBackend, AgentConfig, BundleSource, CpuProfile, Diagnostics, Hypervisor, ImageDigest,
-    RuntimeFiles, RuntimeSource, SandboxDefaults, SetupConfig,
+    ImageSettings, ReferenceSettings, RuntimeFiles, RuntimeSource, SandboxDefaults, SetupConfig,
 };
 use aci_edge_sandboxes::{
     Access, AciEdgeSandbox, EgressPolicy, ExecOutcome, ExecRequest, FilesystemPolicy,
@@ -32,9 +32,12 @@ fn run() -> Result<(), String> {
     let mut bundle = None;
     let mut bundle_digest = None;
     let mut image = None;
+    let mut image_ref = None;
     let mut library = None;
     let mut digest = None;
     let mut image_digest = ImageDigest::Compute;
+    let mut pull_timeout_ms = None;
+    let mut registry_auth_file = None;
     let mut root = None;
     let mut hypervisor = None;
     let mut filesystem = FilesystemPolicy::default();
@@ -63,10 +66,19 @@ fn run() -> Result<(), String> {
             "--bundle" => bundle = Some(value()?),
             "--bundle-sha256" => bundle_digest = Some(parse_digest(&option, &value()?)?),
             "--image" => image = Some(value()?),
+            "--image-ref" => image_ref = Some(value()?),
+            "--registry-auth-file" => registry_auth_file = Some(value()?),
             "--host-library" => library = Some(value()?),
             "--host-sha256" => digest = Some(parse_digest(&option, &value()?)?),
             "--image-sha256" => {
                 image_digest = ImageDigest::Expect(parse_digest(&option, &value()?)?);
+            }
+            "--pull-timeout-ms" => {
+                pull_timeout_ms = Some(
+                    value()?
+                        .parse::<u64>()
+                        .map_err(|_| format!("{option} must be a number of milliseconds"))?,
+                );
             }
             "--state-root" => root = Some(value()?),
             "--hypervisor" => hypervisor = Some(value()?.parse::<Hypervisor>().map_err(describe)?),
@@ -112,8 +124,17 @@ fn run() -> Result<(), String> {
         }),
         _ => return Err("--bundle and --bundle-sha256 go together".to_owned()),
     };
-    let image = PathBuf::from(required("--image", image)?);
-    let image = std::path::absolute(&image).map_err(|error| error.to_string())?;
+    let image = parse_image_source(image, image_ref)?;
+    if matches!(&image, ImageSource::Reference(_)) {
+        if !matches!(&runtime, RuntimeSource::Bundle(_)) {
+            return Err("--image-ref requires --bundle and --bundle-sha256".to_owned());
+        }
+        if !image_digest.is_compute() {
+            return Err("--image-sha256 applies only to --image".to_owned());
+        }
+    } else if pull_timeout_ms.is_some() || registry_auth_file.is_some() {
+        return Err("--pull-timeout-ms and --registry-auth-file require --image-ref".to_owned());
+    }
     let library = required("--host-library", library)?;
     let root = required("--state-root", root)?;
     let digest = digest.ok_or("missing required --host-sha256")?;
@@ -168,7 +189,7 @@ fn run() -> Result<(), String> {
         .with_cpu_profile(cpu_profile)
         .with_defaults(
             SandboxDefaults::default()
-                .with_image(ImageSource::Path(image))
+                .with_image(image)
                 .with_image_digest(image_digest),
         )
         .with_diagnostics(Diagnostics {
@@ -178,6 +199,15 @@ fn run() -> Result<(), String> {
     if let Some(hypervisor) = hypervisor {
         setup = setup.with_hypervisor(hypervisor);
     }
+    let mut references = ReferenceSettings::default();
+    if let Some(timeout) = pull_timeout_ms {
+        references = references.with_pull_timeout_ms(timeout);
+    }
+    if let Some(auth_file) = registry_auth_file {
+        references = references.with_auth_file(auth_file);
+    }
+    setup = setup.with_images(ImageSettings::default().with_references(references));
+    setup.validate().map_err(describe)?;
     let backend =
         Arc::new(AgentBackend::new(AgentConfig::new(setup, library, digest)).map_err(describe)?);
     let client = AciEdgeSandbox::from_shared(backend.clone());
@@ -249,6 +279,23 @@ fn run() -> Result<(), String> {
         return Err(format!("guest command {}", output.outcome));
     }
     Ok(())
+}
+
+fn parse_image_source(
+    image: Option<String>,
+    image_ref: Option<String>,
+) -> Result<ImageSource, String> {
+    match (image, image_ref) {
+        (Some(path), None) => Ok(ImageSource::Path(
+            std::path::absolute(PathBuf::from(path)).map_err(|error| error.to_string())?,
+        )),
+        (None, Some(reference)) if !reference.trim().is_empty() => {
+            Ok(ImageSource::Reference(reference))
+        }
+        (None, Some(_)) => Err("--image-ref must not be empty".to_owned()),
+        (Some(_), Some(_)) => Err("pass either --image or --image-ref, not both".to_owned()),
+        (None, None) => Err("missing required --image or --image-ref".to_owned()),
+    }
 }
 
 fn parse_digest(option: &str, hex: &str) -> Result<[u8; 32], String> {
@@ -333,6 +380,20 @@ fn describe(error: impl Into<aci_edge_sandboxes::Error>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn images_select_either_a_local_path_or_a_registry_reference() {
+        let local = parse_image_source(Some("layers.gpt".into()), None).unwrap();
+        assert!(matches!(local, ImageSource::Path(path) if path.is_absolute()));
+        let reference = "registry.example:5443/team/image:1";
+        assert_eq!(
+            parse_image_source(None, Some(reference.into())).unwrap(),
+            ImageSource::Reference(reference.into())
+        );
+        assert!(parse_image_source(None, None).is_err());
+        assert!(parse_image_source(Some("layers.gpt".into()), Some(reference.into())).is_err());
+        assert!(parse_image_source(None, Some(" ".into())).is_err());
+    }
 
     #[test]
     fn digest_requires_exact_hex_bytes() {
