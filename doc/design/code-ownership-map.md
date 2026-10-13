@@ -31,7 +31,8 @@ contracts between them.
 | Host shares of `run` and `sandbox`: one directory attached directly, or an aggregate for multiple shares or a single regular file; pre-launch checks and the `nvx_share=` tokens that place each child in the guest | [NVX launcher](../../scripts/nvx_tools/sandbox.py) |
 | Structured egress-policy files and their translation to OpenVMM egress rules | NVX launcher's egress-policy compiler |
 | Edge sandbox lifecycle API, request validation, backend capabilities, and the serializable contract model | NVX `aci_edge_sandboxes` crate and its data-model crate |
-| Blockless managed launch, durable sandbox records, OpenVMM process reconciliation, host-path export as aggregate children and their access policy, delivery of the host-mapping table, and egress-rule translation | `aci_edge_sandboxes` default OpenVMM backend |
+| Host side of the control protocol, artifact discovery, blockless managed launch, VM-instance supervision (OpenVMM process reconciliation, interrupted-launch recovery, readiness, the exec pump, and stop), host-path export as aggregate children and their access policy, delivery of the host-mapping table, egress-rule translation, and the fake OpenVMM | [`nvx-rs`](../../nvx-rs/README.md) crate, library `nvx` |
+| Durable sandbox records, conversion of contract requests into `nvx` calls, and the mapping of `nvx` errors onto contract error codes | `aci_edge_sandboxes` default OpenVMM backend |
 | Image-backed edge sandboxes | `aci_edge_sandboxes` optional agent backend, which delegates to a separately supplied native library |
 | Workload namespace and root construction | NVX guest container launch and entry helpers |
 | Live share mounts and the bind of each aggregate child at its target | NVX guest init, host-mount helper, and init agent |
@@ -42,5 +43,6 @@ contracts between them.
 | OpenVMM control-plane and guest-artifact integration tests | OpenVMM microVM and management-RPC VMM tests |
 | NVX Linux and device integration tests | NVX microVM process tests and guest test scripts |
 | Edge sandbox contract, fake-OpenVMM, and real-hypervisor lifecycle tests | `aci_edge_sandboxes` crate tests |
+| Control-protocol golden fixtures, NVX mechanics unit tests, and fake-OpenVMM instance tests | `nvx-rs` crate tests |
 | Copilot adversarial controller and typed broker | NVX adversarial controller and broker |
 | Credential-free adversarial executor and independent oracles | NVX adversarial executor and oracle watchdog |

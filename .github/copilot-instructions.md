@@ -22,8 +22,11 @@
   quality and CLI test definitions. Start with the narrowest affected test, then
   run the applicable commands from those actions.
 - For changes under `aci_edge_sandboxes/`, run the commands in
-  [check-aci-edge-sandboxes](./actions/check-aci-edge-sandboxes/action.yml), which need no hypervisor.
-  `scripts/nvx.py test-aci-edge-sandboxes` exercises the crate on a real hypervisor.
+  [check-aci-edge-sandboxes](./actions/check-aci-edge-sandboxes/action.yml), and for
+  changes under `nvx-rs/`, those in [check-nvx-rs](./actions/check-nvx-rs/action.yml)
+  and, because `aci_edge_sandboxes` builds on `nvx-rs`, check-aci-edge-sandboxes too.
+  They need no hypervisor. `scripts/nvx.py test-aci-edge-sandboxes` exercises both
+  crates on a real hypervisor.
 - OpenVMM source changes also require the package-scoped checks prescribed by the
   nested repository. Do not claim unavailable hardware or cross-platform gates
   passed; report the missing prerequisite and rely on CI when appropriate.
@@ -47,8 +50,8 @@
   [copilot-setup-steps](./workflows/copilot-setup-steps.yml) prepares. It
   initializes `openvmm/`; installs `requirements-dev.txt` into a Python virtual
   environment on `PATH`, the Rust release that `rust-toolchain.toml` pins with
-  the OpenVMM test targets, the `aci_edge_sandboxes` minimum supported Rust
-  version, cargo-nextest, and the native guest build
+  the OpenVMM test targets, the minimum supported Rust versions of the
+  `aci_edge_sandboxes` and `nvx-rs` crates, cargo-nextest, and the native guest build
   prerequisites; grants `/dev/kvm` access; pulls the pinned shell linter images;
   and stages the pinned Linux and Ubuntu Base archives in `.cache/downloads`.
   When CI has cached them for the checked-out inputs, it also restores the guest
@@ -77,7 +80,7 @@
 - With KVM access, run affected microVM scenarios with
   `python3 scripts/nvx.py test-microvm --backend kvm --scenario NAME`, passing only
   the `--processors` counts the change needs, and `aci_edge_sandboxes` backend
-  changes with `python3 scripts/nvx.py test-aci-edge-sandboxes --backend kvm`.
+  or `nvx-rs` changes with `python3 scripts/nvx.py test-aci-edge-sandboxes --backend kvm`.
   MSHV and WHP are never available there. The setup summary names the runner's
   CPU. Built-in CPU profiles serve the runner CPUs met so far, the AMD EPYC
   7763, 9V74, and 9V45 and the Intel Xeon 8573C, among the generations that
