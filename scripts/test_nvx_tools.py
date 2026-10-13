@@ -4485,6 +4485,61 @@ python3() {
         )
         self.assertNotIn("test-openvmm --backend", unit_tests_job)
 
+    def test_ci_measures_each_performance_series_on_its_benchmark_runner(self):
+        # Each backend's pool mixes VMs whose results differ by more than the
+        # run-to-run noise (#383, #415). The platform jobs, and only they,
+        # require the label of the one runner per pool that measures a series.
+        github = BuildConstants.REPO_ROOT / ".github"
+        workflow = (github / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        platform_workflow = (github / "workflows" / "run-platform.yml").read_text(
+            encoding="utf-8"
+        )
+        pools = {
+            "platform-kvm": ("linux", "kvm"),
+            "platform-mshv": ("linux", "mshv"),
+            "platform-whp": ("windows", "whp"),
+        }
+        self.assertEqual(set(pools), set(ci.REQUIRED_CI_PLATFORM_JOBS))
+        jobs = re.findall(
+            r"^  ([a-z0-9-]+):$", workflow.split("\njobs:\n", 1)[1], re.MULTILINE
+        )
+        self.assertLessEqual(set(pools), set(jobs))
+        for job_name in jobs:
+            job = _workflow_job(workflow, job_name)
+            runners = [
+                json.loads(labels)
+                for labels in re.findall(r"^ +runner: '(.+)'$", job, re.MULTILINE)
+            ]
+            with self.subTest(job=job_name):
+                if job_name in pools:
+                    operating_system, backend = pools[job_name]
+                    self.assertIn(
+                        "    uses: ./.github/workflows/run-platform.yml\n", job
+                    )
+                    self.assertEqual(
+                        runners,
+                        [
+                            [
+                                "self-hosted",
+                                operating_system,
+                                backend,
+                                "virtual-machine",
+                                "benchmark",
+                            ]
+                        ],
+                    )
+                else:
+                    self.assertNotIn("run-platform.yml", job)
+                    for labels in runners:
+                        self.assertNotIn("benchmark", labels)
+        self.assertIn(
+            "    runs-on: ${{ fromJSON(inputs.runner) }}\n", platform_workflow
+        )
+        self.assertIn(
+            "    - benchmark\n",
+            (github / "actionlint.yaml").read_text(encoding="utf-8"),
+        )
+
     def test_ci_validates_the_cli_once_per_os_after_checking_out_openvmm(self):
         # The CLI tests read OpenVMM's pinned CPU profiles from the submodule,
         # which a runner's workspace holds at the pinned revision only after

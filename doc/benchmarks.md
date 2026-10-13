@@ -588,6 +588,22 @@ follow the same flow with their own platform jobs:
 - `Required status check` fails unless every job that the change schedules, including
   `platform-kvm`, `performance-gate`, and `nvx-microvm-tests-kvm`, has its expected result.
 
+Each platform job runs on its backend's benchmark runner. The job targets the pool's labels
+plus `benchmark`, which exactly one runner of each pool carries, so every run measures the
+series on the same VM, and the gate compares a pull request with history from that VM. The
+pools mix VMs whose results differ by more than the run-to-run noise: over the same `dev`
+commits, the WHP runners on Emerald Rapids hosts measured about 10% slower than those on Ice
+Lake hosts, and MSHV runners in another scale set measured guest-exit teardown several times
+slower (#415). A pooled series compared each pull request with whichever runners had measured
+the base-branch window, so runner placement alone could fail the gate. The benchmark runner
+also takes other jobs of its pool, so a platform job may wait for it, and the platform jobs of
+concurrent runs measure one after another. List the benchmark runners with
+`gh api repos/microsoft/nvx/actions/runners --jq '.runners[] | select(any(.labels[]; .name == "benchmark")) | .name'`,
+and provision them with the benchmark switch of the
+[runner setup scripts](../scripts/setup/README.md#github-actions-runners). Moving the label to
+another runner is a performance-platform change: move it only together with a pull request
+that resets the series' history, as for the storage changes below.
+
 Linux and Windows CI use a reduced device contract of one warmup and ten retained attempts.
 Both CI contracts use one-second operation windows. Canonical baseline collection uses the full
 `5 + 30` contract.
@@ -603,8 +619,8 @@ removed before measuring. Other validation failures stop immediately, and a seco
 unstable result still fails the job. The stability guard rejects a p50 more than
 25% above p25 and also rejects an adjacent gap above 25% when at least two samples
 lie on each side.
-Singleton outliers remain tolerated, while pooled runners cannot publish a
-bimodal host-stall series into topology-wide history. On the Linux CI runners,
+Singleton outliers remain tolerated, while a host stall cannot publish a bimodal
+series into the history. On the Linux CI runners,
 snapshot generation takes about 1 ms on KVM and about 4 ms on MSHV, so a
 sub-millisecond CPU stall in two samples is enough to cross the gap limit.
 
@@ -642,10 +658,8 @@ records names, resource or VM identifiers, the subscription, tags, network addre
 or credentials, and records an unreachable service as `azure.error`. Acceptance and
 diagnostic suites print the provenance before they measure, and the step summary
 includes it as the benchmark host table. A device-io resume ignores `host` when it
-compares controls and provenance. Runner and machine names are diagnostic only: the
-regression gate pools every runner of a series into one history, and a series should
-be split by runner only if evidence shows a persistent runner-specific offset larger
-than the gate's tolerance.
+compares controls and provenance. The runner and machine names identify the benchmark
+runner that measured a result.
 
 When investigating instability, compare each attempt's
 `snapshot_capture.<backend>.profile.raw_samples` with its `samples_ms`. For example, a
@@ -701,9 +715,9 @@ performance tier, caching policy, or bursting setting, and moving scratch betwee
 the OS, data, and temporary disks. Because snapshot generation is bounded by the
 scratch volume's write throughput, such a change shifts
 `openvmm_snapshot_generation` and can shift the other lifecycle metrics. Apply it to
-every pooled runner of the series at once; a change on some runners only would mix
-two storage regimes in one history. In the same pull request, reset the affected
-metrics by removing them from the series' history files, such as
+every runner of the pool at once, so that the benchmark runner and any runner that
+later takes over its label share one storage regime. In the same pull request, reset
+the affected metrics by removing them from the series' history files, such as
 `data/windows-whp-virtual-machine-microvm-v2-1vcpu.csv`, so that the gate restarts
 their ten-point warmup instead of comparing the new storage with the old baseline.
 
