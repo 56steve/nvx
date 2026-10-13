@@ -75,8 +75,9 @@ general guest-to-host denial with no announcer, an exact proxy exception, and,
 under explicit allow with egress denied but for the guest's connection to a
 host service, that the guest reaches that service through its gateway and that
 the host exchanges TCP lines with a guest server over IPv4 and IPv6 loopback
-and through an explicit forward to the same guest port, and a UDP datagram and
-its reply from the published port. It also verifies that a guest listener on
+and through an explicit forward to the same guest port, and UDP datagrams and
+their replies with guest servers on published ports over IPv4 and IPv6
+loopback. It also verifies that a guest listener on
 guest loopback alone is not published, that no host network address reaches the
 guest, and pre-boot rejection of an explicit allow with a snapshot, of a
 forward under deny, and of a mismatched proxy. Managed lifecycle coverage

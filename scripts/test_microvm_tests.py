@@ -3239,6 +3239,7 @@ class MicrovmTests(unittest.TestCase):
                         PROXY_PORT="8443",
                         GUEST_PORT="0",
                         PRIVATE_GUEST_PORT="0",
+                        UDP_IPV6_GUEST_PORT="0",
                     )
                     .replace("nvx-exit", "nvx_exit")
                     .replace("/proc/cmdline", cmdline.as_posix())
@@ -3286,6 +3287,7 @@ class MicrovmTests(unittest.TestCase):
                         PROXY_PORT="8443",
                         GUEST_PORT="0",
                         PRIVATE_GUEST_PORT="0",
+                        UDP_IPV6_GUEST_PORT="0",
                     )
                     .replace("nvx-exit", "nvx_exit")
                     .replace("/proc/cmdline", path.as_posix())
@@ -3318,6 +3320,7 @@ class MicrovmTests(unittest.TestCase):
             PROXY_PORT="8443",
             GUEST_PORT="0",
             PRIVATE_GUEST_PORT="0",
+            UDP_IPV6_GUEST_PORT="0",
         )
         self.assertIn("nc -u -w 1 10.0.0.1 8443", script)
         self.assertIn("nc -u -w 1 10.0.0.1 8444", script)
@@ -3330,8 +3333,10 @@ class MicrovmTests(unittest.TestCase):
         announcer: bool = True,
         tcp_request: bool = True,
         udp_request: bool = True,
+        udp_ipv6_request: bool = True,
         private_request: bool = False,
         listeners: bool = True,
+        udp_ipv6_listener: bool = True,
         private_listeners: bool = True,
     ) -> subprocess.CompletedProcess[str]:
         shell = _posix_shell()
@@ -3345,6 +3350,8 @@ class MicrovmTests(unittest.TestCase):
         if listeners:
             tcp6 += f"   0: {'0' * 32}:1F90 {'0' * 32}:0000 0A{tail}"
             udp6 += f"   0: {'0' * 32}:1F90 {'0' * 32}:0000 07{tail}"
+        if udp_ipv6_listener:
+            udp6 += f"   1: {'0' * 32}:1F92 {'0' * 32}:0000 07{tail}"
         if private_listeners:
             tcp += f"   0: 0100007F:1F91 00000000:0000 0A{tail}"
             tcp6 += f"   1: {'0' * 24}01000000:1F91 {'0' * 32}:0000 0A{tail}"
@@ -3368,6 +3375,7 @@ class MicrovmTests(unittest.TestCase):
                     PROXY_PORT="0",
                     GUEST_PORT="8080",
                     PRIVATE_GUEST_PORT="8081",
+                    UDP_IPV6_GUEST_PORT="8082",
                 )
                 .replace("nvx-exit", "nvx_exit")
                 .replace("/proc/", f"{root.as_posix()}/proc/")
@@ -3380,6 +3388,7 @@ class MicrovmTests(unittest.TestCase):
             )
             tcp_server = "echo NVX-HOST-LOOPBACK-INBOUND" if tcp_request else ":"
             udp_server = "echo NVX-HOST-LOOPBACK-UDP" if udp_request else ":"
+            udp_ipv6_server = "echo NVX-HOST-LOOPBACK-UDP" if udp_ipv6_request else ":"
             private_server = (
                 "echo NVX-HOST-LOOPBACK-INBOUND" if private_request else ":"
             )
@@ -3390,6 +3399,7 @@ class MicrovmTests(unittest.TestCase):
                 "wget() { echo NVX-HOST-LOOPBACK-GENERAL; }\n"
                 'nc() { case "$*" in\n'
                 f"'-l -p '*) {tcp_server} ;;\n"
+                f"'-u -l -p 8082 '*) {udp_ipv6_server} ;;\n"
                 f"'-u -l -p '*) {udp_server} ;;\n"
                 f"'-l -s '*) {private_server} ;;\n"
                 "*) return 1 ;;\n"
@@ -3472,6 +3482,76 @@ class MicrovmTests(unittest.TestCase):
         finally:
             listener.close()
 
+    def test_host_loopback_udp_exchange_repeats_until_the_guest_answers(self):
+        for address, family in (
+            ("127.0.0.1", socket.AF_INET),
+            ("::1", socket.AF_INET6),
+        ):
+            with self.subTest(address):
+                server = socket.socket(family, socket.SOCK_DGRAM)
+                try:
+                    server.bind((address, 0))
+                except OSError:
+                    server.close()
+                    continue
+                port = int(server.getsockname()[1])
+                received: list[bytes] = []
+
+                def serve(
+                    server: socket.socket = server,
+                    received: list[bytes] = received,
+                ) -> None:
+                    # The guest misses the first request, as while it resolves
+                    # the address at which it sees the host.
+                    server.recvfrom(64)
+                    data, peer = server.recvfrom(64)
+                    received.append(data)
+                    server.sendto(microvm_tests.HOST_LOOPBACK_UDP_REPLY, peer)
+
+                thread = threading.Thread(target=serve, daemon=True)
+                thread.start()
+                try:
+                    microvm_tests._host_loopback_udp_exchange(address, port, 10)
+                    thread.join(10)
+                finally:
+                    server.close()
+                self.assertEqual(received, [microvm_tests.HOST_LOOPBACK_UDP_REQUEST])
+
+    def test_host_loopback_udp_exchange_rejects_unexpected_replies(self):
+        for label, reply, other_port in (
+            ("payload", b"UNEXPECTED\n", False),
+            ("source", microvm_tests.HOST_LOOPBACK_UDP_REPLY, True),
+        ):
+            with (
+                self.subTest(label),
+                socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as server,
+                socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as other,
+            ):
+                server.bind(("127.0.0.1", 0))
+                other.bind(("127.0.0.1", 0))
+                port = int(server.getsockname()[1])
+
+                def serve(
+                    server: socket.socket = server,
+                    sender: socket.socket = other if other_port else server,
+                    reply: bytes = reply,
+                ) -> None:
+                    _, peer = server.recvfrom(64)
+                    sender.sendto(reply, peer)
+
+                thread = threading.Thread(target=serve, daemon=True)
+                thread.start()
+                with self.assertRaisesRegex(RuntimeError, "unexpected guest UDP reply"):
+                    microvm_tests._host_loopback_udp_exchange("127.0.0.1", port, 10)
+                thread.join(10)
+
+    def test_host_loopback_udp_exchange_times_out_without_an_answer(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as server:
+            server.bind(("127.0.0.1", 0))
+            port = int(server.getsockname()[1])
+            with self.assertRaisesRegex(TimeoutError, "did not answer"):
+                microvm_tests._host_loopback_udp_exchange("127.0.0.1", port, 0)
+
     def test_host_loopback_allow_script_checks_publication_and_traffic(self):
         run = self._run_host_loopback_allow_script
         for label, check, expected in (
@@ -3497,6 +3577,16 @@ class MicrovmTests(unittest.TestCase):
             ),
             ("tcp-unreached", functools.partial(run, tcp_request=False), 97),
             ("udp-unreached", functools.partial(run, udp_request=False), 97),
+            (
+                "udp-ipv6-listener-missing",
+                functools.partial(run, udp_ipv6_listener=False),
+                95,
+            ),
+            (
+                "udp-ipv6-unreached",
+                functools.partial(run, udp_ipv6_request=False),
+                97,
+            ),
             ("private-reached", functools.partial(run, private_request=True), 96),
         ):
             with self.subTest(label):

@@ -3281,6 +3281,7 @@ def run_host_loopback_policy(
                 PROXY_PORT=str(proxy_port),
                 GUEST_PORT="0",
                 PRIVATE_GUEST_PORT="0",
+                UDP_IPV6_GUEST_PORT="0",
             ),
             HOST_LOOPBACK_UDP_CONTROL_MARKER,
             timeout=timeout,
@@ -3315,6 +3316,7 @@ def run_host_loopback_policy(
                 PROXY_PORT=str(proxy_port),
                 GUEST_PORT="0",
                 PRIVATE_GUEST_PORT="0",
+                UDP_IPV6_GUEST_PORT="0",
             ),
             HOST_LOOPBACK_DENY_MARKER,
             timeout=timeout,
@@ -3357,9 +3359,13 @@ def run_host_loopback_policy(
     allowed_general_port = int(allowed_general.getsockname()[1])
     guest_port = _host_loopback_publication_port()
     while True:
+        # Busybox's UDP server answers only its first peer, so the guest
+        # answers UDP over IPv6 loopback on a port of its own.
+        udp_ipv6_guest_port = _host_loopback_publication_port()
         _, host_forward_port = _available_tcp_address()
         _, private_guest_port = _available_tcp_address()
-        if len({guest_port, host_forward_port, private_guest_port}) == 3:
+        ports = {guest_port, udp_ipv6_guest_port, host_forward_port, private_guest_port}
+        if len(ports) == 4:
             break
     allow_errors: list[Exception] = []
     allow_server = threading.Thread(
@@ -3419,11 +3425,16 @@ def run_host_loopback_policy(
                     PROXY_PORT="0",
                     GUEST_PORT=str(guest_port),
                     PRIVATE_GUEST_PORT=str(private_guest_port),
+                    UDP_IPV6_GUEST_PORT=str(udp_ipv6_guest_port),
                 ),
             )
             process.wait_for_line(HOST_LOOPBACK_INGRESS_READY_MARKER, timeout)
             _verify_host_loopback_publication(
-                guest_port, host_forward_port, private_guest_port, timeout
+                guest_port,
+                udp_ipv6_guest_port,
+                host_forward_port,
+                private_guest_port,
+                timeout,
             )
             process.send_line(HOST_LOOPBACK_CHECKED.decode())
             process.wait_for_line(HOST_LOOPBACK_ALLOW_MARKER, timeout)
@@ -3536,8 +3547,38 @@ def _host_loopback_tcp_exchange(address: str, port: int, timeout: float) -> None
         time.sleep(0.1)
 
 
+def _host_loopback_udp_exchange(address: str, port: int, timeout: float) -> None:
+    """Exchange a datagram with the guest's UDP server through ``address:port``.
+
+    The request is repeated until the guest answers it, from the port that it
+    reached, since the guest may still be resolving the address at which it
+    sees the host when the first request arrives.
+    """
+    family = socket.AF_INET6 if ":" in address else socket.AF_INET
+    with socket.socket(family, socket.SOCK_DGRAM) as client:
+        client.bind((address, 0))
+        client.settimeout(0.5)
+        deadline = time.monotonic() + timeout
+        while True:
+            client.sendto(HOST_LOOPBACK_UDP_REQUEST, (address, port))
+            try:
+                reply, source = client.recvfrom(4096)
+                break
+            except (TimeoutError, ConnectionResetError) as error:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"guest UDP server did not answer through {address}:{port}"
+                    ) from error
+    if reply != HOST_LOOPBACK_UDP_REPLY or tuple(source[:2]) != (address, port):
+        raise RuntimeError(f"unexpected guest UDP reply {reply!r} from {source}")
+
+
 def _verify_host_loopback_publication(
-    guest_port: int, host_forward_port: int, private_guest_port: int, timeout: float
+    guest_port: int,
+    udp_ipv6_guest_port: int,
+    host_forward_port: int,
+    private_guest_port: int,
+    timeout: float,
 ) -> None:
     """Verify from the host what explicit host-loopback access publishes."""
     _wait_until(
@@ -3545,9 +3586,11 @@ def _verify_host_loopback_publication(
             _holds_loopback(socket.AF_INET, socket.SOCK_STREAM, guest_port)
             and _holds_loopback(socket.AF_INET6, socket.SOCK_STREAM, guest_port)
             and _holds_loopback(socket.AF_INET, socket.SOCK_DGRAM, guest_port)
+            and _holds_loopback(socket.AF_INET6, socket.SOCK_DGRAM, udp_ipv6_guest_port)
         ),
         timeout,
-        f"guest port {guest_port} was not published on host loopback",
+        f"guest ports {guest_port} and {udp_ipv6_guest_port} were not published "
+        "on host loopback",
     )
     # The UDP listener was announced after every other one had started, so a
     # guest-loopback listener, had it been announced, would be published now.
@@ -3569,18 +3612,11 @@ def _verify_host_loopback_publication(
         ("127.0.0.1", host_forward_port),
     ):
         _host_loopback_tcp_exchange(address, port, timeout)
-    with _udp_client(0.5) as client:
-        deadline = time.monotonic() + timeout
-        while True:
-            client.sendto(HOST_LOOPBACK_UDP_REQUEST, ("127.0.0.1", guest_port))
-            try:
-                reply, source = client.recvfrom(4096)
-                break
-            except (TimeoutError, ConnectionResetError):
-                if time.monotonic() >= deadline:
-                    raise
-        if reply != HOST_LOOPBACK_UDP_REPLY or source != ("127.0.0.1", guest_port):
-            raise RuntimeError(f"unexpected guest UDP reply {reply!r} from {source}")
+    for address, port in (
+        ("127.0.0.1", guest_port),
+        ("::1", udp_ipv6_guest_port),
+    ):
+        _host_loopback_udp_exchange(address, port, timeout)
 
 
 def run_host_loopback_rejections(
