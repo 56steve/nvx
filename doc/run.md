@@ -334,16 +334,12 @@ blocked, while the exact TCP proxy endpoint remains available. UDP on that
 same port and other host service ports remain blocked even with ordinary
 egress allowed.
 
-The portable profile does **not** support generic bidirectional host-loopback
-allow on its own. Explicit `--host-loopback allow` without any forward is
-rejected before VM resources are opened unless ingress is `allow`, which then
-also admits the host to the guest's listeners. For deliberate port publishing,
-repeat `--host-loopback-forward tcp:HOST_PORT:GUEST_PORT` or its UDP form to
-expose only selected localhost ports toward the guest, with explicit
-`--host-loopback allow`. These forwards do not satisfy a generic allow policy
-that provides no port list. Omitting `--host-loopback` preserves existing
-guest-to-host mapping without publishing guest ports. Guest-originated traffic
-remains subject to egress policy.
+Explicit `--host-loopback allow` opens access between the guest and host
+loopback in both directions without a port list, and
+`--host-loopback-forward` publishes further localhost ports; see
+[Host-loopback access](#host-loopback-access). Omitting `--host-loopback`
+preserves the existing guest-to-host mapping without publishing guest ports.
+Guest-originated traffic remains subject to egress policy.
 
 Most `nvx.py run` options pass through unchanged: `--machine`, `--processors`,
 `--cpu-profile`, `--mount`, `--net`, `--network-profile`, `--cmdline`,
@@ -432,6 +428,57 @@ IPv6-only, and a UDP socket on `::` unless the guest sets
 admit them to OpenVMM, for example an inbound rule for `openvmm.exe` on
 Windows. Snapshot capture and restore reject ingress `allow`, because the
 published listeners are live host attachments.
+
+### Host-loopback access
+
+Explicit `--host-loopback allow` opens host loopback to the guest and the guest
+to host loopback, without a port list:
+
+```bash
+./bin/openvmm \
+  --single-process \
+  --machine microvm \
+  --hypervisor kvm \
+  --memory 128M \
+  --kernel guest/vmlinux \
+  --initrd guest/initramfs.cpio.gz \
+  --net 10.0.0.2/24 \
+  --network-profile portable \
+  --network-egress deny \
+  --host-loopback allow
+```
+
+The guest reaches host loopback services through its gateway, subject to the
+egress policy: a host service on `127.0.0.1:8080` at `10.0.0.1:8080`, and one
+on `[::1]:8080` at `[fd00::a00:1]:8080`. The guest sees host peers at
+addresses that OpenVMM assigns inside its own network, and the egress policy
+applies to its traffic to them as it applies at the gateway, so a rule that
+denies a gateway port denies it at those addresses too. In the other
+direction, OpenVMM appends `virtnet_ingress=host-loopback` to the kernel
+command line unless ingress is `allow`, and the guest's `nvx-ingress` reports
+its listeners as it does for
+[private-network ingress](#private-network-ingress). For each reported port,
+OpenVMM listens on the same port of host `127.0.0.1` or `::1`, for each family
+on which the guest listens, and admits only the host, so neither the host's
+networks nor the internet reach the guest. Replies to the host pass whatever
+the egress policy. A guest listener bound to `127.0.0.1` or `::1` alone is
+never reported and stays private to the guest. A port that a host process
+holds, on loopback or on every host address, stays with that process: OpenVMM
+logs a warning and retries with the next report. A host process that later
+binds every host address at a published port fails on Linux; on Windows,
+unless it asks for exclusive use of the port, it succeeds but gets no loopback
+traffic, which stays with the guest, as it would with any host process
+listening on loopback alone. With ingress `allow` as well, the listeners that
+OpenVMM publishes on every host address admit the host instead.
+
+Repeat `--host-loopback-forward tcp:HOST_PORT:GUEST_PORT` or its UDP form, at
+most 64 times, to publish further localhost ports at guest ports of your
+choice, such as host `127.0.0.1:18080` to guest port `8080`; forwards need
+explicit `--host-loopback allow`. The guest answers forwarded traffic at
+addresses that OpenVMM assigns inside its own network, and the egress policy
+filters those replies, so forwarded ports need an egress policy that lets them
+out. Snapshot capture and restore reject explicit `--host-loopback allow`,
+because its listeners are live host attachments.
 
 ## Migration from the retired profile
 

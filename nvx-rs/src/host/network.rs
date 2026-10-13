@@ -6,12 +6,22 @@
 //! are expanded into that form exactly: exceptions are subtracted from their networks, a rule
 //! without destinations matches `0.0.0.0/0` and `::/0`, and `any` protocol with a port or a port
 //! range becomes a TCP and a UDP rule. Rules that cannot be expressed exactly are rejected.
+//!
+//! Host-loopback access is bidirectional: with it allowed, the guest reaches host loopback
+//! services through its gateway, and OpenVMM publishes the guest's listeners on host loopback.
+//! [`LoopbackForward`]s publish further host loopback ports at guest ports of their choice.
+
+use std::collections::HashSet;
+use std::net::Ipv4Addr;
 
 use crate::error::{Error, Result};
-use crate::net::cidr::Cidr;
+use crate::net::cidr::{self, Cidr};
 
 /// Largest number of allow rules, and of deny rules, that OpenVMM accepts.
 pub const MAX_RULES: usize = 256;
+
+/// Largest number of [`LoopbackForward`]s that OpenVMM accepts.
+pub const MAX_LOOPBACK_FORWARDS: usize = 64;
 
 /// Allow or deny decision of a network posture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -153,12 +163,41 @@ impl EgressRules {
     }
 }
 
+/// Transport protocol of a [`LoopbackForward`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ForwardProtocol {
+    /// TCP connections.
+    Tcp,
+    /// UDP datagrams.
+    Udp,
+}
+
+impl ForwardProtocol {
+    /// Returns OpenVMM's spelling of this protocol.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Tcp => "tcp",
+            Self::Udp => "udp",
+        }
+    }
+}
+
+/// A port on host IPv4 loopback that OpenVMM forwards to a guest port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LoopbackForward {
+    /// Transport protocol.
+    pub protocol: ForwardProtocol,
+    /// Port on `127.0.0.1` where OpenVMM listens; nonzero.
+    pub host_port: u16,
+    /// Guest port that receives the traffic; nonzero.
+    pub guest_port: u16,
+}
+
 /// The network posture of a VM.
 ///
 /// A connection matching a `deny` rule is blocked. Otherwise a connection matching an `allow`
-/// rule is permitted, and any other connection follows the `egress` default. OpenVMM's portable
-/// profile denies the guest's access to host loopback services, and the host's own access to the
-/// guest.
+/// rule is permitted, and any other connection follows the `egress` default. Access between the
+/// guest and host loopback follows `host_loopback` in both directions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkPolicy {
     /// Default policy for guest-initiated connections.
@@ -171,19 +210,36 @@ pub struct NetworkPolicy {
     /// OpenVMM listens on every host address at the TCP and UDP ports where the guest listens,
     /// and admits clients on the host's private networks, whose addresses are not globally
     /// reachable, but not clients inside the guest network, IPv6 link-local clients, or the host
-    /// itself; replies to their connections pass whatever the egress policy.
+    /// itself unless `host_loopback` allows it; replies to their connections pass whatever the
+    /// egress policy.
     pub ingress: Access,
+    /// Access between the guest and host loopback, in both directions. With [`Access::Allow`],
+    /// the guest reaches host loopback services through its gateway, subject to the egress
+    /// policy, and the host reaches the guest's TCP and UDP listeners on non-loopback guest
+    /// addresses at the same ports of host IPv4 and IPv6 loopback, where OpenVMM listens without
+    /// displacing a host listener and admits only the host; replies to the host pass whatever
+    /// the egress policy. With `ingress` allowed too, the listeners on every host address admit
+    /// the host instead. With [`Access::Deny`], neither direction is open.
+    pub host_loopback: Access,
+    /// Ports on host IPv4 loopback forwarded to guest ports, at most [`MAX_LOOPBACK_FORWARDS`],
+    /// each protocol and host port at most once. Forwards need `host_loopback` allowed, and
+    /// because the egress policy filters the guest's replies, which go to addresses that OpenVMM
+    /// assigns inside the guest network, also an `egress` default of [`Access::Allow`] and no
+    /// `deny` rule that covers the guest network.
+    pub host_loopback_forwards: Vec<LoopbackForward>,
 }
 
 impl NetworkPolicy {
-    /// Applies `egress` as the default egress policy, with no rules, and denies ingress. Messages
-    /// call the rules `egress.allow` and `egress.deny`.
+    /// Applies `egress` as the default egress policy, with no rules, and denies ingress and
+    /// host-loopback access. Messages call the rules `egress.allow` and `egress.deny`.
     pub fn new(egress: Access) -> Self {
         Self {
             egress,
             allow: EgressRules::new("egress.allow"),
             deny: EgressRules::new("egress.deny"),
             ingress: Access::Deny,
+            host_loopback: Access::Deny,
+            host_loopback_forwards: Vec::new(),
         }
     }
 
@@ -204,13 +260,14 @@ impl NetworkPolicy {
 
 /// Returns the OpenVMM options that enforce `policy` for a guest at `guest_network`.
 ///
-/// Without a policy, or when egress is denied without allow rules and ingress is denied, no
-/// network device is attached. Otherwise the portable profile applies the egress posture and the
-/// ingress default with host loopback denied.
+/// Without a policy, or when egress is denied without allow rules and ingress and host-loopback
+/// access are denied, no network device is attached. Otherwise the portable profile applies the
+/// egress posture, the ingress default, the host-loopback access, and the host-loopback forwards.
 ///
 /// Fails with [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported) when a rule cannot be
-/// expressed exactly, or when the rules of one action expand to more than [`MAX_RULES`] OpenVMM
-/// rules.
+/// expressed exactly, when the rules of one action expand to more than [`MAX_RULES`] OpenVMM
+/// rules, or when the host-loopback forwards break the rules of
+/// [`NetworkPolicy::host_loopback_forwards`].
 pub fn openvmm_arguments(
     policy: Option<&NetworkPolicy>,
     guest_network: &str,
@@ -218,9 +275,15 @@ pub fn openvmm_arguments(
     let Some(policy) = policy else {
         return Ok(Vec::new());
     };
+    if !policy.host_loopback_forwards.is_empty() && policy.host_loopback != Access::Allow {
+        return Err(Error::unsupported(
+            "host-loopback forwards need host-loopback access allowed",
+        ));
+    }
     if policy.egress == Access::Deny
         && policy.allow.rules.is_empty()
         && policy.ingress == Access::Deny
+        && policy.host_loopback == Access::Deny
     {
         return Ok(Vec::new());
     }
@@ -234,7 +297,7 @@ pub fn openvmm_arguments(
         "--network-ingress",
         policy.ingress.as_str(),
         "--host-loopback",
-        "deny",
+        policy.host_loopback.as_str(),
     ]
     .map(str::to_owned)
     .to_vec();
@@ -261,7 +324,97 @@ pub fn openvmm_arguments(
             arguments.push(rule);
         }
     }
+    check_loopback_forwards(policy, guest_network)?;
+    for forward in &policy.host_loopback_forwards {
+        arguments.push("--host-loopback-forward".to_owned());
+        arguments.push(format!(
+            "{}:{}:{}",
+            forward.protocol.as_str(),
+            forward.host_port,
+            forward.guest_port
+        ));
+    }
     Ok(arguments)
+}
+
+/// Checks the host-loopback forwards of a policy whose rules expand, and whose host-loopback
+/// access is allowed when it has forwards, against the rules of
+/// [`NetworkPolicy::host_loopback_forwards`].
+fn check_loopback_forwards(policy: &NetworkPolicy, guest_network: &str) -> Result<()> {
+    let forwards = &policy.host_loopback_forwards;
+    if forwards.is_empty() {
+        return Ok(());
+    }
+    let unsupported = |message: String| Err(Error::unsupported(message));
+    if forwards.len() > MAX_LOOPBACK_FORWARDS {
+        return unsupported(format!(
+            "the openvmm backend accepts at most {MAX_LOOPBACK_FORWARDS} host-loopback forwards"
+        ));
+    }
+    let mut bindings = HashSet::new();
+    for forward in forwards {
+        if forward.host_port == 0 || forward.guest_port == 0 {
+            return unsupported(
+                "host-loopback forward ports must be between 1 and 65535".to_owned(),
+            );
+        }
+        if !bindings.insert((forward.protocol, forward.host_port)) {
+            return unsupported(format!(
+                "host-loopback forwards bind {} host port {} more than once",
+                forward.protocol.as_str(),
+                forward.host_port
+            ));
+        }
+    }
+    if policy.egress != Access::Allow {
+        return unsupported(
+            "host-loopback forwards need egress allowed by default for their replies".to_owned(),
+        );
+    }
+    let Some(network) = guest_subnet(guest_network) else {
+        return unsupported(format!("guest network {guest_network:?} is not valid"));
+    };
+    for (index, rule) in policy.deny.rules.iter().enumerate() {
+        if rule_covers(rule, network) {
+            return unsupported(format!(
+                "{}[{index}] cannot cover the guest network, which carries host-loopback forward \
+                 replies",
+                policy.deny.name
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Returns the IPv4 network of `guest_network`, a static guest address in `ADDRESS/PREFIX` form.
+fn guest_subnet(guest_network: &str) -> Option<Cidr> {
+    let (address, prefix) = guest_network.split_once('/')?;
+    let address: Ipv4Addr = address.parse().ok()?;
+    let prefix = cidr::parse_prefix_length(prefix).filter(|prefix| (1..=32).contains(prefix))?;
+    let mask = u32::MAX << (32 - u32::from(prefix));
+    Cidr::parse(&format!(
+        "{}/{prefix}",
+        Ipv4Addr::from(u32::from(address) & mask)
+    ))
+    .ok()
+}
+
+/// Returns whether `rule`, whose destinations parse, matches an address of `network`.
+fn rule_covers(rule: &EgressRule, network: Cidr) -> bool {
+    rule.to.is_empty()
+        || rule.to.iter().any(|peer| {
+            let Ok(destination) = Cidr::parse(&peer.cidr) else {
+                return false;
+            };
+            let excluded = peer
+                .except
+                .iter()
+                .filter_map(|value| Cidr::parse(value).ok())
+                .collect::<Vec<_>>();
+            destination
+                .subtract(&excluded, MAX_RULES)
+                .is_none_or(|remainder| remainder.iter().any(|part| part.overlaps(network)))
+        })
 }
 
 /// Appends the OpenVMM rules equivalent to `rule`.
@@ -423,6 +576,104 @@ mod tests {
                     "deny",
                 ]
             );
+        }
+        // Host-loopback access needs the device even when egress and ingress are denied.
+        let mut host_loopback = NetworkPolicy::new(Access::Deny);
+        host_loopback.host_loopback = Access::Allow;
+        assert_eq!(
+            openvmm_arguments(Some(&host_loopback), "10.0.0.2/24").unwrap(),
+            [
+                "--net",
+                "10.0.0.2/24",
+                "--network-profile",
+                "portable",
+                "--network-egress",
+                "deny",
+                "--network-ingress",
+                "deny",
+                "--host-loopback",
+                "allow",
+            ]
+        );
+    }
+
+    #[test]
+    fn host_loopback_forwards_follow_openvmm_rules() {
+        let forward = |protocol, host_port, guest_port| LoopbackForward {
+            protocol,
+            host_port,
+            guest_port,
+        };
+        let forwarded = |forwards: Vec<LoopbackForward>| {
+            let mut policy = NetworkPolicy::new(Access::Allow);
+            policy.host_loopback = Access::Allow;
+            policy.host_loopback_forwards = forwards;
+            policy
+        };
+        let rejected = |policy: &NetworkPolicy, expected: &str| {
+            let error = openvmm_arguments(Some(policy), "10.0.0.2/24").unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::Unsupported);
+            assert!(error.message().contains(expected), "{error}");
+        };
+
+        let valid = forwarded(vec![
+            forward(ForwardProtocol::Tcp, 18080, 8080),
+            forward(ForwardProtocol::Udp, 18080, 8081),
+        ]);
+        let arguments = openvmm_arguments(Some(&valid), "10.0.0.2/24").unwrap();
+        assert_eq!(
+            rules(&arguments, "--host-loopback-forward"),
+            ["tcp:18080:8080", "udp:18080:8081"]
+        );
+        assert!(has_pair(&arguments, "--host-loopback", "allow"));
+
+        let mut denied = valid.clone();
+        denied.host_loopback = Access::Deny;
+        rejected(&denied, "need host-loopback access allowed");
+        let mut closed = valid.clone();
+        closed.egress = Access::Deny;
+        rejected(&closed, "egress allowed by default");
+        rejected(
+            &forwarded(vec![
+                forward(ForwardProtocol::Tcp, 18080, 8080),
+                forward(ForwardProtocol::Tcp, 18080, 8081),
+            ]),
+            "more than once",
+        );
+        rejected(
+            &forwarded(vec![forward(ForwardProtocol::Udp, 0, 8080)]),
+            "between 1 and 65535",
+        );
+        rejected(
+            &forwarded(
+                (1..=65)
+                    .map(|port| forward(ForwardProtocol::Tcp, port, port))
+                    .collect(),
+            ),
+            "at most 64",
+        );
+
+        // The guest's replies to forwarded traffic leave toward the guest network.
+        for rule in [
+            EgressRule::default(),
+            EgressRule::to("10.0.0.0/8"),
+            EgressRule::to("10.0.0.0/24"),
+            EgressRule::to("10.0.0.77").on_port(Protocol::Tcp, 443),
+        ] {
+            rejected(&valid.clone().with_deny(rule), "forward replies");
+        }
+        for rule in [
+            EgressRule::to("10.0.1.0/24"),
+            EgressRule::to("fd00::/8"),
+            EgressRule {
+                to: vec![Destination {
+                    cidr: "0.0.0.0/0".to_owned(),
+                    except: vec!["10.0.0.0/24".to_owned()],
+                }],
+                ports: Vec::new(),
+            },
+        ] {
+            openvmm_arguments(Some(&valid.clone().with_deny(rule)), "10.0.0.2/24").unwrap();
         }
     }
 

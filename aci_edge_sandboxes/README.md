@@ -408,13 +408,13 @@ provisioned again to accept the change.
   DNS server in `/etc/resolv.conf` when the policy allows TCP or UDP port 53 to it, and
   otherwise the gateway's IPv6 address when the policy allows DNS to that one. Choose a guest
   network that contains no address the guest must reach. Unlike with the
-  [OpenVMM backend](#network-rules), ingress must be `deny`, and host-loopback access must be
-  `deny` unless ports are forwarded, as described next.
+  [OpenVMM backend](#network-rules), ingress must be `deny`; host-loopback access may be allowed
+  independently, as described next.
 
-### Native proxy and forwarded ports
+### Native proxy and host loopback
 
-Two provision options connect the guest to host loopback without opening it in general. They
-are exclusive: a proxy needs host-loopback access denied, and forwarded ports need it allowed.
+The proxy keeps general host-loopback access denied. Generic listener publication and explicit
+forwards need host-loopback access allowed.
 
 - `runtimeConfig.networkProxy` (`ProvisionRequest::with_network_proxy`) names an HTTP or HTTPS
   proxy that listens on host IPv4 loopback, such as `http://127.0.0.1:3128` or
@@ -427,15 +427,20 @@ are exclusive: a proxy needs host-loopback access denied, and forwarded ports ne
   `https_proxy` naming the proxy at the gateway, such as `http://10.0.0.1:3128`, and `NO_PROXY`
   and `no_proxy` set to `localhost,127.0.0.1`; an HTTPS proxy's certificate must therefore be
   valid for the gateway's address.
+- `network.ingress.hostLoopback: allow` lets the guest reach host-loopback services through its
+  gateway, and publishes each TCP or UDP listener that the guest binds to a non-loopback address
+  on the same port of host IPv4 or IPv6 loopback, without a port list. A listener bound only to
+  guest `127.0.0.1` or `::1` stays private to the sandbox, OpenVMM never publishes a listener on
+  a LAN or public interface or displaces a host listener that holds the port, and replies to the
+  host pass whatever the egress policy.
 - `hostLoopbackForwards` of the sandbox spec (`SandboxSpec::with_host_loopback_forward`, passed
-  to `AciEdgeSandbox::provision_with`) publishes up to 64 guest ports on host loopback: OpenVMM listens on
-  `127.0.0.1:hostPort` and relays each TCP connection or UDP datagram to the guest's
-  `guestPort`. Ports are nonzero, and a host port appears at most once per protocol. Forwarded
-  ports need `network.ingress.hostLoopback: allow`, which also lets the guest reach every host
-  loopback service through its gateway; `allow` without forwarded ports is rejected. The guest
-  answers forwarded traffic at addresses that OpenVMM assigns inside the guest network, so the
-  egress default must be `allow`, which leaves the guest's other egress open, and no deny rule
-  may cover the guest network.
+  to `AciEdgeSandbox::provision_with`) publishes up to 64 further guest ports on host loopback:
+  OpenVMM listens on `127.0.0.1:hostPort` and relays each TCP connection or UDP datagram to the
+  guest's `guestPort`. Ports are nonzero, and a host port appears at most once per protocol.
+  Forwarded ports need `network.ingress.hostLoopback: allow`. The guest answers forwarded
+  traffic at addresses that OpenVMM assigns inside the guest network, so the egress default
+  must be `allow`, which leaves the guest's other egress open, and no deny rule may cover the
+  guest network.
 
 Only the guest sets the proxy variables: an exec whose `process.env` names one of them, in any
 case, fails with `policy_validation`, with or without a proxy.
@@ -596,7 +601,8 @@ terminate the VM when the caller exits.
 | `network.egress.default` | applied (`allow` or `deny`) | n/a |
 | `network.egress.allow`, `deny` | applied; see [Network rules](#network-rules) | n/a |
 | `network.ingress.default` | applied (`allow` or `deny`); see [Network rules](#network-rules) | n/a |
-| `network.ingress.hostLoopback` | `deny` applied (also when omitted); `allow` rejected | n/a |
+| `network.ingress.hostLoopback` | applied (`allow` or `deny`, `deny` when omitted); see [Network rules](#network-rules) | n/a |
+| `spec.hostLoopbackForwards` (ACI Edge Sandboxes extension) | applied; see [Network rules](#network-rules) | n/a |
 | `microvm.provision.memoryMib` | applied | n/a |
 | `process.commandLine` | n/a | run as `/bin/sh -c <commandLine>`; at most 4096 bytes |
 | `process.argv` (ACI Edge Sandboxes extension) | n/a | applied; absolute program, up to 64 arguments of 4096 bytes |
@@ -778,7 +784,8 @@ Rules are expanded into OpenVMM rules exactly: exceptions are subtracted from
 their networks, a port range becomes one OpenVMM range rule for each network,
 and protocol `any` with a port or a port range becomes a TCP and a UDP rule.
 Rules that would expand to more than 256 OpenVMM rules are rejected. Egress
-denied without allow rules, with ingress denied, attaches no network device;
+denied without allow rules, with ingress and host loopback denied, attaches no
+network device;
 otherwise the guest gets `10.0.0.2/24` behind the profile's NAT gateway
 `10.0.0.1`, which also serves DNS, and `fd00::a00:2/120` behind the gateway's
 IPv6 address `fd00::a00:1`.
@@ -788,11 +795,28 @@ each TCP and UDP port on which the workload listens, within about a second of
 the workload starting to listen, and relays clients on the host's private
 networks, whose addresses are not globally reachable, to the guest. It refuses
 other clients, clients inside the guest network, which the guest would take for
-its neighbors, IPv6 link-local clients, and the host itself, because host
-loopback stays denied. Replies to admitted clients pass whatever the egress
-policy. A port that a host process already holds is not published, and clients
-on other hosts need the host's firewall to admit them to OpenVMM; see
-[Private-network ingress](../doc/run.md#private-network-ingress).
+its neighbors, IPv6 link-local clients, and the host itself unless
+`network.ingress.hostLoopback` is `allow`. Replies to admitted clients pass
+whatever the egress policy. A port that a host process already holds is not
+published, and clients on other hosts need the host's firewall to admit them to
+OpenVMM; see [Private-network ingress](../doc/run.md#private-network-ingress).
+
+With `network.ingress.hostLoopback: allow`, access between the workload and
+host loopback is bidirectional: the workload reaches host loopback services
+through its gateway, such as `10.0.0.1:8080` for a host service on
+`127.0.0.1:8080`, subject to the egress policy, and the host reaches the
+workload. Without ingress allowed, OpenVMM listens on host IPv4 and IPv6
+loopback alone at each TCP and UDP port on which the workload listens on a
+non-loopback address, admits only the host, and lets replies to it pass
+whatever the egress policy; a workload listener on guest loopback stays
+private, and a port that a host process already holds is not published. The
+sandbox spec's `hostLoopbackForwards` (`SandboxSpec::with_host_loopback_forward`,
+passed to `AciEdgeSandbox::provision_with`) publish up to 64 further host
+loopback ports at guest ports of their choice. They need host-loopback access
+allowed, and because the workload answers them at addresses that OpenVMM
+assigns inside the guest network, an egress default of `allow` and no deny rule
+that covers the guest network; see
+[Host-loopback access](../doc/run.md#host-loopback-access).
 
 ### Idempotence and concurrency
 
@@ -888,7 +912,7 @@ fake-OpenVMM lifecycle test.
 - `nvx.py test-aci-edge-sandboxes` runs the ignored `openvmm_e2e` tests against a real
   hypervisor with the repository's kernel and Alpine initramfs: the lifecycle,
   working directories, host path mapping, network rules, private-network
-  ingress, and exec environments.
+  ingress, bidirectional host-loopback access, and exec environments.
   CI runs them on
   Linux/KVM, Linux/MSHV, and Windows/WHP.
 

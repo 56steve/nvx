@@ -63,7 +63,8 @@ impl Cidr {
             && mask(other.bits(), self.prefix, self.width()) == self.bits()
     }
 
-    fn overlaps(self, other: Self) -> bool {
+    /// Returns whether this network and `other` share an address.
+    pub(crate) fn overlaps(self, other: Self) -> bool {
         self.contains(other) || other.contains(self)
     }
 

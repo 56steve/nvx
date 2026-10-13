@@ -248,16 +248,19 @@ if [ -n "$nip" ]; then
             IFS=$oldifs
         fi
 
-        # With private-network ingress, the gateway learns the workload's
-        # listeners from nvx-ingress and publishes them on the host.
+        # With private-network or host-loopback ingress, the gateway learns
+        # the workload's listeners from nvx-ingress and publishes them on the
+        # host: to its private networks, or on host loopback alone.
         ningress=$(sed -n 's/.*virtnet_ingress=\([^ ]*\).*/\1/p' /proc/cmdline)
-        if [ "$ningress" = allow ]; then
-            if [ -n "$ngw" ] && [ -x /sbin/nvx-ingress ]; then
-                /sbin/nvx-ingress "$ngw" </dev/null &
-            else
-                virtnet_error "private-network ingress needs /sbin/nvx-ingress and an IPv4 gateway"
-            fi
-        fi
+        case "$ningress" in
+            allow | host-loopback)
+                if [ -n "$ngw" ] && [ -x /sbin/nvx-ingress ]; then
+                    /sbin/nvx-ingress "$ngw" </dev/null &
+                else
+                    virtnet_error "$ningress ingress needs /sbin/nvx-ingress and an IPv4 gateway"
+                fi
+                ;;
+        esac
 
         nprobe=$(sed -n 's/.*virtnet_probe=\([^ ]*\).*/\1/p' /proc/cmdline)
         if [ -n "$nprobe" ]; then

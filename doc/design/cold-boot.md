@@ -100,7 +100,9 @@ tokens. A fresh boot then appends host-owned tokens in this order:
    followed by `nvx_control_tty=hvc2`; and
 5. network bootstrap tokens, including gateway DNS only when the egress
    policy permits it, which names the IPv4 gateway or else the IPv6 one, and
-   `virtnet_ingress=allow` last when ingress is allowed, followed by
+   `virtnet_ingress=allow` last when ingress is allowed, or
+   `virtnet_ingress=host-loopback` when only explicit host-loopback access
+   is, followed by
    [filesystem bootstrap tokens](machine-and-device-abi.md#filesystem) for
    the attached HostFs export or aggregate.
 

@@ -36,7 +36,8 @@
 //! | `filesystem.deniedPaths` | hidden inside mapped paths | n/a |
 //! | `network.egress` | default and IPv4 and IPv6 rules applied | n/a |
 //! | `network.ingress.default` | `allow` and `deny` applied; see below | n/a |
-//! | `network.ingress.hostLoopback` | `deny` only | n/a |
+//! | `network.ingress.hostLoopback` | `allow` and `deny` applied, omitted means `deny`; see below | n/a |
+//! | `spec.hostLoopbackForwards` | applied; see below | n/a |
 //! | `microvm.provision.memoryMib` | applied | n/a |
 //! | `process.commandLine` | n/a | run as `/bin/sh -c <commandLine>`, at most 4096 bytes |
 //! | `process.cwd` | n/a | an absolute guest path of at most 4095 bytes; `/` when omitted |
@@ -59,13 +60,22 @@
 //! beside mapped files. A whole volume, or a file directly in a volume's root, is not mapped.
 //! Egress rules are expanded
 //! into OpenVMM's IPv4 and IPv6 rules exactly; rules that would need more than 256 OpenVMM rules
-//! are rejected. Egress denied without allow rules, with ingress denied,
+//! are rejected. Egress denied without allow rules, with ingress and host loopback denied,
 //! attaches no network device. With `network.ingress.default: allow`, OpenVMM listens on every
 //! host address at the TCP and UDP ports where the workload listens, and admits clients on the
 //! host's private networks, whose addresses are not globally reachable, but not clients inside
-//! the guest network, IPv6 link-local clients, or the host itself, because host loopback stays
-//! denied; replies to their connections pass whatever the egress
-//! policy. Workloads run as the fixed non-root identity of
+//! the guest network, IPv6 link-local clients, or the host itself unless host loopback is
+//! allowed; replies to their connections pass whatever the egress
+//! policy. With `network.ingress.hostLoopback: allow`, the workload reaches host loopback
+//! services through its gateway, subject to the egress policy, and the host reaches the
+//! workload: without ingress allowed, OpenVMM listens on host IPv4 and IPv6 loopback alone, never
+//! displacing a host listener, at the ports where the workload listens on a non-loopback address,
+//! and admits only the host, whose replies pass whatever the egress policy. A workload listener on
+//! guest loopback stays private. The sandbox spec's `hostLoopbackForwards`
+//! ([`AciEdgeSandbox::provision_with`](crate::AciEdgeSandbox::provision_with)) publish up to 64
+//! further host loopback ports at guest ports of their choice; they need host loopback allowed
+//! and an egress default of `allow`, and no deny rule may cover the guest network, where the
+//! workload answers them. Workloads run as the fixed non-root identity of
 //! [`OpenVmmConfig::workload_uid`] and [`OpenVmmConfig::workload_gid`] (see
 //! [`OpenVmmConfig::map_host_identity`] for Linux hosts) with no capabilities, read end-of-file on
 //! standard input, and may produce at most 1 MiB of combined output.
@@ -139,10 +149,11 @@ use crate::error::{Error, Result};
 use crate::exec::{Completion, ExecFailure, ExecOutcome};
 use crate::id::SandboxId;
 use crate::model::{
-    Access, Command, DeprovisionResult, ExecRequest, FilesystemPolicy, Metadata, NetworkPolicy,
-    NetworkRule, ProcessSpec, Protocol, ProvisionRequest, ProvisionResult, StartResult, StopResult,
-    duration_millis,
+    Access, Command, DeprovisionResult, ExecRequest, FilesystemPolicy, ForwardProtocol,
+    HostLoopbackForward, Metadata, NetworkPolicy, NetworkRule, ProcessSpec, Protocol,
+    ProvisionRequest, ProvisionResult, StartResult, StopResult, duration_millis,
 };
+use crate::spec::SandboxSpec;
 
 /// Shell that interprets `process.commandLine`.
 const SHELL: &str = "/bin/sh";
@@ -214,16 +225,23 @@ impl OpenVmmBackend {
             hostname: record.hostname.clone(),
             kernel_parameters: self.config.kernel_command_line.clone(),
             guest_network: self.config.guest_network.clone(),
-            network: record.network.as_ref().map(network_policy),
+            network: record
+                .network
+                .as_ref()
+                .map(|policy| network_policy(policy, &record.host_loopback_forwards)),
             filesystem: record.filesystem.clone(),
             breakaway_from_job: self.config.breakaway_from_job,
         }
     }
 }
 
-/// Converts the contract's network section into NVX's network posture, under the contract's
-/// field names.
-fn network_policy(policy: &NetworkPolicy) -> network::NetworkPolicy {
+/// Converts the contract's network section and the sandbox spec's host-loopback forwards into
+/// NVX's network posture, under the contract's field names. An omitted host-loopback access is
+/// denied.
+fn network_policy(
+    policy: &NetworkPolicy,
+    forwards: &[HostLoopbackForward],
+) -> network::NetworkPolicy {
     let access = |access: Access| match access {
         Access::Allow => network::Access::Allow,
         Access::Deny => network::Access::Deny,
@@ -237,6 +255,18 @@ fn network_policy(policy: &NetworkPolicy) -> network::NetworkPolicy {
         allow: rules("network.egress.allow", &policy.egress.allow),
         deny: rules("network.egress.deny", &policy.egress.deny),
         ingress: access(policy.ingress.default),
+        host_loopback: access(policy.ingress.host_loopback.unwrap_or(Access::Deny)),
+        host_loopback_forwards: forwards
+            .iter()
+            .map(|forward| network::LoopbackForward {
+                protocol: match forward.protocol {
+                    ForwardProtocol::Tcp => network::ForwardProtocol::Tcp,
+                    ForwardProtocol::Udp => network::ForwardProtocol::Udp,
+                },
+                host_port: forward.host_port,
+                guest_port: forward.guest_port,
+            })
+            .collect(),
     }
 }
 
@@ -403,8 +433,10 @@ impl Backend for OpenVmmBackend {
         capabilities.network.egress_deny = true;
         capabilities.network.ingress_allow = true;
         capabilities.network.ingress_deny = true;
+        capabilities.network.host_loopback_allow = true;
         capabilities.network.host_loopback_deny = true;
         capabilities.network.egress_rules = true;
+        capabilities.spec.host_loopback_forwards = true;
         capabilities.filesystem.readonly_paths = true;
         capabilities.filesystem.readwrite_paths = true;
         capabilities.filesystem.denied_paths = true;
@@ -427,6 +459,14 @@ impl Backend for OpenVmmBackend {
     }
 
     fn validate_provision(&self, request: &ProvisionRequest) -> Result<()> {
+        self.validate_provision_with(request, &SandboxSpec::new())
+    }
+
+    fn validate_provision_with(
+        &self,
+        request: &ProvisionRequest,
+        spec: &SandboxSpec,
+    ) -> Result<()> {
         let memory_mib = request
             .microvm
             .provision
@@ -437,8 +477,27 @@ impl Backend for OpenVmmBackend {
                 "microvm.provision.memoryMib must be positive",
             ));
         }
-        let network = request.network.as_ref().map(network_policy);
-        network::openvmm_arguments(network.as_ref(), &self.config.guest_network)?;
+        let forwarded = !spec.host_loopback_forwards.is_empty();
+        let Some(policy) = &request.network else {
+            if forwarded {
+                return Err(Error::policy_validation(
+                    "spec.hostLoopbackForwards require network.ingress.hostLoopback: allow",
+                ));
+            }
+            return Ok(());
+        };
+        if forwarded && policy.ingress.host_loopback != Some(Access::Allow) {
+            return Err(Error::policy_validation(
+                "spec.hostLoopbackForwards require network.ingress.hostLoopback: allow",
+            ));
+        }
+        if forwarded && policy.egress.default != Access::Allow {
+            return Err(Error::policy_validation(
+                "spec.hostLoopbackForwards require network.egress.default: allow for their replies",
+            ));
+        }
+        let network = network_policy(policy, &spec.host_loopback_forwards);
+        network::openvmm_arguments(Some(&network), &self.config.guest_network)?;
         Ok(())
     }
 
@@ -447,7 +506,15 @@ impl Backend for OpenVmmBackend {
     }
 
     fn provision(&self, request: &ProvisionRequest) -> Result<ProvisionResult> {
-        self.validate_provision(request)?;
+        self.provision_with(request, &SandboxSpec::new())
+    }
+
+    fn provision_with(
+        &self,
+        request: &ProvisionRequest,
+        spec: &SandboxSpec,
+    ) -> Result<ProvisionResult> {
+        self.validate_provision_with(request, spec)?;
         self.probe()?;
         let memory_mib = request
             .microvm
@@ -469,6 +536,7 @@ impl Backend for OpenVmmBackend {
             backend: BACKEND_KEY.to_owned(),
             network: request.network.clone(),
             filesystem,
+            host_loopback_forwards: spec.host_loopback_forwards.clone(),
             memory_mib,
             workload_uid: identity.uid,
             workload_gid: identity.gid,
@@ -815,9 +883,11 @@ mod tests {
                 .with_deny(NetworkRule::to("192.0.2.7").on_protocol(Protocol::Icmp)),
             ..NetworkPolicy::deny_all()
         };
-        let converted = network_policy(&policy);
+        let converted = network_policy(&policy, &[]);
         assert_eq!(converted.egress, network::Access::Deny);
         assert_eq!(converted.ingress, network::Access::Deny);
+        assert_eq!(converted.host_loopback, network::Access::Deny);
+        assert!(converted.host_loopback_forwards.is_empty());
         assert_eq!(converted.allow.name, "network.egress.allow");
         assert_eq!(converted.deny.name, "network.egress.deny");
         assert_eq!(
@@ -838,6 +908,22 @@ mod tests {
             converted.deny.rules,
             [network::EgressRule::to("192.0.2.7").on_protocol(network::Protocol::Icmp)]
         );
+        // Host-loopback access and the spec's forwards carry over.
+        let mut loopback = policy.clone();
+        loopback.ingress.host_loopback = Some(Access::Allow);
+        let converted = network_policy(
+            &loopback,
+            &[HostLoopbackForward::new(ForwardProtocol::Udp, 18080, 8080)],
+        );
+        assert_eq!(converted.host_loopback, network::Access::Allow);
+        assert_eq!(
+            converted.host_loopback_forwards,
+            [network::LoopbackForward {
+                protocol: network::ForwardProtocol::Udp,
+                host_port: 18080,
+                guest_port: 8080,
+            }]
+        );
         // Messages name the contract's fields.
         let icmp_port = NetworkPolicy {
             egress: EgressPolicy::new(Access::Deny)
@@ -845,7 +931,7 @@ mod tests {
             ..NetworkPolicy::deny_all()
         };
         let error = Error::from(
-            network::openvmm_arguments(Some(&network_policy(&icmp_port)), "10.0.0.2/24")
+            network::openvmm_arguments(Some(&network_policy(&icmp_port, &[])), "10.0.0.2/24")
                 .unwrap_err(),
         );
         assert_eq!(error.code(), ErrorCode::PolicyValidation);

@@ -230,7 +230,7 @@ fn program_name() -> String {
 }
 
 fn parse(program: &str, arguments: &[String]) -> Result<Options, String> {
-    const VALUED: [&str; 23] = [
+    const VALUED: [&str; 24] = [
         "--mount-aggregate",
         "--mount-child",
         "--mount-deny",
@@ -254,6 +254,7 @@ fn parse(program: &str, arguments: &[String]) -> Result<Options, String> {
         "--network-egress",
         "--network-ingress",
         "--host-loopback",
+        "--host-loopback-forward",
     ];
     let mut values: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     let mut flags = BTreeSet::new();
@@ -403,6 +404,11 @@ fn parse(program: &str, arguments: &[String]) -> Result<Options, String> {
         && !values.contains_key("--network-egress")
     {
         return Err("--network-egress is required with egress rules".to_owned());
+    }
+    if values.contains_key("--host-loopback-forward")
+        && values.get("--host-loopback").map(Vec::as_slice) != Some(&["allow"][..])
+    {
+        return Err("--host-loopback-forward requires explicit --host-loopback allow".to_owned());
     }
     if !tokens.iter().any(|token| token.starts_with("hostname=")) {
         return Err("the kernel command line must set the hostname".to_owned());

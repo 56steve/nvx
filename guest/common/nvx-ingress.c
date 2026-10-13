@@ -1,7 +1,8 @@
 // nvx-ingress announces the guest's TCP and UDP listeners to the gateway of
 // the portable network profile, which publishes them to the host's private
-// networks. The init system starts it, as root, when the kernel command line
-// carries virtnet_ingress=allow.
+// networks or, for host-loopback ingress alone, on host loopback. The init
+// system starts it, as root, when the kernel command line carries
+// virtnet_ingress=allow or virtnet_ingress=host-loopback.
 //
 // Every 100 ms it reads the kernel's socket tables. A TCP socket in the LISTEN
 // state is a listener, and so is an unconnected UDP socket that persists for a
