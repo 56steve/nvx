@@ -534,7 +534,9 @@ These are destination-based L3/L4 rules, not hostname or HTTP-content filters.
 They apply to every frame that the guest transmits, including replies on
 explicitly forwarded connections, but they are not an independent RX firewall
 or host-wide firewall. Responses arriving through the host sockets use the RX
-path.
+path. Ingress `allow` additionally admits replies on the flows that the
+endpoint carries, as [Host-local access and ingress](#host-local-access-and-ingress)
+describes.
 
 #### Host-local access and ingress
 
@@ -557,9 +559,9 @@ separate backend service governed by the egress policy, not by the general
 host-loopback mapping.
 
 An outbound connection does not make guest services reachable from the host
-or LAN. General `--network-ingress allow` is unsupported and rejected before
-launch. Deliberate host-to-guest publishing instead requires explicit
-localhost TCP or UDP port forwards, at most 64 of them. For example:
+or LAN. Without ingress `allow`, which the paragraphs below describe,
+deliberate host-to-guest publishing requires explicit localhost TCP or UDP
+port forwards, at most 64 of them. For example:
 
 ```text
 --host-loopback allow
@@ -570,11 +572,43 @@ This binds a real host listener on `127.0.0.1:8080` and forwards connections
 to guest port `80`; it does not bind a LAN-facing listener. Each forward
 requires explicit `--host-loopback allow`, and omitting `--host-loopback`
 keeps the default gateway mapping without publishing guest ports. The portable
-NAT cannot offer generic bidirectional host-loopback connectivity, so an
-explicit `--host-loopback allow` is accepted only with explicit
-`--host-loopback-forward` attachments. For host-loopback peers, the backend
-uses synthetic peer addresses so the guest routes replies through its NIC
-rather than its own loopback, and reverse-translates those addresses on TX.
+NAT cannot offer generic bidirectional host-loopback connectivity on its own,
+so an explicit `--host-loopback allow` is accepted only with explicit
+`--host-loopback-forward` attachments or with ingress `allow`. For
+host-loopback peers, the backend uses synthetic peer addresses so the guest
+routes replies through its NIC rather than its own loopback, and
+reverse-translates those addresses on TX.
+
+Ingress `allow` publishes the guest's listeners to the host's private
+networks. OpenVMM then appends the `virtnet_ingress=allow` token, which callers
+may not supply, after the other network tokens, and the guest announces its
+listeners in UDP datagrams to port 1021 of the IPv4 gateway from a source port
+below 1024. An announcement is the magic `NVXL`, version 1, a flags byte whose
+bit 0 marks omitted listeners, a big-endian 16-bit count of at most 64, and
+that many four-byte entries in strictly increasing order of protocol and port:
+the IP protocol number, 6 for TCP or 17 for UDP, a family mask with 1 for IPv4
+and 2 for IPv6, and the big-endian nonzero port. The endpoint consumes
+announcements before the egress policy, which neither authorizes nor forwards
+them, and each one replaces the published set.
+
+For each published port and family, the endpoint listens on that port of every
+host address and relays only peers in the IPv4 private-use, shared,
+link-local, benchmarking, and documentation ranges or the IPv6 unique local,
+site-local, documentation, and benchmarking ranges, none of which is globally
+reachable, except peers inside the guest's own subnets, which the guest would
+take for its gateway or its neighbors. Peers at the host's own addresses,
+including loopback, need an explicit host-loopback allow.
+
+Under ingress allow, the policy also admits ARP requests and Neighbor
+Solicitations for the guest's subnet and Neighbor Solicitations for the
+link-local addresses at which the gateway presents host peers. It admits a
+frame that its rules deny when the frame continues a flow that the endpoint
+carries: a TCP segment other than an initial SYN, or a UDP datagram from a
+published port to a peer that recently sent one to it, which leaves through
+the port's host listener. Ingress allow selects canonical policy encoding
+version 5, which adds the ingress action, and leaves the encoding and digest
+of ingress-deny policies unchanged. Snapshot capture and restore reject it,
+and the TAP backend rejects ingress-allow policies.
 
 #### DNS
 
@@ -622,7 +656,8 @@ digest. The snapshot records the IPv6 identity; a snapshot whose network
 predates it restores IPv4-only. Restore reconstructs a fresh endpoint and
 requires the profile and policy again; native sockets, DNS requests, and flow
 objects are never serialized. Explicit localhost forwards are process-local
-attachments, and snapshot capture and restore reject them.
+attachments, and so are the listeners that ingress `allow` publishes; snapshot
+capture and restore reject both.
 
 Capture quiesces the endpoint, drains completion ownership, and requires the
 saved queues to contain no unrepresented RX or TX packets. It then saves the
