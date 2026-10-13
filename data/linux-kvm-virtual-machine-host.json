@@ -1,0 +1,47 @@
+{
+  "platform": "linux-kvm-virtual-machine",
+  "runner_name": "azure-kvm-3",
+  "machine_name": "esaurez-nvx-ci-linux-kvm-vmss000003",
+  "cpu": {
+    "vendor": "GenuineIntel",
+    "family": 6,
+    "model": 106,
+    "stepping": 6,
+    "brand": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+    "microcode": "0xffffffff"
+  },
+  "logical_processors": 8,
+  "memory_gib": 31.3,
+  "os": {
+    "system": "Linux",
+    "release": "6.6.157.1-1.azl3",
+    "revision": null
+  },
+  "azure": {
+    "vm_size": "Standard_D8s_v5",
+    "os_disk": {
+      "storage_account_type": "Premium_LRS",
+      "size_gib": 128,
+      "caching": "ReadWrite",
+      "write_accelerator_enabled": false,
+      "ephemeral_option": null
+    }
+  },
+  "volumes": {
+    "workspace": {
+      "volume": "/",
+      "filesystem": "ext4",
+      "system_volume": true
+    },
+    "temporary": {
+      "volume": "/tmp",
+      "filesystem": "tmpfs",
+      "system_volume": false
+    },
+    "scratch": {
+      "volume": "/tmp",
+      "filesystem": "tmpfs",
+      "system_volume": false
+    }
+  }
+}

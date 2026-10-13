@@ -600,9 +600,12 @@ also takes other jobs of its pool, so a platform job may wait for it, and the pl
 concurrent runs measure one after another. List the benchmark runners with
 `gh api repos/microsoft/nvx/actions/runners --jq '.runners[] | select(any(.labels[]; .name == "benchmark")) | .name'`,
 and provision them with the benchmark switch of the
-[runner setup scripts](../scripts/setup/README.md#github-actions-runners). Moving the label to
-another runner is a performance-platform change: move it only together with a pull request
-that resets the series' history, as for the storage changes below.
+[runner setup scripts](../scripts/setup/README.md#github-actions-runners). Before it
+measures, each platform job checks that its runner is the host that the series' history comes
+from, as [Expected benchmark hosts](#expected-benchmark-hosts) describes. Moving the label to
+another runner is therefore a performance-platform change: unless the new runner's host
+matches in every required field, its platform jobs fail until a pull request accepts its host
+and resets the series' history.
 
 Linux and Windows CI use a reduced device contract of one warmup and ten retained attempts.
 Both CI contracts use one-second operation windows. Canonical baseline collection uses the full
@@ -645,13 +648,16 @@ files identify the bounded lifecycle remeasurements within one workflow attempt,
 not the workflow's `github.run_attempt`.
 
 Lifecycle JSON results and workload `benchmark-metadata.json` files record host
-provenance under `host`: the runner name from `RUNNER_NAME`, the machine name,
-operating system, CPU model, logical processor count, and physical memory, and the
+provenance under `host`: the runner name from `RUNNER_NAME`, the machine name, the
+operating system with its kernel release or Windows build and cumulative-update
+revision (UBR), the CPU model with its vendor, family, model, stepping, and microcode
+revision, the logical processor count, and physical memory, and the
 volume, file system, size, system-volume flag, disk number, and SCSI address behind
 the workspace, temporary, and scratch directories. The disk number and SCSI address
 tell the Azure OS disk from a data-disk LUN or the temporary disk. On a possible Azure
 VM, the coordinator queries the instance metadata service once, directly rather than
-through a proxy, and keeps only the VM size; each managed disk's SKU, size, caching
+through a proxy and with up to three attempts when the service doesn't respond, and
+keeps only the VM size; each managed disk's SKU, size, caching
 policy, write-accelerator and ephemeral settings, and data-disk LUN; the throughput
 and IOPS limits that Ultra Disks report; and the temporary disk's size. It never
 records names, resource or VM identifiers, the subscription, tags, network addresses,
@@ -716,8 +722,13 @@ the OS, data, and temporary disks. Because snapshot generation is bounded by the
 scratch volume's write throughput, such a change shifts
 `openvmm_snapshot_generation` and can shift the other lifecycle metrics. Apply it to
 every runner of the pool at once, so that the benchmark runner and any runner that
-later takes over its label share one storage regime. In the same pull request, reset
-the affected metrics by removing them from the series' history files, such as
+later takes over its label share one storage regime. The expected host records the
+VM size and the SKU, size, and caching of the disks behind these volumes, so the
+benchmark runner's next platform job fails its host check; in the same pull request,
+accept the new host and reset the series' history, as
+[Expected benchmark hosts](#expected-benchmark-hosts) describes. For a change that the
+host doesn't record, such as a performance tier or bursting setting, reset at least the
+affected metrics by removing them from the series' history files, such as
 `data/windows-whp-virtual-machine-microvm-v2-1vcpu.csv`, so that the gate restarts
 their ten-point warmup instead of comparing the new storage with the old baseline.
 
@@ -733,9 +744,71 @@ has enough matching history.
 
 Only the virtual-machine topologies exercised by CI have tracked histories. CI passes
 `--history-reset-dir data` to honor metrics explicitly removed from a tracked candidate history
-file even before the reset merges into the base branch. After merge, reset metrics start the
+file even before the reset merges into the base branch, and to compare the candidate expected
+hosts with the base branch's. After merge, reset metrics start the
 normal ten-point warmup again; a missing candidate file alone does not reset a base-branch
 history.
+
+### Expected benchmark hosts
+
+Each tracked series names the host that measured its history in `data/<platform>-host.json`,
+such as [`data/windows-whp-virtual-machine-host.json`](../data/windows-whp-virtual-machine-host.json).
+The file is the identity of that host's provenance: the runner and machine names; the CPU's
+vendor, family, model, stepping, brand string, and microcode revision; the logical processors
+and memory; the operating system with its kernel release, or its Windows build and UBR; the
+Azure VM size and the Azure disks that can back the benchmark's volumes; and the mount point,
+file system, and system-volume flag of the workspace, temporary, and scratch volumes. The OS
+disk counts when a volume is the system volume, and the data and temporary disks when a volume
+is on another disk, so the data disk of a Linux runner, whose scratch is on tmpfs, doesn't.
+Paths, device names, SCSI addresses, and volume sizes are left out because they differ between
+identical VMs.
+
+Before its first benchmark, the platform job's `Check Linux benchmark host` or `Check Windows
+benchmark host` step runs `nvx.py performance check-host`, which compares the runner with the
+file. Each field is required or advisory:
+
+| Property | Required | Advisory |
+| --- | --- | --- |
+| CPU | Vendor, family, model, stepping, and brand string | Microcode revision |
+| Processors and memory | Logical processors; memory within 5% | |
+| Linux | Kernel major and minor version and flavor, the release tokens that contain letters, such as `mshv3` and `azl3` | Kernel patch release |
+| Windows | Build, such as `10.0.26100` | Cumulative-update revision (UBR) |
+| Azure | VM size; each disk's SKU, size, caching, write accelerator, ephemeral option, and limits | |
+| Volumes | Mount point, file system, and system-volume flag | |
+| Runner | | Runner and machine names |
+
+A required difference fails the job before it measures. Its error annotation lists every
+difference, and the step summary compares each property and shows the runner's host file,
+which the diagnostics artifact also keeps as `<platform>-host.json`. The memory tolerance
+absorbs kernel reservations, which differ between VMs of one size: the KVM and MSHV runners,
+both `Standard_D8s_v5`, report 31.3 and 30.9 GiB. The kernel flavor is required because the
+`azure-mshv-scus` runners of #415, on `6.6.137.mshv2-2.azl3` rather than `6.6.148-200.azl3`,
+measured guest-exit teardown several times slower. An advisory difference, such as a
+microcode or Windows cumulative update, a kernel patch release, or a VM replaced by an
+identical one, only warns. To acknowledge it, replace the file with the runner's host; that
+needs no history reset.
+
+`performance collect` writes the host that results record next to them as
+`<platform>-host.json`. It refuses inputs of which only some record a host, and refuses to
+collect results of two hosts, or results with and without a recorded host, into one directory. `performance persist` refuses to append results
+whose recorded host differs from the history's `<platform>-host.json` in a required field, or
+that record no host for a history that records one. `Persist performance baseline` also passes
+`--require-host`, which requires both host files, as a backstop for `dev` pushes.
+
+To accept a new host, for example after a redeploy, resize, reimage, or OS update changed a
+required property, or after the `benchmark` label moved to a runner whose host differs, open a
+pull request that, in one change:
+
+1. Replaces `data/<platform>-host.json` with the runner's host from the failed check's step
+   summary or diagnostics artifact.
+2. Resets the series by truncating each of its history files, such as
+   `data/<platform>-microvm-v2-1vcpu.csv`, to its header line.
+
+The pull request's platform job compares the runner with the new file, and the gate treats the
+reset metrics as warmup. The gate compares the pull request's expected hosts with the base
+branch's and fails when a required property changed while the series' history files keep any
+row, of any metric, so that the new host's results never extend the previous host's history.
+After the merge, `dev` pushes restart the series' ten-point warmup.
 
 ## Lifecycle methodology
 

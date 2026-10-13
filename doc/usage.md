@@ -45,7 +45,7 @@ python3 scripts/nvx.py performance gate --help
 | `run` | Run an OpenVMM microVM. |
 | `sandbox` | Run or manage workloads over EROFS layers and private ext4 scratch. |
 | `benchmark` | Run the OpenVMM-native benchmark coordinator. |
-| `performance` | Collect, gate, and persist CI performance results. |
+| `performance` | Collect, gate, and persist CI performance results, and check benchmark hosts. |
 | `collect-sources` | Materialize verified Linux, Alpine, and Ubuntu release sources. |
 | `collect-alpine-sources` | Collect exact Alpine recipes and upstream sources. |
 | `collect-ubuntu-sources` | Collect exact Ubuntu source packages. |
@@ -825,6 +825,12 @@ command names that attempt.
 diagnostics, the benchmark host provenance, and any snapshot-generation storage
 telemetry. With `--lifecycle-attempt-log`, it also lists every attempt, marks
 the published one, and reports the telemetry of rejected attempts.
+When the inputs record the benchmark host, the command also writes it to
+`--output-dir` as `<platform>-host.json`, the format of an
+[expected benchmark host](benchmarks.md#expected-benchmark-hosts). It fails if
+only some inputs record a host, if the inputs, or a host file already in
+`--output-dir`, record another host, and if `--output-dir` would mix results
+that record a host with results that record none.
 
 #### `performance validate-openvmm`
 
@@ -855,7 +861,8 @@ python3 scripts/nvx.py performance collect-openvmm
 ```
 
 Converts a complete 128 MiB, guest-exit OpenVMM `e2e` result into an
-eight-metric lifecycle p50 CSV.
+eight-metric lifecycle p50 CSV. Like `performance collect`, it writes the
+recorded benchmark host to `--output-dir` as `<platform>-host.json`.
 
 #### `performance gate`
 
@@ -877,7 +884,10 @@ Checks target p50 values for regressions against rolling baseline histories.
 available window and treats metrics with insufficient history as warmups.
 `--summary` writes a Markdown summary.
 `--history-reset-dir` names tracked candidate histories; metrics removed from
-an existing history file restart baseline warmup.
+an existing history file restart baseline warmup. When a candidate expected
+host, `<platform>-host.json` in `--history-reset-dir`, differs from the one in
+`--baseline-dir` in a required property, the gate fails unless the candidate
+history files keep no row of that series, of any metric.
 
 #### `performance persist`
 
@@ -886,10 +896,41 @@ python3 scripts/nvx.py performance persist
     --source-dir PATH
     --history-dir PATH
     [--exclude-metric NAME]...
+    [--require-host]
 ```
 
 Appends current p50 values to branch history. Repeat `--exclude-metric` to omit
-more than one metric.
+more than one metric. When both directories contain a platform's host file,
+`<platform>-host.json`, the command refuses to append that platform's results
+if their recorded host differs from the history's in a required property, and
+warns about advisory differences. It also refuses results without a host file
+for a history that has one. `--require-host` requires both files for every
+platform.
+
+#### `performance check-host`
+
+```text
+python3 scripts/nvx.py performance check-host
+    --platform PLATFORM
+    --history-dir PATH
+    [--scratch-dir PATH]
+    [--output PATH]
+    [--summary PATH]
+```
+
+Compares this host with the expected host of the `PLATFORM` series,
+`<platform>-host.json` in `--history-dir`, as CI does before it measures the
+series; see [Expected benchmark hosts](benchmarks.md#expected-benchmark-hosts).
+The command exits with status 1 when a required property, such as the CPU, the
+VM size, the OS build, or a benchmark disk or volume, differs, and with status
+2 when the expected host is missing or malformed. An advisory difference, such
+as the microcode revision or a Windows cumulative update, only warns. The
+command prints every compared property, and reports the required and the
+advisory differences as one GitHub Actions error and one warning annotation.
+`--scratch-dir` names the benchmark scratch directory whose volume the
+benchmarks will use; it defaults to the system temporary directory. `--output`
+writes this host in the host-file format, ready to replace the expected host,
+and `--summary` appends a Markdown comparison that includes it.
 
 ## Source and package commands
 

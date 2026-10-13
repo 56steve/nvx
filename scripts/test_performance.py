@@ -2,6 +2,7 @@
 # pyright: reportPrivateUsage=false
 
 import contextlib
+import copy
 import io
 import json
 import re
@@ -9,13 +10,14 @@ import statistics
 import sys
 import tempfile
 import unittest
+from collections.abc import Sequence
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parent))
 import nvx  # noqa: E402
-from nvx_tools import benchmark, performance  # noqa: E402
+from nvx_tools import benchmark, benchmark_host, performance  # noqa: E402
 from nvx_tools.common import sha256_file  # noqa: E402
 
 COLD_START_LOG = """
@@ -238,6 +240,135 @@ BENCHMARK_HOST: dict[str, object] = {
         }
     },
 }
+# The provenance that the KVM and WHP benchmark runners recorded in run
+# 38377573110, with the CPU signatures and OS builds that doctor H2 reported.
+KVM_RUNNER_HOST: dict[str, object] = {
+    "schema_version": 1,
+    "runner_name": "azure-kvm-3",
+    "machine_name": "esaurez-nvx-ci-linux-kvm-vmss000003",
+    "os": "Linux-6.6.157.1-1.azl3-x86_64-with-glibc2.38",
+    "os_version": {"system": "Linux", "release": "6.6.157.1-1.azl3", "revision": None},
+    "cpu_model": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+    "cpu": {
+        "vendor": "GenuineIntel",
+        "family": 6,
+        "model": 106,
+        "stepping": 6,
+        "microcode": "0xffffffff",
+    },
+    "logical_processors": 8,
+    "memory_bytes": 33605677056,
+    "azure": {
+        "vm_size": "Standard_D8s_v5",
+        "os_disk": {
+            "storage_account_type": "Premium_LRS",
+            "size_gib": 128,
+            "caching": "ReadWrite",
+            "write_accelerator_enabled": False,
+            "ephemeral_option": None,
+        },
+        "data_disks": [
+            {
+                "lun": 0,
+                "storage_account_type": "Premium_LRS",
+                "size_gib": 512,
+                "caching": "None",
+                "write_accelerator_enabled": False,
+                "ephemeral_option": None,
+                "bytes_per_second_throttle": None,
+                "ops_per_second_throttle": None,
+            }
+        ],
+        "resource_disk_size_kib": 0,
+    },
+    "volumes": {
+        "workspace": {
+            "path": "/opt/nvx-runner/_work/nvx/nvx",
+            "volume": "/",
+            "filesystem": "ext4",
+            "system_volume": True,
+            "size_bytes": 134618656768,
+            "device": "sda3",
+            "disk": "sda",
+            "scsi_address": "0:0:0:0",
+        },
+        "temporary": {
+            "path": "/tmp",
+            "volume": "/tmp",
+            "filesystem": "tmpfs",
+            "system_volume": False,
+            "size_bytes": 16802840576,
+        },
+        "scratch": {
+            "path": "/tmp",
+            "volume": "/tmp",
+            "filesystem": "tmpfs",
+            "system_volume": False,
+            "size_bytes": 16802840576,
+        },
+    },
+}
+WHP_RUNNER_HOST: dict[str, object] = {
+    **copy.deepcopy(KVM_RUNNER_HOST),
+    "runner_name": "azure-windows-5",
+    "machine_name": "vmssvaoan000004",
+    "os": "Windows-2025Server-10.0.26100-SP0",
+    "os_version": {"system": "Windows", "release": "10.0.26100", "revision": 33438},
+    "memory_bytes": 34301759488,
+    "azure": {
+        **copy.deepcopy(cast(dict[str, object], KVM_RUNNER_HOST["azure"])),
+        "os_disk": {
+            "storage_account_type": "Premium_LRS",
+            "size_gib": 128,
+            "caching": "None",
+            "write_accelerator_enabled": False,
+            "ephemeral_option": None,
+        },
+    },
+    "volumes": {
+        "workspace": {
+            "path": "C:\\actions-runner\\_work\\nvx\\nvx",
+            "volume": "C:",
+            "filesystem": "NTFS",
+            "size_bytes": 135771664384,
+            "system_volume": True,
+            "disk_number": 0,
+            "scsi_address": "0:0:0:0",
+        },
+        "temporary": {
+            "path": "C:\\Windows\\ServiceProfiles\\NetworkService\\AppData\\Local\\Temp",
+            "volume": "C:",
+            "filesystem": "NTFS",
+            "size_bytes": 135771664384,
+            "system_volume": True,
+            "disk_number": 0,
+            "scsi_address": "0:0:0:0",
+        },
+        "scratch": {
+            "path": "F:\\nvx-benchmark-scratch\\windows-whp-virtual-machine-1-1",
+            "volume": "F:",
+            "filesystem": "NTFS",
+            "size_bytes": 549721206784,
+            "system_volume": False,
+            "disk_number": 1,
+            "scsi_address": "1:0:0:0",
+        },
+    },
+}
+KVM_SERIES = "linux-kvm-virtual-machine"
+WHP_SERIES = "windows-whp-virtual-machine"
+
+
+def changed_host(
+    host: dict[str, object], path: Sequence[str | int], value: object
+) -> dict[str, object]:
+    """Return a copy of ``host`` with the value at ``path`` replaced."""
+    result = copy.deepcopy(host)
+    parent: Any = result
+    for key in path[:-1]:
+        parent = parent[key]
+    parent[path[-1]] = value
+    return result
 
 
 def profiled_lifecycle_document(
@@ -928,6 +1059,17 @@ class PerformanceTests(unittest.TestCase):
             logs.mkdir()
             (logs / "cold-start.log").write_text(COLD_START_LOG, encoding="utf-8")
             (logs / "virtfs.log").write_text(VIRTFS_LOG, encoding="utf-8")
+            # The workload records the host that the lifecycle attempts record.
+            (logs / performance.BENCHMARK_METADATA_FILENAME).write_text(
+                json.dumps(
+                    {
+                        "backend": "whp",
+                        "memory_mib": {"lifecycle": 128},
+                        "host": BENCHMARK_HOST,
+                    }
+                ),
+                encoding="utf-8",
+            )
             log = root / "acceptance-attempts.json"
             for index, document in enumerate(
                 (
@@ -2421,6 +2563,917 @@ class PerformanceTests(unittest.TestCase):
                 lifecycle_input=lifecycle_path,
             )
             self.assertTrue(result.is_file())
+
+
+class BenchmarkHostTests(unittest.TestCase):
+    def identity(
+        self, host: dict[str, object], platform: str = KVM_SERIES
+    ) -> dict[str, object]:
+        return benchmark_host.host_identity(platform, host)
+
+    def compare(
+        self,
+        expected: dict[str, object],
+        actual: dict[str, object],
+        platform: str = KVM_SERIES,
+    ) -> list[benchmark_host.HostField]:
+        return benchmark_host.compare_hosts(
+            self.identity(expected, platform), self.identity(actual, platform)
+        )
+
+    def test_identity_keeps_only_what_identifies_a_benchmark_host(self):
+        kvm = self.identity(KVM_RUNNER_HOST)
+
+        self.assertEqual(kvm["platform"], KVM_SERIES)
+        self.assertEqual(kvm["runner_name"], "azure-kvm-3")
+        self.assertEqual(
+            kvm["cpu"],
+            {
+                "vendor": "GenuineIntel",
+                "family": 6,
+                "model": 106,
+                "stepping": 6,
+                "brand": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+                "microcode": "0xffffffff",
+            },
+        )
+        self.assertEqual(kvm["logical_processors"], 8)
+        self.assertEqual(kvm["memory_gib"], 31.3)
+        self.assertEqual(
+            kvm["os"],
+            {"system": "Linux", "release": "6.6.157.1-1.azl3", "revision": None},
+        )
+        # Paths, device names, SCSI addresses, and sizes differ between
+        # identical VMs.
+        tmpfs = {"volume": "/tmp", "filesystem": "tmpfs", "system_volume": False}
+        self.assertEqual(
+            kvm["volumes"],
+            {
+                "workspace": {
+                    "volume": "/",
+                    "filesystem": "ext4",
+                    "system_volume": True,
+                },
+                "temporary": tmpfs,
+                "scratch": tmpfs,
+            },
+        )
+        # A Linux runner's volumes are on the OS disk and tmpfs, so its data
+        # disk is not part of its identity; WHP scratch is on a data disk.
+        self.assertEqual(
+            kvm["azure"],
+            {
+                "vm_size": "Standard_D8s_v5",
+                "os_disk": {
+                    "storage_account_type": "Premium_LRS",
+                    "size_gib": 128,
+                    "caching": "ReadWrite",
+                    "write_accelerator_enabled": False,
+                    "ephemeral_option": None,
+                },
+            },
+        )
+        whp = self.identity(WHP_RUNNER_HOST, WHP_SERIES)
+        self.assertEqual(
+            set(cast(dict[str, object], whp["azure"])),
+            {"vm_size", "os_disk", "data_disks", "resource_disk_size_kib"},
+        )
+        self.assertEqual(cast(dict[str, object], whp["os"])["revision"], 33438)
+        with tempfile.TemporaryDirectory() as temporary:
+            path = benchmark_host.host_file(Path(temporary), WHP_SERIES)
+            benchmark_host.write_host(path, whp)
+            self.assertEqual(benchmark_host.read_host(path, WHP_SERIES), whp)
+
+    def test_tracked_expected_hosts_describe_each_ci_series(self):
+        repository = Path(__file__).parents[1]
+        series = re.findall(
+            r"^[ \t]*benchmark-platform:[ \t]*(\S+)[ \t]*$",
+            (repository / ".github" / "workflows" / "ci.yml").read_text(
+                encoding="utf-8"
+            ),
+            re.MULTILINE,
+        )
+
+        self.assertTrue(series)
+        for platform in series:
+            with self.subTest(platform=platform):
+                path = benchmark_host.host_file(repository / "data", platform)
+                host = benchmark_host.read_host(path, platform)
+                text = path.read_bytes().decode("utf-8").replace("\r\n", "\n")
+                self.assertEqual(text, benchmark_host.format_host(host))
+                cpu = cast(dict[str, object], host["cpu"])
+                system = cast(dict[str, object], host["os"])
+                azure = cast(dict[str, object], host["azure"])
+                required = {
+                    "cpu.vendor": cpu["vendor"],
+                    "cpu.family": cpu["family"],
+                    "cpu.model": cpu["model"],
+                    "cpu.stepping": cpu["stepping"],
+                    "cpu.brand": cpu["brand"],
+                    "logical_processors": host["logical_processors"],
+                    "memory_gib": host["memory_gib"],
+                    "os.system": system["system"],
+                    "os.release": system["release"],
+                    "azure.vm_size": azure["vm_size"],
+                }
+                for field, value in required.items():
+                    self.assertIsNotNone(value, field)
+                self.assertEqual(
+                    tuple(cast(dict[str, object], host["volumes"])),
+                    benchmark_host.VOLUME_ROLES,
+                )
+                if system["system"] == "Windows":
+                    self.assertIsNotNone(system["revision"])
+
+    def test_identical_hosts_match_within_the_memory_tolerance(self):
+        # Kernels reserve different amounts of a VM's memory: the same VM
+        # size reported 30.9 and 31.3 GiB on the MSHV and KVM runners.
+        fields = self.compare(
+            KVM_RUNNER_HOST,
+            changed_host(KVM_RUNNER_HOST, ("memory_bytes",), 33186406400),
+        )
+
+        self.assertEqual(
+            [field.label for field in fields],
+            [
+                "Runner",
+                "Machine",
+                "CPU signature",
+                "CPU model",
+                "CPU microcode",
+                "Logical processors",
+                "Memory",
+                "Operating system",
+                "Linux kernel",
+                "Azure VM size",
+                "Azure OS disk",
+                "Workspace volume",
+                "Temporary-directory volume",
+                "Benchmark scratch volume",
+            ],
+        )
+        self.assertEqual({field.result for field in fields}, {benchmark_host.MATCH})
+        memory = next(field for field in fields if field.label == "Memory")
+        self.assertEqual((memory.expected, memory.actual), ("31.3 GiB", "30.9 GiB"))
+
+    def test_each_required_difference_is_a_mismatch(self):
+        windows_scratch = {
+            "path": "C:\\Windows\\Temp",
+            "volume": "C:",
+            "filesystem": "NTFS",
+            "system_volume": True,
+            "disk_number": 0,
+        }
+        cases: tuple[
+            tuple[dict[str, object], Sequence[str | int], object, set[str]], ...
+        ] = (
+            # An Emerald Rapids host of the same VM size (#383, #426).
+            (KVM_RUNNER_HOST, ("cpu", "model"), 207, {"CPU signature"}),
+            (KVM_RUNNER_HOST, ("cpu", "stepping"), 7, {"CPU signature"}),
+            (
+                KVM_RUNNER_HOST,
+                ("cpu_model",),
+                "INTEL(R) XEON(R) PLATINUM 8573C",
+                {"CPU model"},
+            ),
+            (KVM_RUNNER_HOST, ("logical_processors",), 16, {"Logical processors"}),
+            (KVM_RUNNER_HOST, ("memory_bytes",), 2 * 33605677056, {"Memory"}),
+            # Another kernel version, or the flavor of #415's runners.
+            (
+                KVM_RUNNER_HOST,
+                ("os_version", "release"),
+                "6.12.40.1-1.azl3",
+                {"Linux kernel"},
+            ),
+            (
+                KVM_RUNNER_HOST,
+                ("os_version", "release"),
+                "6.6.137.mshv2-2.azl3",
+                {"Linux kernel"},
+            ),
+            (
+                WHP_RUNNER_HOST,
+                ("os_version", "release"),
+                "10.0.26200",
+                {"Windows build"},
+            ),
+            (
+                KVM_RUNNER_HOST,
+                ("azure", "vm_size"),
+                "Standard_D8ds_v5",
+                {"Azure VM size"},
+            ),
+            (
+                KVM_RUNNER_HOST,
+                ("azure", "os_disk", "caching"),
+                "None",
+                {"Azure OS disk"},
+            ),
+            (
+                KVM_RUNNER_HOST,
+                ("azure", "os_disk", "storage_account_type"),
+                "StandardSSD_LRS",
+                {"Azure OS disk"},
+            ),
+            (
+                WHP_RUNNER_HOST,
+                ("azure", "data_disks", 0, "size_gib"),
+                1024,
+                {"Azure data disks"},
+            ),
+            (
+                WHP_RUNNER_HOST,
+                ("azure", "data_disks", 0, "caching"),
+                "ReadOnly",
+                {"Azure data disks"},
+            ),
+            (
+                KVM_RUNNER_HOST,
+                ("volumes", "scratch", "filesystem"),
+                "ext4",
+                {"Benchmark scratch volume"},
+            ),
+            # Scratch on the system disk leaves the data disks unused.
+            (
+                WHP_RUNNER_HOST,
+                ("volumes", "scratch"),
+                windows_scratch,
+                {
+                    "Benchmark scratch volume",
+                    "Azure data disks",
+                    "Azure temporary disk",
+                },
+            ),
+            # Values that cannot be read fail closed.
+            (KVM_RUNNER_HOST, ("cpu", "vendor"), None, {"CPU signature"}),
+            (
+                KVM_RUNNER_HOST,
+                ("azure",),
+                {"error": "Azure instance metadata is unavailable: timed out"},
+                {"Azure VM size", "Azure OS disk"},
+            ),
+            (KVM_RUNNER_HOST, ("azure",), None, {"Azure VM size"}),
+        )
+        for host, path, value, labels in cases:
+            platform = WHP_SERIES if host is WHP_RUNNER_HOST else KVM_SERIES
+            with self.subTest(path=path, value=value):
+                fields = self.compare(host, changed_host(host, path, value), platform)
+                self.assertEqual(
+                    {field.label for field in benchmark_host.mismatches(fields)},
+                    labels,
+                )
+                self.assertEqual(benchmark_host.drift(fields), [])
+
+    def test_advisory_differences_only_drift(self):
+        cases: tuple[tuple[dict[str, object], Sequence[str], object, str], ...] = (
+            (KVM_RUNNER_HOST, ("runner_name",), "azure-kvm-1", "Runner"),
+            (
+                KVM_RUNNER_HOST,
+                ("machine_name",),
+                "esaurez-nvx-ci-linux-kvm-vmss000001",
+                "Machine",
+            ),
+            (KVM_RUNNER_HOST, ("cpu", "microcode"), "0xd0003e7", "CPU microcode"),
+            (
+                KVM_RUNNER_HOST,
+                ("os_version", "release"),
+                "6.6.160.1-2.azl3",
+                "Linux kernel",
+            ),
+            (WHP_RUNNER_HOST, ("os_version", "revision"), 33500, "Windows build"),
+        )
+        for host, path, value, label in cases:
+            platform = WHP_SERIES if host is WHP_RUNNER_HOST else KVM_SERIES
+            with self.subTest(path=path):
+                fields = self.compare(host, changed_host(host, path, value), platform)
+                self.assertEqual(benchmark_host.mismatches(fields), [])
+                self.assertEqual(
+                    [field.label for field in benchmark_host.drift(fields)], [label]
+                )
+
+    def test_kernel_series_keeps_the_version_and_flavor(self):
+        for release, series in (
+            ("6.6.157.1-1.azl3", "6.6 azl3"),
+            ("6.6.148-200.azl3", "6.6 azl3"),
+            ("6.6.137.mshv2-2.azl3", "6.6 mshv2 azl3"),
+            ("6.18.34.mshv3-1.azl3", "6.18 mshv3 azl3"),
+            ("6.8.0-1015-azure", "6.8 azure"),
+        ):
+            with self.subTest(release=release):
+                self.assertEqual(benchmark_host.kernel_series(release), series)
+
+    def test_host_files_reject_unknown_and_malformed_fields(self):
+        host = self.identity(KVM_RUNNER_HOST)
+        cpu = cast(dict[str, object], host["cpu"])
+        cases: tuple[tuple[object, str], ...] = (
+            ({**host, "surface_digest": "sha256:0"}, "surface_digest is missing"),
+            ({**host, "cpu": {**cpu, "family": "6"}}, "cpu.family is missing"),
+            ({**host, "memory_gib": True}, "memory_gib is missing"),
+            (
+                {key: value for key, value in host.items() if key != "volumes"},
+                "volumes is missing",
+            ),
+            ({**host, "platform": WHP_SERIES}, "describes platform"),
+            ([host], "the document is missing"),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "host.json"
+            for document, message in cases:
+                with self.subTest(message=message):
+                    path.write_text(json.dumps(document), encoding="utf-8")
+                    with self.assertRaisesRegex(
+                        benchmark_host.HostFileError, re.escape(message)
+                    ):
+                        benchmark_host.read_host(path, KVM_SERIES)
+            path.write_text("{", encoding="utf-8")
+            with self.assertRaisesRegex(benchmark_host.HostFileError, "cannot read"):
+                benchmark_host.read_host(path, KVM_SERIES)
+            with self.assertRaisesRegex(benchmark_host.HostFileError, "does not exist"):
+                benchmark_host.read_host(path.with_name("missing.json"), KVM_SERIES)
+
+    def check_host(
+        self, root: Path, provenance: dict[str, object], *, expected: bool = True
+    ) -> tuple[int, str, str, dict[str, object]]:
+        history = root / "data"
+        if expected:
+            benchmark_host.write_host(
+                benchmark_host.host_file(history, KVM_SERIES),
+                self.identity(KVM_RUNNER_HOST),
+            )
+        scratch = root / "scratch"
+        scratch.mkdir()
+        output = root / "runs" / f"{KVM_SERIES}-host.json"
+        summary = root / "summary.md"
+        stdout = io.StringIO()
+        with (
+            patch.object(
+                performance.host_telemetry,
+                "host_provenance",
+                return_value=copy.deepcopy(provenance),
+            ) as collect,
+            contextlib.redirect_stdout(stdout),
+        ):
+            status = performance.check_host(
+                KVM_SERIES,
+                history,
+                scratch_dir=scratch,
+                output=output,
+                summary_path=summary,
+            )
+        collect.assert_called_once_with(benchmark_host.benchmark_volumes(scratch))
+        return (
+            status,
+            stdout.getvalue(),
+            summary.read_text(encoding="utf-8"),
+            json.loads(output.read_text(encoding="utf-8")),
+        )
+
+    def test_check_host_fails_and_lists_every_required_difference(self):
+        # azure-kvm-3 back on an Emerald Rapids host with #415's kernel.
+        provenance = changed_host(KVM_RUNNER_HOST, ("cpu", "model"), 207)
+        provenance = changed_host(provenance, ("cpu", "stepping"), 2)
+        provenance = changed_host(
+            provenance, ("cpu_model",), "INTEL(R) XEON(R) PLATINUM 8573C"
+        )
+        provenance = changed_host(
+            provenance, ("os_version", "release"), "6.6.137.mshv2-2.azl3"
+        )
+        provenance = changed_host(
+            provenance, ("machine_name",), "esaurez-nvx-ci-linux-kvm-vmss000009"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            status, output, summary, actual = self.check_host(
+                Path(temporary), provenance
+            )
+
+        self.assertEqual(status, 1)
+        errors = [line for line in output.splitlines() if line.startswith("::error")]
+        self.assertEqual(len(errors), 1)
+        self.assertTrue(errors[0].startswith("::error title=Benchmark host mismatch::"))
+        for difference in (
+            "CPU signature: expected GenuineIntel 6/106/6, found GenuineIntel 6/207/2",
+            "CPU model: expected Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz, "
+            "found INTEL(R) XEON(R) PLATINUM 8573C",
+            "Linux kernel: expected 6.6.157.1-1.azl3, found 6.6.137.mshv2-2.azl3",
+        ):
+            self.assertIn(difference, errors[0])
+        self.assertIn("in 3 required field(s)", errors[0])
+        self.assertNotIn("Machine", errors[0])
+        warnings = [
+            line for line in output.splitlines() if line.startswith("::warning")
+        ]
+        self.assertEqual(len(warnings), 1)
+        self.assertIn(
+            "Machine: expected esaurez-nvx-ci-linux-kvm-vmss000003, "
+            "found esaurez-nvx-ci-linux-kvm-vmss000009",
+            warnings[0],
+        )
+        self.assertEqual(actual, self.identity(provenance))
+        self.assertIn("**mismatch** (3 required field(s) differ)", summary)
+        self.assertIn(
+            "| CPU signature | GenuineIntel 6/106/6 | GenuineIntel 6/207/2 | "
+            "**mismatch** |",
+            summary,
+        )
+        self.assertIn("| Machine | esaurez-nvx-ci-linux-kvm-vmss000003 |", summary)
+        self.assertIn("accept the host", summary)
+        self.assertIn(benchmark_host.format_host(actual), summary)
+
+    def test_check_host_warns_about_advisory_drift(self):
+        provenance = changed_host(KVM_RUNNER_HOST, ("cpu", "microcode"), "0xd0003e7")
+        with tempfile.TemporaryDirectory() as temporary:
+            status, output, summary, _ = self.check_host(Path(temporary), provenance)
+
+        self.assertEqual(status, 0)
+        self.assertNotIn("::error", output)
+        self.assertIn(
+            "::warning title=Benchmark host drift::Linux / KVM / Virtual machine: "
+            "this runner differs from ",
+            output,
+        )
+        self.assertIn(
+            "CPU microcode: expected 0xffffffff, found 0xd0003e7. Update the file",
+            output,
+        )
+        self.assertIn("match with drift (1 advisory field(s) differ)", summary)
+        self.assertIn("needs no history reset", summary)
+
+    def test_check_host_passes_on_the_expected_host(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            status, output, summary, actual = self.check_host(
+                Path(temporary), KVM_RUNNER_HOST
+            )
+
+        self.assertEqual(status, 0)
+        self.assertNotIn("::", output)
+        self.assertIn(
+            "Benchmark host check for linux-kvm-virtual-machine: match", output
+        )
+        self.assertIn("`: match.", summary)
+        self.assertEqual(actual, self.identity(KVM_RUNNER_HOST))
+
+    def test_check_host_requires_an_expected_host(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            status, output, summary, actual = self.check_host(
+                Path(temporary), KVM_RUNNER_HOST, expected=False
+            )
+
+        self.assertEqual(status, 2)
+        self.assertIn("::error title=Benchmark host::", output)
+        self.assertIn("linux-kvm-virtual-machine-host.json does not exist", output)
+        self.assertIn("**No valid expected host**", summary)
+        self.assertIn(benchmark_host.format_host(actual), summary)
+
+    def test_check_host_compares_before_writing_over_the_expected_host(self):
+        # --output may name the expected host file itself.
+        provenance = changed_host(KVM_RUNNER_HOST, ("cpu", "model"), 207)
+        with tempfile.TemporaryDirectory() as temporary:
+            history = Path(temporary)
+            expected = benchmark_host.host_file(history, KVM_SERIES)
+            benchmark_host.write_host(expected, self.identity(KVM_RUNNER_HOST))
+            stdout = io.StringIO()
+            with (
+                patch.object(
+                    performance.host_telemetry,
+                    "host_provenance",
+                    return_value=provenance,
+                ),
+                contextlib.redirect_stdout(stdout),
+            ):
+                status = performance.check_host(KVM_SERIES, history, output=expected)
+
+            self.assertEqual(status, 1)
+            self.assertIn("::error title=Benchmark host mismatch::", stdout.getvalue())
+            self.assertEqual(
+                benchmark_host.read_host(expected, KVM_SERIES),
+                self.identity(provenance),
+            )
+
+    def test_check_host_cli(self):
+        args = nvx.parse_args(
+            [
+                "performance",
+                "check-host",
+                "--platform",
+                KVM_SERIES,
+                "--history-dir",
+                "data",
+                "--scratch-dir",
+                "scratch",
+                "--output",
+                "host.json",
+                "--summary",
+                "summary.md",
+            ]
+        )
+        with patch.object(performance, "check_host", return_value=1) as check:
+            self.assertEqual(args.handler(args), 1)
+
+        check.assert_called_once_with(
+            KVM_SERIES,
+            Path("data"),
+            scratch_dir=Path("scratch"),
+            output=Path("host.json"),
+            summary_path=Path("summary.md"),
+        )
+        self.assertTrue(
+            nvx.parse_args(
+                [
+                    "performance",
+                    "persist",
+                    "--source-dir",
+                    "results",
+                    "--history-dir",
+                    "data",
+                    "--require-host",
+                ]
+            ).require_host
+        )
+
+    def test_annotations_escape_workflow_command_data(self):
+        self.assertEqual(
+            performance._annotation("error", "Host: a, b", "100%\nfound"),
+            "::error title=Host%3A a%2C b::100%25%0Afound",
+        )
+
+    def test_collect_records_the_host_of_its_results(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "acceptance.json"
+            document = lifecycle_document()
+            document["host"] = KVM_RUNNER_HOST
+            source.write_text(json.dumps(document), encoding="utf-8")
+            results = root / "results"
+
+            performance.collect_openvmm_results(KVM_SERIES, "first", source, results)
+
+            path = benchmark_host.host_file(results, KVM_SERIES)
+            self.assertEqual(
+                benchmark_host.read_host(path, KVM_SERIES),
+                self.identity(KVM_RUNNER_HOST),
+            )
+            # Another host's results cannot join them.
+            document["host"] = changed_host(
+                KVM_RUNNER_HOST, ("machine_name",), "esaurez-nvx-ci-linux-kvm-vmss1"
+            )
+            source.write_text(json.dumps(document), encoding="utf-8")
+            with self.assertRaisesRegex(
+                performance.PerformanceError,
+                "records another host than .*Machine: expected",
+            ):
+                performance.collect_openvmm_results(
+                    KVM_SERIES, "second", source, results
+                )
+            self.assertEqual(
+                {
+                    result.commit
+                    for result in performance.read_results(
+                        results / f"{KVM_SERIES}.csv"
+                    )
+                },
+                {"first"},
+            )
+            # Results that record no host leave no host file.
+            del document["host"]
+            source.write_text(json.dumps(document), encoding="utf-8")
+            performance.collect_openvmm_results(
+                KVM_SERIES, "third", source, root / "other"
+            )
+            self.assertFalse(
+                benchmark_host.host_file(root / "other", KVM_SERIES).exists()
+            )
+            # Results with and without a recorded host never mix, in either
+            # order.
+            with self.assertRaisesRegex(
+                performance.PerformanceError,
+                "the linux-kvm-virtual-machine results record no host, but "
+                ".* records the host",
+            ):
+                performance.collect_openvmm_results(
+                    KVM_SERIES, "fourth", source, results
+                )
+            document["host"] = KVM_RUNNER_HOST
+            controls = cast(dict[str, object], document["controls"])
+            controls.update({"microvm_abi_version": 2, "processors": 1})
+            source.write_text(json.dumps(document), encoding="utf-8")
+            with self.assertRaisesRegex(
+                performance.PerformanceError,
+                "holds linux-kvm-virtual-machine results that record no host",
+            ):
+                performance.collect_openvmm_results(
+                    KVM_SERIES, "fifth", source, root / "other"
+                )
+            self.assertFalse(
+                benchmark_host.host_file(root / "other", KVM_SERIES).exists()
+            )
+
+    def test_collect_rejects_lifecycle_and_workload_results_of_two_hosts(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            logs = root / "logs"
+            logs.mkdir()
+            (logs / "cold-start.log").write_text(COLD_START_LOG, encoding="utf-8")
+            (logs / "virtfs.log").write_text(VIRTFS_LOG, encoding="utf-8")
+            (logs / performance.BENCHMARK_METADATA_FILENAME).write_text(
+                json.dumps(
+                    {
+                        "backend": "kvm",
+                        "memory_mib": {"lifecycle": 128},
+                        "host": KVM_RUNNER_HOST,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            lifecycle = lifecycle_document()
+            lifecycle["host"] = KVM_RUNNER_HOST
+            lifecycle_path = root / "acceptance.json"
+            lifecycle_path.write_text(json.dumps(lifecycle), encoding="utf-8")
+
+            performance.collect_results(
+                KVM_SERIES,
+                "commit",
+                logs,
+                root / "results",
+                lifecycle_input=lifecycle_path,
+            )
+            self.assertEqual(
+                benchmark_host.read_host(
+                    benchmark_host.host_file(root / "results", KVM_SERIES), KVM_SERIES
+                ),
+                self.identity(KVM_RUNNER_HOST),
+            )
+
+            lifecycle["host"] = changed_host(
+                KVM_RUNNER_HOST, ("cpu_model",), "INTEL(R) XEON(R) PLATINUM 8573C"
+            )
+            lifecycle_path.write_text(json.dumps(lifecycle), encoding="utf-8")
+            with self.assertRaisesRegex(
+                performance.PerformanceError, "record different hosts: CPU model"
+            ):
+                performance.collect_results(
+                    KVM_SERIES,
+                    "commit",
+                    logs,
+                    root / "other",
+                    lifecycle_input=lifecycle_path,
+                )
+            self.assertFalse((root / "other").exists())
+            # A host that only the lifecycle records doesn't vouch for the
+            # workload metrics.
+            metadata = logs / performance.BENCHMARK_METADATA_FILENAME
+            metadata.write_text(
+                json.dumps({"backend": "kvm", "memory_mib": {"lifecycle": 128}}),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                performance.PerformanceError,
+                "acceptance.json records a host, but .*benchmark-metadata.json "
+                "records none",
+            ):
+                performance.collect_results(
+                    KVM_SERIES,
+                    "commit",
+                    logs,
+                    root / "other",
+                    lifecycle_input=lifecycle_path,
+                )
+            self.assertFalse((root / "other").exists())
+
+    def write_series(
+        self,
+        directory: Path,
+        commits: Sequence[str],
+        host: dict[str, object] | None,
+        p50: float = 10.0,
+    ) -> Path:
+        path = directory / f"{KVM_SERIES}-microvm-v2-1vcpu.csv"
+        performance.write_results(
+            path,
+            [
+                performance.Result(
+                    commit, "openvmm_cold_start", "ms", "lower", p50, KVM_SERIES, 2, 1
+                )
+                for commit in commits
+            ],
+        )
+        if host is not None:
+            benchmark_host.write_host(
+                benchmark_host.host_file(directory, KVM_SERIES), self.identity(host)
+            )
+        return path
+
+    def test_persist_refuses_results_of_another_host(self):
+        new_host = changed_host(KVM_RUNNER_HOST, ("cpu", "model"), 207)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            history = self.write_series(root / "data", ["base"], KVM_RUNNER_HOST)
+            self.write_series(root / "results", ["new"], new_host)
+
+            for require_host in (True, False):
+                with self.subTest(require_host=require_host):
+                    with self.assertRaisesRegex(
+                        performance.PerformanceError,
+                        "refusing to persist the linux-kvm-virtual-machine results: "
+                        "their host differs from .* in required fields: "
+                        "CPU signature: expected GenuineIntel 6/106/6, "
+                        "found GenuineIntel 6/207/6",
+                    ):
+                        performance.persist_results(
+                            root / "results", root / "data", require_host=require_host
+                        )
+                    self.assertEqual(
+                        [row.commit for row in performance.read_results(history)],
+                        ["base"],
+                    )
+
+    def test_persist_warns_about_advisory_drift(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            history = self.write_series(root / "data", ["base"], KVM_RUNNER_HOST)
+            self.write_series(
+                root / "results",
+                ["new"],
+                changed_host(
+                    KVM_RUNNER_HOST, ("os_version", "release"), "6.6.160.1-1.azl3"
+                ),
+            )
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                performance.persist_results(
+                    root / "results", root / "data", require_host=True
+                )
+
+            self.assertIn(
+                "::warning title=Benchmark host drift::The host of the "
+                "linux-kvm-virtual-machine results differs from ",
+                stdout.getvalue(),
+            )
+            self.assertEqual(
+                [row.commit for row in performance.read_results(history)],
+                ["base", "new"],
+            )
+
+    def test_persist_requires_both_hosts_when_asked(self):
+        for recorded, expected in ((False, True), (True, False)):
+            with (
+                self.subTest(recorded=recorded, expected=expected),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                root = Path(temporary)
+                history = self.write_series(
+                    root / "data", ["base"], KVM_RUNNER_HOST if expected else None
+                )
+                self.write_series(
+                    root / "results", ["new"], KVM_RUNNER_HOST if recorded else None
+                )
+                missing = root / ("results" if not recorded else "data")
+                with self.assertRaisesRegex(
+                    performance.PerformanceError,
+                    "cannot verify the host of the linux-kvm-virtual-machine "
+                    f"results: {re.escape(str(missing))}",
+                ):
+                    performance.persist_results(
+                        root / "results", root / "data", require_host=True
+                    )
+                # Without --require-host, a history that records no host
+                # accepts any results, but results that record none never
+                # join a history that records one.
+                if recorded:
+                    performance.persist_results(root / "results", root / "data")
+                    self.assertEqual(
+                        [row.commit for row in performance.read_results(history)],
+                        ["base", "new"],
+                    )
+                else:
+                    with self.assertRaisesRegex(
+                        performance.PerformanceError, "cannot verify the host"
+                    ):
+                        performance.persist_results(root / "results", root / "data")
+                    self.assertEqual(
+                        [row.commit for row in performance.read_results(history)],
+                        ["base"],
+                    )
+
+    def gate(
+        self, root: Path, candidate_host: dict[str, object], *, reset: bool
+    ) -> tuple[int, str, str]:
+        commits = [f"base-{index}" for index in range(10)]
+        self.write_series(root / "baseline", commits, KVM_RUNNER_HOST)
+        self.write_series(root / "data", [] if reset else commits, candidate_host)
+        self.write_series(root / "results", ["pr"], candidate_host)
+        summary = root / "summary.md"
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            status = performance.gate_results(
+                root / "baseline",
+                root / "results",
+                10,
+                50,
+                summary,
+                history_reset_dir=root / "data",
+            )
+        return status, stdout.getvalue(), summary.read_text(encoding="utf-8")
+
+    def test_gate_requires_a_new_host_to_reset_its_series(self):
+        new_host = changed_host(KVM_RUNNER_HOST, ("cpu", "model"), 207)
+        with tempfile.TemporaryDirectory() as temporary:
+            status, output, summary = self.gate(Path(temporary), new_host, reset=False)
+
+        self.assertEqual(status, 1)
+        self.assertIn(
+            "This change accepts a new expected host for linux-kvm-virtual-machine, "
+            "so each of its metrics must restart its warmup: CPU signature: "
+            "expected GenuineIntel 6/106/6, found GenuineIntel 6/207/6.",
+            summary,
+        )
+        self.assertIn("**Host changed without a history reset**", summary)
+        kept = "linux-kvm-virtual-machine-microvm-v2-1vcpu.csv (10 row(s))"
+        self.assertIn(
+            "**The linux-kvm-virtual-machine series keeps the previous host's "
+            f"history**: {kept}.",
+            summary,
+        )
+        self.assertIn(
+            "::error title=Benchmark host changed without a history reset::", output
+        )
+        self.assertIn(f"keeps the previous host's history: {kept}.", output)
+
+    def test_gate_requires_a_new_host_to_reset_metrics_it_no_longer_measures(self):
+        # The change stops measuring a metric whose previous-host rows remain;
+        # a later change could measure it again on top of them.
+        new_host = changed_host(KVM_RUNNER_HOST, ("cpu", "model"), 207)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.write_series(root / "baseline", ["base"], KVM_RUNNER_HOST)
+            history = self.write_series(root / "data", [], new_host)
+            performance.write_results(
+                history,
+                [
+                    performance.Result(
+                        "base", "retired_metric", "ms", "lower", 5.0, KVM_SERIES, 2, 1
+                    )
+                ],
+            )
+            self.write_series(root / "results", ["pr"], new_host)
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                status = performance.gate_results(
+                    root / "baseline",
+                    root / "results",
+                    10,
+                    50,
+                    history_reset_dir=root / "data",
+                )
+
+        self.assertEqual(status, 1)
+        self.assertIn(
+            "keeps the previous host's history: "
+            "linux-kvm-virtual-machine-microvm-v2-1vcpu.csv (1 row(s))",
+            stdout.getvalue(),
+        )
+
+    def test_gate_warms_up_a_series_that_accepts_a_new_host(self):
+        new_host = changed_host(KVM_RUNNER_HOST, ("cpu", "model"), 207)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            status, output, summary = self.gate(root, new_host, reset=True)
+
+            self.assertEqual(status, 0)
+            self.assertNotIn("::error", output)
+            self.assertIn("Warmup (history reset)", summary)
+            # After the merge, dev appends the new host's results, and only
+            # them, to the reset history.
+            performance.persist_results(
+                root / "results", root / "data", require_host=True
+            )
+            self.assertEqual(
+                [
+                    row.commit
+                    for row in performance.read_results(
+                        root / "data" / f"{KVM_SERIES}-microvm-v2-1vcpu.csv"
+                    )
+                ],
+                ["pr"],
+            )
+            self.write_series(root / "results", ["old"], KVM_RUNNER_HOST)
+            with self.assertRaisesRegex(
+                performance.PerformanceError, "refusing to persist"
+            ):
+                performance.persist_results(
+                    root / "results", root / "data", require_host=True
+                )
+
+    def test_gate_needs_no_reset_for_advisory_host_edits(self):
+        acknowledged = changed_host(KVM_RUNNER_HOST, ("cpu", "microcode"), "0xd0003e7")
+        with tempfile.TemporaryDirectory() as temporary:
+            status, output, summary = self.gate(
+                Path(temporary), acknowledged, reset=False
+            )
+
+        self.assertEqual(status, 0)
+        self.assertNotIn("::error", output)
+        self.assertNotIn("accepts a new expected host", summary)
+        self.assertIn("| OK |", summary)
 
 
 if __name__ == "__main__":

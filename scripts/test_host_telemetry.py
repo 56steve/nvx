@@ -6,6 +6,7 @@
 import http.client
 import json
 import os
+import platform
 import struct
 import sys
 import tempfile
@@ -197,12 +198,39 @@ class AzureProvenanceTests(unittest.TestCase):
                 host_telemetry,
                 "read_azure_compute_metadata",
                 side_effect=TimeoutError("timed out"),
-            ),
+            ) as read,
         ):
             self.assertEqual(
                 host_telemetry.azure_vm_provenance(),
                 {"error": "Azure instance metadata is unavailable: timed out"},
             )
+        self.assertEqual(read.call_count, host_telemetry.AZURE_IMDS_ATTEMPTS)
+
+        # Unavailable metadata fails the benchmark host check, so a transient
+        # timeout is retried, but malformed metadata is not.
+        host_telemetry._azure_vm_provenance.cache_clear()
+        with (
+            patch.object(host_telemetry, "may_be_azure_vm", return_value=True),
+            patch.object(
+                host_telemetry,
+                "read_azure_compute_metadata",
+                side_effect=[TimeoutError("timed out"), IMDS_COMPUTE],
+            ),
+        ):
+            provenance = host_telemetry.azure_vm_provenance()
+        assert provenance is not None
+        self.assertEqual(provenance["vm_size"], "Standard_D16ds_v5")
+        host_telemetry._azure_vm_provenance.cache_clear()
+        with (
+            patch.object(host_telemetry, "may_be_azure_vm", return_value=True),
+            patch.object(
+                host_telemetry, "read_azure_compute_metadata", return_value={}
+            ) as read,
+        ):
+            provenance = host_telemetry.azure_vm_provenance()
+        assert provenance is not None
+        self.assertIn("no vmSize", str(provenance["error"]))
+        read.assert_called_once_with()
 
         # Another service on the link-local address must not fail the run.
         host_telemetry._azure_vm_provenance.cache_clear()
@@ -268,6 +296,18 @@ class HostProvenanceTests(unittest.TestCase):
         self.assertEqual(provenance["runner_name"], "azure-windows-3")
         self.assertEqual(provenance["logical_processors"], os.cpu_count())
         self.assertEqual(provenance["azure"], {"vm_size": "Standard_D16ds_v5"})
+        self.assertEqual(
+            set(cast(dict[str, object], provenance["cpu"])),
+            {"vendor", "family", "model", "stepping", "microcode"},
+        )
+        version = cast(dict[str, object], provenance["os_version"])
+        self.assertEqual(set(version), {"system", "release", "revision"})
+        if sys.platform == "win32":
+            self.assertEqual(version["release"], platform.version())
+            self.assertIsInstance(version["revision"], int)
+        else:
+            self.assertEqual(version["release"], platform.release())
+            self.assertIsNone(version["revision"])
         memory = provenance["memory_bytes"]
         self.assertIsInstance(memory, int)
         self.assertGreater(cast(int, memory), 0)
@@ -277,6 +317,122 @@ class HostProvenanceTests(unittest.TestCase):
         self.assertNotIn("error", volumes["scratch"])
         self.assertIn("volume", volumes["scratch"])
         self.assertGreater(cast(int, volumes["scratch"]["size_bytes"]), 0)
+
+    def test_reads_the_windows_cpu_signature_and_microcode(self):
+        processor = "Intel64 Family 6 Model 106 Stepping 6, GenuineIntel"
+        # The registry keeps the revision in the high doubleword.
+        revision = bytes.fromhex("00000000ffffffff")
+
+        self.assertEqual(
+            host_telemetry._windows_cpu_signature(processor, revision),
+            {
+                "vendor": "GenuineIntel",
+                "family": 6,
+                "model": 106,
+                "stepping": 6,
+                "microcode": "0xffffffff",
+            },
+        )
+        self.assertEqual(
+            host_telemetry._windows_cpu_signature(
+                "AMD64 Family 25 Model 17 Stepping 1, AuthenticAMD",
+                bytes.fromhex("01121b0a"),
+            )["microcode"],
+            "0xa1b1201",
+        )
+        self.assertEqual(
+            host_telemetry._windows_cpu_signature("", None),
+            dict.fromkeys(("vendor", "family", "model", "stepping", "microcode")),
+        )
+
+    def test_reads_the_linux_cpu_signature_and_microcode(self):
+        cpuinfo = "\n".join(
+            (
+                "processor\t: 0",
+                "vendor_id\t: GenuineIntel",
+                "cpu family\t: 6",
+                "model\t\t: 207",
+                "model name\t: INTEL(R) XEON(R) PLATINUM 8573C",
+                "stepping\t: 2",
+                "microcode\t: 0xffffffff",
+                "",
+                "processor\t: 1",
+                "vendor_id\t: AuthenticAMD",
+                "",
+            )
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "cpuinfo"
+            path.write_text(cpuinfo, encoding="utf-8")
+            with (
+                patch.object(host_telemetry, "_CPUINFO", path),
+                patch.object(host_telemetry.sys, "platform", "linux"),
+            ):
+                signature = host_telemetry.cpu_signature()
+                model = host_telemetry.cpu_model()
+
+        self.assertEqual(
+            signature,
+            {
+                "vendor": "GenuineIntel",
+                "family": 6,
+                "model": 207,
+                "stepping": 2,
+                "microcode": "0xffffffff",
+            },
+        )
+        self.assertEqual(model, "INTEL(R) XEON(R) PLATINUM 8573C")
+        self.assertEqual(
+            host_telemetry._linux_cpu_signature({"vendor_id": "GenuineIntel"}),
+            {
+                "vendor": "GenuineIntel",
+                "family": None,
+                "model": None,
+                "stepping": None,
+                "microcode": None,
+            },
+        )
+
+    def test_os_version_records_the_kernel_release_or_windows_update_revision(self):
+        def registry(key: str, name: str) -> object:
+            self.assertEqual(
+                (key, name),
+                (r"SOFTWARE\Microsoft\Windows NT\CurrentVersion", "UBR"),
+            )
+            return 33438
+
+        with (
+            patch.object(host_telemetry.sys, "platform", "win32"),
+            patch.object(host_telemetry.platform, "version", return_value="10.0.26100"),
+            patch.object(
+                host_telemetry, "_windows_registry_value", side_effect=registry
+            ),
+        ):
+            self.assertEqual(
+                host_telemetry.os_version(),
+                {"system": "Windows", "release": "10.0.26100", "revision": 33438},
+            )
+        with (
+            patch.object(host_telemetry.sys, "platform", "win32"),
+            patch.object(host_telemetry.platform, "version", return_value="10.0.26100"),
+            patch.object(
+                host_telemetry,
+                "_windows_registry_value",
+                side_effect=FileNotFoundError("UBR"),
+            ),
+        ):
+            self.assertIsNone(host_telemetry.os_version()["revision"])
+        with (
+            patch.object(host_telemetry.sys, "platform", "linux"),
+            patch.object(host_telemetry.platform, "system", return_value="Linux"),
+            patch.object(
+                host_telemetry.platform, "release", return_value="6.6.157.1-1.azl3"
+            ),
+        ):
+            self.assertEqual(
+                host_telemetry.os_version(),
+                {"system": "Linux", "release": "6.6.157.1-1.azl3", "revision": None},
+            )
 
     def test_volume_errors_are_recorded_instead_of_raised(self):
         reader = (
@@ -339,7 +495,19 @@ class HostProvenanceTests(unittest.TestCase):
             "runner_name": "azure-windows-3",
             "machine_name": "VMSSVAOAN000002",
             "os": "Windows-2022Server-10.0.20348-SP0",
+            "os_version": {
+                "system": "Windows",
+                "release": "10.0.20348",
+                "revision": 4294,
+            },
             "cpu_model": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+            "cpu": {
+                "vendor": "GenuineIntel",
+                "family": 6,
+                "model": 106,
+                "stepping": 6,
+                "microcode": "0xffffffff",
+            },
             "logical_processors": 16,
             "memory_bytes": 64 * GIB,
             "azure": host_telemetry.azure_compute_provenance(IMDS_COMPUTE),
@@ -373,9 +541,12 @@ class HostProvenanceTests(unittest.TestCase):
             {
                 "Runner": "azure-windows-3",
                 "Machine": "VMSSVAOAN000002",
-                "Operating system": "Windows-2022Server-10.0.20348-SP0",
+                "Operating system": (
+                    "Windows-2022Server-10.0.20348-SP0, build 10.0.20348.4294"
+                ),
                 "CPU": (
-                    "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz, "
+                    "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz "
+                    "(GenuineIntel 6/106/6, microcode 0xffffffff), "
                     "16 logical processors"
                 ),
                 "Memory": "64.0 GiB",

@@ -86,6 +86,13 @@ and generated artifacts as closely as practical.
   count, metric direction, current sample, and exact baseline window before running
   [nvx-benchmark](../nvx-benchmark/SKILL.md). Never compare different hosts or series
   as a reproduction.
+- A failed `Check Linux benchmark host` or `Check Windows benchmark host` step means
+  that the benchmark runner is no longer the host of its series' history; its error
+  annotation and step summary list every difference. Classify it as an infrastructure
+  change, not a product defect. Accept the new host and reset the series' history
+  only on request, as
+  [Expected benchmark hosts](../../../doc/benchmarks.md#expected-benchmark-hosts)
+  describes.
 
 Do not alter the current checkout merely to reach the run SHA. Use immutable `git show`
 content for inspection and report when exact-SHA execution is unavailable. Do not

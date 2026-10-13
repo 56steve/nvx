@@ -37,6 +37,20 @@ inputs:
 runs:
   using: composite
   steps:
+    # The series' history comes from one host, data/<platform>-host.json.
+    # Refuse to measure it on another; the diagnostics artifact keeps this
+    # runner's host file for accepting it (doc/benchmarks.md).
+    - name: Check Linux benchmark host
+      if: runner.os != 'Windows'
+      shell: bash
+      run: |
+        set -euo pipefail
+        python3 scripts/nvx.py performance check-host \
+          --platform "${{ inputs.platform }}" \
+          --history-dir data \
+          --output "data/runs/${{ inputs.platform }}/${{ inputs.platform }}-host.json" \
+          --summary "${GITHUB_STEP_SUMMARY}"
+
     - name: Run Linux acceptance test
       if: runner.os != 'Windows'
       shell: bash
@@ -203,6 +217,25 @@ runs:
         "NVX_BENCHMARK_SCRATCH_DIR=$Scratch" |
           Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
         Write-Output "Benchmark scratch: $Scratch"
+
+    # The scratch volume is part of the host, so the check follows its
+    # preparation.
+    - name: Check Windows benchmark host
+      if: runner.os == 'Windows'
+      shell: powershell
+      run: |
+        $ErrorActionPreference = "Stop"
+        $ScratchArgs = @()
+        if ($env:NVX_BENCHMARK_SCRATCH_DIR) {
+          $ScratchArgs = @("--scratch-dir", $env:NVX_BENCHMARK_SCRATCH_DIR)
+        }
+        python scripts\nvx.py performance check-host `
+          --platform "${{ inputs.platform }}" `
+          --history-dir data `
+          --output "data/runs/${{ inputs.platform }}/${{ inputs.platform }}-host.json" `
+          --summary $env:GITHUB_STEP_SUMMARY `
+          @ScratchArgs
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
     - name: Run Windows acceptance test
       if: runner.os == 'Windows'

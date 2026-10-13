@@ -33,7 +33,7 @@ from pathlib import Path
 from string import Template
 from typing import IO, Literal, Protocol, TextIO, TypedDict, cast
 
-from . import common, host_telemetry
+from . import benchmark_host, common, host_telemetry
 from .adversarial_oracles import ProcessTreeContainment
 from .build_constants import (
     AlpineBuildConstants,
@@ -6273,11 +6273,9 @@ def _system_temporary_directory(args: argparse.Namespace) -> Path:
 def benchmark_host_provenance(args: argparse.Namespace) -> dict[str, object]:
     """Return safe provenance for this host and the benchmark's volumes."""
     return host_telemetry.host_provenance(
-        {
-            "workspace": BuildConstants.REPO_ROOT,
-            "temporary": _system_temporary_directory(args),
-            "scratch": _resolved_scratch_directory(args),
-        }
+        benchmark_host.benchmark_volumes(
+            _resolved_scratch_directory(args), _system_temporary_directory(args)
+        )
     )
 
 
