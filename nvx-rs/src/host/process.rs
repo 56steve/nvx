@@ -9,15 +9,16 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use super::config::OpenVmmConfig;
 use super::platform;
-use super::protocol::CAPABILITY_LEN;
+use crate::protocol::CAPABILITY_LEN;
 
 const KILL_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// An OpenVMM process this caller launched and has not released yet.
-pub(crate) struct Launched {
+///
+/// Release it with [`detach_child`], or terminate it with [`kill_child`].
+pub struct Launched {
     #[cfg(not(windows))]
     child: Child,
     #[cfg(windows)]
@@ -25,7 +26,8 @@ pub(crate) struct Launched {
 }
 
 impl Launched {
-    pub(crate) fn id(&self) -> u32 {
+    /// Returns the process ID.
+    pub fn id(&self) -> u32 {
         #[cfg(not(windows))]
         return self.child.id();
         #[cfg(windows)]
@@ -40,8 +42,12 @@ impl Launched {
 /// in arguments, the environment, or the log. OpenVMM output goes to `log`, and OpenVMM inherits
 /// no other handle of the caller, so a caller whose own output is a pipe sees end-of-file when it
 /// exits rather than when the VM does.
-pub(crate) fn spawn(
-    config: &OpenVmmConfig,
+///
+/// On Windows, `breakaway_from_job` starts OpenVMM outside the caller's job object, which must
+/// permit breakaway, so that the VM survives the caller.
+pub fn spawn(
+    openvmm: &Path,
+    breakaway_from_job: bool,
     arguments: &[OsString],
     capability: &[u8; CAPABILITY_LEN],
     log: File,
@@ -54,11 +60,11 @@ pub(crate) fn spawn(
     #[cfg(windows)]
     {
         platform::spawn_detached(
-            &config.openvmm,
+            openvmm,
             arguments,
             working_dir,
             [stdin.into(), log.into(), stderr.into()],
-            config.breakaway_from_job,
+            breakaway_from_job,
         )
         .map(|process| Launched { process })
     }
@@ -66,14 +72,14 @@ pub(crate) fn spawn(
     {
         // Rust opens its own descriptors close-on-exec, and `platform::detach` marks any other
         // descriptor of the caller, so OpenVMM receives only these.
-        let mut command = Command::new(&config.openvmm);
+        let mut command = Command::new(openvmm);
         command
             .args(arguments)
             .current_dir(working_dir)
             .stdin(Stdio::from(stdin))
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(stderr));
-        platform::detach(&mut command, config.breakaway_from_job);
+        platform::detach(&mut command, breakaway_from_job);
         command.spawn().map(|child| Launched { child })
     }
 }
@@ -84,7 +90,7 @@ pub(crate) fn spawn(
 /// while this process lives. If that thread cannot start, the child becomes a zombie after it
 /// exits; liveness checks treat zombies without threads as exited, so only the process table
 /// entry leaks. The OpenVMM process keeps running either way.
-pub(crate) fn detach_child(launched: Launched) {
+pub fn detach_child(launched: Launched) {
     #[cfg(not(windows))]
     {
         let mut child = launched.child;
@@ -100,7 +106,7 @@ pub(crate) fn detach_child(launched: Launched) {
 
 /// Kills a launched process that was never recorded, through its handle, which cannot race with
 /// process ID reuse. Returns whether it exited within ten seconds.
-pub(crate) fn kill_child(launched: Launched) -> bool {
+pub fn kill_child(launched: Launched) -> bool {
     #[cfg(windows)]
     return launched.process.terminate(KILL_TIMEOUT);
     #[cfg(not(windows))]
@@ -123,7 +129,7 @@ pub(crate) fn kill_child(launched: Launched) -> bool {
 
 /// Waits until the process with the given identity is gone, returning whether it exited before
 /// `deadline`. Inconclusive checks count as still running.
-pub(crate) fn wait_for_exit(pid: u32, start_time: u64, deadline: Instant) -> bool {
+pub fn wait_for_exit(pid: u32, start_time: u64, deadline: Instant) -> bool {
     loop {
         match platform::process_start_time(pid) {
             Ok(Some(current)) if current == start_time => {}
@@ -138,7 +144,7 @@ pub(crate) fn wait_for_exit(pid: u32, start_time: u64, deadline: Instant) -> boo
 }
 
 /// Kills the process and waits up to ten seconds for it to disappear.
-pub(crate) fn kill(pid: u32, start_time: u64) -> io::Result<bool> {
+pub fn kill(pid: u32, start_time: u64) -> io::Result<bool> {
     platform::kill_process(pid, start_time)?;
     Ok(wait_for_exit(
         pid,
@@ -155,7 +161,6 @@ mod tests {
     use std::sync::mpsc;
 
     use super::*;
-    use nvx::Hypervisor;
 
     /// Spawns a long-running child while this process holds an inheritable pipe writer, as a
     /// descriptor that the caller's parent or native code left without close-on-exec would be.
@@ -195,18 +200,18 @@ mod tests {
         assert!(child_keeps_inherited_writer(plain));
 
         let directory = tempfile::tempdir().unwrap();
-        let config = OpenVmmConfig::new(
-            "sleep",
-            "vmlinux",
-            "initramfs.cpio.gz",
-            Hypervisor::Kvm,
-            directory.path(),
-        );
         let openvmm = || {
             let log = File::create(directory.path().join("openvmm.log")).unwrap();
             let arguments = [OsString::from("60")];
             let capability = [1; CAPABILITY_LEN];
-            let launched = spawn(&config, &arguments, &capability, log, directory.path());
+            let launched = spawn(
+                Path::new("sleep"),
+                false,
+                &arguments,
+                &capability,
+                log,
+                directory.path(),
+            );
             launched.unwrap().child
         };
         assert!(!child_keeps_inherited_writer(openvmm));

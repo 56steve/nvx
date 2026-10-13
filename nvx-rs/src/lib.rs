@@ -10,15 +10,20 @@
 //!   test doubles share it.
 //! - [`net`]: IP networks in CIDR notation and their subtraction.
 //! - [`Hypervisor`]: the hypervisors that run the VMs.
+//! - [`host`] (feature `host`): control sessions, and process and platform primitives.
 //!
 //! # Features
 //!
+//! - `host` (default): the [`host`] module.
 //! - `serde`: the serde form of [`Hypervisor`].
 
 mod error;
 mod hypervisor;
 pub mod net;
 pub mod protocol;
+
+#[cfg(feature = "host")]
+pub mod host;
 
 pub use error::{Error, ErrorKind, Result};
 pub use hypervisor::Hypervisor;

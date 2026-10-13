@@ -36,10 +36,10 @@ use windows_sys::Win32::System::Threading::{
 };
 
 use super::Transport;
-use crate::openvmm::config::Hypervisor;
+use crate::hypervisor::Hypervisor;
 
-/// Whether this host can run the OpenVMM backend.
-pub(crate) const SUPPORTED: bool = true;
+/// Whether this host can run NVX microVMs.
+pub const SUPPORTED: bool = true;
 
 fn wide(value: impl AsRef<OsStr>) -> Vec<u16> {
     value.as_ref().encode_wide().chain([0]).collect()
@@ -118,7 +118,7 @@ fn open_existing_process(pid: u32, access: u32) -> io::Result<Option<OwnedHandle
 
 /// Returns the creation time of a live process, `None` if the process no longer exists or
 /// belongs to another user, or an error if its state cannot be determined.
-pub(crate) fn process_start_time(pid: u32) -> io::Result<Option<u64>> {
+pub fn process_start_time(pid: u32) -> io::Result<Option<u64>> {
     let Some(process) =
         open_existing_process(pid, PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE)?
     else {
@@ -411,7 +411,7 @@ pub(crate) fn probe_hypervisor(hypervisor: Hypervisor) -> Result<(), String> {
 
 /// Creates `path` if needed. The directory inherits the ACL of its parent, which is private to
 /// the user under the default state root.
-pub(crate) fn create_private_dir(path: &Path) -> io::Result<()> {
+pub fn create_private_dir(path: &Path) -> io::Result<()> {
     match fs::create_dir(path) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
@@ -430,7 +430,7 @@ pub(crate) fn create_private_dir(path: &Path) -> io::Result<()> {
 /// Returns the volume serial number and file index of a file or directory.
 ///
 /// The object is opened without access rights, which succeeds even while OpenVMM holds it open.
-pub(crate) fn file_identity(path: &Path) -> io::Result<(u64, u64)> {
+pub fn file_identity(path: &Path) -> io::Result<(u64, u64)> {
     let file = OpenOptions::new()
         .access_mode(0)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)

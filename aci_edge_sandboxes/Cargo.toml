@@ -15,8 +15,8 @@ links = "aci_edge_sandboxes"
 
 [features]
 default = ["openvmm"]
-# The default backend, which drives the `openvmm` binary directly.
-openvmm = []
+# The default backend, which drives the `openvmm` binary directly through `nvx`.
+openvmm = ["nvx-rs/host"]
 # Stages the OpenVMM executable, guest kernel, and control initramfs at build time; see
 # `Artifacts::bundled`. The build script downloads the release pinned in `artifacts.json`, or
 # copies the release directory named by `ACI_EDGE_SANDBOXES_BUNDLE_DIR`.

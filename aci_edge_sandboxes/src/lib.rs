@@ -43,7 +43,7 @@
 //!
 //! # Features
 //!
-//! - `openvmm` (default): the [`openvmm`] backend.
+//! - `openvmm` (default): the [`openvmm`] backend, and the host side of [`nvx`].
 //! - `bundled`: stages the OpenVMM executable, guest kernel, and control initramfs at build time;
 //!   see `openvmm::Artifacts::bundled`.
 //! - `async`: Tokio wrappers ([`AsyncAciEdgeSandbox`], [`AsyncExecution`]) around the synchronous core.

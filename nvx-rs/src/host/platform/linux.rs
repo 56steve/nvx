@@ -11,10 +11,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use super::Transport;
-use crate::openvmm::config::Hypervisor;
+use crate::hypervisor::Hypervisor;
 
-/// Whether this host can run the OpenVMM backend.
-pub(crate) const SUPPORTED: bool = true;
+/// Whether this host can run NVX microVMs.
+pub const SUPPORTED: bool = true;
 
 /// Returns the start time of a live process, `None` if the process no longer exists, or an error
 /// if its state cannot be determined.
@@ -23,7 +23,7 @@ pub(crate) const SUPPORTED: bool = true;
 /// exits, as on Windows: a zombie whose main thread exited first still runs while its other threads
 /// exit, and they keep the process's descriptors, such as an inherited log and its lock, open.
 /// Zombies without other threads count as exited.
-pub(crate) fn process_start_time(pid: u32) -> io::Result<Option<u64>> {
+pub fn process_start_time(pid: u32) -> io::Result<Option<u64>> {
     let stat = match fs::read_to_string(format!("/proc/{pid}/stat")) {
         Ok(stat) => stat,
         Err(error)
@@ -253,7 +253,7 @@ pub(crate) fn probe_hypervisor(hypervisor: Hypervisor) -> Result<(), String> {
 }
 
 /// Creates `path` if needed and restricts it to the current user.
-pub(crate) fn create_private_dir(path: &Path) -> io::Result<()> {
+pub fn create_private_dir(path: &Path) -> io::Result<()> {
     match DirBuilder::new().mode(0o700).create(path) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
@@ -269,7 +269,7 @@ pub(crate) fn create_private_dir(path: &Path) -> io::Result<()> {
 }
 
 /// Returns the device and inode of a file or directory.
-pub(crate) fn file_identity(path: &Path) -> io::Result<(u64, u64)> {
+pub fn file_identity(path: &Path) -> io::Result<(u64, u64)> {
     let metadata = fs::metadata(path)?;
     Ok((metadata.dev(), metadata.ino()))
 }

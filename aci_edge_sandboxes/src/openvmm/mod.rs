@@ -98,9 +98,6 @@ mod contract;
 mod filesystem;
 mod launch;
 mod network;
-mod platform;
-mod process;
-mod session;
 mod state;
 
 use std::fs;
@@ -110,6 +107,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use nvx::host::session::{self, ControlSession, ExecEvent, SessionError};
+use nvx::host::{platform, process};
 use nvx::protocol::{
     self, CAPABILITY_LEN, ExitCategory, GuestFeatures, MAX_ARGUMENT_BYTES, MAX_CWD_BYTES,
     MAX_OUTPUT_BYTES, MAX_TIMEOUT_MS, Workload, WorkloadEnvironment,
@@ -119,7 +118,6 @@ use serde_json::Value;
 pub use self::artifacts::Artifacts;
 pub use self::config::OpenVmmConfig;
 pub use self::filesystem::{guest_path, resolve_guest_path};
-use self::session::{ControlSession, ExecEvent, SessionError};
 use self::state::{
     BACKEND_KEY, LaunchRecord, ProcessIdentity, RuntimeRecord, STATE_FORMAT, SandboxRecord,
     StateStore,
@@ -492,7 +490,7 @@ impl Backend for OpenVmmBackend {
         if self.config.skip_hypervisor_probe {
             return Ok(());
         }
-        platform::probe_hypervisor(self.config.hypervisor).map_err(Error::backend_unavailable)
+        Ok(platform::probe_hypervisor(self.config.hypervisor)?)
     }
 
     fn validate_provision(&self, request: &ProvisionRequest) -> Result<()> {
@@ -603,7 +601,8 @@ impl Backend for OpenVmmBackend {
         )?;
         let started = Instant::now();
         let child = match process::spawn(
-            &self.config,
+            &self.config.openvmm,
+            self.config.breakaway_from_job,
             &arguments,
             &capability,
             log,
