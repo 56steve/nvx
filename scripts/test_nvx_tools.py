@@ -2998,20 +2998,44 @@ class CiConfigurationTests(unittest.TestCase):
                     f"undefined job dependencies: {dependencies - jobs}",
                 )
         required = _workflow_job(workflow, "required-status-check")
-        self.assertIn("      - aci-edge-sandboxes\n", required)
+        for job in ("aci-edge-sandboxes", "nvx-rs"):
+            with self.subTest(job=job):
+                self.assertIn(f"      - {job}\n", required)
+                self.assertIn(f"${{{{ needs.{job}.result }}}}", required)
 
     def test_development_release_requires_successful_crate_checks(self):
         workflow = (
             BuildConstants.REPO_ROOT / ".github" / "workflows" / "ci.yml"
         ).read_text(encoding="utf-8")
         release_job = _workflow_job(workflow, "release")
-        self.assertIn("      - aci-edge-sandboxes\n", release_job)
         predicate = release_job.split("    if:", 1)[1].split("    runs-on:", 1)[0]
-        self.assertIn("needs.aci-edge-sandboxes.result == 'success' &&", predicate)
-        self.assertNotIn("needs.aci-edge-sandboxes.result == 'skipped'", predicate)
+        for job in ("aci-edge-sandboxes", "nvx-rs"):
+            with self.subTest(job=job):
+                self.assertIn(f"      - {job}\n", release_job)
+                self.assertIn(f"needs.{job}.result == 'success' &&", predicate)
+                self.assertNotIn(f"needs.{job}.result == 'skipped'", predicate)
+
+    def test_crate_checks_run_on_every_os(self):
+        workflow = (
+            BuildConstants.REPO_ROOT / ".github" / "workflows" / "ci.yml"
+        ).read_text(encoding="utf-8")
+        for job, action in (
+            ("aci-edge-sandboxes", "check-aci-edge-sandboxes"),
+            ("nvx-rs", "check-nvx-rs"),
+        ):
+            with self.subTest(job=job):
+                definition = _workflow_job(workflow, job)
+                self.assertIn("os: [ubuntu-latest, windows-latest]", definition)
+                self.assertIn(f"uses: ./.github/actions/{action}", definition)
+        self.assertEqual(ci.REQUIRED_CI_RESULT_ENVIRONMENTS["nvx-rs"], "NVX_RS_RESULT")
 
     def test_required_ci_result_policy(self):
-        always_successful = {"quality", "aci-edge-sandboxes", "openvmm-changes"}
+        always_successful = {
+            "quality",
+            "aci-edge-sandboxes",
+            "nvx-rs",
+            "openvmm-changes",
+        }
         # Jobs that succeed whenever the repository's jobs run.
         repository = always_successful | set(ci.REQUIRED_CI_CLI_JOBS)
         builds = set(ci.REQUIRED_CI_BUILD_JOBS)
@@ -3234,6 +3258,8 @@ class CiConfigurationTests(unittest.TestCase):
             (("ubuntu/packages.lock.json",), (True, True, False, False)),
             (("azurelinux/packages.lock.json",), (True, True, False, False)),
             (("aci_edge_sandboxes/src/lib.rs",), (True, True, False, False)),
+            (("nvx-rs/src/lib.rs",), (True, True, False, False)),
+            (("nvx-rs/Cargo.lock",), (True, True, False, False)),
             (("scripts/nvx_tools/microvm_tests.py",), (True, True, False, False)),
             (
                 (".github/workflows/run-nvx-microvm-tests.yml",),
@@ -5004,14 +5030,18 @@ python3() {
                 # Report a missing toolchain without writing the trusted RUSTUP_HOME.
                 self.assertEqual(_yaml_field(step, "RUSTUP_AUTO_INSTALL"), ['"0"'])
 
-        crate_action = (
-            github / "actions" / "check-aci-edge-sandboxes" / "action.yml"
-        ).read_text(encoding="utf-8")
-        self.assertEqual(_yaml_field(crate_action, "default"), ['""'])
-        install = _composite_action_step(crate_action, "Install Rust toolchains")
-        self.assertIn("../rust-toolchain.toml", install)
-        self.assertIn("REQUESTED_TOOLCHAIN: ${{ inputs.toolchain }}", install)
-        self.assertEqual(crate_action.count("${{ inputs.toolchain }}"), 1)
+        for crate in ("aci-edge-sandboxes", "nvx-rs"):
+            with self.subTest(crate=crate):
+                crate_action = (
+                    github / "actions" / f"check-{crate}" / "action.yml"
+                ).read_text(encoding="utf-8")
+                self.assertEqual(_yaml_field(crate_action, "default"), ['""'])
+                install = _composite_action_step(
+                    crate_action, "Install Rust toolchains"
+                )
+                self.assertIn("../rust-toolchain.toml", install)
+                self.assertIn("REQUESTED_TOOLCHAIN: ${{ inputs.toolchain }}", install)
+                self.assertEqual(crate_action.count("${{ inputs.toolchain }}"), 1)
 
         setup = (workflows / "copilot-setup-steps.yml").read_text(encoding="utf-8")
         self.assertIn("      - rust-toolchain.toml\n", setup)

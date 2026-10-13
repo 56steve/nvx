@@ -384,8 +384,8 @@ trusted repository branch before running the backend matrices.
 ## Job graph and runner capacity
 
 A `dev` push or a pull request that is ready for review starts these jobs at
-once: `quality`, `aci-edge-sandboxes`, `nvx-cli-linux`, and `nvx-cli-windows`
-on GitHub-hosted runners, and `openvmm-changes`, which classifies the change
+once: `quality`, `aci-edge-sandboxes`, `nvx-rs`, `nvx-cli-linux`, and
+`nvx-cli-windows` on GitHub-hosted runners, and `openvmm-changes`, which classifies the change
 (see [Change classification](#change-classification)). When it finishes,
 `artifacts` and `debug-kernel` restore or build the guest artifacts on
 GitHub-hosted runners, the three `build-openvmm-*` producers restore or build
@@ -432,7 +432,7 @@ participate in the decision:
 - `run-tests` is true when a test input changed: the OpenVMM pin, the guests
   and their package locks, the CLI and its modules, the workflows and actions
   that build and run the tests, the runner setup scripts, the Rust pin, or the
-  `aci_edge_sandboxes` crate. It enables the NVX microVM tests.
+  `aci_edge_sandboxes` and `nvx-rs` crates. It enables the NVX microVM tests.
 - `run-openvmm-unit-tests` and `run-openvmm-vmm-tests` enable the OpenVMM
   suites. A push sets both to `run-tests`. A pull request sets each only when
   one of that suite's own inputs changed. The unit tests depend on the OpenVMM
@@ -507,7 +507,8 @@ qualification.
 ## Rust toolchain
 
 [`rust-toolchain.toml`](../rust-toolchain.toml) pins the exact Rust release
-that builds OpenVMM, its test guests, the `aci_edge_sandboxes` crate, and the
+that builds OpenVMM, its test guests, the `aci_edge_sandboxes` and `nvx-rs`
+crates, and the
 host tools that NVX compiles, such as the doctor's time probe and the Windows
 curl shim. Rustup applies the file to every `cargo` and `rustc` run in the
 checkout, including in the `openvmm` submodule, and `test-openvmm` also exports
@@ -541,7 +542,7 @@ setup scripts and the Specula runner setup read, together; a test in
 `scripts/test_nvx_tools.py` fails while they differ. Update every self-hosted
 runner as the setup guide describes before the change merges.
 
-## Rust crate
+## Rust crates
 
 The required `aci-edge-sandboxes` job checks the [`aci_edge_sandboxes` crate](../aci_edge_sandboxes/README.md) on
 GitHub-hosted Ubuntu and Windows runners through the
@@ -551,10 +552,21 @@ release that `rust-toolchain.toml` pins. It also runs the unit, mock, and fake-O
 integration tests, checks the declared minimum Rust version, and cross-checks
 the macOS build that MXC compiles. The fake-OpenVMM tests drive the real
 OpenVMM backend through its control protocol without a hypervisor.
-The action also validates bundled artifact staging with a fixture package.
-The development release job depends on `aci-edge-sandboxes` and requires its combined
-Linux/Windows result to be successful; failed, cancelled, or skipped crate
-checks cannot publish a release.
+
+The required `nvx-rs` job checks the [`nvx-rs` crate](../nvx-rs/README.md),
+which holds the NVX mechanics that the backend builds on, on the same runners
+through the [`check-nvx-rs`](../.github/actions/check-nvx-rs/action.yml)
+action. It runs rustfmt, Clippy with warnings denied for all targets and
+features and for the library without default features, the unit, golden
+protocol-fixture, and fake-OpenVMM instance tests, rustdoc with warnings
+denied, the minimum Rust version check, and the macOS cross-check. It also
+validates bundled artifact staging with a fixture package. Both actions set
+`NVX_BUNDLE=skip` for `--all-features` builds, so that `bundled` stages nothing
+instead of downloading the pinned release.
+
+The development release job depends on `aci-edge-sandboxes` and `nvx-rs` and
+requires their combined Linux/Windows results to be successful; failed,
+cancelled, or skipped crate checks cannot publish a release.
 
 Each `nvx-microvm-tests-{kvm,mshv,whp}` job then runs
 `nvx.py test-aci-edge-sandboxes` on its self-hosted runner; the debug-kernel
@@ -565,8 +577,8 @@ that guest state lasts only until a stop, that a start terminates the VM of an
 interrupted earlier start, host path mappings, egress rules, and per-execution
 environments and working directories. On failure
 it keeps the OpenVMM log under `build/test-results/aci-edge-sandboxes-<backend>`, which is
-uploaded with the other microVM logs. Changes under `aci_edge_sandboxes/` therefore trigger
-the NVX microVM test matrix.
+uploaded with the other microVM logs. Changes under `aci_edge_sandboxes/` or `nvx-rs/`
+therefore trigger the NVX microVM test matrix.
 
 ## Adversarial campaigns
 

@@ -1,17 +1,19 @@
-//! Versions of the OpenVMM control contract this crate speaks.
+//! Versions of the OpenVMM control contract that this crate speaks, and the compatibility of NVX
+//! releases with it.
 //!
 //! The build script includes this file to check bundled artifacts, so it must not depend on the
 //! rest of the crate.
 
 /// OpenVMM microVM ABI version this crate drives.
-pub(crate) const MICROVM_ABI_VERSION: u64 = 2;
+pub const MICROVM_ABI_VERSION: u64 = 2;
 /// Control-console broker protocol version this crate speaks.
-pub(crate) const CONTROL_SESSION_PROTOCOL_VERSION: u64 = 1;
+pub const CONTROL_SESSION_PROTOCOL_VERSION: u64 = 1;
 /// Control contract revision this crate speaks.
-pub(crate) const CONTROL_CONTRACT_REVISION: &str = "nvx-microvm-v2-control-v2";
+pub const CONTROL_CONTRACT_REVISION: &str = "nvx-microvm-v2-control-v2";
 
 /// Returns whether the `openvmm` section of an NVX `SOURCE-MANIFEST.json` declares this contract.
-pub(crate) fn manifest_is_compatible(manifest: &serde_json::Value) -> bool {
+#[cfg(feature = "host")]
+pub fn manifest_is_compatible(manifest: &serde_json::Value) -> bool {
     let field = |name: &str| {
         manifest
             .get("openvmm")

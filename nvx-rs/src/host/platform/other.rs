@@ -5,10 +5,10 @@ use std::process::Command;
 use std::time::Duration;
 
 use super::Transport;
-use crate::openvmm::config::Hypervisor;
+use crate::hypervisor::Hypervisor;
 
-/// Whether this host can run the OpenVMM backend.
-pub(crate) const SUPPORTED: bool = false;
+/// Whether this host can run NVX microVMs.
+pub const SUPPORTED: bool = false;
 
 fn unsupported() -> io::Error {
     io::Error::new(
@@ -17,7 +17,8 @@ fn unsupported() -> io::Error {
     )
 }
 
-pub(crate) fn process_start_time(_pid: u32) -> io::Result<Option<u64>> {
+/// Reports every process as gone: this host runs no OpenVMM processes.
+pub fn process_start_time(_pid: u32) -> io::Result<Option<u64>> {
     Ok(None)
 }
 
@@ -25,7 +26,8 @@ pub(crate) fn kill_process(_pid: u32, _start_time: u64) -> io::Result<()> {
     Ok(())
 }
 
-pub(crate) fn file_identity(_path: &Path) -> io::Result<(u64, u64)> {
+/// Fails: this host cannot export host paths.
+pub fn file_identity(_path: &Path) -> io::Result<(u64, u64)> {
     Err(unsupported())
 }
 
@@ -35,7 +37,8 @@ pub(crate) fn probe_hypervisor(_hypervisor: Hypervisor) -> Result<(), String> {
     Err(unsupported().to_string())
 }
 
-pub(crate) fn create_private_dir(path: &Path) -> io::Result<()> {
+/// Creates `path` if needed.
+pub fn create_private_dir(path: &Path) -> io::Result<()> {
     match fs::create_dir(path) {
         Err(error) if error.kind() != io::ErrorKind::AlreadyExists => Err(error),
         _ => Ok(()),

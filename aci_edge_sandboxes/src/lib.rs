@@ -11,7 +11,8 @@
 //! | [`AciEdgeSandbox::deprovision`] | provisioned → (none) | optional metadata; the ID becomes stale |
 //!
 //! Every operation is implemented by a pluggable [`Backend`]. The default backend,
-//! [`openvmm::OpenVmmBackend`], drives the `openvmm` binary directly. [`AciEdgeSandbox`] validates each
+//! [`openvmm::OpenVmmBackend`], drives the `openvmm` binary directly through the [`nvx`] crate,
+//! which this crate re-exports. [`AciEdgeSandbox`] validates each
 //! request in a fixed order before the backend acts on it: structural errors
 //! ([`ErrorCode::MalformedRequest`], [`ErrorCode::MalformedId`]) come first, then requests the
 //! backend cannot honor ([`ErrorCode::PolicyValidation`]), then backend-specific failures.
@@ -25,7 +26,7 @@
 //! use aci_edge_sandboxes::openvmm::OpenVmmConfig;
 //! use aci_edge_sandboxes::{AciEdgeSandbox, ExecRequest, ProvisionRequest};
 //!
-//! // Locates OpenVMM, the guest kernel, and the Alpine initramfs; see `openvmm::Artifacts`.
+//! // Locates OpenVMM, the guest kernel, and the Alpine initramfs; see `nvx::Artifacts`.
 //! let client = AciEdgeSandbox::openvmm(OpenVmmConfig::discover()?)?;
 //! let sandbox = client.provision(&ProvisionRequest::new())?.sandbox_id;
 //! client.start(&sandbox)?;
@@ -43,18 +44,20 @@
 //!
 //! # Features
 //!
-//! - `openvmm` (default): the [`openvmm`] backend.
+//! - `openvmm` (default): the [`openvmm`] backend, and the host side of [`nvx`].
 //! - `bundled`: stages the OpenVMM executable, guest kernel, and control initramfs at build time;
-//!   see `openvmm::Artifacts::bundled`.
+//!   see `nvx::Artifacts::bundled`.
 //! - `async`: Tokio wrappers ([`AsyncAciEdgeSandbox`], [`AsyncExecution`]) around the synchronous core.
 //! - `agent`: the [`agent`] backend, a thin client of a separately supplied native library
 //!   that owns the sandbox lifecycle.
-//! - `testing`: an in-memory [`testing::MockBackend`] for consumers' own tests.
+//! - `testing`: an in-memory [`testing::MockBackend`] for consumers' own tests, and the fake
+//!   OpenVMM of `nvx::testing`.
 
 // The data model lives in `aci_edge_sandboxes_model`; these keep its modules at their crate paths.
-#[cfg(feature = "openvmm")]
-pub(crate) use aci_edge_sandboxes_model::cidr;
 pub(crate) use aci_edge_sandboxes_model::{capabilities, error, id, model, spec, validate};
+/// The NVX mechanics that the `openvmm` backend builds on: artifact discovery, hypervisors,
+/// guest paths, the control protocol, and the supervision of VM instances.
+pub use nvx;
 
 mod backend;
 mod client;

@@ -4,8 +4,11 @@
 //! initramfs; there are no image layers, scratch disks, or container namespaces. Guest state lives
 //! in memory and lasts until the sandbox stops.
 //!
-//! [`OpenVmmBackend`] keeps each sandbox in a state directory under
-//! [`OpenVmmConfig::state_root`], so every operation can run in a different process:
+//! [`OpenVmmBackend`] converts the contract's requests into the launch specifications, policies,
+//! and workloads of [`nvx`], and maps NVX's errors onto the contract's error codes. It keeps each
+//! sandbox in a state directory under [`OpenVmmConfig::state_root`], which holds the sandbox's
+//! configuration and the files of its VM [`Instance`](nvx::host::instance::Instance), so every
+//! operation can run in a different process:
 //!
 //! - **provision** validates the request and records the configuration. No VM runs yet.
 //! - **start** launches a detached OpenVMM process with the managed lifecycle, passes it a fresh
@@ -29,7 +32,7 @@
 //!
 //! | Field | provision | exec |
 //! | --- | --- | --- |
-//! | `filesystem.readonlyPaths`, `readwritePaths` | mapped at their [`guest_path`] | n/a |
+//! | `filesystem.readonlyPaths`, `readwritePaths` | mapped at their [`nvx::guest_path`] | n/a |
 //! | `filesystem.deniedPaths` | hidden inside mapped paths | n/a |
 //! | `network.egress` | default and IPv4 and IPv6 rules applied | n/a |
 //! | `network.ingress`, `hostLoopback` | `deny` only | n/a |
@@ -44,7 +47,7 @@
 //! the workload. A directory that does not exist, is not a directory, or that the workload cannot
 //! search fails the launch instead: the execution ends with [`ExecFailure::WorkingDirectory`]
 //! after a diagnostic on standard error, and nothing runs. Relative paths are rejected with
-//! [`ErrorCode::PolicyValidation`](crate::ErrorCode::PolicyValidation); [`guest_path`]
+//! [`ErrorCode::PolicyValidation`](crate::ErrorCode::PolicyValidation); [`nvx::guest_path`]
 //! translates host paths.
 //!
 //! Host paths share OpenVMM's single virtio-fs device: the backend exports each outermost mapped
@@ -91,55 +94,52 @@
 //! [`Canceller::cancel`](crate::Canceller::cancel) asks the guest to kill the workload; the
 //! execution then ends with [`ExecOutcome::Cancelled`]. If the process that runs an execution
 //! dies, the guest kills the workload as soon as it notices that the control session is gone.
+//!
+//! # Errors
+//!
+//! NVX's errors keep their messages. [`nvx::ErrorKind::Unavailable`] becomes
+//! [`ErrorCode::BackendUnavailable`](crate::ErrorCode::BackendUnavailable),
+//! [`nvx::ErrorKind::Unsupported`] becomes
+//! [`ErrorCode::PolicyValidation`](crate::ErrorCode::PolicyValidation),
+//! [`nvx::ErrorKind::Exited`] becomes [`ErrorCode::NotStarted`](crate::ErrorCode::NotStarted)
+//! when an exec finds the sandbox's VM gone, and every other error becomes
+//! [`ErrorCode::BackendError`](crate::ErrorCode::BackendError).
 
-mod artifacts;
 mod config;
-mod contract;
-mod filesystem;
-mod launch;
-mod network;
-mod platform;
-mod process;
-mod protocol;
-mod session;
 mod state;
 
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use serde_json::Value;
+use nvx::Artifacts;
+use nvx::host::filesystem::{self, ExportPlan, ExportRequest, PathList};
+use nvx::host::instance::{Execution, RuntimeRecord, WorkloadOutcome};
+use nvx::host::launch::{LaunchSpec, WorkloadIdentity};
+use nvx::host::report::Report;
+use nvx::host::{network, platform};
+use nvx::protocol::{
+    self, MAX_ARGUMENT_BYTES, MAX_CWD_BYTES, MAX_OUTPUT_BYTES, MAX_TIMEOUT_MS, Workload,
+    WorkloadEnvironment,
+};
 
-pub use self::artifacts::Artifacts;
-pub use self::config::{Hypervisor, OpenVmmConfig};
-pub use self::filesystem::{guest_path, resolve_guest_path};
-use self::protocol::{
-    CAPABILITY_LEN, ExitCategory, GuestFeatures, MAX_ARGUMENT_BYTES, MAX_CWD_BYTES,
-    MAX_OUTPUT_BYTES, MAX_TIMEOUT_MS, Workload, WorkloadEnvironment,
-};
-use self::session::{ControlSession, ExecEvent, SessionError};
-use self::state::{
-    BACKEND_KEY, LaunchRecord, ProcessIdentity, RuntimeRecord, STATE_FORMAT, SandboxRecord,
-    StateStore,
-};
+pub use self::config::OpenVmmConfig;
+use self::state::{BACKEND_KEY, STATE_FORMAT, SandboxRecord, StateStore};
 use crate::backend::{Backend, ExecControl, ExecIo};
 use crate::capabilities::Capabilities;
 use crate::error::{Error, Result};
 use crate::exec::{Completion, ExecFailure, ExecOutcome};
 use crate::id::SandboxId;
 use crate::model::{
-    Command, DeprovisionResult, ExecRequest, Metadata, ProcessSpec, ProvisionRequest,
-    ProvisionResult, StartResult, StopResult, duration_millis,
+    Access, Command, DeprovisionResult, ExecRequest, FilesystemPolicy, Metadata, NetworkPolicy,
+    NetworkRule, ProcessSpec, Protocol, ProvisionRequest, ProvisionResult, StartResult, StopResult,
+    duration_millis,
 };
 
 /// Shell that interprets `process.commandLine`.
 const SHELL: &str = "/bin/sh";
-
-/// Longest delay between a cancellation request and its delivery to the guest.
-const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 /// [`Backend`] that drives the `openvmm` binary directly.
 ///
@@ -180,147 +180,132 @@ impl OpenVmmBackend {
 
     /// Returns the path of the OpenVMM log of a sandbox's latest start, for diagnostics.
     pub fn log_path(&self, sandbox_id: &SandboxId) -> PathBuf {
-        self.store.log_path(sandbox_id)
+        self.store.instance(sandbox_id).log_path()
     }
 
-    /// Returns whether the recorded OpenVMM process still runs, clearing stale runtime state.
-    ///
-    /// State is cleared only when the process is definitely gone; an inconclusive check fails
-    /// the operation instead, so a live VM is never forgotten. A start whose caller died before
-    /// recording OpenVMM's identity is recovered through its launch marker.
+    /// Returns whether the recorded OpenVMM process still runs, clearing stale runtime state;
+    /// see [`Instance::reconcile`](nvx::host::instance::Instance::reconcile).
     fn reconcile(&self, sandbox_id: &SandboxId) -> Result<RunState> {
-        if let Some(runtime) = self.store.runtime(sandbox_id)? {
-            let current = platform::process_start_time(runtime.pid).map_err(|error| {
-                Error::backend_error(format!(
-                    "cannot determine whether OpenVMM process {} of sandbox {sandbox_id} is \
-                     running",
-                    runtime.pid
-                ))
-                .with_source(error)
-            })?;
-            if current == Some(runtime.start_time) {
-                self.store.remove_launch(sandbox_id);
-                return Ok(RunState::Running(runtime));
-            }
-            self.store.clear_runtime(sandbox_id)?;
-            return Ok(RunState::Provisioned);
-        }
-        if let Some(launch) = self.store.launch(sandbox_id)? {
-            self.recover_launch(sandbox_id, &launch)?;
-            self.store.clear_runtime(sandbox_id)?;
-        }
-        Ok(RunState::Provisioned)
+        Ok(match self.store.instance(sandbox_id).reconcile()? {
+            Some(runtime) => RunState::Running(runtime),
+            None => RunState::Provisioned,
+        })
     }
 
-    /// Terminates the OpenVMM process of a start whose caller died before recording it.
-    ///
-    /// Lifecycle locks serialize starts, so a launch marker seen under the lock always belongs
-    /// to an interrupted start. Recorded identity is authoritative even before an endpoint
-    /// exists; legacy markers can be recovered only when their endpoint identifies the child.
-    fn recover_launch(&self, sandbox_id: &SandboxId, launch: &LaunchRecord) -> Result<()> {
-        let interrupted = |detail: &str| {
-            Error::backend_error(format!(
-                "an interrupted start of sandbox {sandbox_id} {detail}"
-            ))
-        };
-        let identity = match &launch.process {
-            Some(identity) => identity.clone(),
-            None => {
-                let pid = platform::endpoint_server_pid(&launch.endpoint)
-                    .map_err(|error| interrupted("cannot be recovered yet").with_source(error))?;
-                let Some(pid) = pid else {
-                    return Err(interrupted(
-                        "has no recorded process identity or observable endpoint; cannot verify \
-                         that OpenVMM exited, so the launch marker is retained",
-                    ));
-                };
-                let Some(start_time) = platform::process_start_time(pid)
-                    .map_err(|error| interrupted("cannot be recovered yet").with_source(error))?
-                else {
-                    return Ok(());
-                };
-                ProcessIdentity { pid, start_time }
-            }
-        };
-        match process::kill(identity.pid, identity.start_time) {
-            Ok(true) => Ok(()),
-            Ok(false) => Err(interrupted(&format!(
-                "left OpenVMM process {} running, and it did not exit",
-                identity.pid
-            ))),
-            Err(error) => Err(interrupted(&format!(
-                "left OpenVMM process {} running, and it could not be terminated",
-                identity.pid
-            ))
-            .with_source(error)),
+    /// Returns the launch specification of a provisioned sandbox.
+    fn launch_spec(&self, record: &SandboxRecord) -> LaunchSpec {
+        LaunchSpec {
+            openvmm: self.config.openvmm.clone(),
+            kernel: self.config.kernel.clone(),
+            initrd: self.config.initrd.clone(),
+            hypervisor: self.config.hypervisor,
+            memory_mib: record.memory_mib,
+            identity: WorkloadIdentity {
+                uid: record.workload_uid,
+                gid: record.workload_gid,
+                create_account: record.create_workload_account,
+            },
+            hostname: record.hostname.clone(),
+            kernel_parameters: self.config.kernel_command_line.clone(),
+            guest_network: self.config.guest_network.clone(),
+            network: record.network.as_ref().map(network_policy),
+            filesystem: record.filesystem.clone(),
+            breakaway_from_job: self.config.breakaway_from_job,
         }
     }
+}
 
-    fn session_error(&self, sandbox_id: &SandboxId, error: SessionError) -> Error {
-        match error {
-            SessionError::ProcessExited => {
-                Error::not_started(format!("sandbox {sandbox_id} stopped unexpectedly"))
-            }
-            SessionError::TimedOut => Error::backend_error(format!(
-                "sandbox {sandbox_id} did not accept a control session within {} s; another exec \
-                 may still be running",
-                self.config.control_timeout.as_secs()
-            )),
-            other => Error::backend_error(format!(
-                "the control session with sandbox {sandbox_id} failed: {other}"
-            ))
-            .with_source(other),
-        }
+/// Converts the contract's network section into NVX's network posture, under the contract's
+/// field names.
+fn network_policy(policy: &NetworkPolicy) -> network::NetworkPolicy {
+    let access = |access: Access| match access {
+        Access::Allow => network::Access::Allow,
+        Access::Deny => network::Access::Deny,
+    };
+    let rules = |name: &str, rules: &[NetworkRule]| network::EgressRules {
+        name: name.to_owned(),
+        rules: rules.iter().map(egress_rule).collect(),
+    };
+    network::NetworkPolicy {
+        egress: access(policy.egress.default),
+        allow: rules("network.egress.allow", &policy.egress.allow),
+        deny: rules("network.egress.deny", &policy.egress.deny),
+        ingress: access(policy.ingress.default),
     }
+}
 
-    fn start_failure(&self, sandbox_id: &SandboxId, reason: &str) -> Error {
-        Error::backend_error(format!(
-            "sandbox {sandbox_id} failed to start: {reason}; see {}",
-            self.store.log_path(sandbox_id).display()
-        ))
+fn egress_rule(rule: &NetworkRule) -> network::EgressRule {
+    network::EgressRule {
+        to: rule
+            .to
+            .iter()
+            .map(|peer| network::Destination {
+                cidr: peer.cidr.clone(),
+                except: peer.except.clone(),
+            })
+            .collect(),
+        ports: rule
+            .ports
+            .iter()
+            .map(|port| network::PortSelector {
+                protocol: match port.protocol {
+                    Protocol::Tcp => network::Protocol::Tcp,
+                    Protocol::Udp => network::Protocol::Udp,
+                    Protocol::Icmp => network::Protocol::Icmp,
+                    Protocol::Any => network::Protocol::Any,
+                },
+                port: port.port,
+                end_port: port.end_port,
+            })
+            .collect(),
     }
+}
 
-    /// Terminates a launch that did not become ready.
-    ///
-    /// Runtime state is cleared only once the process has exited. Otherwise the sandbox stays
-    /// marked as running so that `stop` can retry instead of a second VM being started.
-    fn abort_start(&self, sandbox_id: &SandboxId, runtime: &RuntimeRecord, reason: &str) -> Error {
-        let cleanup = match process::kill(runtime.pid, runtime.start_time) {
-            Ok(true) => {
-                let _ = self.store.clear_runtime(sandbox_id);
-                return self.start_failure(sandbox_id, reason);
-            }
-            Ok(false) => "it did not exit".to_owned(),
-            Err(error) => error.to_string(),
-        };
-        self.start_failure(
-            sandbox_id,
-            &format!(
-                "{reason}; OpenVMM process {} could not be terminated ({cleanup}), so the \
-                 sandbox stays marked as running until it is stopped",
-                runtime.pid
-            ),
-        )
-    }
+/// Plans the export of the contract's filesystem section, under the contract's field names.
+fn export_plan(policy: &FilesystemPolicy) -> Result<Option<ExportPlan>> {
+    Ok(filesystem::plan(&ExportRequest {
+        read_only: PathList {
+            name: "filesystem.readonlyPaths",
+            paths: &policy.readonly_paths,
+        },
+        read_write: PathList {
+            name: "filesystem.readwritePaths",
+            paths: &policy.readwrite_paths,
+        },
+        denied: PathList {
+            name: "filesystem.deniedPaths",
+            paths: &policy.denied_paths,
+        },
+    })?)
+}
 
-    /// Terminates a launch whose guest image lacks control features that this backend needs.
-    ///
-    /// An older image would boot and answer, but it would silently ignore host path mappings and
-    /// cancellation requests, so the sandbox must not run at all.
-    fn reject_guest(
-        &self,
-        sandbox_id: &SandboxId,
-        runtime: &RuntimeRecord,
-        missing: &[&str],
-    ) -> Error {
-        let reason = format!(
-            "the guest image lacks control features that the openvmm backend needs ({}); use an \
-             NVX release or build that includes them, for example through {}",
-            missing.join(", "),
-            Artifacts::ENV_DIR
-        );
-        Error::backend_unavailable(self.abort_start(sandbox_id, runtime, &reason).message())
+/// Maps a failure to reach the VM of a running sandbox for an exec: a VM that is gone leaves the
+/// sandbox not started.
+fn exec_error(error: nvx::Error) -> Error {
+    if error.kind() != nvx::ErrorKind::Exited {
+        return error.into();
     }
+    let (_, message, source) = error.into_parts();
+    let error = Error::not_started(message);
+    match source {
+        Some(source) => error.with_source(source),
+        None => error,
+    }
+}
+
+/// Summarizes OpenVMM's outcome report as stop metadata.
+fn report_metadata(report: &Report) -> Metadata {
+    let mut metadata = Metadata::new();
+    if let Some(category) = &report.category {
+        metadata.insert("vmOutcome".to_owned(), category.as_str().into());
+    }
+    if let Some(status) = report.status_code {
+        metadata.insert("vmStatusCode".to_owned(), status.into());
+    }
+    if let Some(complete) = report.teardown_complete {
+        metadata.insert("teardownComplete".to_owned(), complete.into());
+    }
+    metadata
 }
 
 fn workload_argv(process: &ProcessSpec) -> Result<Vec<String>> {
@@ -368,7 +353,7 @@ fn prepare_exec(process: &ProcessSpec) -> Result<Workload<'_>> {
     {
         return Err(Error::policy_validation(format!(
             "process.cwd {cwd:?} must be an absolute guest path; map host paths with \
-             openvmm::guest_path"
+             nvx::guest_path"
         )));
     }
     if let Some(cwd) = &process.cwd
@@ -389,59 +374,9 @@ fn prepare_exec(process: &ProcessSpec) -> Result<Workload<'_>> {
         cwd: process.cwd.as_deref(),
         environment,
     };
-    protocol::encode_exec_payload(&workload).map_err(|error| Error::policy_validation(error.0))?;
+    protocol::encode_exec_payload(&workload)
+        .map_err(|error| Error::policy_validation(error.into_message()))?;
     Ok(workload)
-}
-
-/// Returns the calling user's IDs when workloads that map host paths should use them; see
-/// [`OpenVmmConfig::map_host_identity`].
-fn host_identity(config: &OpenVmmConfig, maps_host_paths: bool) -> Option<(u32, u32)> {
-    if !(maps_host_paths && config.map_host_identity) {
-        return None;
-    }
-    #[cfg(unix)]
-    {
-        // SAFETY: geteuid and getegid have no preconditions.
-        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
-        (uid != 0 && gid != 0).then_some((uid, gid))
-    }
-    #[cfg(not(unix))]
-    None
-}
-
-/// Explains why a launch did not become ready.
-fn readiness_failure(error: &SessionError, runs_as_host_user: bool) -> String {
-    let mut reason = error.to_string();
-    // An image that predates account creation ends its boot, before the guest agent starts, when
-    // it finds no account for the host user that the workloads run as. The VM then vanishes, or
-    // its control endpoint closes first.
-    let vm_ended = matches!(error, SessionError::ProcessExited | SessionError::Closed);
-    if runs_as_host_user && vm_ended {
-        reason.push_str(
-            "; a guest image that predates workload account creation exits during boot when \
-             workloads run under the host user's IDs, so use an NVX release or build that \
-             includes it",
-        );
-    }
-    reason
-}
-
-fn read_report(path: &Path) -> Option<Metadata> {
-    let report: Value = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
-    let mut metadata = Metadata::new();
-    if let Some(outcome) = report.get("outcome") {
-        if let Some(category) = outcome.get("category").and_then(Value::as_str) {
-            metadata.insert("vmOutcome".to_owned(), category.into());
-        }
-        if let Some(status) = outcome.get("status_code").and_then(Value::as_i64) {
-            metadata.insert("vmStatusCode".to_owned(), status.into());
-        }
-    }
-    if let Some(teardown) = report.get("teardown").and_then(Value::as_object) {
-        let complete = teardown.values().all(|step| step.as_bool() == Some(true));
-        metadata.insert("teardownComplete".to_owned(), complete.into());
-    }
-    Some(metadata)
 }
 
 impl Backend for OpenVmmBackend {
@@ -471,28 +406,17 @@ impl Backend for OpenVmmBackend {
     }
 
     fn probe(&self) -> Result<()> {
-        if !platform::SUPPORTED {
-            return Err(Error::backend_unavailable(
-                "the openvmm backend supports Linux and Windows hosts only",
-            ));
-        }
-        for (path, description) in [
-            (&self.config.openvmm, "OpenVMM executable"),
-            (&self.config.kernel, "NVX guest kernel"),
-            (&self.config.initrd, "NVX guest initramfs"),
-        ] {
-            if !path.is_file() {
-                return Err(Error::backend_unavailable(format!(
-                    "{description} not found: {}",
-                    path.display()
-                )));
-            }
-        }
+        Artifacts::new(
+            &self.config.openvmm,
+            &self.config.kernel,
+            &self.config.initrd,
+        )
+        .probe()?;
         #[cfg(feature = "testing")]
         if self.config.skip_hypervisor_probe {
             return Ok(());
         }
-        platform::probe_hypervisor(self.config.hypervisor).map_err(Error::backend_unavailable)
+        Ok(platform::probe_hypervisor(self.config.hypervisor)?)
     }
 
     fn validate_provision(&self, request: &ProvisionRequest) -> Result<()> {
@@ -506,7 +430,8 @@ impl Backend for OpenVmmBackend {
                 "microvm.provision.memoryMib must be positive",
             ));
         }
-        network::network_arguments(request.network.as_ref(), &self.config.guest_network)?;
+        let network = request.network.as_ref().map(network_policy);
+        network::openvmm_arguments(network.as_ref(), &self.config.guest_network)?;
         Ok(())
     }
 
@@ -523,38 +448,31 @@ impl Backend for OpenVmmBackend {
             .memory_mib
             .unwrap_or(self.config.memory_mib);
         let filesystem = match &request.filesystem {
-            Some(policy) => filesystem::plan(policy)?,
+            Some(policy) => export_plan(policy)?,
             None => None,
         };
-        let (workload_uid, workload_gid, create_workload_account) =
-            match host_identity(&self.config, filesystem.is_some()) {
-                Some((uid, gid)) => (uid, gid, true),
-                None => (self.config.workload_uid, self.config.workload_gid, false),
-            };
+        let identity = WorkloadIdentity::select(
+            self.config.workload_uid,
+            self.config.workload_gid,
+            self.config.map_host_identity,
+            filesystem.is_some(),
+        );
         let record = SandboxRecord {
             format: STATE_FORMAT,
             backend: BACKEND_KEY.to_owned(),
             network: request.network.clone(),
             filesystem,
             memory_mib,
-            workload_uid,
-            workload_gid,
-            create_workload_account,
+            workload_uid: identity.uid,
+            workload_gid: identity.gid,
+            create_workload_account: identity.create_account,
             hostname: self.config.hostname.clone(),
         };
-        launch::kernel_command_line(&self.config.kernel_command_line, &record)?;
+        let spec = self.launch_spec(&record);
+        spec.kernel_command_line()?;
         let sandbox_id = SandboxId::generate()?;
         // Windows names each start's control pipe afresh, but every name has the same length.
-        let endpoint =
-            platform::control_endpoint(&self.store.socket_path(&sandbox_id)).map_err(|error| {
-                Error::backend_error("cannot choose a control endpoint").with_source(error)
-            })?;
-        launch::check_process_command_line(
-            &self.config,
-            &record,
-            &endpoint,
-            &self.store.outcome_path(&sandbox_id),
-        )?;
+        self.store.instance(&sandbox_id).check_launch(&spec)?;
         self.store.create(&sandbox_id, &record)?;
         Ok(ProvisionResult {
             sandbox_id,
@@ -570,121 +488,12 @@ impl Backend for OpenVmmBackend {
             )));
         }
         self.probe()?;
-        if let Some(mapping) = &record.filesystem {
-            filesystem::verify(mapping)?;
-        }
-
-        let mut capability = [0u8; CAPABILITY_LEN];
-        while capability == [0; CAPABILITY_LEN] {
-            getrandom::fill(&mut capability).map_err(|error| {
-                Error::backend_error("cannot generate a control capability").with_source(error)
-            })?;
-        }
-        let socket = self.store.socket_path(sandbox_id);
-        state::remove_if_present(&socket)?;
-        let endpoint = platform::control_endpoint(&socket).map_err(|error| {
-            Error::backend_error("cannot choose a control endpoint").with_source(error)
-        })?;
-        let report = self.store.outcome_path(sandbox_id);
-        state::remove_if_present(&report)?;
-        let arguments = launch::openvmm_arguments(&self.config, &record, &endpoint, &report)?;
-
-        self.store.write_capability(sandbox_id, &capability)?;
-        let log = self.store.create_log(sandbox_id)?;
-        // Until the child is identified, recovery must retain this marker unless the endpoint
-        // identifies the child. An absent endpoint never proves that a launch has exited.
-        self.store.write_launch(
-            sandbox_id,
-            &LaunchRecord {
-                format: STATE_FORMAT,
-                endpoint: endpoint.clone(),
-                process: None,
-            },
-        )?;
-        let started = Instant::now();
-        let child = match process::spawn(
-            &self.config,
-            &arguments,
-            &capability,
-            log,
-            &self.store.dir(sandbox_id),
-        ) {
-            Ok(child) => child,
-            Err(error) => {
-                let _ = self.store.clear_runtime(sandbox_id);
-                return Err(Error::backend_error(format!(
-                    "cannot launch {}",
-                    self.config.openvmm.display()
-                ))
-                .with_source(error));
-            }
-        };
-        let pid = child.id();
-        let start_time = match platform::process_start_time(pid) {
-            Ok(Some(start_time)) => start_time,
-            outcome => {
-                // Keep the launch marker unless OpenVMM is gone, so recovery can retry.
-                if process::kill_child(child) {
-                    let _ = self.store.clear_runtime(sandbox_id);
-                }
-                let reason = match outcome {
-                    Err(error) => format!("cannot identify the OpenVMM process: {error}"),
-                    _ => "OpenVMM exited during startup".to_owned(),
-                };
-                return Err(self.start_failure(sandbox_id, &reason));
-            }
-        };
-        let runtime = RuntimeRecord {
-            format: STATE_FORMAT,
-            pid,
-            start_time,
-            endpoint: endpoint.clone(),
-        };
-        let identified = LaunchRecord {
-            format: STATE_FORMAT,
-            endpoint: endpoint.clone(),
-            process: Some(ProcessIdentity { pid, start_time }),
-        };
-        if let Err(error) = self
+        let started = self
             .store
-            .write_launch(sandbox_id, &identified)
-            .and_then(|()| self.store.write_runtime(sandbox_id, &runtime))
-        {
-            if process::kill_child(child) {
-                let _ = self.store.clear_runtime(sandbox_id);
-            }
-            return Err(error);
-        }
-        process::detach_child(child);
-        self.store.remove_launch(sandbox_id);
-        let deadline = started + self.config.start_timeout;
-        let ready = session::connect(&endpoint, pid, start_time, deadline)
-            .and_then(|transport| ControlSession::attach(transport, &capability, deadline))
-            .and_then(|mut session| {
-                session.ping(deadline)?;
-                let features = session.features(deadline)?;
-                Ok((session, features))
-            });
-        let (mut session, features) = match ready {
-            Ok(ready) => ready,
-            Err(error) => {
-                let reason = readiness_failure(&error, record.create_workload_account);
-                return Err(self.abort_start(sandbox_id, &runtime, &reason));
-            }
-        };
-        let missing = features.missing(GuestFeatures::REQUIRED);
-        if !missing.is_empty() {
-            return Err(self.reject_guest(sandbox_id, &runtime, &missing));
-        }
-        // Workloads run only once the guest has mounted every mapped host path.
-        if let Some(mapping) = &record.filesystem
-            && let Err(error) = session.map_host_paths(&filesystem::guest_table(mapping), deadline)
-        {
-            let reason = format!("the host paths were not mapped: {error}");
-            return Err(self.abort_start(sandbox_id, &runtime, &reason));
-        }
+            .instance(sandbox_id)
+            .start(&self.launch_spec(&record), self.config.start_timeout)?;
         let mut metadata = Metadata::new();
-        let boot_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let boot_ms = u64::try_from(started.boot.as_millis()).unwrap_or(u64::MAX);
         metadata.insert("bootMilliseconds".to_owned(), boot_ms.into());
         Ok(StartResult {
             metadata: Some(metadata),
@@ -698,6 +507,7 @@ impl Backend for OpenVmmBackend {
         io: ExecIo,
     ) -> Result<Box<dyn ExecControl>> {
         let workload = prepare_exec(&request.process)?;
+        let instance = self.store.instance(sandbox_id);
         let (runtime, capability) = {
             let (_guard, _) = self.store.lock_and_load(sandbox_id)?;
             match self.reconcile(sandbox_id)? {
@@ -707,39 +517,26 @@ impl Backend for OpenVmmBackend {
                     )));
                 }
                 RunState::Running(runtime) => {
-                    let capability = self.store.read_capability(sandbox_id)?;
+                    let capability = instance.read_capability()?;
                     (runtime, capability)
                 }
             }
         };
-        let deadline = Instant::now() + self.config.control_timeout;
-        let mut session =
-            session::connect(&runtime.endpoint, runtime.pid, runtime.start_time, deadline)
-                .and_then(|transport| ControlSession::attach(transport, &capability, deadline))
-                .map_err(|error| self.session_error(sandbox_id, error))?;
-        let request_id = session
-            .start_exec(&workload, deadline)
-            .map_err(|error| self.session_error(sandbox_id, error))?;
-        let timeout_ms = workload.timeout_ms;
-        let response_deadline = (timeout_ms > 0).then(|| {
-            Instant::now()
-                + Duration::from_millis(timeout_ms.into())
-                + self.config.exec_response_grace
-        });
+        let execution = instance
+            .exec(
+                &runtime,
+                &capability,
+                &workload,
+                self.config.control_timeout,
+                self.config.exec_response_grace,
+            )
+            .map_err(exec_error)?;
         let shared = Arc::new(ExecShared::default());
         let worker = Arc::clone(&shared);
-        let control_timeout = self.config.control_timeout;
         thread::Builder::new()
             .name("aci-edge-sandboxes-openvmm-exec".to_owned())
             .spawn(move || {
-                let outcome = pump(
-                    session,
-                    request_id,
-                    response_deadline,
-                    io,
-                    &worker.cancel_requested,
-                    control_timeout,
-                );
+                let outcome = pump(execution, io, &worker.cancel_requested);
                 worker.finish(outcome);
             })
             .map_err(|error| {
@@ -755,42 +552,15 @@ impl Backend for OpenVmmBackend {
                 "sandbox {sandbox_id} is not running"
             )));
         };
-        let deadline = Instant::now() + self.config.stop_timeout;
-        let graceful = (|| -> std::result::Result<(), SessionError> {
-            let capability = self
-                .store
-                .read_capability(sandbox_id)
-                .map_err(|error| SessionError::Protocol(error.to_string()))?;
-            let transport =
-                session::connect(&runtime.endpoint, runtime.pid, runtime.start_time, deadline)?;
-            let mut session = ControlSession::attach(transport, &capability, deadline)?;
-            session.stop(deadline)?;
-            drop(session);
-            if process::wait_for_exit(runtime.pid, runtime.start_time, deadline) {
-                Ok(())
-            } else {
-                Err(SessionError::TimedOut)
-            }
-        })();
-        let forced = !matches!(graceful, Ok(()) | Err(SessionError::ProcessExited));
-        if forced {
-            let exited = process::kill(runtime.pid, runtime.start_time).map_err(|error| {
-                Error::backend_error(format!("cannot terminate OpenVMM process {}", runtime.pid))
-                    .with_source(error)
-            })?;
-            if !exited {
-                return Err(Error::backend_error(format!(
-                    "OpenVMM process {} did not terminate",
-                    runtime.pid
-                )));
-            }
-        }
+        let stopped = self
+            .store
+            .instance(sandbox_id)
+            .stop(&runtime, self.config.stop_timeout)?;
         let mut metadata = Metadata::new();
-        metadata.insert("forced".to_owned(), forced.into());
-        if let Some(report) = read_report(&self.store.outcome_path(sandbox_id)) {
-            metadata.extend(report);
+        metadata.insert("forced".to_owned(), stopped.forced.into());
+        if let Some(report) = &stopped.report {
+            metadata.extend(report_metadata(report));
         }
-        self.store.clear_runtime(sandbox_id)?;
         Ok(StopResult {
             metadata: Some(metadata),
         })
@@ -810,107 +580,30 @@ impl Backend for OpenVmmBackend {
     }
 }
 
-/// Relays workload events to the output sinks and returns the terminal outcome.
-///
-/// Events are read in short slices so that a cancellation request reaches the guest promptly.
-/// The guest then terminates the workload and reports the cancelled outcome as usual.
+/// Relays workload events to the output sinks of `io` and returns the terminal outcome. The
+/// sinks close when it returns.
 fn pump(
-    mut session: ControlSession,
-    request_id: u64,
-    mut deadline: Option<Instant>,
+    execution: Execution,
     mut io: ExecIo,
     cancel_requested: &AtomicBool,
-    control_timeout: Duration,
 ) -> Result<ExecOutcome> {
-    let mut forwarded = 0usize;
-    let mut stdout_open = true;
-    let mut stderr_open = true;
-    let mut cancel_sent = false;
-    loop {
-        if !cancel_sent && cancel_requested.load(Ordering::Acquire) {
-            let cancellation_deadline = Instant::now() + control_timeout;
-            session
-                .cancel_exec(request_id, cancellation_deadline)
-                .map_err(|error| {
-                    Error::backend_error(format!(
-                        "cannot deliver the cancellation request: {error}"
-                    ))
-                    .with_source(error)
-                })?;
-            deadline = Some(deadline.map_or(cancellation_deadline, |deadline| {
-                deadline.min(cancellation_deadline)
-            }));
-            cancel_sent = true;
+    let outcome = execution.pump(
+        &mut |chunk: &[u8]| io.stdout.write(chunk),
+        &mut |chunk: &[u8]| io.stderr.write(chunk),
+        cancel_requested,
+    )?;
+    Ok(match outcome {
+        WorkloadOutcome::Exited(code) => ExecOutcome::Exited(code),
+        WorkloadOutcome::Signaled(signal) => ExecOutcome::Signaled(signal),
+        WorkloadOutcome::TimedOut => ExecOutcome::TimedOut,
+        WorkloadOutcome::OutputLimitExceeded => {
+            ExecOutcome::Failed(ExecFailure::OutputLimitExceeded)
         }
-        let slice = Instant::now() + CANCEL_POLL_INTERVAL;
-        let poll_deadline = if cancel_sent {
-            deadline
-        } else {
-            Some(deadline.map_or(slice, |deadline| deadline.min(slice)))
-        };
-        let event = match session.next_exec_event(request_id, poll_deadline) {
-            Err(SessionError::TimedOut)
-                if poll_deadline != deadline
-                    && deadline.is_none_or(|deadline| Instant::now() < deadline) =>
-            {
-                continue;
-            }
-            event => event,
-        };
-        let event = event.map_err(|error| match error {
-            SessionError::TimedOut => {
-                Error::backend_error("timed out waiting for the workload outcome")
-            }
-            SessionError::Closed | SessionError::Reset => Error::backend_error(
-                "the control session ended before the workload finished; the sandbox VM may \
-                     have stopped",
-            ),
-            other => Error::backend_error(format!("the control session failed: {other}"))
-                .with_source(other),
-        })?;
-        let (chunk, sink, open) = match event {
-            ExecEvent::Stdout(chunk) => (chunk, &mut io.stdout, &mut stdout_open),
-            ExecEvent::Stderr(chunk) => (chunk, &mut io.stderr, &mut stderr_open),
-            ExecEvent::Exit { category, status } => {
-                return Ok(match category {
-                    ExitCategory::Exit => ExecOutcome::Exited(status),
-                    ExitCategory::Signal => {
-                        ExecOutcome::Signaled(if status > 128 { status - 128 } else { status })
-                    }
-                    ExitCategory::Timeout => ExecOutcome::TimedOut,
-                    ExitCategory::OutputLimit => {
-                        ExecOutcome::Failed(ExecFailure::OutputLimitExceeded)
-                    }
-                    ExitCategory::Failed => ExecOutcome::Failed(ExecFailure::Workload),
-                    ExitCategory::Cancelled => ExecOutcome::Cancelled,
-                });
-            }
-            ExecEvent::Rejected { status, category } => {
-                return match category.as_str() {
-                    protocol::LAUNCH_FAILED => Ok(ExecOutcome::Failed(ExecFailure::LaunchFailed)),
-                    // The guest already wrote a diagnostic that names the directory to stderr.
-                    protocol::CWD_FAILED => Ok(ExecOutcome::Failed(ExecFailure::WorkingDirectory)),
-                    // Only a start that was interrupted leaves a guest without its mappings.
-                    protocol::MAPPINGS_INCOMPLETE => Err(Error::backend_error(
-                        "the guest has not mounted every mapped host path, because its start did \
-                         not complete; stop the sandbox and start it again",
-                    )),
-                    _ => Err(Error::backend_error(format!(
-                        "the guest agent rejected the workload: {category} (status {status})"
-                    ))),
-                };
-            }
-        };
-        forwarded = forwarded.saturating_add(chunk.len());
-        if forwarded > MAX_OUTPUT_BYTES {
-            return Err(Error::backend_error(
-                "the guest exceeded the output limit of the control protocol",
-            ));
-        }
-        if *open && sink.write(&chunk).is_err() {
-            *open = false;
-        }
-    }
+        WorkloadOutcome::Failed => ExecOutcome::Failed(ExecFailure::Workload),
+        WorkloadOutcome::Cancelled => ExecOutcome::Cancelled,
+        WorkloadOutcome::LaunchFailed => ExecOutcome::Failed(ExecFailure::LaunchFailed),
+        WorkloadOutcome::WorkingDirectory => ExecOutcome::Failed(ExecFailure::WorkingDirectory),
+    })
 }
 
 #[derive(Default)]
@@ -943,8 +636,11 @@ impl ExecControl for OpenVmmExecution {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
     use crate::ErrorCode;
+    use crate::model::{EgressPolicy, NetworkPeer, NetworkPort};
 
     #[test]
     fn command_lines_run_through_the_shell() {
@@ -983,7 +679,7 @@ mod tests {
             let request = ExecRequest::command_line("pwd").with_cwd(relative);
             let error = prepare_exec(&request.process).unwrap_err();
             assert_eq!(error.code(), ErrorCode::PolicyValidation);
-            assert!(error.message().contains("openvmm::guest_path"), "{error}");
+            assert!(error.message().contains("nvx::guest_path"), "{error}");
         }
         // The whole 4096-byte command line remains available with a working directory.
         let longest = "x".repeat(MAX_ARGUMENT_BYTES);
@@ -1095,35 +791,148 @@ mod tests {
     }
 
     #[test]
-    fn readiness_failures_explain_images_without_workload_accounts() {
-        let hint = "predates workload account creation";
-        for ended in [SessionError::ProcessExited, SessionError::Closed] {
-            assert!(readiness_failure(&ended, true).contains(hint));
-            // Only a sandbox that needs the account suggests it.
-            assert!(!readiness_failure(&ended, false).contains(hint));
-        }
-        for other in [
-            SessionError::TimedOut,
-            SessionError::Protocol("invalid record".to_owned()),
-        ] {
-            assert_eq!(readiness_failure(&other, true), other.to_string());
-        }
+    fn network_policies_convert_field_for_field() {
+        let policy = NetworkPolicy {
+            egress: EgressPolicy::new(Access::Deny)
+                .with_allow(NetworkRule {
+                    to: vec![NetworkPeer {
+                        cidr: "10.0.0.0/30".to_owned(),
+                        except: vec!["10.0.0.1".to_owned()],
+                    }],
+                    ports: vec![NetworkPort {
+                        protocol: Protocol::Tcp,
+                        port: Some(80),
+                        end_port: Some(81),
+                    }],
+                })
+                .with_deny(NetworkRule::to("192.0.2.7").on_protocol(Protocol::Icmp)),
+            ..NetworkPolicy::deny_all()
+        };
+        let converted = network_policy(&policy);
+        assert_eq!(converted.egress, network::Access::Deny);
+        assert_eq!(converted.ingress, network::Access::Deny);
+        assert_eq!(converted.allow.name, "network.egress.allow");
+        assert_eq!(converted.deny.name, "network.egress.deny");
+        assert_eq!(
+            converted.allow.rules,
+            [network::EgressRule {
+                to: vec![network::Destination {
+                    cidr: "10.0.0.0/30".to_owned(),
+                    except: vec!["10.0.0.1".to_owned()],
+                }],
+                ports: vec![network::PortSelector {
+                    protocol: network::Protocol::Tcp,
+                    port: Some(80),
+                    end_port: Some(81),
+                }],
+            }]
+        );
+        assert_eq!(
+            converted.deny.rules,
+            [network::EgressRule::to("192.0.2.7").on_protocol(network::Protocol::Icmp)]
+        );
+        // Messages name the contract's fields.
+        let icmp_port = NetworkPolicy {
+            egress: EgressPolicy::new(Access::Deny)
+                .with_allow(NetworkRule::to("10.0.0.0/8").on_port(Protocol::Icmp, 8)),
+            ..NetworkPolicy::deny_all()
+        };
+        let error = Error::from(
+            network::openvmm_arguments(Some(&network_policy(&icmp_port)), "10.0.0.2/24")
+                .unwrap_err(),
+        );
+        assert_eq!(error.code(), ErrorCode::PolicyValidation);
+        assert_eq!(
+            error.message(),
+            "network.egress.allow[0].ports[0]: ICMP has no ports"
+        );
     }
 
     #[test]
-    fn reports_are_summarized_without_free_form_fields() {
+    fn filesystem_messages_name_the_contract_fields() {
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("outcome.json");
-        fs::write(
-            &path,
-            r#"{"schema_version":1,"outcome":{"operation":"managed","category":"success",
-               "status_code":0},"teardown":{"workers":true,"memory":true}}"#,
-        )
-        .unwrap();
-        let report = read_report(&path).unwrap();
-        assert_eq!(report["vmOutcome"], "success");
-        assert_eq!(report["vmStatusCode"], 0);
-        assert_eq!(report["teardownComplete"], true);
-        assert!(read_report(&directory.path().join("missing.json")).is_none());
+        let missing = directory.path().join("missing");
+        let policy = FilesystemPolicy {
+            readwrite_paths: vec![missing.clone()],
+            ..FilesystemPolicy::default()
+        };
+        let error = export_plan(&policy).unwrap_err();
+        assert_eq!(error.code(), ErrorCode::PolicyValidation);
+        assert!(
+            error
+                .message()
+                .starts_with("filesystem.readwritePaths entry"),
+            "{error}"
+        );
+        let work = directory.path().join("work");
+        fs::create_dir(&work).unwrap();
+        let policy = FilesystemPolicy {
+            readwrite_paths: vec![work.clone()],
+            denied_paths: vec![work.join("not-yet")],
+            ..FilesystemPolicy::default()
+        };
+        let error = export_plan(&policy).unwrap_err();
+        assert!(
+            error.message().starts_with("filesystem.deniedPaths entry"),
+            "{error}"
+        );
+        assert_eq!(export_plan(&FilesystemPolicy::default()).unwrap(), None);
+    }
+
+    #[test]
+    fn vms_gone_during_an_exec_leave_the_sandbox_not_started() {
+        let gone = exec_error(nvx::Error::exited(
+            "sandbox aci-edge-sandboxes:00 stopped unexpectedly",
+        ));
+        assert_eq!(gone.code(), ErrorCode::NotStarted);
+        assert_eq!(
+            gone.message(),
+            "sandbox aci-edge-sandboxes:00 stopped unexpectedly"
+        );
+        for (kind, code) in [
+            (nvx::ErrorKind::TimedOut, ErrorCode::BackendError),
+            (nvx::ErrorKind::Protocol, ErrorCode::BackendError),
+            (nvx::ErrorKind::Unavailable, ErrorCode::BackendUnavailable),
+        ] {
+            assert_eq!(exec_error(nvx::Error::new(kind, "x")).code(), code);
+        }
+        // Elsewhere, a VM that exited is a backend failure.
+        assert_eq!(
+            Error::from(nvx::Error::exited("OpenVMM exited during startup")).code(),
+            ErrorCode::BackendError
+        );
+    }
+
+    #[test]
+    fn reports_become_stop_metadata() {
+        let report = Report {
+            category: Some("success".to_owned()),
+            status_code: Some(0),
+            teardown_complete: Some(true),
+        };
+        let metadata = report_metadata(&report);
+        assert_eq!(metadata["vmOutcome"], "success");
+        assert_eq!(metadata["vmStatusCode"], 0);
+        assert_eq!(metadata["teardownComplete"], true);
+        assert!(report_metadata(&Report::default()).is_empty());
+    }
+
+    #[test]
+    fn provisioning_without_artifacts_records_nothing() {
+        let directory = tempfile::tempdir().unwrap();
+        let Some(hypervisor) = nvx::Hypervisor::platform_default() else {
+            return;
+        };
+        let config = OpenVmmConfig::new(
+            directory.path().join("openvmm"),
+            directory.path().join("vmlinux"),
+            directory.path().join("initrd"),
+            hypervisor,
+            directory.path().join("state"),
+        );
+        let backend = OpenVmmBackend::new(config).unwrap();
+        let error = backend.provision(&ProvisionRequest::new()).unwrap_err();
+        assert_eq!(error.code(), ErrorCode::BackendUnavailable);
+        assert!(error.message().contains("not found"), "{error}");
     }
 }

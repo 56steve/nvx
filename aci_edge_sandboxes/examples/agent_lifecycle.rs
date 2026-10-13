@@ -325,8 +325,9 @@ fn parse_forward(option: &str, text: &str) -> Result<HostLoopbackForward, String
     }
 }
 
-fn describe(error: aci_edge_sandboxes::Error) -> String {
-    error.to_string()
+/// Describes an error of the crate or of NVX, with the crate's error code.
+fn describe(error: impl Into<aci_edge_sandboxes::Error>) -> String {
+    error.into().to_string()
 }
 
 #[cfg(test)]

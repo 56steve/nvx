@@ -348,7 +348,8 @@ python3 scripts/nvx.py test-aci-edge-sandboxes
     [--cargo CARGO]
 ```
 
-Runs the ignored `openvmm_e2e` tests of the [`aci_edge_sandboxes` crate](../aci_edge_sandboxes/README.md)
+Runs the ignored `openvmm_e2e` tests of the [`aci_edge_sandboxes` crate](../aci_edge_sandboxes/README.md),
+whose OpenVMM backend builds on the [`nvx-rs` crate](../nvx-rs/README.md),
 against a real hypervisor. The tests start sandboxes with `build/vmlinux` and
 the Alpine initramfs, whose userland the workloads use directly, and run
 workloads. They check the workload identity, timeouts, and cancellation, that

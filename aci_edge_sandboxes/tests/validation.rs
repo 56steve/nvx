@@ -6,7 +6,8 @@ use std::fs;
 use std::io;
 use std::time::Duration;
 
-use aci_edge_sandboxes::openvmm::{Hypervisor, OpenVmmConfig};
+use aci_edge_sandboxes::nvx::Hypervisor;
+use aci_edge_sandboxes::openvmm::OpenVmmConfig;
 use aci_edge_sandboxes::{
     Access, AciEdgeSandbox, ErrorCode, ExecIo, ExecRequest, FilesystemPolicy, NetworkPolicy,
     NetworkPort, NetworkRule, OutputSink, ProcessSpec, Protocol, ProvisionRequest, SandboxId,

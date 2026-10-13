@@ -73,7 +73,8 @@ the Python and shell checks.
 | Python in `scripts/` and `.github/specula/` | Ruff lint and format with 88-column lines, Pyright in strict mode over `scripts/` against Linux and Windows APIs, and the Specula wiring tests. The code targets Python 3.10. | [check-quality](../.github/actions/check-quality/action.yml), [pyproject.toml](../pyproject.toml) |
 | Guest and setup shell scripts | ShellCheck, and shfmt with four-space indentation and indented `case` branches. Scripts are POSIX `sh` unless check-quality checks them as Bash. | [check-quality](../.github/actions/check-quality/action.yml) |
 | `scripts/setup/setup-windows-whp.ps1` | PowerShell syntax | [check-quality](../.github/actions/check-quality/action.yml) |
-| `aci_edge_sandboxes/` | rustfmt, Clippy and rustdoc with warnings denied, tests, and the minimum supported Rust version; see [Rust crate](ci.md#rust-crate) | [check-aci-edge-sandboxes](../.github/actions/check-aci-edge-sandboxes/action.yml) |
+| `aci_edge_sandboxes/` | rustfmt, Clippy and rustdoc with warnings denied, tests, and the minimum supported Rust version; see [Rust crates](ci.md#rust-crates) | [check-aci-edge-sandboxes](../.github/actions/check-aci-edge-sandboxes/action.yml) |
+| `nvx-rs/` | rustfmt, Clippy and rustdoc with warnings denied, tests including a bundled-release fixture, the minimum supported Rust version, and a macOS check; see [Rust crates](ci.md#rust-crates) | [check-nvx-rs](../.github/actions/check-nvx-rs/action.yml) |
 | NVX CLI | Compiles `scripts/`, runs every `scripts/test_*.py` module, and checks command help, on Linux and Windows | [validate-nvx](../.github/actions/validate-nvx/action.yml) |
 
 check-quality names each shell script that it checks, and a CLI test fails
@@ -101,10 +102,13 @@ The scenarios that drive the public `nvx.py sandbox` commands live in
 registers them.
 
 Unit tests for the host tooling live in `scripts/test_*.py`. The
-`aci_edge_sandboxes` crate keeps unit tests alongside its Rust source and
-integration tests in `aci_edge_sandboxes/tests`. The
-`scripts/nvx.py test-aci-edge-sandboxes --backend BACKEND` command runs all
-ignored `openvmm_e2e` tests on a real hypervisor. [Validation](design/validation.md)
+`aci_edge_sandboxes` and `nvx-rs` crates keep unit tests alongside their Rust
+source and integration tests in their `tests` directories. Tests of the NVX
+mechanics, such as the golden fixtures of the control protocol, belong in
+`nvx-rs`, and tests of the ACI Edge Sandboxes contract in
+`aci_edge_sandboxes`. The `scripts/nvx.py test-aci-edge-sandboxes --backend
+BACKEND` command runs all ignored `openvmm_e2e` tests on a real hypervisor,
+which exercises both crates. [Validation](design/validation.md)
 describes what the OpenVMM VMM tests and the NVX microVM suite cover.
 
 ## OpenVMM

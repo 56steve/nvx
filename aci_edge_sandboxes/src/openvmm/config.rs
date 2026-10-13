@@ -2,12 +2,12 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use aci_edge_sandboxes_model::spec::{is_valid_guest_network, is_valid_hostname};
+use nvx::Hypervisor;
+use nvx::host::artifacts::{Artifacts, absolute};
+use nvx::host::instance::SOCKET_NAME;
+use nvx::host::launch::{self, WorkloadIdentity};
 
-use super::artifacts::{Artifacts, absolute};
-use super::launch;
 use crate::error::{Error, Result};
-
-pub use aci_edge_sandboxes_model::setup::Hypervisor;
 
 /// Configuration of the [`OpenVmmBackend`](super::OpenVmmBackend).
 ///
@@ -76,20 +76,20 @@ pub struct OpenVmmConfig {
 
 impl OpenVmmConfig {
     /// Default guest memory in MiB.
-    pub const DEFAULT_MEMORY_MIB: u32 = 256;
+    pub const DEFAULT_MEMORY_MIB: u32 = launch::DEFAULT_MEMORY_MIB;
     /// Default workload user and group ID (Alpine's `nobody`).
-    pub const DEFAULT_WORKLOAD_ID: u32 = 65534;
+    pub const DEFAULT_WORKLOAD_ID: u32 = WorkloadIdentity::DEFAULT.uid;
     /// Default workload hostname.
-    pub const DEFAULT_HOSTNAME: &'static str = "nvx-sandbox";
+    pub const DEFAULT_HOSTNAME: &'static str = launch::DEFAULT_HOSTNAME;
     /// Default guest network address.
-    pub const DEFAULT_GUEST_NETWORK: &'static str = "10.0.0.2/24";
+    pub const DEFAULT_GUEST_NETWORK: &'static str = launch::DEFAULT_GUEST_NETWORK;
     /// Longest accepted `start_timeout`, `control_timeout`, `stop_timeout`, or
     /// `exec_response_grace`: 30 days.
     ///
     /// The bound keeps every deadline derived from these timeouts, including a workload's own
     /// timeout plus `exec_response_grace`, representable as an [`Instant`](std::time::Instant) and
     /// within the roughly 49-day range of Windows' millisecond waits.
-    pub const MAX_TIMEOUT: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+    pub const MAX_TIMEOUT: Duration = launch::MAX_TIMEOUT;
 
     /// Creates a configuration from explicit artifact paths.
     pub fn new(
@@ -237,18 +237,11 @@ impl OpenVmmConfig {
                 self.guest_network
             ));
         }
-        if let Some(problem) = kernel_command_line_problem(&self.kernel_command_line) {
+        // Provisioning checks the tokens that each sandbox adds.
+        if let Some(problem) =
+            launch::kernel_parameters_problem(&self.kernel_command_line, &self.hostname)
+        {
             return invalid(format!("kernel_command_line {problem}"));
-        }
-        // Every sandbox's command line starts with these parameters and the hostname, and ends
-        // with a NUL; provisioning then checks the tokens that each sandbox adds.
-        let base = launch::base_command_line(&self.kernel_command_line, &self.hostname);
-        if base.len() + 1 > launch::COMMAND_LINE_BUDGET {
-            return invalid(format!(
-                "kernel_command_line and the hostname leave no room in the {}-byte kernel \
-                 command line",
-                launch::COMMAND_LINE_BUDGET
-            ));
         }
         for (name, value, positive) in [
             ("start_timeout", self.start_timeout, true),
@@ -256,22 +249,13 @@ impl OpenVmmConfig {
             ("stop_timeout", self.stop_timeout, true),
             ("exec_response_grace", self.exec_response_grace, false),
         ] {
-            if positive && value.is_zero() {
-                return invalid(format!("{name} must be positive"));
-            }
-            if value > Self::MAX_TIMEOUT {
-                return invalid(format!(
-                    "{name} must be at most {} days",
-                    Self::MAX_TIMEOUT.as_secs() / (24 * 60 * 60)
-                ));
+            if let Some(problem) = launch::timeout_problem(value, positive) {
+                return invalid(format!("{name} {problem}"));
             }
         }
         if cfg!(unix) {
             // sockaddr_un holds 108 bytes including the terminating NUL.
-            let socket = self
-                .state_root
-                .join("0".repeat(32))
-                .join(super::state::SOCKET_NAME);
+            let socket = self.state_root.join("0".repeat(32)).join(SOCKET_NAME);
             if socket.as_os_str().len() >= 108 {
                 return invalid(format!(
                     "state_root {} is too long for a Unix control socket path",
@@ -281,28 +265,6 @@ impl OpenVmmConfig {
         }
         Ok(())
     }
-}
-
-/// Describes why extra kernel parameters are unacceptable, if they are.
-pub(crate) fn kernel_command_line_problem(value: &str) -> Option<String> {
-    if value.contains('\0') {
-        return Some("contains a NUL character".to_owned());
-    }
-    if value.contains(['"', '\'']) {
-        return Some("must not contain quotes".to_owned());
-    }
-    value.split_whitespace().find_map(|token| {
-        if token == "--" {
-            Some("must not contain the -- delimiter".to_owned())
-        } else if token.starts_with("nvx_")
-            || token.starts_with("tsc=")
-            || token.starts_with("hostname=")
-        {
-            Some(format!("uses the reserved token {token:?}"))
-        } else {
-            None
-        }
-    })
 }
 
 #[cfg(test)]
@@ -381,6 +343,26 @@ mod tests {
                 "{config:?}"
             );
         }
+        // The messages name the configuration's fields.
+        let mut config = base.clone();
+        config.kernel_command_line = "x".repeat(room + 1);
+        assert_eq!(
+            config.normalized().unwrap_err().message(),
+            "kernel_command_line and the hostname leave no room in the 1024-byte kernel command \
+             line"
+        );
+        let mut config = base.clone();
+        config.stop_timeout = Duration::ZERO;
+        assert_eq!(
+            config.normalized().unwrap_err().message(),
+            "stop_timeout must be positive"
+        );
+        let mut config = base;
+        config.control_timeout = Duration::MAX;
+        assert_eq!(
+            config.normalized().unwrap_err().message(),
+            "control_timeout must be at most 30 days"
+        );
     }
 
     #[test]
@@ -403,10 +385,6 @@ mod tests {
             assert!(!is_valid_guest_network(reserved), "{reserved}");
         }
         assert!(is_valid_guest_network("10.0.0.6/30"));
-        assert!(kernel_command_line_problem("quiet loglevel=0").is_none());
-        assert!(kernel_command_line_problem("tsc=reliable").is_some());
-        assert!(kernel_command_line_problem("hostname=other").is_some());
-        assert!(kernel_command_line_problem("a -- b").is_some());
         assert_eq!("mshv".parse::<Hypervisor>().unwrap(), Hypervisor::Mshv);
     }
 }

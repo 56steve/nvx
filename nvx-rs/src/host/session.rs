@@ -6,7 +6,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use super::platform::{self, Transport};
-use super::protocol::{
+use crate::protocol::{
     self, APP_CANCEL, APP_ERROR, APP_EXEC, APP_EXIT, APP_FEATURES, APP_HEADER_LEN, APP_MAPS,
     APP_PING, APP_READY, APP_STDERR, APP_STDOUT, APP_STOP, APP_STOPPED, CAPABILITY_LEN,
     ExitCategory, GuestFeatures, HostMap, OUTER_DATA, OUTER_ERROR, OUTER_HEADER_LEN,
@@ -16,7 +16,7 @@ use super::protocol::{
 
 /// Failure of a control session.
 #[derive(Debug)]
-pub(crate) enum SessionError {
+pub enum SessionError {
     /// The deadline passed.
     TimedOut,
     /// The OpenVMM process exited.
@@ -56,7 +56,7 @@ impl std::error::Error for SessionError {}
 
 impl From<ProtocolError> for SessionError {
     fn from(error: ProtocolError) -> Self {
-        Self::Protocol(error.0)
+        Self::Protocol(error.into_message())
     }
 }
 
@@ -72,7 +72,7 @@ impl From<io::Error> for SessionError {
 
 /// Connects to the control endpoint of OpenVMM process `pid`, retrying until `deadline` while
 /// the endpoint is not yet available and the process is still alive.
-pub(crate) fn connect(
+pub fn connect(
     endpoint: &str,
     pid: u32,
     start_time: u64,
@@ -105,18 +105,33 @@ pub(crate) fn connect(
 
 /// Event observed while an execution runs.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum ExecEvent {
+pub enum ExecEvent {
+    /// A chunk of the workload's standard output.
     Stdout(Vec<u8>),
+    /// A chunk of the workload's standard error.
     Stderr(Vec<u8>),
-    Exit { category: ExitCategory, status: i32 },
-    Rejected { status: i32, category: String },
+    /// The workload ended.
+    Exit {
+        /// How it ended.
+        category: ExitCategory,
+        /// Its exit status, 128 plus the signal number for [`ExitCategory::Signal`].
+        status: i32,
+    },
+    /// The guest agent refused the workload, and nothing of it runs any longer.
+    Rejected {
+        /// The guest's error number.
+        status: i32,
+        /// The error category, such as [`LAUNCH_FAILED`](crate::protocol::LAUNCH_FAILED),
+        /// truncated to 64 characters.
+        category: String,
+    },
 }
 
 /// Authenticated control session.
 ///
 /// Received bytes are buffered until a whole record is available, so a read that times out
 /// loses nothing and callers can poll with short deadlines.
-pub(crate) struct ControlSession {
+pub struct ControlSession {
     transport: Box<dyn Transport>,
     received: Vec<u8>,
     instance_id: [u8; 16],
@@ -127,7 +142,7 @@ pub(crate) struct ControlSession {
 
 impl ControlSession {
     /// Authenticates with the capability OpenVMM received at launch.
-    pub(crate) fn attach(
+    pub fn attach(
         transport: Box<dyn Transport>,
         capability: &[u8; CAPABILITY_LEN],
         deadline: Instant,
@@ -171,7 +186,7 @@ impl ControlSession {
     }
 
     /// Waits until the guest agent acknowledges readiness.
-    pub(crate) fn ping(&mut self, deadline: Instant) -> Result<(), SessionError> {
+    pub fn ping(&mut self, deadline: Instant) -> Result<(), SessionError> {
         let request_id = request_id()?;
         self.send_app(APP_PING, request_id, &[], Some(deadline))?;
         let (kind, response_id, status, payload) = self.read_app(Some(deadline))?;
@@ -187,7 +202,7 @@ impl ControlSession {
     ///
     /// An agent that predates the request refuses it as an unsupported operation, which means
     /// that the image provides none of them.
-    pub(crate) fn features(&mut self, deadline: Instant) -> Result<GuestFeatures, SessionError> {
+    pub fn features(&mut self, deadline: Instant) -> Result<GuestFeatures, SessionError> {
         let request_id = request_id()?;
         self.send_app(APP_FEATURES, request_id, &[], Some(deadline))?;
         let (kind, response_id, status, payload) = self.read_app(Some(deadline))?;
@@ -207,7 +222,7 @@ impl ControlSession {
 
     /// Hands the guest agent the host mapping table, in as many requests as it takes, and waits
     /// until it has mounted every entry.
-    pub(crate) fn map_host_paths(
+    pub fn map_host_paths(
         &mut self,
         maps: &[HostMap],
         deadline: Instant,
@@ -248,7 +263,7 @@ impl ControlSession {
     }
 
     /// Starts a workload and returns the request ID that identifies its events.
-    pub(crate) fn start_exec(
+    pub fn start_exec(
         &mut self,
         workload: &Workload<'_>,
         deadline: Instant,
@@ -260,7 +275,7 @@ impl ControlSession {
     }
 
     /// Reads the next event of the workload started with `request_id`.
-    pub(crate) fn next_exec_event(
+    pub fn next_exec_event(
         &mut self,
         request_id: u64,
         deadline: Option<Instant>,
@@ -293,16 +308,12 @@ impl ControlSession {
     /// The guest reports the workload's outcome as a regular exec event, with the cancelled
     /// category if the request arrived before the workload exited. A request for a workload that
     /// already finished is ignored.
-    pub(crate) fn cancel_exec(
-        &mut self,
-        request_id: u64,
-        deadline: Instant,
-    ) -> Result<(), SessionError> {
+    pub fn cancel_exec(&mut self, request_id: u64, deadline: Instant) -> Result<(), SessionError> {
         self.send_app(APP_CANCEL, request_id, &[], Some(deadline))
     }
 
     /// Asks the guest agent to shut the VM down.
-    pub(crate) fn stop(&mut self, deadline: Instant) -> Result<(), SessionError> {
+    pub fn stop(&mut self, deadline: Instant) -> Result<(), SessionError> {
         let request_id = request_id()?;
         self.send_app(APP_STOP, request_id, &[], Some(deadline))?;
         let (kind, response_id, status, payload) = self.read_app(Some(deadline))?;
@@ -429,7 +440,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
-    use crate::openvmm::protocol::{
+    use crate::protocol::{
         WorkloadEnvironment, decode_app, decode_outer_header, encode_app, encode_outer,
     };
 

@@ -4,7 +4,8 @@
 
 use std::fs;
 
-use aci_edge_sandboxes::openvmm::{Hypervisor, OpenVmmConfig};
+use aci_edge_sandboxes::nvx::Hypervisor;
+use aci_edge_sandboxes::openvmm::OpenVmmConfig;
 use aci_edge_sandboxes::{AciEdgeSandbox, ErrorCode, ProvisionRequest};
 
 fn hypervisor() -> Hypervisor {

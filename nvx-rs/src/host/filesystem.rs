@@ -1,6 +1,6 @@
 //! Host paths exposed to the guest through OpenVMM's aggregate virtio-fs export.
 //!
-//! OpenVMM offers one virtio-fs device. The backend attaches it as an aggregate: a synthetic,
+//! OpenVMM offers one virtio-fs device. NVX attaches it as an aggregate: a synthetic,
 //! read-only root that lists one child per exported host directory or file, named by its index,
 //! which the guest's init mounts at a directory that only the guest's root can enter. The guest
 //! agent then bind-mounts each mapped path at its target, read-only or read-write, from the
@@ -27,16 +27,15 @@ use std::path::{Component, Path, PathBuf, Prefix};
 use serde::{Deserialize, Serialize};
 
 use super::platform;
-use super::protocol::{HostMap, MAX_HOST_MAPPINGS};
 use crate::error::{Error, Result};
-use crate::model::FilesystemPolicy;
+use crate::protocol::{HostMap, MAPS_TOKEN, MAX_HOST_MAPPINGS};
 
 /// Guest directory where the guest's init mounts the export; only the guest's root can enter
 /// its parent.
-pub(crate) const GUEST_EXPORT: &str = "/run/nvx/hostfs/root";
+pub const GUEST_EXPORT: &str = "/run/nvx/hostfs/root";
 
-/// Largest number of host directories that OpenVMM exports through one aggregate.
-const MAX_CHILDREN: usize = 256;
+/// Largest number of host directories and files that OpenVMM exports through one aggregate.
+pub const MAX_CHILDREN: usize = 256;
 /// Largest number of hidden, allowed, or writable paths that OpenVMM accepts in one exported
 /// directory, and their largest combined length.
 const MAX_POLICY_PATHS: usize = 128;
@@ -48,77 +47,82 @@ const MAX_AGGREGATE_POLICY_BYTES: usize = 128 * 1024;
 const MAX_GUEST_PATH: usize = 4095;
 
 /// Guest directories that a mapping must not cover, because the guest's own system lives there.
-const RESERVED_TARGETS: [&str; 13] = [
+pub const RESERVED_TARGETS: [&str; 13] = [
     "/bin", "/boot", "/dev", "/etc", "/lib", "/proc", "/root", "/run", "/sbin", "/sys", "/usr",
     "/var", "/init",
 ];
 
-/// Exported host directories and per-path bind mounts of one sandbox.
+/// The host paths of one sandbox, as [`plan`] exports them: the children of OpenVMM's aggregate
+/// export and the bind mounts of the guest agent.
+///
+/// Callers record the plan, so its serde form is part of their state and must not change.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct HostMapping {
+pub struct ExportPlan {
     /// Children of the aggregate export; each is named by its index.
-    pub(crate) children: Vec<Child>,
+    pub children: Vec<ExportChild>,
     /// Bind mounts the guest agent creates, parents before children.
-    pub(crate) binds: Vec<Bind>,
+    pub binds: Vec<Bind>,
 }
 
 /// One host directory or file of the aggregate export.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct Child {
+pub struct ExportChild {
     /// Canonical host directory, or the canonical host file that the child exposes alone.
-    pub(crate) root: PathBuf,
+    pub root: PathBuf,
     /// Whether the root is a regular file, which OpenVMM exposes without its directory. Records
     /// without file children leave it out, and earlier crates refuse records with them.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub(crate) file: bool,
+    pub file: bool,
     /// Whether the guest may modify it, which a read-write mapping inside it requires.
-    pub(crate) writable: bool,
+    pub writable: bool,
     /// Whether OpenVMM hides everything but the allowed paths, because the root is no mapping,
     /// which only records of earlier crates hold.
-    pub(crate) hidden: bool,
+    pub hidden: bool,
     /// Canonical host paths inside the child that OpenVMM hides.
-    pub(crate) denied: Vec<PathBuf>,
+    pub denied: Vec<PathBuf>,
     /// Identities, at provision, of the denied paths that a workload could move: those inside
     /// a read-write mapping.
-    pub(crate) denied_identities: Vec<Option<FileIdentity>>,
+    pub denied_identities: Vec<Option<FileIdentity>>,
     /// Canonical mapped paths that stay visible below a hidden root.
-    pub(crate) allowed: Vec<PathBuf>,
+    pub allowed: Vec<PathBuf>,
     /// Canonical paths to which OpenVMM limits the guest's writes; empty if the guest may modify
     /// everything that it can reach in a writable child.
-    pub(crate) write: Vec<PathBuf>,
+    pub write: Vec<PathBuf>,
 }
 
 /// Device and file index of a host object, which survive renames.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct FileIdentity {
-    pub(crate) device: u64,
-    pub(crate) index: u64,
+pub struct FileIdentity {
+    /// Device, or the volume serial number on Windows.
+    pub device: u64,
+    /// Inode, or the file index on Windows.
+    pub index: u64,
 }
 
 /// One mapped host path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct Bind {
+pub struct Bind {
     /// Index of the child that holds the mapped path.
-    pub(crate) child: usize,
+    pub child: usize,
     /// Path relative to the child's root, `/`-separated; empty for the root itself.
-    pub(crate) source: String,
+    pub source: String,
     /// Absolute guest path.
-    pub(crate) target: String,
+    pub target: String,
     /// Whether the guest mounts it read-only.
-    pub(crate) read_only: bool,
+    pub read_only: bool,
     /// Identity of the host object at provision, when it lies inside a read-write mapping and a
     /// workload could therefore move it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) identity: Option<FileIdentity>,
+    pub identity: Option<FileIdentity>,
 }
 
 impl Bind {
     /// Path of the mapped object relative to the guest's mount of the export.
-    pub(crate) fn guest_source(&self) -> String {
+    pub fn guest_source(&self) -> String {
         guest_source(self.child, &self.source)
     }
 }
@@ -131,7 +135,7 @@ fn guest_source(child: usize, source: &str) -> String {
     }
 }
 
-/// Returns the guest path at which the backend exposes the host path `path`, or `None` if it
+/// Returns the guest path at which a sandbox exposes the host path `path`, or `None` if it
 /// has no guest equivalent (relative paths, UNC paths, or paths that are not valid UTF-8).
 ///
 /// A Windows path `C:\work\src` maps to `/mnt/c/work/src`, and an absolute Linux path maps to
@@ -184,7 +188,29 @@ pub fn resolve_guest_path(path: &Path) -> Option<String> {
     }
 }
 
-/// Plans the mapping of `policy`, or returns `None` if it maps nothing.
+/// A list of host paths, and the name by which messages refer to its entries, such as
+/// `readOnly`.
+#[derive(Debug, Clone, Copy)]
+pub struct PathList<'a> {
+    /// The name of the list in messages.
+    pub name: &'a str,
+    /// The host paths.
+    pub paths: &'a [PathBuf],
+}
+
+/// The host paths that a sandbox maps, read-only or read-write, and those that it hides inside
+/// them.
+#[derive(Debug, Clone, Copy)]
+pub struct ExportRequest<'a> {
+    /// Host paths that the guest reads.
+    pub read_only: PathList<'a>,
+    /// Host paths that the guest reads and writes.
+    pub read_write: PathList<'a>,
+    /// Host paths hidden inside the mapped paths.
+    pub denied: PathList<'a>,
+}
+
+/// Plans the export of `request`, or returns `None` if it maps nothing.
 ///
 /// Mapped paths must exist, and their guest paths derive from their resolved host paths, so two
 /// spellings of one object (links, letter case, or short names) map to one guest path. A path
@@ -192,24 +218,24 @@ pub fn resolve_guest_path(path: &Path) -> Option<String> {
 /// and a policy that would need more children than OpenVMM offers is refused. A denied path must
 /// not contain a mapped path, and a denied path that does not exist yet must not lie inside a
 /// mapped path, because nothing could hide it once a workload creates it.
-pub(crate) fn plan(policy: &FilesystemPolicy) -> Result<Option<HostMapping>> {
-    let unsupported = |message: String| Err(Error::policy_validation(message));
+///
+/// Fails with [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported) when the request breaks
+/// these rules or exceeds a limit of OpenVMM or the guest agent.
+pub fn plan(request: &ExportRequest<'_>) -> Result<Option<ExportPlan>> {
+    let unsupported = |message: String| Err(Error::unsupported(message));
     let mut mapped: Vec<Mapped> = Vec::new();
-    for (paths, read_only, field) in [
-        (&policy.readonly_paths, true, "filesystem.readonlyPaths"),
-        (&policy.readwrite_paths, false, "filesystem.readwritePaths"),
-    ] {
-        for path in paths {
+    for (list, read_only) in [(request.read_only, true), (request.read_write, false)] {
+        let field = list.name;
+        for path in list.paths {
             let canonical = canonicalize(path).map_err(|error| {
-                Error::policy_validation(format!(
+                Error::unsupported(format!(
                     "{field} entry {} is not accessible",
                     path.display()
                 ))
                 .with_source(error)
             })?;
             let metadata = fs::metadata(&canonical).map_err(|error| {
-                Error::policy_validation(format!("cannot inspect {}", path.display()))
-                    .with_source(error)
+                Error::unsupported(format!("cannot inspect {}", path.display())).with_source(error)
             })?;
             if !metadata.is_dir() && !metadata.is_file() {
                 return unsupported(format!(
@@ -292,7 +318,7 @@ pub(crate) fn plan(policy: &FilesystemPolicy) -> Result<Option<HostMapping>> {
             roots.len()
         ));
     }
-    let denied = denied_paths(policy, &mapped)?;
+    let denied = denied_paths(request.denied, &mapped)?;
     // Only objects inside a read-write mapping can be swapped by a workload; pinning others
     // would make ordinary host edits, which often replace files, block the next start.
     let movable = |path: &Path| {
@@ -313,7 +339,7 @@ pub(crate) fn plan(policy: &FilesystemPolicy) -> Result<Option<HostMapping>> {
             .collect();
         // Every root is a mapping itself, so the guest reaches all of it.
         let Some(own) = inside.iter().find(|entry| entry.canonical == root) else {
-            return Err(Error::backend_error(format!(
+            return Err(Error::other(format!(
                 "{} is exported but not mapped",
                 root.display()
             )));
@@ -346,7 +372,7 @@ pub(crate) fn plan(policy: &FilesystemPolicy) -> Result<Option<HostMapping>> {
             .iter()
             .map(|path| movable(path).then(|| identity(path)).transpose())
             .collect::<Result<Vec<_>>>()?;
-        children.push(Child {
+        children.push(ExportChild {
             root,
             file: !own.directory,
             writable,
@@ -370,7 +396,7 @@ pub(crate) fn plan(policy: &FilesystemPolicy) -> Result<Option<HostMapping>> {
             .iter()
             .position(|child| entry.canonical.starts_with(&child.root))
         else {
-            return Err(Error::backend_error(format!(
+            return Err(Error::other(format!(
                 "{} lies in no exported directory",
                 entry.given.display()
             )));
@@ -401,7 +427,7 @@ pub(crate) fn plan(policy: &FilesystemPolicy) -> Result<Option<HostMapping>> {
             .cmp(&depth(&right.target))
             .then_with(|| left.target.cmp(&right.target))
     });
-    Ok(Some(HostMapping { children, binds }))
+    Ok(Some(ExportPlan { children, binds }))
 }
 
 /// Explains why a mapped host directory, given in canonical form, cannot be exported, or returns
@@ -437,7 +463,7 @@ fn export_roots(mapped: &[Mapped]) -> Result<Vec<PathBuf>> {
     for root in &roots {
         let current = identity(root)?;
         if let Some((_, other)) = identities.iter().find(|(other, _)| *other == current) {
-            return Err(Error::policy_validation(format!(
+            return Err(Error::unsupported(format!(
                 "{} and {} are the same host directory or file; map it once",
                 other.display(),
                 root.display()
@@ -450,13 +476,14 @@ fn export_roots(mapped: &[Mapped]) -> Result<Vec<PathBuf>> {
 
 /// Resolves the denied paths that OpenVMM needs to hide: those that exist, without the ones
 /// that other denied paths contain.
-fn denied_paths(policy: &FilesystemPolicy, mapped: &[Mapped]) -> Result<Vec<PathBuf>> {
-    let unsupported = |message: String| Err(Error::policy_validation(message));
+fn denied_paths(list: PathList<'_>, mapped: &[Mapped]) -> Result<Vec<PathBuf>> {
+    let unsupported = |message: String| Err(Error::unsupported(message));
+    let field = list.name;
     let mut denied: Vec<PathBuf> = Vec::new();
-    for path in &policy.denied_paths {
+    for path in list.paths {
         let (canonical, exists) = canonicalize_lenient(path).map_err(|error| {
-            Error::policy_validation(format!(
-                "filesystem.deniedPaths entry {} cannot be resolved",
+            Error::unsupported(format!(
+                "{field} entry {} cannot be resolved",
                 path.display()
             ))
             .with_source(error)
@@ -466,7 +493,7 @@ fn denied_paths(policy: &FilesystemPolicy, mapped: &[Mapped]) -> Result<Vec<Path
             .find(|entry| entry.canonical.starts_with(&canonical))
         {
             return unsupported(format!(
-                "filesystem.deniedPaths entry {} contains the mapped path {}",
+                "{field} entry {} contains the mapped path {}",
                 path.display(),
                 entry.given.display()
             ));
@@ -477,8 +504,8 @@ fn denied_paths(policy: &FilesystemPolicy, mapped: &[Mapped]) -> Result<Vec<Path
                 .find(|entry| canonical.starts_with(&entry.canonical))
             {
                 return unsupported(format!(
-                    "filesystem.deniedPaths entry {} does not exist, so it cannot be hidden \
-                     inside the mapped path {}",
+                    "{field} entry {} does not exist, so it cannot be hidden inside the mapped \
+                     path {}",
                     path.display(),
                     entry.given.display()
                 ));
@@ -515,65 +542,125 @@ fn outermost<'a>(entries: &[&'a Mapped]) -> Vec<&'a Mapped> {
         .collect()
 }
 
-/// Checks that every child's root is still the kind of object that provision exported, and that
-/// every mapped and denied path inside a read-write mapping still names the object it named at
-/// provision.
-///
-/// A file that a directory replaced would otherwise grant the whole directory, and a workload
-/// with a read-write mapping could rename a denied or read-only object and put a decoy at its
-/// path, so the next start would protect the decoy instead. The VM is stopped while this runs, so
-/// no workload can race with it, and OpenVMM checks each child's kind again when it opens it.
-pub(crate) fn verify(mapping: &HostMapping) -> Result<()> {
-    let changed = |path: &Path| {
-        Err(Error::backend_error(format!(
-            "{} no longer names the host object it named at provision; deprovision the sandbox \
-             and provision it again",
-            path.display()
-        )))
-    };
-    for child in &mapping.children {
-        let kind_matches = fs::symlink_metadata(&child.root).is_ok_and(|metadata| {
-            if child.file {
-                metadata.is_file()
-            } else {
-                metadata.is_dir()
+impl ExportPlan {
+    /// Checks that every child's root is still the kind of object that [`plan`] exported, and that
+    /// every mapped and denied path inside a read-write mapping still names the object it named
+    /// then.
+    ///
+    /// A file that a directory replaced would otherwise grant the whole directory, and a workload
+    /// with a read-write mapping could rename a denied or read-only object and put a decoy at its
+    /// path, so the next start would protect the decoy instead. Run it while the VM is stopped,
+    /// so that no workload can race with it; OpenVMM checks each child's kind again when it opens
+    /// it.
+    pub fn verify(&self) -> Result<()> {
+        let changed = |path: &Path| {
+            Err(Error::other(format!(
+                "{} no longer names the host object it named at provision; deprovision the \
+                 sandbox and provision it again",
+                path.display()
+            )))
+        };
+        for child in &self.children {
+            let kind_matches = fs::symlink_metadata(&child.root).is_ok_and(|metadata| {
+                if child.file {
+                    metadata.is_file()
+                } else {
+                    metadata.is_dir()
+                }
+            });
+            if !kind_matches {
+                return changed(&child.root);
             }
-        });
-        if !kind_matches {
-            return changed(&child.root);
         }
-    }
-    for bind in &mapping.binds {
-        let Some(expected) = bind.identity else {
-            continue;
-        };
-        let Some(child) = mapping.children.get(bind.child) else {
-            return Err(Error::backend_error(
-                "the sandbox state maps a path of an unknown host directory",
-            ));
-        };
-        let path = if bind.source.is_empty() {
-            child.root.clone()
-        } else {
-            child.root.join(&bind.source)
-        };
-        match platform::file_identity(&path) {
-            Ok((device, index)) if (FileIdentity { device, index }) == expected => {}
-            _ => return changed(&path),
-        }
-    }
-    for child in &mapping.children {
-        for (path, expected) in child.denied.iter().zip(&child.denied_identities) {
-            let Some(expected) = expected else {
+        for bind in &self.binds {
+            let Some(expected) = bind.identity else {
                 continue;
             };
-            match platform::file_identity(path) {
-                Ok((device, index)) if (FileIdentity { device, index }) == *expected => {}
-                _ => return changed(path),
+            let Some(child) = self.children.get(bind.child) else {
+                return Err(Error::io(
+                    "the sandbox state maps a path of an unknown host directory",
+                ));
+            };
+            let path = if bind.source.is_empty() {
+                child.root.clone()
+            } else {
+                child.root.join(&bind.source)
+            };
+            match platform::file_identity(&path) {
+                Ok((device, index)) if (FileIdentity { device, index }) == expected => {}
+                _ => return changed(&path),
             }
         }
+        for child in &self.children {
+            for (path, expected) in child.denied.iter().zip(&child.denied_identities) {
+                let Some(expected) = expected else {
+                    continue;
+                };
+                match platform::file_identity(path) {
+                    Ok((device, index)) if (FileIdentity { device, index }) == *expected => {}
+                    _ => return changed(path),
+                }
+            }
+        }
+        Ok(())
     }
-    Ok(())
+
+    /// Kernel command-line token that tells the guest agent how many bind mounts to expect over
+    /// the control channel.
+    pub fn kernel_token(&self) -> String {
+        format!("{MAPS_TOKEN}{}", self.binds.len())
+    }
+
+    /// The bind mounts in the order and form in which the guest agent receives them.
+    pub fn guest_table(&self) -> Vec<HostMap> {
+        self.binds
+            .iter()
+            .map(|bind| HostMap {
+                source: bind.guest_source(),
+                target: bind.target.clone(),
+                read_only: bind.read_only,
+            })
+            .collect()
+    }
+
+    /// OpenVMM options that export the plan's directories and files with their access policies.
+    /// A file child carries the `file` flag, so OpenVMM refuses a directory that replaced the
+    /// file.
+    pub fn openvmm_arguments(&self) -> Vec<String> {
+        let mut arguments = vec!["--mount-aggregate".to_owned(), GUEST_EXPORT.to_owned()];
+        for (index, child) in self.children.iter().enumerate() {
+            let mode = if child.writable { "rw" } else { "ro" };
+            let kind = if child.file { ",file" } else { "" };
+            arguments.push("--mount-child".to_owned());
+            arguments.push(format!(
+                "{index},{},{mode}{kind}",
+                display_path(&child.root)
+            ));
+        }
+        let mut add = |option: &str, path: &Path| {
+            arguments.push(option.to_owned());
+            arguments.push(display_path(path));
+        };
+        for child in self.children.iter().filter(|child| child.hidden) {
+            add("--mount-deny", &child.root);
+        }
+        for child in &self.children {
+            for path in &child.denied {
+                add("--mount-deny", path);
+            }
+        }
+        for child in &self.children {
+            for path in &child.allowed {
+                add("--mount-allow", path);
+            }
+        }
+        for child in &self.children {
+            for path in &child.write {
+                add("--mount-write", path);
+            }
+        }
+        arguments
+    }
 }
 
 /// Applies OpenVMM's rules for exported directories, which it reaches without links.
@@ -585,11 +672,10 @@ fn check_root(root: &Path) -> Result<()> {
             continue;
         }
         let metadata = fs::symlink_metadata(&current).map_err(|error| {
-            Error::policy_validation(format!("cannot inspect {}", current.display()))
-                .with_source(error)
+            Error::unsupported(format!("cannot inspect {}", current.display())).with_source(error)
         })?;
         if metadata.file_type().is_symlink() || is_reparse_point(&metadata) {
-            return Err(Error::policy_validation(format!(
+            return Err(Error::unsupported(format!(
                 "OpenVMM cannot export {}, because {} is a link or reparse point",
                 root.display(),
                 current.display()
@@ -603,7 +689,7 @@ fn check_root(root: &Path) -> Result<()> {
 /// `root`, so a policy that OpenVMM would refuse fails at provision rather than at every start.
 /// Returns their combined length.
 fn check_policy_paths(root: &Path, paths: &[PathBuf], action: &str) -> Result<usize> {
-    let unsupported = |message: String| Err(Error::policy_validation(message));
+    let unsupported = |message: String| Err(Error::unsupported(message));
     let count = paths.len();
     if count > MAX_POLICY_PATHS {
         return unsupported(format!(
@@ -639,7 +725,7 @@ fn check_policy_paths(root: &Path, paths: &[PathBuf], action: &str) -> Result<us
         for component in relative.split('/') {
             current.push(component);
             let metadata = fs::symlink_metadata(&current).map_err(|error| {
-                Error::policy_validation(format!("cannot inspect {}", current.display()))
+                Error::unsupported(format!("cannot inspect {}", current.display()))
                     .with_source(error)
             })?;
             if metadata.file_type().is_symlink() || is_reparse_point(&metadata) {
@@ -686,8 +772,7 @@ fn identity(path: &Path) -> Result<FileIdentity> {
     platform::file_identity(path)
         .map(|(device, index)| FileIdentity { device, index })
         .map_err(|error| {
-            Error::policy_validation(format!("cannot identify {}", path.display()))
-                .with_source(error)
+            Error::unsupported(format!("cannot identify {}", path.display())).with_source(error)
         })
 }
 
@@ -699,63 +784,6 @@ fn relative_text(root: &Path, path: &Path) -> Option<String> {
         parts.push(component.as_os_str().to_str()?);
     }
     Some(parts.join("/"))
-}
-
-/// Kernel command-line token that tells the guest agent how many bind mounts to expect over
-/// the control channel.
-pub(crate) fn kernel_token(mapping: &HostMapping) -> String {
-    format!("nvx_maps={}", mapping.binds.len())
-}
-
-/// The bind mounts in the order and form in which the guest agent receives them.
-pub(crate) fn guest_table(mapping: &HostMapping) -> Vec<HostMap> {
-    mapping
-        .binds
-        .iter()
-        .map(|bind| HostMap {
-            source: bind.guest_source(),
-            target: bind.target.clone(),
-            read_only: bind.read_only,
-        })
-        .collect()
-}
-
-/// OpenVMM options that export the mapping's directories and files with their access policies.
-/// A file child carries the `file` flag, so OpenVMM refuses a directory that replaced the file.
-pub(crate) fn openvmm_arguments(mapping: &HostMapping) -> Vec<String> {
-    let mut arguments = vec!["--mount-aggregate".to_owned(), GUEST_EXPORT.to_owned()];
-    for (index, child) in mapping.children.iter().enumerate() {
-        let mode = if child.writable { "rw" } else { "ro" };
-        let kind = if child.file { ",file" } else { "" };
-        arguments.push("--mount-child".to_owned());
-        arguments.push(format!(
-            "{index},{},{mode}{kind}",
-            display_path(&child.root)
-        ));
-    }
-    let mut add = |option: &str, path: &Path| {
-        arguments.push(option.to_owned());
-        arguments.push(display_path(path));
-    };
-    for child in mapping.children.iter().filter(|child| child.hidden) {
-        add("--mount-deny", &child.root);
-    }
-    for child in &mapping.children {
-        for path in &child.denied {
-            add("--mount-deny", path);
-        }
-    }
-    for child in &mapping.children {
-        for path in &child.allowed {
-            add("--mount-allow", path);
-        }
-    }
-    for child in &mapping.children {
-        for path in &child.write {
-            add("--mount-write", path);
-        }
-    }
-    arguments
 }
 
 struct Mapped {
@@ -841,7 +869,33 @@ fn display_path(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ErrorCode;
+    use crate::ErrorKind;
+
+    /// The lists of a filesystem policy as callers hold them, under the names that messages give
+    /// them.
+    #[derive(Debug, Default)]
+    struct FilesystemPolicy {
+        readonly_paths: Vec<PathBuf>,
+        readwrite_paths: Vec<PathBuf>,
+        denied_paths: Vec<PathBuf>,
+    }
+
+    fn plan(policy: &FilesystemPolicy) -> Result<Option<ExportPlan>> {
+        super::plan(&ExportRequest {
+            read_only: PathList {
+                name: "filesystem.readonlyPaths",
+                paths: &policy.readonly_paths,
+            },
+            read_write: PathList {
+                name: "filesystem.readwritePaths",
+                paths: &policy.readwrite_paths,
+            },
+            denied: PathList {
+                name: "filesystem.deniedPaths",
+                paths: &policy.denied_paths,
+            },
+        })
+    }
 
     fn root() -> tempfile::TempDir {
         let directory = tempfile::tempdir().unwrap();
@@ -865,7 +919,7 @@ mod tests {
         canonicalize(path).unwrap()
     }
 
-    fn sources(mapping: &HostMapping) -> Vec<(String, bool)> {
+    fn sources(mapping: &ExportPlan) -> Vec<(String, bool)> {
         mapping
             .binds
             .iter()
@@ -943,7 +997,7 @@ mod tests {
             ]
         );
 
-        let arguments = openvmm_arguments(&mapping);
+        let arguments = mapping.openvmm_arguments();
         assert_eq!(arguments[..2], ["--mount-aggregate", GUEST_EXPORT]);
         assert_eq!(
             option_values(&arguments, "--mount-child"),
@@ -960,8 +1014,8 @@ mod tests {
             ]
         );
         assert_eq!(arguments.len(), 8);
-        assert_eq!(kernel_token(&mapping), "nvx_maps=3");
-        let table = guest_table(&mapping);
+        assert_eq!(mapping.kernel_token(), "nvx_maps=3");
+        let table = mapping.guest_table();
         assert_eq!(table.len(), 3);
         assert_eq!(
             table[1].target,
@@ -1022,7 +1076,7 @@ mod tests {
 
         // OpenVMM exposes each file as the child itself, so nothing hides its directory, and the
         // `file` flag makes it refuse a directory in the file's place.
-        let arguments = openvmm_arguments(&mapping);
+        let arguments = mapping.openvmm_arguments();
         assert_eq!(
             option_values(&arguments, "--mount-child")[0],
             format!("0,{},ro,file", display_path(&work.join("config.json")))
@@ -1038,7 +1092,7 @@ mod tests {
         let record = serde_json::to_value(&mapping).unwrap();
         assert_eq!(record["children"][0]["file"], true);
         assert!(record["children"][1].get("file").is_none());
-        let restored: HostMapping = serde_json::from_value(record).unwrap();
+        let restored: ExportPlan = serde_json::from_value(record).unwrap();
         assert_eq!(restored, mapping);
 
         // A file inside a mapped directory belongs to that directory's child.
@@ -1107,7 +1161,7 @@ mod tests {
             ..FilesystemPolicy::default()
         })
         .unwrap_err();
-        assert_eq!(error.code(), ErrorCode::PolicyValidation);
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
         assert!(error.message().contains("at most 256"), "{error}");
         assert!(
             error
@@ -1212,7 +1266,7 @@ mod tests {
                 .all(Option::is_none)
         );
         assert_eq!(
-            option_values(&openvmm_arguments(&mapping), "--mount-deny").len(),
+            option_values(&mapping.openvmm_arguments(), "--mount-deny").len(),
             2
         );
     }
@@ -1249,8 +1303,8 @@ mod tests {
         ];
         for policy in cases {
             assert_eq!(
-                plan(&policy).unwrap_err().code(),
-                ErrorCode::PolicyValidation,
+                plan(&policy).unwrap_err().kind(),
+                ErrorKind::Unsupported,
                 "{policy:?}"
             );
         }
@@ -1259,10 +1313,7 @@ mod tests {
                 readonly_paths: vec![PathBuf::from("/usr")],
                 ..FilesystemPolicy::default()
             };
-            assert_eq!(
-                plan(&system).unwrap_err().code(),
-                ErrorCode::PolicyValidation
-            );
+            assert_eq!(plan(&system).unwrap_err().kind(), ErrorKind::Unsupported);
         }
         let empty = FilesystemPolicy {
             denied_paths: vec![base.join("tools")],
@@ -1339,7 +1390,7 @@ mod tests {
             denied_paths: vec![base.join("work/out/My Secrets")],
         };
         let mapping = plan(&spaced).unwrap().unwrap();
-        let arguments = openvmm_arguments(&mapping);
+        let arguments = mapping.openvmm_arguments();
         assert!(
             option_values(&arguments, "--mount-child")[0].ends_with("notes one.txt,ro,file"),
             "{arguments:?}"
@@ -1351,10 +1402,7 @@ mod tests {
             denied_paths: vec![base.join("work/out/ leading")],
             ..FilesystemPolicy::default()
         };
-        assert_eq!(
-            plan(&leading).unwrap_err().code(),
-            ErrorCode::PolicyValidation
-        );
+        assert_eq!(plan(&leading).unwrap_err().kind(), ErrorKind::Unsupported);
         if !cfg!(windows) {
             fs::create_dir_all(base.join("work/out/tab\there")).unwrap();
             fs::create_dir_all(base.join("work/out/colon:here")).unwrap();
@@ -1365,8 +1413,8 @@ mod tests {
                     ..FilesystemPolicy::default()
                 };
                 assert_eq!(
-                    plan(&policy).unwrap_err().code(),
-                    ErrorCode::PolicyValidation,
+                    plan(&policy).unwrap_err().kind(),
+                    ErrorKind::Unsupported,
                     "{name}"
                 );
             }
@@ -1378,8 +1426,8 @@ mod tests {
                 ..FilesystemPolicy::default()
             };
             assert_eq!(
-                plan(&nested_file).unwrap_err().code(),
-                ErrorCode::PolicyValidation
+                plan(&nested_file).unwrap_err().kind(),
+                ErrorKind::Unsupported
             );
         }
     }
@@ -1412,7 +1460,7 @@ mod tests {
             },
         ] {
             let error = plan(&policy).unwrap_err();
-            assert_eq!(error.code(), ErrorCode::PolicyValidation);
+            assert_eq!(error.kind(), ErrorKind::Unsupported);
             assert!(error.message().contains("at most 128"), "{error}");
         }
     }
@@ -1434,22 +1482,16 @@ mod tests {
                 .iter()
                 .all(Option::is_some)
         );
-        verify(&mapping).unwrap();
+        mapping.verify().unwrap();
         fs::rename(base.join("work/src/secret"), base.join("work/src/moved")).unwrap();
         fs::create_dir(base.join("work/src/secret")).unwrap();
-        assert_eq!(
-            verify(&mapping).unwrap_err().code(),
-            ErrorCode::BackendError
-        );
+        assert_eq!(mapping.verify().unwrap_err().kind(), ErrorKind::Other);
         fs::remove_dir(base.join("work/src/secret")).unwrap();
         fs::rename(base.join("work/src/moved"), base.join("work/src/secret")).unwrap();
-        verify(&mapping).unwrap();
+        mapping.verify().unwrap();
         fs::rename(base.join("work/src"), base.join("work/src-moved")).unwrap();
         fs::create_dir_all(base.join("work/src/secret")).unwrap();
-        assert_eq!(
-            verify(&mapping).unwrap_err().code(),
-            ErrorCode::BackendError
-        );
+        assert_eq!(mapping.verify().unwrap_err().kind(), ErrorKind::Other);
 
         // Without a read-write parent, nothing a workload could move is pinned, so host edits
         // that replace objects do not block the next start.
@@ -1460,7 +1502,7 @@ mod tests {
         let mapping = plan(&read_only).unwrap().unwrap();
         fs::remove_dir_all(base.join("tools")).unwrap();
         fs::create_dir(base.join("tools")).unwrap();
-        verify(&mapping).unwrap();
+        mapping.verify().unwrap();
 
         // Every child keeps its kind: a directory in place of a file child would grant all of it,
         // and a directory child must remain a directory.
@@ -1471,30 +1513,24 @@ mod tests {
             ..FilesystemPolicy::default()
         };
         let mapping = plan(&with_file).unwrap().unwrap();
-        verify(&mapping).unwrap();
+        mapping.verify().unwrap();
         fs::remove_file(&settings).unwrap();
         fs::create_dir(&settings).unwrap();
-        assert_eq!(
-            verify(&mapping).unwrap_err().code(),
-            ErrorCode::BackendError
-        );
+        assert_eq!(mapping.verify().unwrap_err().kind(), ErrorKind::Other);
         fs::remove_dir(&settings).unwrap();
         fs::write(&settings, b"{}").unwrap();
-        verify(&mapping).unwrap();
+        mapping.verify().unwrap();
         fs::remove_dir(base.join("tools")).unwrap();
         fs::write(base.join("tools"), b"").unwrap();
-        assert_eq!(
-            verify(&mapping).unwrap_err().code(),
-            ErrorCode::BackendError
-        );
+        assert_eq!(mapping.verify().unwrap_err().kind(), ErrorKind::Other);
     }
 
     /// A directory on another volume than the temporary directory, if the host has one: the one
-    /// that `ACI_EDGE_SANDBOXES_TEST_SECOND_VOLUME` names, or the runner's temporary directory
+    /// that `NVX_TEST_SECOND_VOLUME` names, or the runner's temporary directory
     /// on GitHub's Windows runners. Tests create their files below it. Linux's `/dev/shm` does
     /// not qualify, because it lies in the guest's reserved `/dev`.
     fn second_volume() -> Option<PathBuf> {
-        let candidate = std::env::var_os("ACI_EDGE_SANDBOXES_TEST_SECOND_VOLUME")
+        let candidate = std::env::var_os("NVX_TEST_SECOND_VOLUME")
             .or_else(|| std::env::var_os("RUNNER_TEMP"))
             .map(PathBuf::from)?;
         let temporary = canonical(&std::env::temp_dir());

@@ -20,6 +20,7 @@ are build products or caches and are not part of the tracked source tree. The
 | `ubuntu` | Pinned Ubuntu supplemental binary-package lock |
 | `azurelinux` | Checksum-pinned Azure Linux supplemental RPM lock |
 | `aci_edge_sandboxes` | Rust crate `aci_edge_sandboxes`: state-aware sandbox API with an OpenVMM backend and an opt-in native-agent backend |
+| `nvx-rs` | Rust crate `nvx-rs`, library `nvx`: the NVX mechanics that the OpenVMM backend builds on |
 | `openvmm` | Public OpenVMM Git submodule from `nanvix/openvmm`, tracking its `main` branch |
 | `data` | Tracked performance history and generated benchmark data |
 | `scripts/nvx_tools` | Implementation of the `nvx.py` commands |
@@ -89,11 +90,21 @@ nvx/
 |-- aci_edge_sandboxes/          Rust crate `aci_edge_sandboxes` for the state-aware sandbox API
 |   |-- model/                   Serializable contract and wire-model crate
 |   |-- src/                     Facade and backends
-|   |   |-- openvmm/             Default backend that drives the openvmm binary
+|   |   |-- openvmm/             Default backend: converts requests into nvx calls
 |   |   |-- agent/               Opt-in backend over a separately supplied native agent library
-|   |   `-- bin/                 aci-edge-sandboxes-fake-openvmm test double
+|   |   `-- bin/                 aci-edge-sandboxes-fake-openvmm wrapper of the nvx fake OpenVMM
 |   |-- examples/                Runnable lifecycle examples for the OpenVMM and agent backends
 |   |-- tests/                   Mock, fake-OpenVMM, validation, real-hypervisor, and agent-library tests
+|   `-- build.rs                 Passes the bundle that nvx-rs staged on to dependents
+|-- nvx-rs/                      Rust crate `nvx-rs`, library `nvx`, for the NVX mechanics
+|   |-- src/
+|   |   |-- protocol/            Control-console codec shared by the host and the guest
+|   |   |-- contract.rs          Control-contract versions and release compatibility
+|   |   |-- net/                 CIDR parsing and subtraction, and hostname and guest-network forms
+|   |   |-- host/                Artifacts, launch, policy lowering, sessions, and VM instances
+|   |   |-- testing/             Fake OpenVMM (feature `testing`)
+|   |   `-- bin/                 nvx-fake-openvmm test double
+|   |-- tests/                   Fake-OpenVMM instance lifecycle tests
 |   |-- build.rs                 Stages the bundled artifacts (feature `bundled`)
 |   `-- artifacts.json           Release package pinned for the bundled artifacts
 |-- openvmm/                     OpenVMM Git submodule
@@ -242,11 +253,23 @@ kernel-specific details.
 The Rust crate `aci_edge_sandboxes`, which exposes the five-phase state-aware sandbox lifecycle
 (provision, start, exec, stop, and deprovision) to consumers such as MXC. It
 defines the contract types, a pluggable backend trait, and the default backend,
-which launches the `openvmm` binary and speaks the guest agent's control
-protocol. The opt-in `agent` feature adds a second backend, a thin client of a
-separately supplied native agent library that owns the whole sandbox lifecycle.
-The crate builds independently of the OpenVMM submodule. See its
-[README](../aci_edge_sandboxes/README.md) for the API, the policy honor matrix, and tests.
+which converts the contract's requests into calls of the `nvx` library and maps
+its errors onto the contract's error codes. The opt-in `agent` feature adds a
+second backend, a thin client of a separately supplied native agent library
+that owns the whole sandbox lifecycle. The crate builds independently of the
+OpenVMM submodule. See its [README](../aci_edge_sandboxes/README.md) for the
+API, the policy honor matrix, and tests.
+
+### `nvx-rs/`
+
+The Rust crate `nvx-rs`, whose library `nvx` holds the NVX mechanics: the
+authenticated control protocol of the guest agent, artifact discovery and
+bundled-release staging, OpenVMM's command line, the lowering of network and
+filesystem policies, process and platform primitives for Linux and Windows
+hosts, the supervision of VM instances, and a fake OpenVMM for tests. It is a
+standalone crate with its own `Cargo.lock`, like `aci_edge_sandboxes`, and
+builds independently of the OpenVMM submodule. See its
+[README](../nvx-rs/README.md).
 
 ### `openvmm/`
 
@@ -319,6 +342,7 @@ see [Automated environment bootstrap](setup.md#automated-environment-bootstrap).
 | `dist/` | Staged binary and source release archives |
 | `openvmm/target/` | Rust build output produced inside the OpenVMM submodule |
 | `aci_edge_sandboxes/target/` | Rust build output of the `aci_edge_sandboxes` crate |
+| `nvx-rs/target/` | Rust build output of the `nvx-rs` crate |
 | `.ruff_cache/` | Ruff's local lint cache |
 | `__pycache__/` | Python bytecode caches that may appear below Python source directories |
 
