@@ -577,12 +577,16 @@ requires explicit `--host-loopback allow`, and omitting `--host-loopback`
 keeps the default gateway mapping without publishing guest ports. For
 host-loopback peers, the backend uses synthetic peer addresses so the guest
 routes replies through its NIC rather than its own loopback, and
-reverse-translates those addresses on TX. The endpoint's egress policy
-evaluates the guest's traffic to a synthetic address at the host address that
-it stands for, and at the gateway of its family for host loopback, so a
-synthetic address reaches no host-loopback port that the rules deny at the
-gateway. The virtio-net prefilter, which knows no synthetic addresses, leaves
-them to the endpoint.
+reverse-translates those addresses on TX. Synthetic addresses lie inside the
+guest's subnet of their family, allocated downward from its last usable
+address, such as `10.0.0.254` and `fd00::a00:ff`, so the guest answers them
+from its address in that subnet, which the egress policy admits as the guest's
+source address. The
+endpoint's egress policy evaluates the guest's traffic to a synthetic address
+at the host address that it stands for, and at the gateway of its family for
+host loopback, so a synthetic address reaches no host-loopback port that the
+rules deny at the gateway. The virtio-net prefilter, which knows no synthetic
+addresses, leaves them to the endpoint.
 
 Ingress `allow` publishes the guest's listeners to the host's private
 networks. OpenVMM then appends the `virtnet_ingress=allow` token, which callers
@@ -615,22 +619,22 @@ let a loopback binding take loopback traffic from a listener of the same user
 on every address, it first binds the port on every address of the family and,
 with a dual-stack socket, on every address of both families, which Windows
 binds independently, and keeps those bindings until the loopback binding
-holds the port, so no host listener can bind every address in between. A host listener that binds every address of a
-published port later fails on Linux; on Windows, unless it asks for exclusive
-use of the port, it succeeds and the publication keeps the port's loopback
-traffic, as a loopback listener of any host process would.
+holds the port, so no host listener can bind every address in between. A host
+listener that binds every address of a published port later fails on Linux; on
+Windows, unless it asks for exclusive use of the port, it succeeds and the
+publication keeps the port's loopback traffic, as a loopback listener of any
+host process would.
 
 Under ingress allow, or host-loopback allow alone, the policy also admits ARP
-requests and Neighbor Solicitations for the guest's subnet and Neighbor
-Solicitations for the link-local addresses at which the gateway presents host
-peers. It admits a frame that its rules deny when the frame continues a flow
-that the endpoint carries: a TCP segment other than an initial SYN, or a UDP
-datagram from a published port to a peer that recently sent one to it, which
-leaves through the port's host listener. Either selects canonical policy
-encoding version 5, which adds the ingress action, 0 for allow and 2 for host
-loopback alone, and leaves the encoding and digest of other policies
-unchanged. Snapshot capture and restore reject both, and the TAP backend
-rejects policies that allow either.
+requests and Neighbor Solicitations for the guest's subnet, where the gateway
+presents host peers. It admits a frame that its rules deny when the frame
+continues a flow that the endpoint carries: a TCP segment other than an
+initial SYN, or a UDP datagram from a published port to a peer that recently
+sent one to it, which leaves through the port's host listener. Either selects
+canonical policy encoding version 5, which adds the ingress action, 0 for
+allow and 2 for host loopback alone, and leaves the encoding and digest of
+other policies unchanged. Snapshot capture and restore reject both, and the
+TAP backend rejects policies that allow either.
 
 #### DNS
 
