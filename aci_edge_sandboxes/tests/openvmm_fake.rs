@@ -1402,6 +1402,18 @@ fn launch_arguments_select_the_managed_alpine_guest() {
         nvx.deprovision(&sandbox_id).unwrap();
     }
 
+    // A /30 guest network holds only the gateway and the guest, so OpenVMM has no address at
+    // which to present host peers.
+    let mut loopback = NetworkPolicy::deny_all();
+    loopback.ingress.host_loopback = Some(Access::Allow);
+    let narrow = fixture.nvx_with(|config| config.guest_network = "10.0.0.2/30".to_owned());
+    let error = narrow
+        .provision(&ProvisionRequest::new().with_network(loopback))
+        .unwrap_err();
+    assert_eq!(error.code(), ErrorCode::PolicyValidation);
+    assert!(error.message().contains("/29 or shorter"), "{error}");
+    assert_eq!(fixture.sandbox_dirs(), 0);
+
     // The spec's forwards reach OpenVMM when the policy lets their replies out.
     let mut forwarding = NetworkPolicy::egress(Access::Allow);
     forwarding.ingress.host_loopback = Some(Access::Allow);

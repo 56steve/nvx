@@ -23,6 +23,11 @@ pub const MAX_RULES: usize = 256;
 /// Largest number of [`LoopbackForward`]s that OpenVMM accepts.
 pub const MAX_LOOPBACK_FORWARDS: usize = 64;
 
+/// Longest guest network prefix that host-loopback access accepts. OpenVMM presents a host peer
+/// to the guest at an address of the guest network, and a /30 network holds only the gateway and
+/// the guest.
+pub const MAX_HOST_LOOPBACK_PREFIX: u8 = 29;
+
 /// Allow or deny decision of a network posture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Access {
@@ -219,7 +224,8 @@ pub struct NetworkPolicy {
     /// addresses at the same ports of host IPv4 and IPv6 loopback, where OpenVMM listens without
     /// displacing a host listener and admits only the host; replies to the host pass whatever
     /// the egress policy. With `ingress` allowed too, the listeners on every host address admit
-    /// the host instead. With [`Access::Deny`], neither direction is open.
+    /// the host instead. With [`Access::Deny`], neither direction is open. [`Access::Allow`]
+    /// needs a guest network prefix of at most [`MAX_HOST_LOOPBACK_PREFIX`].
     pub host_loopback: Access,
     /// Ports on host IPv4 loopback forwarded to guest ports, at most [`MAX_LOOPBACK_FORWARDS`],
     /// each protocol and host port at most once, and each protocol and guest port at most once.
@@ -266,7 +272,8 @@ impl NetworkPolicy {
 ///
 /// Fails with [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported) when a rule cannot be
 /// expressed exactly, when the rules of one action expand to more than [`MAX_RULES`] OpenVMM
-/// rules, or when the host-loopback forwards break the rules of
+/// rules, when host-loopback access is allowed for a guest network whose prefix is longer than
+/// [`MAX_HOST_LOOPBACK_PREFIX`], or when the host-loopback forwards break the rules of
 /// [`NetworkPolicy::host_loopback_forwards`].
 pub fn openvmm_arguments(
     policy: Option<&NetworkPolicy>,
@@ -279,6 +286,19 @@ pub fn openvmm_arguments(
         return Err(Error::unsupported(
             "host-loopback forwards need host-loopback access allowed",
         ));
+    }
+    // OpenVMM presents a host peer to the guest at an address of the guest network, which a /30
+    // network, holding only the gateway and the guest, cannot spare.
+    if policy.host_loopback == Access::Allow
+        && guest_network
+            .split_once('/')
+            .and_then(|(_, prefix)| cidr::parse_prefix_length(prefix))
+            .is_some_and(|prefix| prefix > MAX_HOST_LOOPBACK_PREFIX)
+    {
+        return Err(Error::unsupported(format!(
+            "host-loopback access needs a guest network prefix of /{MAX_HOST_LOOPBACK_PREFIX} or \
+             shorter, which leaves an address at which OpenVMM presents host peers to the guest"
+        )));
     }
     if policy.egress == Access::Deny
         && policy.allow.rules.is_empty()
@@ -605,6 +625,28 @@ mod tests {
                 "allow",
             ]
         );
+    }
+
+    #[test]
+    fn host_loopback_access_needs_room_for_host_peers() {
+        let mut policy = NetworkPolicy::new(Access::Deny);
+        policy.host_loopback = Access::Allow;
+        // A /30 network holds only the gateway and the guest.
+        let error = openvmm_arguments(Some(&policy), "10.0.0.2/30").unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        assert!(error.message().contains("/29 or shorter"), "{error}");
+        for guest_network in ["10.0.0.2/29", "10.0.0.2/24"] {
+            let arguments = openvmm_arguments(Some(&policy), guest_network).unwrap();
+            assert!(
+                has_pair(&arguments, "--host-loopback", "allow"),
+                "{guest_network}"
+            );
+        }
+        // Host-loopback access that is denied needs no host peers.
+        let mut denied = NetworkPolicy::new(Access::Allow);
+        denied.host_loopback = Access::Deny;
+        let arguments = openvmm_arguments(Some(&denied), "10.0.0.2/30").unwrap();
+        assert!(has_pair(&arguments, "--host-loopback", "deny"));
     }
 
     #[test]

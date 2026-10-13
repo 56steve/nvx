@@ -432,7 +432,8 @@ forwards need host-loopback access allowed.
   on the same port of host IPv4 or IPv6 loopback, without a port list. A listener bound only to
   guest `127.0.0.1` or `::1` stays private to the sandbox, OpenVMM never publishes a listener on
   a LAN or public interface or displaces a host listener that holds the port, and replies to the
-  host pass whatever the egress policy.
+  host pass whatever the egress policy. It needs a guest network of `/29` or larger: OpenVMM
+  presents host peers to the guest at an address of its network, which a `/30` cannot spare.
 - `hostLoopbackForwards` of the sandbox spec (`SandboxSpec::with_host_loopback_forward`, passed
   to `AciEdgeSandbox::provision_with`) publishes up to 64 further guest ports on host loopback:
   OpenVMM listens on `127.0.0.1:hostPort` and relays each TCP connection or UDP datagram to the
@@ -810,7 +811,10 @@ workload. Without ingress allowed, OpenVMM listens on host IPv4 and IPv6
 loopback alone at each TCP and UDP port on which the workload listens on a
 non-loopback address, admits only the host, and lets replies to it pass
 whatever the egress policy; a workload listener on guest loopback stays
-private, and a port that a host process already holds is not published. The
+private, and a port that a host process already holds is not published.
+Host-loopback access needs a `guest_network` of `/29` or larger, since OpenVMM
+presents host peers to the workload at an address of that network, and a
+policy that allows it for a `/30` fails with `policy_validation`. The
 sandbox spec's `hostLoopbackForwards` (`SandboxSpec::with_host_loopback_forward`,
 passed to `AciEdgeSandbox::provision_with`) publish up to 64 further host
 loopback ports at guest ports of their choice, one forward per protocol and
