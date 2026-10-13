@@ -312,6 +312,35 @@ class AzureProvenanceTests(unittest.TestCase):
             host_telemetry.read_azure_compute_metadata(timeout=0.1)
         self.assertLess(time.monotonic() - started, 1.0)
 
+    def test_metadata_open_gives_up_at_the_deadline_when_headers_trickle(self):
+        class Response:
+            def __enter__(self) -> "Response":
+                return self
+
+            def __exit__(self, *_: object) -> None:
+                return None
+
+            def read1(self, _size: int) -> bytes:
+                return b""
+
+        def trickle_headers(*_args: object, **_kwargs: object) -> Response:
+            # The status line and headers are read inside opener.open(), so a
+            # deadline checked only while reading the body cannot stop them.
+            time.sleep(1.0)
+            return Response()
+
+        opener = MagicMock()
+        opener.open.side_effect = trickle_headers
+        started = time.monotonic()
+        with (
+            patch.object(
+                host_telemetry.urllib.request, "build_opener", return_value=opener
+            ),
+            self.assertRaises(TimeoutError),
+        ):
+            host_telemetry.read_azure_compute_metadata(timeout=0.1)
+        self.assertLess(time.monotonic() - started, 0.5)
+
 
 class HostProvenanceTests(unittest.TestCase):
     def test_records_runner_cpu_memory_and_volume_roles(self):

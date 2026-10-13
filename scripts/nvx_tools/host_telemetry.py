@@ -293,8 +293,36 @@ def read_azure_compute_metadata(
     # The link-local metadata service must never be reached through a proxy.
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     # The socket timeout only bounds each wait, so a trickling peer could
-    # otherwise hold the read open indefinitely; check an end-to-end deadline.
+    # otherwise hold the request open indefinitely. The request runs on a
+    # daemon thread so the end-to-end deadline also covers opener.open(), which
+    # reads the status line and headers before it returns.
     deadline = time.monotonic() + timeout
+    outcome: dict[str, object] = {}
+
+    def fetch() -> None:
+        try:
+            outcome["document"] = _fetch_compute_metadata(
+                opener, request, timeout, deadline
+            )
+        except Exception as error:
+            outcome["error"] = error
+
+    worker = threading.Thread(target=fetch, name="azure-imds", daemon=True)
+    worker.start()
+    worker.join(max(0.0, deadline - time.monotonic()))
+    if worker.is_alive():
+        raise TimeoutError("metadata response did not finish in time")
+    if "error" in outcome:
+        raise cast(Exception, outcome["error"])
+    return outcome["document"]
+
+
+def _fetch_compute_metadata(
+    opener: urllib.request.OpenerDirector,
+    request: urllib.request.Request,
+    timeout: float,
+    deadline: float,
+) -> object:
     with opener.open(request, timeout=timeout) as response:
         body = bytearray()
         while len(body) < MIB:
