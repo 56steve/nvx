@@ -19,6 +19,9 @@ param(
     [string]$RunnerName,
 
     [Parameter()]
+    [switch]$BenchmarkRunner,
+
+    [Parameter()]
     [ValidateNotNullOrEmpty()]
     [string]$RepositoryUrl = "https://github.com/microsoft/nvx",
 
@@ -1098,6 +1101,15 @@ function Assert-RunnerPackage {
     }
 }
 
+# CI's platform jobs require the benchmark label, which exactly one runner of
+# each backend's pool carries.
+function Get-ActionsRunnerLabels {
+    if ($BenchmarkRunner) {
+        return "windows,whp,virtual-machine,benchmark"
+    }
+    return "windows,whp,virtual-machine"
+}
+
 function Install-ActionsRunner {
     param([Parameter()][string]$Token)
     $archiveName = $RunnerArtifact
@@ -1145,7 +1157,7 @@ function Install-ActionsRunner {
     $runnerConfiguration = Join-Path $RunnerDirectory ".runner"
     $serviceFile = Join-Path $RunnerDirectory ".service"
     $labelsFile = Join-Path $RunnerDirectory ".nvx-labels"
-    $labels = "windows,whp,virtual-machine"
+    $labels = Get-ActionsRunnerLabels
     $runnerNameValidated = $false
     if (Test-Path -LiteralPath $runnerConfiguration -PathType Leaf) {
         $configuration = Get-Content -LiteralPath $runnerConfiguration -Raw |
@@ -1330,7 +1342,7 @@ function Assert-ActionsRunner {
     }
     if (-not [string]::IsNullOrWhiteSpace($RunnerName)) {
         $labelsFile = Join-Path $RunnerDirectory ".nvx-labels"
-        $expectedLabels = "windows,whp,virtual-machine"
+        $expectedLabels = Get-ActionsRunnerLabels
         if (-not (Test-Path -LiteralPath $labelsFile -PathType Leaf) -or
             (Get-Content -LiteralPath $labelsFile -Raw).Trim() -ne
             $expectedLabels) {
@@ -1633,6 +1645,10 @@ if (-not $RunnerOnly -and -not [string]::IsNullOrWhiteSpace($RunnerName)) {
 if ($RunnerTokenStdin -and
     (-not $RunnerOnly -or [string]::IsNullOrWhiteSpace($RunnerName))) {
     throw "-RunnerTokenStdin requires -RunnerOnly and -RunnerName"
+}
+if ($BenchmarkRunner -and
+    (-not $RunnerOnly -or [string]::IsNullOrWhiteSpace($RunnerName))) {
+    throw "-BenchmarkRunner requires -RunnerOnly and -RunnerName"
 }
 
 Assert-SupportedHost -SkipWorkspace:$RunnerOnly

@@ -25,7 +25,7 @@ then stream it to the target without placing it in shell history. On Linux:
 scp scripts/setup/setup-linux-runner.sh scripts/setup/tool-versions.conf HOST:/tmp/
 gh api --method POST repos/microsoft/nvx/actions/runners/registration-token \
   --jq .token |
-  ssh HOST '/tmp/setup-linux-runner.sh --backend kvm --runner-name azure-kvm-3 --runner-token-stdin'
+  ssh HOST '/tmp/setup-linux-runner.sh --backend kvm --runner-name azure-kvm-1 --runner-token-stdin'
 ```
 
 For Windows/WHP, stage `setup-windows-whp.ps1` and `tool-versions.conf` in one
@@ -45,7 +45,14 @@ Both scripts verify the Actions runner package against the manifest's
 checksum. Linux runner labels are `linux`, the selected backend, and
 `virtual-machine`. Windows labels are
 `windows`, `whp`, and `virtual-machine`. Runner names remain unique identities
-but are not registered as labels.
+but are not registered as labels. `--benchmark-runner` on Linux and
+`-BenchmarkRunner` on Windows also register the `benchmark` label, which CI's
+platform jobs require. Exactly one runner of each backend's pool carries it, so
+that every run measures the backend's performance series on the same VM, and
+moving it to another runner changes the series; see
+[CI collection](../../doc/benchmarks.md#ci-collection). Provision the benchmark
+runner with the switch, and pass it when checking that runner: a label that was
+only added through the API is lost when provisioning replaces the registration.
 On Linux, omit `--runner-name` to prepare host dependencies without reconciling
 an existing runner's service or cache directory. Pass its name in a subsequent
 invocation to update the service; `--check-only` still validates runner state.
@@ -98,7 +105,7 @@ Validate an installed runner without changing the host:
 
 ```bash
 sh scripts/setup/setup-linux-runner.sh \
-  --backend kvm --runner-name azure-kvm-3 --check-only
+  --backend kvm --runner-name azure-kvm-1 --check-only
 ```
 
 ```powershell
@@ -122,7 +129,7 @@ that pass and validate the runner:
 ```bash
 scp scripts/setup/setup-linux-runner.sh scripts/setup/tool-versions.conf HOST:/tmp/
 ssh HOST 'sh /tmp/setup-linux-runner.sh --backend kvm'
-ssh HOST 'sh /tmp/setup-linux-runner.sh --backend kvm --runner-name azure-kvm-3 --check-only'
+ssh HOST 'sh /tmp/setup-linux-runner.sh --backend kvm --runner-name azure-kvm-1 --check-only'
 ```
 
 ```powershell

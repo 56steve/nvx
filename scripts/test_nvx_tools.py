@@ -4978,6 +4978,141 @@ python3() {
         ):
             self.assertNotIn(cross_platform_tool, linux_setup)
 
+    def test_linux_runner_setup_adds_the_benchmark_label_on_request(self):
+        # Provisioning replaces a runner's registration, so the benchmark
+        # runner keeps the label that CI's platform jobs require only when
+        # the setup script registers it.
+        linux_setup = (
+            BuildConstants.REPO_ROOT / "scripts" / "setup" / "setup-linux-runner.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            "        --benchmark-runner)\n"
+            "            benchmark_runner=true\n"
+            "            shift\n"
+            "            ;;\n",
+            linux_setup,
+        )
+        self.assertIn("\n    --benchmark-runner      ", linux_setup)
+        # Registration and check mode both use the computed label set.
+        self.assertIn('--labels "$expected_runner_labels"', linux_setup)
+        self.assertIn(
+            '"$expected_runner_labels" ] ||\n'
+            '                die "GitHub Actions runner labels are not validated"',
+            linux_setup,
+        )
+        start = linux_setup.index('\n[ "$benchmark_runner" = false ]')
+        end = linux_setup.index("\nfi\n", start) + len("\nfi\n")
+        labels = linux_setup[start:end]
+        self.assertIn(
+            "\nexpected_runner_labels=linux,${backend},virtual-machine\n", labels
+        )
+        if os.name != "posix":
+            return
+
+        harness = (
+            "set -eu\n"
+            "die() { printf 'error: %s\\n' \"$*\" >&2; exit 1; }\n"
+            "backend=$1\nrunner_name=$2\nbenchmark_runner=$3\n"
+            "runner_directory=/opt/nvx-runner\n"
+            f"{labels}"
+            'printf "%s\\n" "$expected_runner_labels"\n'
+        )
+        for backend, runner_name, benchmark_runner, expected in (
+            ("kvm", "azure-kvm-1", "false", "linux,kvm,virtual-machine"),
+            ("mshv", "", "false", "linux,mshv,virtual-machine"),
+            ("kvm", "azure-kvm-3", "true", "linux,kvm,virtual-machine,benchmark"),
+            ("mshv", "azure-mshv-4", "true", "linux,mshv,virtual-machine,benchmark"),
+            ("kvm", "", "true", None),
+        ):
+            with self.subTest(
+                backend=backend,
+                runner_name=runner_name,
+                benchmark_runner=benchmark_runner,
+            ):
+                result = subprocess.run(
+                    ["sh", "-c", harness, "sh", backend, runner_name, benchmark_runner],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    check=False,
+                )
+                if expected is None:
+                    self.assertEqual(result.returncode, 1)
+                    self.assertEqual(
+                        result.stderr,
+                        "error: --benchmark-runner requires --runner-name\n",
+                    )
+                else:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout, f"{expected}\n")
+
+    def test_windows_runner_setup_adds_the_benchmark_label_on_request(self):
+        setup = BuildConstants.REPO_ROOT / "scripts" / "setup" / "setup-windows-whp.ps1"
+        windows_setup = setup.read_text(encoding="utf-8")
+        self.assertIn("    [switch]$BenchmarkRunner,\n", windows_setup)
+        self.assertIn(
+            "if ($BenchmarkRunner -and\n"
+            "    (-not $RunnerOnly -or [string]::IsNullOrWhiteSpace($RunnerName))) {\n"
+            '    throw "-BenchmarkRunner requires -RunnerOnly and -RunnerName"\n'
+            "}\n",
+            windows_setup,
+        )
+        # Registration and check mode share one label set.
+        self.assertEqual(windows_setup.count('"windows,whp,virtual-machine"'), 1)
+        for function_name, assignment in (
+            ("Install-ActionsRunner", "\n    $labels = Get-ActionsRunnerLabels\n"),
+            (
+                "Assert-ActionsRunner",
+                "\n        $expectedLabels = Get-ActionsRunnerLabels\n",
+            ),
+        ):
+            with self.subTest(function=function_name):
+                function = windows_setup.split(f"\nfunction {function_name} {{\n", 1)[1]
+                self.assertIn(assignment, function.split("\n}\n", 1)[0])
+        if os.name != "nt":
+            return
+
+        harness = f"""
+Set-StrictMode -Version 2.0
+$ErrorActionPreference = "Stop"
+$tokens = $null
+$errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile(
+    '{setup}',
+    [ref]$tokens,
+    [ref]$errors
+)
+if ($errors.Count -ne 0) {{
+    throw "setup script has parse errors"
+}}
+$definition = $ast.Find({{
+        param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -eq "Get-ActionsRunnerLabels"
+    }}, $true)
+. ([scriptblock]::Create($definition.Extent.Text))
+$BenchmarkRunner = $false
+Write-Output (Get-ActionsRunnerLabels)
+$BenchmarkRunner = $true
+Write-Output (Get-ActionsRunnerLabels)
+"""
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", harness],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout.splitlines(),
+            [
+                "windows,whp,virtual-machine",
+                "windows,whp,virtual-machine,benchmark",
+            ],
+        )
+
     def test_repository_pins_one_exact_rust_toolchain(self):
         root = BuildConstants.REPO_ROOT
         [toolchain] = re.findall(
