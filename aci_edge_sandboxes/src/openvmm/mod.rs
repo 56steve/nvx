@@ -29,7 +29,7 @@
 //!
 //! | Field | provision | exec |
 //! | --- | --- | --- |
-//! | `filesystem.readonlyPaths`, `readwritePaths` | mapped at their [`guest_path`] | n/a |
+//! | `filesystem.readonlyPaths`, `readwritePaths` | mapped at their [`nvx::guest_path`] | n/a |
 //! | `filesystem.deniedPaths` | hidden inside mapped paths | n/a |
 //! | `network.egress` | default and IPv4 and IPv6 rules applied | n/a |
 //! | `network.ingress`, `hostLoopback` | `deny` only | n/a |
@@ -44,7 +44,7 @@
 //! the workload. A directory that does not exist, is not a directory, or that the workload cannot
 //! search fails the launch instead: the execution ends with [`ExecFailure::WorkingDirectory`]
 //! after a diagnostic on standard error, and nothing runs. Relative paths are rejected with
-//! [`ErrorCode::PolicyValidation`](crate::ErrorCode::PolicyValidation); [`guest_path`]
+//! [`ErrorCode::PolicyValidation`](crate::ErrorCode::PolicyValidation); [`nvx::guest_path`]
 //! translates host paths.
 //!
 //! Host paths share OpenVMM's single virtio-fs device: the backend exports each outermost mapped
@@ -93,9 +93,7 @@
 //! dies, the guest kills the workload as soon as it notices that the control session is gone.
 
 mod config;
-mod filesystem;
 mod launch;
-mod network;
 mod state;
 
 use std::fs;
@@ -106,8 +104,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use nvx::Artifacts;
+use nvx::host::filesystem::{self, ExportPlan, ExportRequest, PathList};
 use nvx::host::session::{self, ControlSession, ExecEvent, SessionError};
-use nvx::host::{platform, process};
+use nvx::host::{network, platform, process};
 use nvx::protocol::{
     self, CAPABILITY_LEN, ExitCategory, GuestFeatures, MAX_ARGUMENT_BYTES, MAX_CWD_BYTES,
     MAX_OUTPUT_BYTES, MAX_TIMEOUT_MS, Workload, WorkloadEnvironment,
@@ -115,7 +114,6 @@ use nvx::protocol::{
 use serde_json::Value;
 
 pub use self::config::OpenVmmConfig;
-pub use self::filesystem::{guest_path, resolve_guest_path};
 use self::state::{
     BACKEND_KEY, LaunchRecord, ProcessIdentity, RuntimeRecord, STATE_FORMAT, SandboxRecord,
     StateStore,
@@ -126,8 +124,9 @@ use crate::error::{Error, Result};
 use crate::exec::{Completion, ExecFailure, ExecOutcome};
 use crate::id::SandboxId;
 use crate::model::{
-    Command, DeprovisionResult, ExecRequest, Metadata, ProcessSpec, ProvisionRequest,
-    ProvisionResult, StartResult, StopResult, duration_millis,
+    Access, Command, DeprovisionResult, ExecRequest, FilesystemPolicy, Metadata, NetworkPolicy,
+    NetworkRule, ProcessSpec, Protocol, ProvisionRequest, ProvisionResult, StartResult, StopResult,
+    duration_millis,
 };
 
 /// Shell that interprets `process.commandLine`.
@@ -318,6 +317,70 @@ impl OpenVmmBackend {
     }
 }
 
+/// Converts the contract's network section into NVX's network posture, under the contract's
+/// field names.
+fn network_policy(policy: &NetworkPolicy) -> network::NetworkPolicy {
+    let access = |access: Access| match access {
+        Access::Allow => network::Access::Allow,
+        Access::Deny => network::Access::Deny,
+    };
+    let rules = |name: &str, rules: &[NetworkRule]| network::EgressRules {
+        name: name.to_owned(),
+        rules: rules.iter().map(egress_rule).collect(),
+    };
+    network::NetworkPolicy {
+        egress: access(policy.egress.default),
+        allow: rules("network.egress.allow", &policy.egress.allow),
+        deny: rules("network.egress.deny", &policy.egress.deny),
+        ingress: access(policy.ingress.default),
+    }
+}
+
+fn egress_rule(rule: &NetworkRule) -> network::EgressRule {
+    network::EgressRule {
+        to: rule
+            .to
+            .iter()
+            .map(|peer| network::Destination {
+                cidr: peer.cidr.clone(),
+                except: peer.except.clone(),
+            })
+            .collect(),
+        ports: rule
+            .ports
+            .iter()
+            .map(|port| network::PortSelector {
+                protocol: match port.protocol {
+                    Protocol::Tcp => network::Protocol::Tcp,
+                    Protocol::Udp => network::Protocol::Udp,
+                    Protocol::Icmp => network::Protocol::Icmp,
+                    Protocol::Any => network::Protocol::Any,
+                },
+                port: port.port,
+                end_port: port.end_port,
+            })
+            .collect(),
+    }
+}
+
+/// Plans the export of the contract's filesystem section, under the contract's field names.
+fn export_plan(policy: &FilesystemPolicy) -> Result<Option<ExportPlan>> {
+    Ok(filesystem::plan(&ExportRequest {
+        read_only: PathList {
+            name: "filesystem.readonlyPaths",
+            paths: &policy.readonly_paths,
+        },
+        read_write: PathList {
+            name: "filesystem.readwritePaths",
+            paths: &policy.readwrite_paths,
+        },
+        denied: PathList {
+            name: "filesystem.deniedPaths",
+            paths: &policy.denied_paths,
+        },
+    })?)
+}
+
 fn workload_argv(process: &ProcessSpec) -> Result<Vec<String>> {
     match &process.command {
         Command::CommandLine(command_line) => {
@@ -363,7 +426,7 @@ fn prepare_exec(process: &ProcessSpec) -> Result<Workload<'_>> {
     {
         return Err(Error::policy_validation(format!(
             "process.cwd {cwd:?} must be an absolute guest path; map host paths with \
-             openvmm::guest_path"
+             nvx::guest_path"
         )));
     }
     if let Some(cwd) = &process.cwd
@@ -491,7 +554,8 @@ impl Backend for OpenVmmBackend {
                 "microvm.provision.memoryMib must be positive",
             ));
         }
-        network::network_arguments(request.network.as_ref(), &self.config.guest_network)?;
+        let network = request.network.as_ref().map(network_policy);
+        network::openvmm_arguments(network.as_ref(), &self.config.guest_network)?;
         Ok(())
     }
 
@@ -508,7 +572,7 @@ impl Backend for OpenVmmBackend {
             .memory_mib
             .unwrap_or(self.config.memory_mib);
         let filesystem = match &request.filesystem {
-            Some(policy) => filesystem::plan(policy)?,
+            Some(policy) => export_plan(policy)?,
             None => None,
         };
         let (workload_uid, workload_gid, create_workload_account) =
@@ -556,7 +620,7 @@ impl Backend for OpenVmmBackend {
         }
         self.probe()?;
         if let Some(mapping) = &record.filesystem {
-            filesystem::verify(mapping)?;
+            mapping.verify()?;
         }
 
         let mut capability = [0u8; CAPABILITY_LEN];
@@ -664,7 +728,7 @@ impl Backend for OpenVmmBackend {
         }
         // Workloads run only once the guest has mounted every mapped host path.
         if let Some(mapping) = &record.filesystem
-            && let Err(error) = session.map_host_paths(&filesystem::guest_table(mapping), deadline)
+            && let Err(error) = session.map_host_paths(&mapping.guest_table(), deadline)
         {
             let reason = format!("the host paths were not mapped: {error}");
             return Err(self.abort_start(sandbox_id, &runtime, &reason));
@@ -969,7 +1033,7 @@ mod tests {
             let request = ExecRequest::command_line("pwd").with_cwd(relative);
             let error = prepare_exec(&request.process).unwrap_err();
             assert_eq!(error.code(), ErrorCode::PolicyValidation);
-            assert!(error.message().contains("openvmm::guest_path"), "{error}");
+            assert!(error.message().contains("nvx::guest_path"), "{error}");
         }
         // The whole 4096-byte command line remains available with a working directory.
         let longest = "x".repeat(MAX_ARGUMENT_BYTES);

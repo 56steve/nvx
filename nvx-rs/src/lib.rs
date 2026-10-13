@@ -12,12 +12,12 @@
 //!   NVX releases with them.
 //! - [`net`]: IP networks in CIDR notation and their subtraction.
 //! - [`Hypervisor`]: the hypervisors that run the VMs.
-//! - [`host`] (feature `host`): artifact discovery, control sessions, and process and platform
-//!   primitives.
+//! - [`host`] (feature `host`): artifact discovery, the lowering of network and filesystem
+//!   policies, control sessions, and process and platform primitives.
 //!
 //! # Features
 //!
-//! - `host` (default): the [`host`] module.
+//! - `host` (default): the [`host`] module. It enables `serde`.
 //! - `bundled`: stages the OpenVMM executable, guest kernel, and control initramfs at build time;
 //!   see `Artifacts::bundled`. The build script downloads the release that `artifacts.json` pins,
 //!   or copies the release directory that `NVX_BUNDLE_DIR` names.
@@ -35,4 +35,6 @@ pub mod host;
 pub use error::{Error, ErrorKind, Result};
 #[cfg(feature = "host")]
 pub use host::artifacts::Artifacts;
+#[cfg(feature = "host")]
+pub use host::filesystem::{guest_path, resolve_guest_path};
 pub use hypervisor::Hypervisor;

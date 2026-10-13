@@ -8,9 +8,11 @@
 use std::ffi::{OsStr, OsString};
 use std::path::Path;
 
+use nvx::host::network;
+
 use super::config::OpenVmmConfig;
+use super::network_policy;
 use super::state::SandboxRecord;
-use super::{filesystem, network};
 use crate::error::{Error, Result};
 
 /// Bytes of the x86 kernel command line available to caller tokens, including the NUL.
@@ -42,7 +44,7 @@ pub(crate) fn kernel_command_line(extra: &str, record: &SandboxRecord) -> Result
         tokens.push("nvx_workload_account=create".to_owned());
     }
     if let Some(mapping) = &record.filesystem {
-        tokens.push(filesystem::kernel_token(mapping));
+        tokens.push(mapping.kernel_token());
     }
     let command_line = tokens.join(" ");
     if command_line.len() + 1 > COMMAND_LINE_BUDGET {
@@ -140,22 +142,23 @@ pub(crate) fn openvmm_arguments(
     arguments.push("--microvm-report".into());
     arguments.push(report.into());
     arguments.extend(
-        network::network_arguments(record.network.as_ref(), &config.guest_network)?
-            .into_iter()
-            .map(OsString::from),
+        network::openvmm_arguments(
+            record.network.as_ref().map(network_policy).as_ref(),
+            &config.guest_network,
+        )?
+        .into_iter()
+        .map(OsString::from),
     );
     if let Some(mapping) = &record.filesystem {
-        arguments.extend(
-            filesystem::openvmm_arguments(mapping)
-                .into_iter()
-                .map(OsString::from),
-        );
+        arguments.extend(mapping.openvmm_arguments().into_iter().map(OsString::from));
     }
     Ok(arguments)
 }
 
 #[cfg(test)]
 mod tests {
+    use nvx::host::filesystem::{Bind, ExportChild, ExportPlan};
+
     use super::*;
     use crate::openvmm::config::Hypervisor;
     use crate::openvmm::state::{BACKEND_KEY, STATE_FORMAT};
@@ -234,8 +237,8 @@ mod tests {
     #[test]
     fn mappings_add_the_export_and_the_mapping_count() {
         let mut record = record();
-        record.filesystem = Some(filesystem::HostMapping {
-            children: vec![filesystem::Child {
+        record.filesystem = Some(ExportPlan {
+            children: vec![ExportChild {
                 root: "/host/work".into(),
                 file: false,
                 writable: false,
@@ -245,7 +248,7 @@ mod tests {
                 allowed: Vec::new(),
                 write: Vec::new(),
             }],
-            binds: vec![filesystem::Bind {
+            binds: vec![Bind {
                 child: 0,
                 source: String::new(),
                 target: "/host/work".to_owned(),
@@ -311,8 +314,8 @@ mod tests {
         let denied: Vec<std::path::PathBuf> = (0..128)
             .map(|index| format!("/host/work/{index:03}-{}", "d".repeat(240)).into())
             .collect();
-        record.filesystem = Some(filesystem::HostMapping {
-            children: vec![filesystem::Child {
+        record.filesystem = Some(ExportPlan {
+            children: vec![ExportChild {
                 root: "/host/work".into(),
                 file: false,
                 writable: false,

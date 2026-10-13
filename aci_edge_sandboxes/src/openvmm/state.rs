@@ -17,10 +17,10 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+use nvx::host::filesystem::ExportPlan;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use super::filesystem::HostMapping;
 use super::platform;
 use super::protocol::CAPABILITY_LEN;
 use crate::error::{Error, ErrorCode, Result};
@@ -55,7 +55,7 @@ pub(crate) struct SandboxRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) network: Option<NetworkPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) filesystem: Option<HostMapping>,
+    pub(crate) filesystem: Option<ExportPlan>,
     pub(crate) memory_mib: u32,
     pub(crate) workload_uid: u32,
     pub(crate) workload_gid: u32,

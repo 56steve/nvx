@@ -27,7 +27,7 @@ use aci_edge_sandboxes::agent::{
     AgentBackend, AgentConfig, CpuProfile, Hypervisor, ImageDigest, ImageId, RuntimeFiles,
     RuntimeSource, SandboxDefaults, SetupConfig,
 };
-use aci_edge_sandboxes::openvmm::resolve_guest_path;
+use aci_edge_sandboxes::nvx::resolve_guest_path;
 use aci_edge_sandboxes::{
     Access, AciEdgeSandbox, EgressPolicy, Error, ErrorCode, ExecFailure, ExecOutcome, ExecOutput,
     ExecRequest, FilesystemPolicy, ForwardProtocol, HostLoopbackForward, ImageSource, NetworkPeer,

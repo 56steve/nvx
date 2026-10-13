@@ -17,9 +17,8 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use aci_edge_sandboxes::openvmm::{
-    OpenVmmBackend, OpenVmmConfig, resolve_guest_path as guest_path,
-};
+use aci_edge_sandboxes::nvx::resolve_guest_path as guest_path;
+use aci_edge_sandboxes::openvmm::{OpenVmmBackend, OpenVmmConfig};
 use aci_edge_sandboxes::{
     Access, AciEdgeSandbox, EgressPolicy, ErrorCode, ExecFailure, ExecOutcome, ExecOutput,
     ExecRequest, FilesystemPolicy, NetworkPeer, NetworkPolicy, NetworkRule, ProcessSpec, Protocol,

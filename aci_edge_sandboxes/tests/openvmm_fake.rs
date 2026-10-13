@@ -1465,7 +1465,7 @@ fn filesystem_and_network_policies_reach_openvmm() {
     assert_eq!(entries, [("0", false), ("1", true)]);
 
     let guest =
-        aci_edge_sandboxes::openvmm::resolve_guest_path(&base.join("work").join("out")).unwrap();
+        aci_edge_sandboxes::nvx::resolve_guest_path(&base.join("work").join("out")).unwrap();
     assert!(
         state_json(&fixture, &sandbox_id, "sandbox.json")["filesystem"]["binds"]
             .as_array()
@@ -1582,7 +1582,7 @@ fn mapped_files_are_not_working_directories() {
     });
     let sandbox_id = nvx.provision(&request).unwrap().sandbox_id;
     nvx.start(&sandbox_id).unwrap();
-    let guest = |name: &str| aci_edge_sandboxes::openvmm::resolve_guest_path(&work.join(name));
+    let guest = |name: &str| aci_edge_sandboxes::nvx::resolve_guest_path(&work.join(name));
 
     let out = guest("out").unwrap();
     let directory = nvx
@@ -1660,7 +1660,7 @@ fn unrelated_directories_are_exported_side_by_side() {
         assert!(Path::new(host).ends_with(name), "{child}");
     }
     for name in ["projects/app", "build-output", "tools"] {
-        let guest = aci_edge_sandboxes::openvmm::resolve_guest_path(&base.join(name)).unwrap();
+        let guest = aci_edge_sandboxes::nvx::resolve_guest_path(&base.join(name)).unwrap();
         let pwd = nvx
             .exec(
                 &sandbox_id,
@@ -1717,7 +1717,7 @@ fn large_mapping_tables_reach_the_guest_in_several_records() {
             .iter()
             .all(|entry| entry["read_only"] == true && entry["directory"] == true)
     );
-    let last = aci_edge_sandboxes::openvmm::resolve_guest_path(&work.join(&names[799])).unwrap();
+    let last = aci_edge_sandboxes::nvx::resolve_guest_path(&work.join(&names[799])).unwrap();
     let pwd = nvx
         .exec(
             &sandbox_id,
