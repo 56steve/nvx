@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import contextlib
 import errno
+import math
 import os
 import secrets
 import socket
 import struct
 import time
+from collections.abc import Generator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -184,49 +187,132 @@ class _SocketStream:
             output.extend(chunk)
         return bytes(output)
 
-    def write_all(self, data: bytes) -> None:
-        try:
-            self._connection.sendall(data)
-        except _PEER_CLOSED as error:
-            raise ControlEndpointClosed() from error
+    def write_all(self, data: bytes, deadline: float) -> None:
+        unsent = memoryview(data)
+        while unsent:
+            remaining = remaining_timeout(deadline)
+            if remaining <= 0:
+                raise TimeoutError("managed control request timed out")
+            self._connection.settimeout(min(remaining, 0.25))
+            try:
+                sent = self._connection.send(unsent)
+            except TimeoutError:
+                continue
+            except _PEER_CLOSED as error:
+                raise ControlEndpointClosed() from error
+            if not sent:
+                raise ControlEndpointClosed()
+            unsent = unsent[sent:]
 
     def close(self) -> None:
         self._connection.close()
 
 
 if os.name == "nt":
+    import _winapi
     import ctypes
-    import msvcrt
 
-    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    _peek_named_pipe = _kernel32.PeekNamedPipe
-    _peek_named_pipe.argtypes = [
-        ctypes.c_void_p,
-        ctypes.c_void_p,
-        ctypes.c_uint32,
-        ctypes.c_void_p,
-        ctypes.POINTER(ctypes.c_uint32),
-        ctypes.c_void_p,
-    ]
-    _peek_named_pipe.restype = ctypes.c_int
+    _cancel_io_ex = ctypes.WinDLL("kernel32", use_last_error=True).CancelIoEx
+    _cancel_io_ex.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    _cancel_io_ex.restype = ctypes.c_int
 else:
+    _winapi = cast(Any, None)
     ctypes = cast(Any, None)
-    msvcrt = cast(Any, None)
-    _peek_named_pipe = cast(Any, None)
+    _cancel_io_ex = cast(Any, None)
+
+# Windows fails a transfer on a pipe that its server closed or disconnected with
+# ERROR_BROKEN_PIPE, ERROR_NO_DATA, or ERROR_PIPE_NOT_CONNECTED.
+_PIPE_CLOSED_ERRORS = frozenset((109, 232, 233))
+_ERROR_NOT_FOUND = 1168
+
+
+@contextlib.contextmanager
+def _pipe_closure_reported() -> Generator[None]:
+    try:
+        yield
+    except OSError as error:
+        if getattr(error, "winerror", None) in _PIPE_CLOSED_ERRORS:
+            raise ControlEndpointClosed() from error
+        raise
+
+
+def _signaled_before(event: int, deadline: float) -> bool:
+    while True:
+        remaining = remaining_timeout(deadline)
+        if remaining <= 0:
+            return False
+        try:
+            # On the main thread, Ctrl+C ends this wait too.
+            result = _winapi.WaitForMultipleObjects(
+                [event], False, math.ceil(min(remaining, 0.25) * 1000)
+            )
+        except InterruptedError:
+            continue
+        if result == _winapi.WAIT_OBJECT_0:
+            return True
+
+
+def _cancel_transfers(handle: int) -> None:
+    # Overlapped.cancel() marks a transfer as ended at once, so that releasing the
+    # transfer before GetOverlappedResult() reports its end would free a buffer
+    # that Windows may still use. CancelIoEx() leaves the transfer pending, and
+    # releasing a pending transfer waits for its end or leaks its buffer.
+    if not _cancel_io_ex(handle, None):
+        error = ctypes.get_last_error()
+        if error != _ERROR_NOT_FOUND:
+            raise ctypes.WinError(error)
+
+
+def _finish_transfer(handle: int, transfer: Any, deadline: float, message: str) -> int:
+    """Returns how many bytes an overlapped pipe transfer moved.
+
+    A transfer that is still pending at `deadline` is cancelled, and fails with a
+    TimeoutError unless it completed first. Windows uses the transfer's buffer
+    until the transfer ends, so this waits for that even when it fails.
+    """
+    try:
+        completed = _signaled_before(transfer.event, deadline)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            _cancel_transfers(handle)
+            transfer.GetOverlappedResult(True)
+        raise
+    if not completed:
+        _cancel_transfers(handle)
+    count, status = transfer.GetOverlappedResult(True)
+    if status == _winapi.ERROR_OPERATION_ABORTED:
+        raise TimeoutError(message)
+    return count
 
 
 class _NamedPipeStream:
-    def __init__(self, fd: int) -> None:
-        self._fd = fd
+    """A named-pipe client whose transfers end by their deadlines.
+
+    A synchronous write blocks for as long as the endpoint does not drain the
+    pipe, so the client opens the pipe for overlapped I/O and cancels a transfer
+    that outlives its deadline.
+    """
+
+    def __init__(self, handle: int) -> None:
+        self._handle = handle
 
     @classmethod
     def connect(cls, path: Path, timeout: float) -> _NamedPipeStream:
         normalized = os.fspath(path).replace("/", "\\")
         deadline = time.monotonic() + timeout
-        flags = os.O_RDWR | getattr(os, "O_BINARY", 0)
         while True:
             try:
-                return cls(os.open(normalized, flags))
+                return cls(
+                    _winapi.CreateFile(
+                        normalized,
+                        _winapi.GENERIC_READ | _winapi.GENERIC_WRITE,
+                        0,
+                        _winapi.NULL,
+                        _winapi.OPEN_EXISTING,
+                        _winapi.FILE_FLAG_OVERLAPPED,
+                        _winapi.NULL,
+                    )
+                )
             except OSError as error:
                 if time.monotonic() >= deadline:
                     raise TimeoutError(
@@ -237,66 +323,59 @@ class _NamedPipeStream:
                     errno.EACCES,
                     errno.EBUSY,
                     errno.EAGAIN,
-                    # The Windows CRT reports the reconnect transition as EINVAL.
+                    # The reconnect transition fails with ERROR_PIPE_BUSY, which
+                    # Python reports as EINVAL.
                     errno.EINVAL,
                 ):
                     raise
                 time.sleep(0.025)
 
-    def _available(self) -> int:
-        available = ctypes.c_uint32()
-        handle = msvcrt.get_osfhandle(self._fd)
-        if not _peek_named_pipe(
-            handle,
-            None,
-            0,
-            None,
-            ctypes.byref(available),
-            None,
-        ):
-            error = ctypes.get_last_error()
-            if error in (109, 233):
-                raise ControlEndpointClosed()
-            raise OSError(error, "PeekNamedPipe failed")
-        return int(available.value)
-
     def read_exact(self, length: int, deadline: float) -> bytes:
         output = bytearray()
         while len(output) != length:
-            if time.monotonic() >= deadline:
+            if remaining_timeout(deadline) <= 0:
                 raise TimeoutError("managed control response timed out")
-            available = self._available()
-            if available == 0:
-                time.sleep(0.01)
-                continue
-            chunk = os.read(self._fd, min(length - len(output), available))
+            with _pipe_closure_reported():
+                transfer, _ = _winapi.ReadFile(
+                    self._handle, length - len(output), overlapped=True
+                )
+                _finish_transfer(
+                    self._handle,
+                    transfer,
+                    deadline,
+                    "managed control response timed out",
+                )
+            chunk = transfer.getbuffer()
             if not chunk:
                 raise ControlEndpointClosed()
             output.extend(chunk)
         return bytes(output)
 
-    def write_all(self, data: bytes) -> None:
-        remaining = memoryview(data)
-        while remaining:
-            try:
-                count = os.write(self._fd, remaining)
-            except OSError as error:
-                # The CRT reports a write to a pipe that the server closed as
-                # EINVAL, so report it as a closure, as reads do.
-                if error.errno == errno.EINVAL:
-                    self._available()
-                raise
-            if count <= 0:
+    def write_all(self, data: bytes, deadline: float) -> None:
+        unsent = memoryview(data)
+        while unsent:
+            if remaining_timeout(deadline) <= 0:
+                raise TimeoutError("managed control request timed out")
+            with _pipe_closure_reported():
+                transfer, _ = _winapi.WriteFile(self._handle, unsent, overlapped=True)
+                count = _finish_transfer(
+                    self._handle,
+                    transfer,
+                    deadline,
+                    "managed control request timed out",
+                )
+            if not count:
                 raise ControlEndpointClosed()
-            remaining = remaining[count:]
+            unsent = unsent[count:]
 
     def close(self) -> None:
-        os.close(self._fd)
+        _winapi.CloseHandle(self._handle)
 
 
 class ControlSession:
     def __init__(self, stream: _SocketStream | _NamedPipeStream) -> None:
         self._stream = stream
+        self._closed = False
         self._instance_id = bytes(16)
         self._epoch = 0
         self._send_sequence = 0
@@ -318,14 +397,15 @@ class ControlSession:
         )
         session = cls(stream)
         try:
+            deadline = time.monotonic() + timeout
             session._write_outer(
                 OUTER_HOST_ATTACH,
                 bytes(16),
                 0,
                 0,
                 capability,
+                deadline,
             )
-            deadline = time.monotonic() + timeout
             while True:
                 record_type, instance_id, epoch, sequence, payload = (
                     session._read_outer(deadline)
@@ -347,7 +427,22 @@ class ControlSession:
                 session._receive_sequence = sequence + 1
                 return session
         except BaseException:
-            stream.close()
+            session.close()
+            raise
+
+    @contextlib.contextmanager
+    def _transferring_record(self) -> Generator[None]:
+        """Closes the session if sending or receiving a record fails.
+
+        A failed transfer may leave a record partly sent or partly received, after
+        which later records would not frame correctly.
+        """
+        if self._closed:
+            raise ValueError("managed control session is closed")
+        try:
+            yield
+        except BaseException:
+            self.close()
             raise
 
     def _write_outer(
@@ -357,6 +452,7 @@ class ControlSession:
         epoch: int,
         sequence: int,
         payload: bytes,
+        deadline: float,
     ) -> None:
         if len(payload) > OUTER_MAX_PAYLOAD:
             raise ValueError("control payload exceeds the outer protocol limit")
@@ -370,25 +466,33 @@ class ControlSession:
             sequence,
             len(payload),
         )
-        self._stream.write_all(header + payload)
+        with self._transferring_record():
+            self._stream.write_all(header + payload, deadline)
 
     def _read_outer(
         self,
         deadline: float,
     ) -> tuple[int, bytes, int, int, bytes]:
-        header = self._stream.read_exact(OUTER_HEADER.size, deadline)
-        magic, version, record_type, flags, instance_id, epoch, sequence, length = (
-            OUTER_HEADER.unpack(header)
-        )
-        if magic != b"NVXS" or version != 1 or flags != 0 or length > OUTER_MAX_PAYLOAD:
-            raise ScriptError("control endpoint returned an invalid outer record")
-        payload = self._stream.read_exact(length, deadline) if length else b""
+        with self._transferring_record():
+            header = self._stream.read_exact(OUTER_HEADER.size, deadline)
+            magic, version, record_type, flags, instance_id, epoch, sequence, length = (
+                OUTER_HEADER.unpack(header)
+            )
+            if (
+                magic != b"NVXS"
+                or version != 1
+                or flags != 0
+                or length > OUTER_MAX_PAYLOAD
+            ):
+                raise ScriptError("control endpoint returned an invalid outer record")
+            payload = self._stream.read_exact(length, deadline) if length else b""
         return record_type, instance_id, epoch, sequence, payload
 
     def _send_app(
         self,
         kind: int,
         request_id: int,
+        deadline: float,
         payload: bytes = b"",
     ) -> None:
         frame = (
@@ -409,6 +513,7 @@ class ControlSession:
             self._epoch,
             self._send_sequence,
             frame,
+            deadline,
         )
         self._send_sequence += 1
 
@@ -442,8 +547,9 @@ class ControlSession:
 
     def ping(self, timeout: float) -> None:
         request_id = self._request_id()
-        self._send_app(APP_PING, request_id)
-        kind, response_id, status, payload = self._read_app(time.monotonic() + timeout)
+        deadline = time.monotonic() + timeout
+        self._send_app(APP_PING, request_id, deadline)
+        kind, response_id, status, payload = self._read_app(deadline)
         if kind != APP_READY or response_id != request_id or status != 0 or payload:
             raise ScriptError("managed guest did not acknowledge readiness")
 
@@ -531,10 +637,12 @@ class ControlSession:
             raise ValueError("managed exec request exceeds the protocol limit")
 
         request_id = self._request_id()
-        self._send_app(APP_EXEC, request_id, payload)
+        # The response timeout bounds the whole exchange, so an endpoint that
+        # stops reading cannot hold up sending the request either.
+        deadline = time.monotonic() + response_timeout
+        self._send_app(APP_EXEC, request_id, deadline, payload)
         stdout = bytearray()
         stderr = bytearray()
-        deadline = time.monotonic() + response_timeout
         while True:
             kind, response_id, status, response = self._read_app(deadline)
             if response_id != request_id:
@@ -567,13 +675,16 @@ class ControlSession:
 
     def stop(self, timeout: float) -> None:
         request_id = self._request_id()
-        self._send_app(APP_STOP, request_id)
-        kind, response_id, status, payload = self._read_app(time.monotonic() + timeout)
+        deadline = time.monotonic() + timeout
+        self._send_app(APP_STOP, request_id, deadline)
+        kind, response_id, status, payload = self._read_app(deadline)
         if kind != APP_STOPPED or response_id != request_id or status != 0 or payload:
             raise ScriptError("managed guest did not acknowledge stop")
 
     def close(self) -> None:
-        self._stream.close()
+        if not self._closed:
+            self._closed = True
+            self._stream.close()
 
     def __enter__(self) -> ControlSession:
         return self

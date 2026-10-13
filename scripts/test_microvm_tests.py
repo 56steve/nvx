@@ -2469,9 +2469,7 @@ class ControlSessionTests(unittest.TestCase):
     def test_named_pipe_connect_retries_transient_invalid_argument(self):
         error = OSError(control_session.errno.EINVAL, "Invalid argument")
         with (
-            patch.object(
-                control_session.os, "open", side_effect=[error, 123]
-            ) as open_pipe,
+            patch.object(control_session, "_winapi") as winapi,
             patch.object(
                 control_session.time,
                 "monotonic",
@@ -2479,13 +2477,14 @@ class ControlSessionTests(unittest.TestCase):
             ),
             patch.object(control_session.time, "sleep") as sleep,
         ):
+            winapi.CreateFile.side_effect = [error, 123]
             stream = control_session._NamedPipeStream.connect(
                 Path(r"\\.\pipe\nvx-test"),
                 1.0,
             )
 
-        self.assertEqual(stream._fd, 123)
-        self.assertEqual(open_pipe.call_count, 2)
+        self.assertEqual(stream._handle, 123)
+        self.assertEqual(winapi.CreateFile.call_count, 2)
         sleep.assert_called_once_with(0.025)
 
 

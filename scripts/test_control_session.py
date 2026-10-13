@@ -10,9 +10,15 @@ import time
 import unittest
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, cast
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).parent))
 from nvx_tools import control_session  # noqa: E402
+
+if sys.platform == "win32":
+    import _winapi
 
 
 def _read_like_openvmm(descriptor: int) -> bytes | None:
@@ -78,8 +84,7 @@ def _read_outer(connection: socket.socket):
     return (*values[:-1], payload)
 
 
-def _write_app(
-    connection: socket.socket,
+def _app_record(
     *,
     instance_id: bytes,
     sequence: int,
@@ -87,7 +92,7 @@ def _write_app(
     request_id: int,
     status: int,
     payload: bytes,
-) -> None:
+) -> bytes:
     app = (
         control_session.APP_HEADER.pack(
             b"NVXC",
@@ -100,7 +105,7 @@ def _write_app(
         )
         + payload
     )
-    connection.sendall(
+    return (
         control_session.OUTER_HEADER.pack(
             b"NVXS",
             1,
@@ -113,6 +118,105 @@ def _write_app(
         )
         + app
     )
+
+
+def _write_app(
+    connection: socket.socket,
+    *,
+    instance_id: bytes,
+    sequence: int,
+    kind: int,
+    request_id: int,
+    status: int,
+    payload: bytes,
+) -> None:
+    connection.sendall(
+        _app_record(
+            instance_id=instance_id,
+            sequence=sequence,
+            kind=kind,
+            request_id=request_id,
+            status=status,
+            payload=payload,
+        )
+    )
+
+
+class _RecordingStream:
+    """A transport that replays `responses` and records every transfer."""
+
+    def __init__(self, responses: bytes = b"", *, failure: str | None = None):
+        self._responses = bytearray(responses)
+        # The kind of transfer, "write" or "read", that times out.
+        self._failure = failure
+        self.transfers: list[tuple[str, float]] = []
+        self.closes = 0
+
+    def _transfer(self, kind: str, deadline: float) -> None:
+        self.transfers.append((kind, deadline))
+        if kind == self._failure:
+            raise TimeoutError(f"{kind} timed out")
+
+    def write_all(self, data: bytes, deadline: float) -> None:
+        self._transfer("write", deadline)
+
+    def read_exact(self, length: int, deadline: float) -> bytes:
+        self._transfer("read", deadline)
+        data = bytes(self._responses[:length])
+        del self._responses[:length]
+        return data
+
+    def close(self) -> None:
+        self.closes += 1
+
+
+if sys.platform == "win32":
+
+    def _create_pipe(quota: int = 65536) -> tuple[Path, int]:
+        name = rf"\\.\pipe\nvx-control-session-test-{uuid.uuid4().hex}"
+        server = _winapi.CreateNamedPipe(
+            name,
+            _winapi.PIPE_ACCESS_DUPLEX,
+            _winapi.PIPE_WAIT,
+            1,
+            quota,
+            quota,
+            0,
+            _winapi.NULL,
+        )
+        return Path(name), server
+
+    def _accept_client(server: int) -> None:
+        try:
+            _winapi.ConnectNamedPipe(server)
+        except OSError as error:
+            if error.winerror != _winapi.ERROR_PIPE_CONNECTED:
+                raise
+
+    def _pipe_read_exact(handle: int, length: int) -> bytes:
+        output = bytearray()
+        while len(output) != length:
+            chunk, _ = _winapi.ReadFile(handle, length - len(output))
+            output.extend(chunk)
+        return bytes(output)
+
+    def _accept_attach(server: int, capability: bytes, instance_id: bytes) -> None:
+        """Authenticates the client of a pipe as OpenVMM's control endpoint does."""
+        _accept_client(server)
+        header = control_session.OUTER_HEADER.unpack(
+            _pipe_read_exact(server, control_session.OUTER_HEADER.size)
+        )
+        if (
+            header[:4] != (b"NVXS", 1, control_session.OUTER_HOST_ATTACH, 0)
+            or _pipe_read_exact(server, header[-1]) != capability
+        ):
+            raise RuntimeError("test endpoint received an invalid attach record")
+        _winapi.WriteFile(
+            server,
+            control_session.OUTER_HEADER.pack(
+                b"NVXS", 1, control_session.OUTER_READY, 0, instance_id, 1, 0, 0
+            ),
+        )
 
 
 class ControlSessionTests(unittest.TestCase):
@@ -624,6 +728,89 @@ class ControlSessionTests(unittest.TestCase):
             raised.exception, control_session.ControlEndpointClosed
         )
 
+    def test_operations_bound_their_requests_by_their_deadlines(self):
+        # Issue #464: an operation's timeout bounds sending its request as well as
+        # receiving its response, so attach, ping, exec, and stop each write with
+        # the deadline with which they then read.
+        instance = bytes.fromhex("66" * 16)
+        request_id = 0x1234
+
+        def response(sequence: int, kind: int, payload: bytes = b"") -> bytes:
+            return _app_record(
+                instance_id=instance,
+                sequence=sequence,
+                kind=kind,
+                request_id=request_id,
+                status=0,
+                payload=payload,
+            )
+
+        stream = _RecordingStream(
+            control_session.OUTER_HEADER.pack(
+                b"NVXS", 1, control_session.OUTER_READY, 0, instance, 1, 0, 0
+            )
+            + response(1, control_session.APP_READY)
+            + response(2, control_session.APP_EXIT, b"exit")
+            + response(3, control_session.APP_STOPPED)
+        )
+        transport = (
+            control_session._NamedPipeStream
+            if os.name == "nt"
+            else control_session._SocketStream
+        )
+        with (
+            patch.object(transport, "connect", return_value=stream),
+            patch.object(
+                control_session, "time", SimpleNamespace(monotonic=lambda: 1000.0)
+            ),
+            patch.object(
+                control_session.ControlSession, "_request_id", return_value=request_id
+            ),
+        ):
+            session = control_session.ControlSession.connect(
+                Path("endpoint"), bytes(range(1, 33)), 7
+            )
+            session.ping(5)
+            session.exec(("/bin/true",), timeout_ms=0, response_timeout=3)
+            session.stop(2)
+            session.close()
+
+        self.assertEqual(
+            stream.transfers,
+            [
+                ("write", 1007.0),
+                ("read", 1007.0),
+                *(
+                    transfer
+                    for deadline in (1005.0, 1003.0, 1002.0)
+                    for transfer in (
+                        ("write", deadline),
+                        ("read", deadline),
+                        ("read", deadline),
+                    )
+                ),
+            ],
+        )
+
+    def test_failed_transfer_closes_the_session(self):
+        # A transfer that fails, as by timing out, may cut its record short, after
+        # which the endpoint would frame every later record wrongly.
+        for failure in ("write", "read"):
+            with self.subTest(failure=failure):
+                stream = _RecordingStream(failure=failure)
+                session = control_session.ControlSession(cast(Any, stream))
+                with self.assertRaisesRegex(TimeoutError, f"^{failure} timed out$"):
+                    session.ping(5)
+                self.assertEqual(stream.closes, 1)
+                transfers = len(stream.transfers)
+                with self.assertRaisesRegex(
+                    ValueError, "^managed control session is closed$"
+                ):
+                    session.exec(("/bin/true",), timeout_ms=0, response_timeout=5)
+                session.close()
+                self.assertEqual(len(stream.transfers), transfers)
+                self.assertEqual(stream.closes, 1)
+
 
 class CapabilityPipeTests(unittest.TestCase):
     CAPABILITY = bytes(range(1, 33))
@@ -656,6 +843,17 @@ class CapabilityPipeTests(unittest.TestCase):
 
 
 class SocketStreamTests(unittest.TestCase):
+    def test_write_that_sends_nothing_reports_a_closed_endpoint(self):
+        connection = MagicMock(spec=socket.socket)
+        connection.send.return_value = 0
+        stream = control_session._SocketStream(connection)
+        with self.assertRaisesRegex(
+            control_session.ControlEndpointClosed,
+            "^managed control endpoint closed$",
+        ):
+            stream.write_all(b"record", time.monotonic() + 60)
+        connection.send.assert_called_once()
+
     def test_read_reports_a_closed_endpoint(self):
         client, server = socket.socketpair()
         stream = control_session._SocketStream(client)
@@ -677,20 +875,89 @@ class SocketStreamTests(unittest.TestCase):
             self.skipTest("Unix-domain socket closure semantics require Linux")
         client, server = socket.socketpair()
         stream = control_session._SocketStream(client)
-        stream.write_all(b"unread request")
+        stream.write_all(b"unread request", time.monotonic() + 5)
         server.close()
         try:
             with self.assertRaises(control_session.ControlEndpointClosed) as raised:
                 stream.read_exact(1, time.monotonic() + 5)
             self.assertIsInstance(raised.exception.__cause__, ConnectionResetError)
             with self.assertRaises(control_session.ControlEndpointClosed) as raised:
-                stream.write_all(b"record")
+                stream.write_all(b"record", time.monotonic() + 5)
             self.assertIsInstance(raised.exception.__cause__, BrokenPipeError)
         finally:
             stream.close()
 
+    def test_request_to_a_stalled_endpoint_times_out(self):
+        # Issue #464: a request that the endpoint does not read must not hold the
+        # operation past its timeout.
+        if sys.platform != "linux":
+            self.skipTest("Unix-domain socket buffering semantics require Linux")
+        client, server = socket.socketpair()
+        # The request is several times larger than the socket buffer.
+        client.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+        server.settimeout(5)
+        session = control_session.ControlSession(control_session._SocketStream(client))
+        session._instance_id = bytes.fromhex("77" * 16)
+        session._epoch = 1
+        arguments = ("/bin/true", *("a" * 4000,) * 15)
+        released = threading.Event()
+        received = bytearray()
+        failures: list[BaseException] = []
+
+        def serve() -> None:
+            try:
+                # The peer reads nothing until the client gives up, or long
+                # after the client's timeout.
+                released.wait(10)
+                while chunk := server.recv(65536):
+                    received.extend(chunk)
+            except BaseException as error:
+                failures.append(error)
+
+        worker = threading.Thread(target=serve, daemon=True)
+        worker.start()
+        timeout = 0.25
+        try:
+            started = time.monotonic()
+            with self.assertRaisesRegex(
+                TimeoutError, "^managed control request timed out$"
+            ):
+                session.exec(arguments, timeout_ms=0, response_timeout=timeout)
+            elapsed = time.monotonic() - started
+            with self.assertRaisesRegex(
+                ValueError, "^managed control session is closed$"
+            ):
+                session.ping(5)
+        finally:
+            session.close()
+            released.set()
+            worker.join(10)
+            server.close()
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(failures, [])
+        self.assertGreaterEqual(elapsed, timeout)
+        self.assertLess(elapsed, timeout + 2)
+        # The endpoint received only part of the request before the end of stream.
+        self.assertLess(len(received), sum(map(len, arguments)))
+
 
 class NamedPipeStreamTests(unittest.TestCase):
+    def test_write_that_moves_nothing_reports_a_closed_endpoint(self):
+        # The stream is never closed, since its handle is not real.
+        stream = control_session._NamedPipeStream(123)
+        with (
+            patch.object(control_session, "_winapi") as winapi,
+            patch.object(control_session, "_finish_transfer", return_value=0) as finish,
+            self.assertRaisesRegex(
+                control_session.ControlEndpointClosed,
+                "^managed control endpoint closed$",
+            ),
+        ):
+            winapi.WriteFile.return_value = (MagicMock(), 0)
+            stream.write_all(b"record", time.monotonic() + 60)
+        finish.assert_called_once()
+
     def test_write_reports_a_closed_endpoint(self):
         # OpenVMM closes the pipe as it tears the VM down, and the CRT reports a
         # later write to it as EINVAL rather than as a broken pipe.
@@ -718,9 +985,125 @@ class NamedPipeStreamTests(unittest.TestCase):
                 control_session.ControlEndpointClosed,
                 "^managed control endpoint closed$",
             ):
-                stream.write_all(b"record")
+                stream.write_all(b"record", time.monotonic() + 5)
         finally:
             stream.close()
+
+    def test_read_reports_a_closed_endpoint_after_its_data(self):
+        if sys.platform != "win32":
+            self.skipTest("named pipes require a Windows host")
+        path, server = _create_pipe()
+        try:
+            stream = control_session._NamedPipeStream.connect(path, 5)
+            _accept_client(server)
+            _winapi.WriteFile(server, b"ok")
+        finally:
+            _winapi.CloseHandle(server)
+        try:
+            self.assertEqual(stream.read_exact(2, time.monotonic() + 5), b"ok")
+            with self.assertRaisesRegex(
+                control_session.ControlEndpointClosed,
+                "^managed control endpoint closed$",
+            ):
+                stream.read_exact(1, time.monotonic() + 5)
+        finally:
+            stream.close()
+
+    def test_read_times_out_without_losing_later_data(self):
+        if sys.platform != "win32":
+            self.skipTest("named pipes require a Windows host")
+        path, server = _create_pipe()
+        self.addCleanup(_winapi.CloseHandle, server)
+        stream = control_session._NamedPipeStream.connect(path, 5)
+        self.addCleanup(stream.close)
+        _accept_client(server)
+
+        started = time.monotonic()
+        with self.assertRaisesRegex(
+            TimeoutError, "^managed control response timed out$"
+        ):
+            stream.read_exact(2, started + 0.1)
+        self.assertLess(time.monotonic() - started, 2.1)
+        _winapi.WriteFile(server, b"ok")
+        self.assertEqual(stream.read_exact(2, time.monotonic() + 5), b"ok")
+
+    def test_interrupted_write_is_cancelled_before_the_interruption_propagates(self):
+        if sys.platform != "win32":
+            self.skipTest("named pipes require a Windows host")
+        path, server = _create_pipe(1024)
+        self.addCleanup(_winapi.CloseHandle, server)
+        stream = control_session._NamedPipeStream.connect(path, 5)
+        self.addCleanup(stream.close)
+        _accept_client(server)
+
+        with (
+            patch.object(
+                control_session, "_signaled_before", side_effect=KeyboardInterrupt
+            ),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            stream.write_all(b"x" * 4096, time.monotonic() + 5)
+        # The write, which the pipe could not hold, no longer waits in it.
+        self.assertEqual(_winapi.PeekNamedPipe(server)[0], 0)
+
+    def test_request_to_a_stalled_endpoint_times_out_and_closes_the_session(self):
+        # Issue #464: an endpoint that authenticated the session and then stopped
+        # reading held the request's write, and so the operation, past its timeout.
+        if sys.platform != "win32":
+            self.skipTest("named pipes require a Windows host")
+        # The 4,093-byte request does not fit in the endpoint's 1 KiB quota.
+        path, server = _create_pipe(1024)
+        capability = bytes(range(1, 33))
+        released = threading.Event()
+        received = bytearray()
+        failures: list[BaseException] = []
+
+        def serve() -> None:
+            # Type checkers check a nested function apart from its test's skip.
+            assert sys.platform == "win32"
+            try:
+                _accept_attach(server, capability, bytes.fromhex("11" * 16))
+                # The endpoint keeps the pipe open but reads nothing more until
+                # the client gives up, or long after the client's timeout.
+                released.wait(10)
+                while True:
+                    chunk, _ = _winapi.ReadFile(server, 65536)
+                    received.extend(chunk)
+            except BrokenPipeError:
+                pass
+            except BaseException as error:
+                failures.append(error)
+
+        worker = threading.Thread(target=serve, daemon=True)
+        worker.start()
+        timeout = 0.25
+        try:
+            with control_session.ControlSession.connect(path, capability, 5) as session:
+                started = time.monotonic()
+                with self.assertRaisesRegex(
+                    TimeoutError, "^managed control request timed out$"
+                ):
+                    session.exec(
+                        ("/bin/true", "a" * 4000),
+                        timeout_ms=0,
+                        response_timeout=timeout,
+                    )
+                elapsed = time.monotonic() - started
+                with self.assertRaisesRegex(
+                    ValueError, "^managed control session is closed$"
+                ):
+                    session.ping(5)
+        finally:
+            released.set()
+            worker.join(5)
+            _winapi.CloseHandle(server)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(failures, [])
+        self.assertGreaterEqual(elapsed, timeout)
+        self.assertLess(elapsed, timeout + 2)
+        # The endpoint received less than the request before the pipe closed.
+        self.assertLess(len(received), 4000)
 
 
 if __name__ == "__main__":
