@@ -645,13 +645,16 @@ files identify the bounded lifecycle remeasurements within one workflow attempt,
 not the workflow's `github.run_attempt`.
 
 Lifecycle JSON results and workload `benchmark-metadata.json` files record host
-provenance under `host`: the runner name from `RUNNER_NAME`, the machine name,
-operating system, CPU model, logical processor count, and physical memory, and the
+provenance under `host`: the runner name from `RUNNER_NAME`, the machine name, the
+operating system with its kernel release or Windows build and cumulative-update
+revision (UBR), the CPU model with its vendor, family, model, stepping, and microcode
+revision, the logical processor count, and physical memory, and the
 volume, file system, size, system-volume flag, disk number, and SCSI address behind
 the workspace, temporary, and scratch directories. The disk number and SCSI address
 tell the Azure OS disk from a data-disk LUN or the temporary disk. On a possible Azure
 VM, the coordinator queries the instance metadata service once, directly rather than
-through a proxy, and keeps only the VM size; each managed disk's SKU, size, caching
+through a proxy and with up to three attempts when the service doesn't respond, and
+keeps only the VM size; each managed disk's SKU, size, caching
 policy, write-accelerator and ephemeral settings, and data-disk LUN; the throughput
 and IOPS limits that Ultra Disks report; and the temporary disk's size. It never
 records names, resource or VM identifiers, the subscription, tags, network addresses,

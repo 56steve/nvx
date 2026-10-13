@@ -5,10 +5,12 @@
 
 """Record safe benchmark host provenance and bounded storage telemetry.
 
-Provenance names the runner and machine, the CPU and memory, the Azure VM
-size and managed-disk configuration, and the volumes behind the benchmark's
-workspace, temporary, and scratch directories. It never records credentials,
-network addresses, Azure resource identifiers, names, or tags.
+Provenance names the runner and machine, the operating system with its kernel
+release or Windows build and cumulative-update revision, the CPU with its
+signature and microcode revision, the memory, the Azure VM size and
+managed-disk configuration, and the volumes behind the benchmark's workspace,
+temporary, and scratch directories. It never records credentials, network
+addresses, Azure resource identifiers, names, or tags.
 
 Storage telemetry samples cumulative operating-system counters while a
 snapshot capture runs, so that each profiled capture phase can be compared
@@ -54,6 +56,7 @@ AZURE_IMDS_URL = (
     "http://169.254.169.254/metadata/instance/compute?api-version=2021-05-01"
 )
 AZURE_IMDS_TIMEOUT_SECONDS = 2.0
+AZURE_IMDS_ATTEMPTS = 3
 AZURE_CHASSIS_ASSET_TAG = "7783-7084-3265-9085-8269-3286-77"
 DEFENDER_PROCESS_NAMES = frozenset({"msmpeng.exe", "mpdefendercoreservice.exe"})
 MIB = 1024 * 1024
@@ -63,6 +66,12 @@ TICKS_PER_SECOND = 10_000_000
 
 _WINDOWS_PROCESSOR_KEY = r"HARDWARE\DESCRIPTION\System\CentralProcessor\0"
 _WINDOWS_BIOS_KEY = r"HARDWARE\DESCRIPTION\System\BIOS"
+_WINDOWS_CURRENT_VERSION_KEY = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion"
+# The processor that Windows reports, such as
+# "Intel64 Family 6 Model 106 Stepping 6, GenuineIntel": the display family,
+# model, and stepping, and the CPUID vendor.
+_WINDOWS_PROCESSOR = re.compile(r"Family (\d+) Model (\d+) Stepping (\d+), (\S+)")
+_CPUINFO = Path("/proc/cpuinfo")
 _SCSI_ADDRESS = re.compile(r"\d+:\d+:\d+:\d+")
 
 
@@ -76,7 +85,9 @@ def host_provenance(volumes: Mapping[str, Path]) -> dict[str, object]:
         "runner_name": os.environ.get("RUNNER_NAME") or None,
         "machine_name": platform.node() or None,
         "os": platform.platform(),
+        "os_version": os_version(),
         "cpu_model": cpu_model(),
+        "cpu": cpu_signature(),
         "logical_processors": os.cpu_count(),
         "memory_bytes": physical_memory_bytes(),
         "azure": azure_vm_provenance(),
@@ -84,24 +95,113 @@ def host_provenance(volumes: Mapping[str, Path]) -> dict[str, object]:
     }
 
 
+def os_version() -> dict[str, object]:
+    """Return the host OS and the release that identifies its build: the Linux
+    kernel release, or the Windows build and its cumulative-update revision
+    (UBR), which ``platform.platform()`` omits."""
+    if sys.platform == "win32":
+        try:
+            revision = _integer(
+                _windows_registry_value(_WINDOWS_CURRENT_VERSION_KEY, "UBR")
+            )
+        except OSError:
+            revision = None
+        return {
+            "system": "Windows",
+            "release": platform.version() or None,
+            "revision": revision,
+        }
+    return {
+        "system": platform.system() or None,
+        "release": platform.release() or None,
+        "revision": None,
+    }
+
+
 def cpu_model() -> str | None:
     """Return the host CPU's brand string as the host OS reports it."""
     try:
         if sys.platform == "win32":
-            import winreg
-
-            with winreg.OpenKey(
-                winreg.HKEY_LOCAL_MACHINE, _WINDOWS_PROCESSOR_KEY
-            ) as key:
-                value, _ = winreg.QueryValueEx(key, "ProcessorNameString")
+            value = _windows_registry_value(
+                _WINDOWS_PROCESSOR_KEY, "ProcessorNameString"
+            )
             return str(value).strip() or None
-        for line in Path("/proc/cpuinfo").read_text(encoding="utf-8").splitlines():
-            name, separator, value = line.partition(":")
-            if separator and name.strip() == "model name":
-                return value.strip() or None
+        model = _cpuinfo().get("model name")
+        if model is not None:
+            return model or None
     except (OSError, UnicodeError):
         pass
     return platform.processor() or None
+
+
+def cpu_signature() -> dict[str, object]:
+    """Return the host CPU's vendor, display family, model, and stepping, and
+    its microcode revision, as the host OS reports them; each value that the
+    OS doesn't report is None."""
+    if sys.platform == "win32":
+        try:
+            revision = _windows_registry_value(
+                _WINDOWS_PROCESSOR_KEY, "Update Revision"
+            )
+        except OSError:
+            revision = None
+        return _windows_cpu_signature(platform.processor(), revision)
+    try:
+        fields = _cpuinfo()
+    except (OSError, UnicodeError):
+        fields = {}
+    return _linux_cpu_signature(fields)
+
+
+def _windows_cpu_signature(processor: str, revision: object) -> dict[str, object]:
+    match = _WINDOWS_PROCESSOR.search(processor)
+    microcode = None
+    # The registry keeps the revision in the high doubleword of an 8-byte
+    # value, as the MSR reports it.
+    if isinstance(revision, bytes) and len(revision) in (4, 8):
+        microcode = hex(int.from_bytes(revision[-4:], "little"))
+    return {
+        "vendor": match[4] if match else None,
+        "family": int(match[1]) if match else None,
+        "model": int(match[2]) if match else None,
+        "stepping": int(match[3]) if match else None,
+        "microcode": microcode,
+    }
+
+
+def _linux_cpu_signature(fields: Mapping[str, str]) -> dict[str, object]:
+    return {
+        "vendor": fields.get("vendor_id") or None,
+        "family": _integer(fields.get("cpu family")),
+        "model": _integer(fields.get("model")),
+        "stepping": _integer(fields.get("stepping")),
+        "microcode": fields.get("microcode") or None,
+    }
+
+
+def _cpuinfo() -> dict[str, str]:
+    """Return the first processor's /proc/cpuinfo fields."""
+    fields: dict[str, str] = {}
+    for line in _CPUINFO.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            if fields:
+                break
+            continue
+        name, separator, value = line.partition(":")
+        if separator:
+            fields.setdefault(name.strip(), value.strip())
+    return fields
+
+
+def _windows_registry_value(key: str, name: str) -> object:
+    """Return a value under HKEY_LOCAL_MACHINE, which any account can read."""
+    if sys.platform != "win32":
+        raise OSError("the Windows registry is unavailable")
+    import winreg
+
+    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key) as handle:
+        value, _ = winreg.QueryValueEx(handle, name)
+    return value
 
 
 class _MemoryStatus(ctypes.Structure):
@@ -138,7 +238,9 @@ def physical_memory_bytes() -> int | None:
 def azure_vm_provenance() -> dict[str, object] | None:
     """Return the Azure VM size and disks, or None off Azure.
 
-    The instance metadata service is queried at most once per process.
+    The instance metadata service is queried once per process, with up to
+    ``AZURE_IMDS_ATTEMPTS`` attempts when it can't be reached: unavailable
+    metadata fails the benchmark host check.
     """
     return copy.deepcopy(_azure_vm_provenance())
 
@@ -147,10 +249,16 @@ def azure_vm_provenance() -> dict[str, object] | None:
 def _azure_vm_provenance() -> dict[str, object] | None:
     if not may_be_azure_vm():
         return None
-    try:
-        return azure_compute_provenance(read_azure_compute_metadata())
-    except (OSError, ValueError, http.client.HTTPException) as error:
-        return {"error": f"Azure instance metadata is unavailable: {error}"}
+    error: Exception | None = None
+    for _ in range(AZURE_IMDS_ATTEMPTS):
+        try:
+            return azure_compute_provenance(read_azure_compute_metadata())
+        except ValueError as invalid:
+            error = invalid
+            break
+        except (OSError, http.client.HTTPException) as unreachable:
+            error = unreachable
+    return {"error": f"Azure instance metadata is unavailable: {error}"}
 
 
 def may_be_azure_vm() -> bool:
@@ -158,7 +266,8 @@ def may_be_azure_vm() -> bool:
 
     Linux reads Azure's chassis asset tag. Windows exposes only the Hyper-V
     manufacturer and product to unprivileged accounts, so on another Hyper-V
-    guest the metadata query fails after its timeout and records the error.
+    guest the metadata query fails after its attempts time out and records
+    the error.
     """
     try:
         if sys.platform == "win32":
@@ -278,12 +387,21 @@ _VOLUME_ROLE_LABELS = (
 
 def host_provenance_rows(host: Mapping[str, object]) -> list[tuple[str, str]]:
     """Return labeled, human-readable values of recorded host provenance."""
+    system = _text(host.get("os")) or "unknown"
+    version = _string_keys(host.get("os_version"))
+    release = _text(version.get("release"))
+    revision = _integer(version.get("revision"))
+    if release is not None and revision is not None:
+        system = f"{system}, build {release}.{revision}"
     rows = [
         ("Runner", _text(host.get("runner_name")) or "not recorded"),
         ("Machine", _text(host.get("machine_name")) or "unknown"),
-        ("Operating system", _text(host.get("os")) or "unknown"),
+        ("Operating system", system),
     ]
     cpu = _text(host.get("cpu_model")) or "unknown CPU"
+    signature = describe_cpu_signature(_string_keys(host.get("cpu")))
+    if signature:
+        cpu = f"{cpu} ({signature})"
     processors = _integer(host.get("logical_processors"))
     if processors is not None:
         cpu = f"{cpu}, {processors} logical processors"
@@ -306,6 +424,20 @@ def describe_host_provenance(host: Mapping[str, object]) -> str:
     return "; ".join(f"{label}: {value}" for label, value in host_provenance_rows(host))
 
 
+def describe_cpu_signature(cpu: Mapping[str, object]) -> str:
+    """Return a CPU signature, such as ``GenuineIntel 6/106/6, microcode
+    0xffffffff``, or an empty string when none was recorded."""
+    parts: list[str] = []
+    vendor = _text(cpu.get("vendor"))
+    numbers = [_integer(cpu.get(name)) for name in ("family", "model", "stepping")]
+    if vendor is not None and None not in numbers:
+        parts.append(f"{vendor} {'/'.join(str(number) for number in numbers)}")
+    microcode = _text(cpu.get("microcode"))
+    if microcode is not None:
+        parts.append(f"microcode {microcode}")
+    return ", ".join(parts)
+
+
 def _azure_rows(azure: Mapping[str, object]) -> list[tuple[str, str]]:
     error = _text(azure.get("error"))
     if error is not None:
@@ -313,20 +445,20 @@ def _azure_rows(azure: Mapping[str, object]) -> list[tuple[str, str]]:
     rows = [("Azure VM size", _text(azure.get("vm_size")) or "unknown")]
     os_disk = _string_keys(azure.get("os_disk"))
     if os_disk:
-        rows.append(("Azure OS disk", _describe_azure_disk(os_disk)))
+        rows.append(("Azure OS disk", describe_azure_disk(os_disk)))
     data_disks = azure.get("data_disks")
     disks = cast(list[object], data_disks) if isinstance(data_disks, list) else []
     for disk in map(_string_keys, disks):
         lun = _integer(disk.get("lun"))
         label = "Azure data disk" if lun is None else f"Azure data disk LUN {lun}"
-        rows.append((label, _describe_azure_disk(disk)))
+        rows.append((label, describe_azure_disk(disk)))
     temporary = _integer(azure.get("resource_disk_size_kib"))
     if temporary:
         rows.append(("Azure temporary disk", f"{temporary / MIB:.1f} GiB"))
     return rows
 
 
-def _describe_azure_disk(disk: Mapping[str, object]) -> str:
+def describe_azure_disk(disk: Mapping[str, object]) -> str:
     parts = [_text(disk.get("storage_account_type")) or "unknown SKU"]
     size = _integer(disk.get("size_gib"))
     if size is not None:
