@@ -8,15 +8,22 @@
 //! - [`protocol`]: the codec of the control console, the `NVXS` records that OpenVMM brokers and
 //!   the `NVXC` frames of the guest agent. It has no dependencies, so the host, the guest, and
 //!   test doubles share it.
+//! - [`contract`]: the control-contract versions that this crate speaks, and the compatibility of
+//!   NVX releases with them.
 //! - [`net`]: IP networks in CIDR notation and their subtraction.
 //! - [`Hypervisor`]: the hypervisors that run the VMs.
-//! - [`host`] (feature `host`): control sessions, and process and platform primitives.
+//! - [`host`] (feature `host`): artifact discovery, control sessions, and process and platform
+//!   primitives.
 //!
 //! # Features
 //!
 //! - `host` (default): the [`host`] module.
+//! - `bundled`: stages the OpenVMM executable, guest kernel, and control initramfs at build time;
+//!   see `Artifacts::bundled`. The build script downloads the release that `artifacts.json` pins,
+//!   or copies the release directory that `NVX_BUNDLE_DIR` names.
 //! - `serde`: the serde form of [`Hypervisor`].
 
+pub mod contract;
 mod error;
 mod hypervisor;
 pub mod net;
@@ -26,4 +33,6 @@ pub mod protocol;
 pub mod host;
 
 pub use error::{Error, ErrorKind, Result};
+#[cfg(feature = "host")]
+pub use host::artifacts::Artifacts;
 pub use hypervisor::Hypervisor;

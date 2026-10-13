@@ -10,20 +10,27 @@ readme = "README.md"
 keywords = ["sandbox", "microvm", "openvmm", "virtualization"]
 categories = ["virtualization"]
 publish = false
+# Lets the build scripts of dependents read the staged bundle as `DEP_NVX_ARTIFACTS_DIR`.
+links = "nvx"
 
 [lib]
 name = "nvx"
 
 [features]
 default = ["host"]
-# The host side: control sessions, and process and platform primitives.
-host = ["dep:getrandom", "dep:libc", "dep:windows-sys"]
+# The host side: artifact discovery, control sessions, and process and platform primitives.
+host = ["dep:getrandom", "dep:serde_json", "dep:libc", "dep:windows-sys"]
+# Stages the OpenVMM executable, guest kernel, and control initramfs at build time; see
+# `Artifacts::bundled`. The build script downloads the release pinned in `artifacts.json`, or
+# copies the release directory named by `NVX_BUNDLE_DIR`.
+bundled = ["host", "dep:sha2"]
 # The serde form of `Hypervisor`.
 serde = ["dep:serde"]
 
 [dependencies]
 getrandom = { version = "0.4", optional = true }
 serde = { version = "1.0.200", features = ["derive"], optional = true }
+serde_json = { version = "1.0.120", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { version = "0.2.160", optional = true }
@@ -38,6 +45,11 @@ windows-sys = { version = "0.61", optional = true, features = [
     "Win32_System_Pipes",
     "Win32_System_Threading",
 ] }
+
+[build-dependencies]
+# Only the `bundled` build script reads JSON; `host`, which `bundled` enables, enables it here too.
+serde_json = { version = "1.0.120", optional = true }
+sha2 = { version = "0.10", optional = true }
 
 [dev-dependencies]
 serde_json = "1.0.120"

@@ -11,8 +11,8 @@
 use std::io::Write;
 use std::process::ExitCode;
 
-use aci_edge_sandboxes::nvx::Hypervisor;
-use aci_edge_sandboxes::openvmm::{Artifacts, OpenVmmConfig};
+use aci_edge_sandboxes::nvx::{Artifacts, Hypervisor};
+use aci_edge_sandboxes::openvmm::OpenVmmConfig;
 use aci_edge_sandboxes::{AciEdgeSandbox, ExecRequest, ProvisionRequest};
 
 fn main() -> ExitCode {

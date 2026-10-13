@@ -92,9 +92,7 @@
 //! execution then ends with [`ExecOutcome::Cancelled`]. If the process that runs an execution
 //! dies, the guest kills the workload as soon as it notices that the control session is gone.
 
-mod artifacts;
 mod config;
-mod contract;
 mod filesystem;
 mod launch;
 mod network;
@@ -107,6 +105,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use nvx::Artifacts;
 use nvx::host::session::{self, ControlSession, ExecEvent, SessionError};
 use nvx::host::{platform, process};
 use nvx::protocol::{
@@ -115,7 +114,6 @@ use nvx::protocol::{
 };
 use serde_json::Value;
 
-pub use self::artifacts::Artifacts;
 pub use self::config::OpenVmmConfig;
 pub use self::filesystem::{guest_path, resolve_guest_path};
 use self::state::{
@@ -469,23 +467,12 @@ impl Backend for OpenVmmBackend {
     }
 
     fn probe(&self) -> Result<()> {
-        if !platform::SUPPORTED {
-            return Err(Error::backend_unavailable(
-                "the openvmm backend supports Linux and Windows hosts only",
-            ));
-        }
-        for (path, description) in [
-            (&self.config.openvmm, "OpenVMM executable"),
-            (&self.config.kernel, "NVX guest kernel"),
-            (&self.config.initrd, "NVX guest initramfs"),
-        ] {
-            if !path.is_file() {
-                return Err(Error::backend_unavailable(format!(
-                    "{description} not found: {}",
-                    path.display()
-                )));
-            }
-        }
+        Artifacts::new(
+            &self.config.openvmm,
+            &self.config.kernel,
+            &self.config.initrd,
+        )
+        .probe()?;
         #[cfg(feature = "testing")]
         if self.config.skip_hypervisor_probe {
             return Ok(());

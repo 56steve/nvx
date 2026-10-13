@@ -40,6 +40,9 @@ runs:
     - name: Lint
       shell: bash
       working-directory: nvx-rs
+      env:
+        # --all-features enables `bundled`; stage nothing instead of downloading a release.
+        NVX_BUNDLE: skip
       run: |
         set -euo pipefail
         cargo "+${{ steps.toolchains.outputs.toolchain }}" clippy --locked --all-targets --all-features \
@@ -50,21 +53,51 @@ runs:
     - name: Test
       shell: bash
       working-directory: nvx-rs
+      env:
+        # --all-features enables `bundled`; stage nothing instead of downloading a release.
+        NVX_BUNDLE: skip
       run: |
         set -euo pipefail
         cargo "+${{ steps.toolchains.outputs.toolchain }}" test --locked --all-features
         cargo "+${{ steps.toolchains.outputs.toolchain }}" test --locked
 
+    # Stages a synthetic release, which the bundled-artifacts test then requires to find.
+    - name: Check artifact bundling
+      shell: bash
+      working-directory: nvx-rs
+      run: |
+        set -euo pipefail
+        bundle=$(mktemp -d)
+        executable=openvmm
+        bundle_dir="${bundle}"
+        if [[ "${RUNNER_OS}" == Windows ]]; then
+          executable=openvmm.exe
+          bundle_dir=$(cygpath -w "${bundle}")
+        fi
+        mkdir -p "${bundle}/bin" "${bundle}/guest"
+        printf openvmm > "${bundle}/bin/${executable}"
+        printf kernel > "${bundle}/guest/vmlinux"
+        printf initramfs > "${bundle}/guest/initramfs.cpio.gz"
+        cp ../SOURCE-MANIFEST.json "${bundle}/"
+        (cd "${bundle}" && sha256sum "bin/${executable}" guest/vmlinux \
+          guest/initramfs.cpio.gz SOURCE-MANIFEST.json > SHA256SUMS)
+        NVX_BUNDLE_DIR="${bundle_dir}" cargo "+${{ steps.toolchains.outputs.toolchain }}" test --locked --lib \
+          --features bundled artifacts
+
     - name: Build documentation
       shell: bash
       working-directory: nvx-rs
       env:
+        NVX_BUNDLE: skip
         RUSTDOCFLAGS: -D warnings
       run: cargo "+${{ steps.toolchains.outputs.toolchain }}" doc --locked --no-deps --all-features
 
     - name: Check the minimum supported Rust version
       shell: bash
       working-directory: nvx-rs
+      env:
+        # --all-features enables `bundled`; stage nothing instead of downloading a release.
+        NVX_BUNDLE: skip
       run: >-
         cargo "+${{ steps.toolchains.outputs.msrv }}" check
         --locked --all-targets --all-features
@@ -73,6 +106,9 @@ runs:
       if: runner.os == 'Linux'
       shell: bash
       working-directory: nvx-rs
+      env:
+        # --all-features enables `bundled`; stage nothing instead of downloading a release.
+        NVX_BUNDLE: skip
       run: |
         set -euo pipefail
         rustup target add --toolchain "${{ steps.toolchains.outputs.toolchain }}" aarch64-apple-darwin

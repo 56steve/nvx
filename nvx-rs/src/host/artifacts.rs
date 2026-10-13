@@ -1,6 +1,6 @@
 //! Locating the OpenVMM executable and the NVX guest kernel and initramfs.
 //!
-//! [`Artifacts`] names the three files the backend runs. They come from an extracted NVX release
+//! [`Artifacts`] names the three files that a VM runs. They come from an extracted NVX release
 //! archive, an NVX repository checkout, explicit paths, or a bundle that the build script staged
 //! with the `bundled` feature. [`Artifacts::discover`] tries these sources in a fixed order so
 //! consumers such as MXC need no NVX-specific configuration.
@@ -12,11 +12,12 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use super::contract;
+use crate::contract;
 use crate::error::{Error, Result};
+use crate::host::platform;
 
 /// Name of the release manifest at the root of a release archive or repository checkout.
-pub(crate) const MANIFEST_NAME: &str = "SOURCE-MANIFEST.json";
+pub const MANIFEST_NAME: &str = "SOURCE-MANIFEST.json";
 /// Release-layout path of the guest kernel.
 const RELEASE_KERNEL: [&str; 2] = ["guest", "vmlinux"];
 /// Release-layout path of the Alpine initramfs.
@@ -26,13 +27,12 @@ const REPO_BUILD_DIR: &str = "build";
 
 /// Directory staged by the build script when the `bundled` feature is enabled.
 #[cfg(feature = "bundled")]
-const BUNDLED_DIR: Option<&str> = option_env!("ACI_EDGE_SANDBOXES_BUNDLED_ARTIFACTS_DIR");
+const BUNDLED_DIR: Option<&str> = option_env!("NVX_BUNDLED_ARTIFACTS_DIR");
 
 /// The OpenVMM executable and the NVX guest kernel and initramfs.
 ///
-/// Every path is used as given; [`OpenVmmBackend`](super::OpenVmmBackend) resolves relative paths
-/// and reports missing files as
-/// [`ErrorCode::BackendUnavailable`](crate::ErrorCode::BackendUnavailable).
+/// Every path is used as given. Resolve relative paths with [`absolute`] before a VM runs them,
+/// and check that the files exist, because nothing here does.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Artifacts {
@@ -45,7 +45,7 @@ pub struct Artifacts {
 }
 
 impl Artifacts {
-    /// Names the three artifacts the backend needs.
+    /// Names the three artifacts that a VM needs.
     pub fn new(
         openvmm: impl Into<PathBuf>,
         kernel: impl Into<PathBuf>,
@@ -58,11 +58,36 @@ impl Artifacts {
         }
     }
 
+    /// Checks that this host can run NVX VMs and that the three files exist.
+    ///
+    /// Fails with [`ErrorKind::Unavailable`](crate::ErrorKind::Unavailable) otherwise. It does not
+    /// check the hypervisor; [`probe_hypervisor`](super::platform::probe_hypervisor) does.
+    pub fn probe(&self) -> Result<()> {
+        if !platform::SUPPORTED {
+            return Err(Error::unavailable(
+                "the openvmm backend supports Linux and Windows hosts only",
+            ));
+        }
+        for (path, description) in [
+            (&self.openvmm, "OpenVMM executable"),
+            (&self.kernel, "NVX guest kernel"),
+            (&self.initrd, "NVX guest initramfs"),
+        ] {
+            if !path.is_file() {
+                return Err(Error::unavailable(format!(
+                    "{description} not found: {}",
+                    path.display()
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Uses an extracted NVX release archive: `bin/openvmm[.exe]`, `guest/vmlinux`, and
     /// `guest/initramfs.cpio.gz`.
     ///
-    /// Fails with [`ErrorCode::BackendUnavailable`](crate::ErrorCode::BackendUnavailable) when
-    /// the release's `SOURCE-MANIFEST.json` declares an incompatible control contract.
+    /// Fails with [`ErrorKind::Unavailable`](crate::ErrorKind::Unavailable) when the release's
+    /// `SOURCE-MANIFEST.json` declares an incompatible control contract.
     pub fn from_release_dir(release_dir: impl AsRef<Path>) -> Result<Self> {
         let root = absolute(release_dir.as_ref())?;
         check_manifest(&root.join(MANIFEST_NAME))?;
@@ -136,12 +161,11 @@ impl Artifacts {
     /// 3. The [`BESIDE_EXE_DIR`](Self::BESIDE_EXE_DIR) directory next to the current executable,
     ///    in the release layout. Consumers ship the bundle there; with the `bundled` feature the
     ///    build script exports its staged directory to dependent build scripts as
-    ///    `DEP_ACI_EDGE_SANDBOXES_ARTIFACTS_DIR` for this purpose.
+    ///    `DEP_NVX_ARTIFACTS_DIR` for this purpose.
     /// 4. The directory staged by the build script ([`Artifacts::bundled`]).
     ///
-    /// Fails with [`ErrorCode::BackendUnavailable`](crate::ErrorCode::BackendUnavailable) when no
-    /// source is present or the chosen source is unusable. It does not check that the files
-    /// exist; [`AciEdgeSandbox::probe`](crate::AciEdgeSandbox::probe) does.
+    /// Fails with [`ErrorKind::Unavailable`](crate::ErrorKind::Unavailable) when no source is
+    /// present or the chosen source is unusable. It does not check that the files exist.
     pub fn discover() -> Result<Self> {
         let exe_dir = env::current_exe()
             .ok()
@@ -179,7 +203,7 @@ fn discover_with(
         }
         [None, None, None] => {}
         _ => {
-            return Err(Error::backend_unavailable(format!(
+            return Err(Error::unavailable(format!(
                 "set all or none of {}, {}, and {}",
                 Artifacts::ENV_OPENVMM,
                 Artifacts::ENV_KERNEL,
@@ -198,10 +222,10 @@ fn discover_with(
     if let Some(artifacts) = bundled()? {
         return Ok(artifacts);
     }
-    Err(Error::backend_unavailable(format!(
+    Err(Error::unavailable(format!(
         "cannot locate the OpenVMM executable and NVX guest artifacts: set {} or {}, {}, and {}, \
-         place an NVX release in a {:?} directory next to the executable, or build the \
-         aci_edge_sandboxes crate with the bundled feature",
+         place an NVX release in a {:?} directory next to the executable, or build the nvx-rs \
+         crate with the bundled feature",
         Artifacts::ENV_DIR,
         Artifacts::ENV_OPENVMM,
         Artifacts::ENV_KERNEL,
@@ -210,7 +234,8 @@ fn discover_with(
     )))
 }
 
-pub(crate) fn openvmm_executable() -> &'static str {
+/// Returns the file name of the OpenVMM executable on this host.
+pub fn openvmm_executable() -> &'static str {
     if cfg!(windows) {
         "openvmm.exe"
     } else {
@@ -218,19 +243,21 @@ pub(crate) fn openvmm_executable() -> &'static str {
     }
 }
 
-pub(crate) fn absolute(path: &Path) -> Result<PathBuf> {
+/// Resolves a relative path against the current directory, failing with
+/// [`ErrorKind::Unavailable`](crate::ErrorKind::Unavailable).
+pub fn absolute(path: &Path) -> Result<PathBuf> {
     std::path::absolute(path).map_err(|error| {
-        Error::backend_unavailable(format!("cannot resolve {}", path.display())).with_source(error)
+        Error::unavailable(format!("cannot resolve {}", path.display())).with_source(error)
     })
 }
 
 fn read_json(path: &Path, description: &str) -> Result<Value> {
     let text = fs::read_to_string(path).map_err(|error| {
-        Error::backend_unavailable(format!("cannot read {description} {}", path.display()))
+        Error::unavailable(format!("cannot read {description} {}", path.display()))
             .with_source(error)
     })?;
     serde_json::from_str(&text).map_err(|error| {
-        Error::backend_unavailable(format!(
+        Error::unavailable(format!(
             "{description} {} is not valid JSON",
             path.display()
         ))
@@ -238,13 +265,14 @@ fn read_json(path: &Path, description: &str) -> Result<Value> {
     })
 }
 
-/// Checks that an NVX `SOURCE-MANIFEST.json` declares the control contract this crate speaks.
-pub(crate) fn check_manifest(path: &Path) -> Result<()> {
+/// Checks that an NVX `SOURCE-MANIFEST.json` declares the control contract this crate speaks,
+/// failing with [`ErrorKind::Unavailable`](crate::ErrorKind::Unavailable).
+pub fn check_manifest(path: &Path) -> Result<()> {
     let manifest = read_json(path, "NVX manifest")?;
     if contract::manifest_is_compatible(&manifest) {
         Ok(())
     } else {
-        Err(Error::backend_unavailable(format!(
+        Err(Error::unavailable(format!(
             "NVX manifest {} does not declare the {} control contract",
             path.display(),
             contract::CONTROL_CONTRACT_REVISION
@@ -257,7 +285,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::ErrorCode;
+    use crate::ErrorKind;
 
     const COMPATIBLE_MANIFEST: &str = r#"{"openvmm":{"microvm_abi_version":2,
         "control_session_protocol_version":1,
@@ -390,7 +418,7 @@ mod tests {
             no_bundle,
         )
         .unwrap_err();
-        assert_eq!(error.code(), ErrorCode::BackendUnavailable);
+        assert_eq!(error.kind(), ErrorKind::Unavailable);
     }
 
     #[test]
@@ -428,12 +456,12 @@ mod tests {
         assert_eq!(artifacts, expected);
 
         let error = discover_with(variables(&[]), Some(exe_dir.path()), no_bundle).unwrap_err();
-        assert_eq!(error.code(), ErrorCode::BackendUnavailable);
+        assert_eq!(error.kind(), ErrorKind::Unavailable);
         assert!(error.message().contains(Artifacts::ENV_DIR));
         assert!(
             error
                 .message()
-                .contains("build the aci_edge_sandboxes crate with the bundled feature")
+                .contains("build the nvx-rs crate with the bundled feature")
         );
     }
 
@@ -448,9 +476,9 @@ mod tests {
         )
         .unwrap();
         let error = check_manifest(&manifest).unwrap_err();
-        assert_eq!(error.code(), ErrorCode::BackendUnavailable);
+        assert_eq!(error.kind(), ErrorKind::Unavailable);
         let error = check_manifest(&directory.path().join("missing.json")).unwrap_err();
-        assert_eq!(error.code(), ErrorCode::BackendUnavailable);
+        assert_eq!(error.kind(), ErrorKind::Unavailable);
     }
 
     #[test]
@@ -467,7 +495,14 @@ mod tests {
     #[cfg(feature = "bundled")]
     #[test]
     fn the_bundle_is_a_compatible_release() {
-        if let Some(artifacts) = Artifacts::bundled().unwrap() {
+        let bundled = Artifacts::bundled().unwrap();
+        // A build that was asked to stage a release must have staged it.
+        let requested = env::var_os("NVX_BUNDLE_DIR").is_some()
+            && env::var_os("NVX_BUNDLE").is_none_or(|value| value != "skip");
+        if requested && (cfg!(target_os = "linux") || cfg!(windows)) {
+            assert!(bundled.is_some(), "NVX_BUNDLE_DIR was not staged");
+        }
+        if let Some(artifacts) = bundled {
             for path in [&artifacts.openvmm, &artifacts.kernel, &artifacts.initrd] {
                 assert!(path.is_file(), "{} is missing", path.display());
             }

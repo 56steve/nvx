@@ -10,7 +10,8 @@ readme = "README.md"
 keywords = ["sandbox", "microvm", "openvmm", "virtualization"]
 categories = ["virtualization", "api-bindings"]
 publish = false
-# Lets the build scripts of dependents read the staged bundle as `DEP_ACI_EDGE_SANDBOXES_ARTIFACTS_DIR`.
+# Lets the build scripts of dependents read the bundle that `nvx-rs` staged as
+# `DEP_ACI_EDGE_SANDBOXES_ARTIFACTS_DIR`.
 links = "aci_edge_sandboxes"
 
 [features]
@@ -18,9 +19,9 @@ default = ["openvmm"]
 # The default backend, which drives the `openvmm` binary directly through `nvx`.
 openvmm = ["nvx-rs/host"]
 # Stages the OpenVMM executable, guest kernel, and control initramfs at build time; see
-# `Artifacts::bundled`. The build script downloads the release pinned in `artifacts.json`, or
-# copies the release directory named by `ACI_EDGE_SANDBOXES_BUNDLE_DIR`.
-bundled = ["openvmm", "dep:sha2"]
+# `nvx::Artifacts::bundled`. The build script of `nvx-rs` downloads the release pinned in its
+# `artifacts.json`, or copies the release directory named by `NVX_BUNDLE_DIR`.
+bundled = ["openvmm", "nvx-rs/bundled"]
 # Tokio-based asynchronous wrappers around the synchronous core.
 async = ["dep:tokio"]
 # A thin client of an explicitly supplied native agent library that owns the sandbox lifecycle.
@@ -51,10 +52,6 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Pipes",
     "Win32_System_Threading",
 ] }
-
-[build-dependencies]
-serde_json = "1.0.120"
-sha2 = { version = "0.10", optional = true }
 
 [dev-dependencies]
 tempfile = "3.10"

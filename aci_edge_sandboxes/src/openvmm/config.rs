@@ -2,8 +2,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use aci_edge_sandboxes_model::spec::{is_valid_guest_network, is_valid_hostname};
+use nvx::host::artifacts::{Artifacts, absolute};
 
-use super::artifacts::{Artifacts, absolute};
 use super::launch;
 use crate::error::{Error, Result};
 

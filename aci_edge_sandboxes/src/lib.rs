@@ -25,7 +25,7 @@
 //! use aci_edge_sandboxes::openvmm::OpenVmmConfig;
 //! use aci_edge_sandboxes::{AciEdgeSandbox, ExecRequest, ProvisionRequest};
 //!
-//! // Locates OpenVMM, the guest kernel, and the Alpine initramfs; see `openvmm::Artifacts`.
+//! // Locates OpenVMM, the guest kernel, and the Alpine initramfs; see `nvx::Artifacts`.
 //! let client = AciEdgeSandbox::openvmm(OpenVmmConfig::discover()?)?;
 //! let sandbox = client.provision(&ProvisionRequest::new())?.sandbox_id;
 //! client.start(&sandbox)?;
@@ -45,7 +45,7 @@
 //!
 //! - `openvmm` (default): the [`openvmm`] backend, and the host side of [`nvx`].
 //! - `bundled`: stages the OpenVMM executable, guest kernel, and control initramfs at build time;
-//!   see `openvmm::Artifacts::bundled`.
+//!   see `nvx::Artifacts::bundled`.
 //! - `async`: Tokio wrappers ([`AsyncAciEdgeSandbox`], [`AsyncExecution`]) around the synchronous core.
 //! - `agent`: the [`agent`] backend, a thin client of a separately supplied native library
 //!   that owns the sandbox lifecycle.
