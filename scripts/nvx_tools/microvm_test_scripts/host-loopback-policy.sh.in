@@ -6,6 +6,32 @@ fail() {
     exit "$code"
 }
 
+# Waits until the kernel lists a socket whose local address matches the awk
+# pattern $1 in state $2 of the tables that follow.
+wait_for_socket() {
+    pattern=$1
+    state=$2
+    shift 2
+    tries=0
+    while ! awk -v pattern="$pattern" -v state="$state" \
+        '$2 ~ pattern && $4 == state { found = 1 } END { exit !found }' "$@"; do
+        [ "$tries" -lt 100 ] || return 1
+        tries=$((tries + 1))
+        sleep 0.05
+    done
+}
+
+# Waits until the file $2 holds the line $1, which a server may write after
+# the host's release arrives.
+wait_for_line() {
+    tries=0
+    while ! grep -qx "$1" "$2" 2>/dev/null; do
+        [ "$tries" -lt 100 ] || return 1
+        tries=$((tries + 1))
+        sleep 0.05
+    done
+}
+
 case "@MODE@" in
 udp-control)
     printf 'NVX-HOST-LOOPBACK-UDP-CONTROL' |
@@ -15,6 +41,10 @@ udp-control)
     echo NVX-HOST-LOOPBACK-UDP-CONTROL-OK
     ;;
 deny)
+    # Denied host loopback publishes none of the guest's listeners.
+    if grep -q 'virtnet_ingress=' /proc/cmdline || pidof nvx-ingress >/dev/null; then
+        fail 89
+    fi
     if wget -T 2 -qO /dev/null http://@GATEWAY_IPV4@:@GENERAL_PORT@/general; then
         fail 90
     fi
@@ -31,30 +61,66 @@ deny)
     echo NVX-HOST-LOOPBACK-DENY-OK
     ;;
 allow)
+    # Explicit host-loopback access without ingress asks the guest to announce
+    # its listeners, which OpenVMM publishes on host loopback alone.
+    grep -q 'virtnet_ingress=host-loopback' /proc/cmdline || fail 86
+    pidof nvx-ingress >/dev/null || fail 87
     general=$(wget -T 5 -qO- http://@GATEWAY_IPV4@:@GENERAL_PORT@/general) ||
         fail 93
     [ "$general" = NVX-HOST-LOOPBACK-GENERAL ] || fail 94
-    rm -f /tmp/nvx-host-loopback-inbound
-    nc -l -p @GUEST_PORT@ -w 5 >/tmp/nvx-host-loopback-inbound &
-    listener_pid=$!
+    rm -f /tmp/nvx-host-loopback-tcp-ipv4 /tmp/nvx-host-loopback-tcp-ipv6 \
+        /tmp/nvx-host-loopback-tcp-forward /tmp/nvx-host-loopback-udp \
+        /tmp/nvx-host-loopback-udp-ipv6 \
+        /tmp/nvx-host-loopback-private-ipv4 /tmp/nvx-host-loopback-private-ipv6
+    # The dual-stack TCP server answers the host over IPv4 and IPv6 loopback
+    # and through the explicit forward, one client at a time. Each dual-stack
+    # UDP server answers the host's first datagram through its published port,
+    # one over IPv4 loopback and the other over IPv6 loopback.
+    for client in ipv4 ipv6 forward; do
+        printf 'NVX-HOST-LOOPBACK-TCP-ACK\n' |
+            nc -l -p @GUEST_PORT@ -w 20 >"/tmp/nvx-host-loopback-tcp-$client" \
+                2>/dev/null || true
+    done &
+    {
+        printf 'NVX-HOST-LOOPBACK-UDP-REPLY\n'
+        sleep 20
+    } | nc -u -l -p @GUEST_PORT@ -w 20 >/tmp/nvx-host-loopback-udp 2>/dev/null &
+    {
+        printf 'NVX-HOST-LOOPBACK-UDP-REPLY\n'
+        sleep 20
+    } | nc -u -l -p @UDP_IPV6_GUEST_PORT@ -w 20 \
+        >/tmp/nvx-host-loopback-udp-ipv6 2>/dev/null &
+    # Listeners on guest loopback alone stay private to the guest.
+    nc -l -s 127.0.0.1 -p @PRIVATE_GUEST_PORT@ -w 20 \
+        >/tmp/nvx-host-loopback-private-ipv4 2>/dev/null &
+    private_ipv4=$!
+    nc -l -s ::1 -p @PRIVATE_GUEST_PORT@ -w 20 \
+        >/tmp/nvx-host-loopback-private-ipv6 2>/dev/null &
+    private_ipv6=$!
     port_hex=$(printf '%04X' @GUEST_PORT@)
-    tries=0
-    # The listener is dual-stack, so the kernel lists it among IPv6 sockets.
-    while ! awk -v port=":$port_hex" \
-        '$2 ~ port "$" && $4 == "0A" { found = 1 } END { exit !found }' \
-        /proc/net/tcp /proc/net/tcp6; do
-        kill -0 "$listener_pid" 2>/dev/null || fail 95
-        [ "$tries" -lt 100 ] || fail 95
-        tries=$((tries + 1))
-        sleep 0.05
-    done
+    udp_ipv6_hex=$(printf '%04X' @UDP_IPV6_GUEST_PORT@)
+    private_hex=$(printf '%04X' @PRIVATE_GUEST_PORT@)
+    wait_for_socket ":$port_hex\$" 0A /proc/net/tcp /proc/net/tcp6 || fail 95
+    wait_for_socket ":$port_hex\$" 07 /proc/net/udp /proc/net/udp6 || fail 95
+    # A dual-stack socket appears among the IPv6 sockets alone.
+    wait_for_socket ":$udp_ipv6_hex\$" 07 /proc/net/udp6 || fail 95
+    wait_for_socket "^0100007F:$private_hex\$" 0A /proc/net/tcp || fail 96
+    wait_for_socket "^00000000000000000000000001000000:$private_hex\$" 0A \
+        /proc/net/tcp6 || fail 96
     echo NVX-HOST-LOOPBACK-INGRESS-READY
-    wait "$listener_pid" || true
-    if ! grep -qx NVX-HOST-LOOPBACK-INBOUND /tmp/nvx-host-loopback-inbound; then
-        wc -c /tmp/nvx-host-loopback-inbound
-        od -An -tx1 /tmp/nvx-host-loopback-inbound
+
+    read -r release || fail 76
+    [ "$release" = NVX-HOST-LOOPBACK-CHECKED ] || fail 77
+    for client in ipv4 ipv6 forward; do
+        wait_for_line NVX-HOST-LOOPBACK-INBOUND \
+            "/tmp/nvx-host-loopback-tcp-$client" || fail 97
+    done
+    wait_for_line NVX-HOST-LOOPBACK-UDP /tmp/nvx-host-loopback-udp || fail 97
+    wait_for_line NVX-HOST-LOOPBACK-UDP /tmp/nvx-host-loopback-udp-ipv6 ||
         fail 97
-    fi
+    kill "$private_ipv4" "$private_ipv6" 2>/dev/null || true
+    [ ! -s /tmp/nvx-host-loopback-private-ipv4 ] || fail 96
+    [ ! -s /tmp/nvx-host-loopback-private-ipv6 ] || fail 96
     echo NVX-HOST-LOOPBACK-ALLOW-OK
     ;;
 *)

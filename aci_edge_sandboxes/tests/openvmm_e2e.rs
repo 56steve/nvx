@@ -1374,6 +1374,90 @@ fn private_network_ingress_publishes_workload_listeners() {
     let _ = listener.wait();
 }
 
+/// Returns whether a host socket holds TCP `port` on IPv4 loopback, as OpenVMM's listener for a
+/// guest port published on host loopback does.
+fn published_on_loopback(port: u16) -> bool {
+    std::net::TcpListener::bind(("127.0.0.1", port)).is_err()
+}
+
+#[test]
+#[ignore = "requires a hypervisor and NVX guest artifacts; run scripts/nvx.py test-aci-edge-sandboxes"]
+fn host_loopback_access_is_bidirectional() {
+    use std::io::Write as _;
+
+    let (nvx, backend) = client("loopback");
+    // A host service on loopback, which the workload reaches at its gateway.
+    let service = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let service_port = service.local_addr().unwrap().port();
+    let serving = thread::spawn(move || {
+        let (mut connection, _) = service.accept().unwrap();
+        connection.write_all(b"NVX-HOST-SERVICE\n").unwrap();
+    });
+    // Egress admits only the workload's connection to that service, so the workload's replies to
+    // the host pass because host loopback admits them.
+    let mut policy = NetworkPolicy {
+        egress: EgressPolicy::new(Access::Deny)
+            .with_allow(NetworkRule::to("10.0.0.1").on_port(Protocol::Tcp, service_port)),
+        ..NetworkPolicy::deny_all()
+    };
+    policy.ingress.host_loopback = Some(Access::Allow);
+    let sandbox = started(
+        &nvx,
+        &backend,
+        &ProvisionRequest::new().with_network(policy),
+    );
+    let output = shell(
+        &nvx,
+        id(&sandbox),
+        &format!("nc -w 3 10.0.0.1 {service_port} </dev/null"),
+    );
+    assert_eq!(output.stdout, b"NVX-HOST-SERVICE\n", "{output:?}");
+    serving.join().unwrap();
+
+    // The host reaches a workload listener at the same port of host loopback, but not at the
+    // host's own network address.
+    let port = std::net::TcpListener::bind(("0.0.0.0", 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let listener = nvx
+        .exec(
+            id(&sandbox),
+            &ExecRequest::command_line(format!("timeout 10 nc -l -p {port}")),
+        )
+        .unwrap();
+    wait_until(
+        || published_on_loopback(port),
+        "the workload's port is published on host loopback",
+    );
+    let route = std::net::UdpSocket::bind(("0.0.0.0", 0)).unwrap();
+    if route.connect(("192.0.2.1", 9)).is_ok()
+        && let Ok(local) = route.local_addr()
+        && !local.ip().is_loopback()
+        && !local.ip().is_unspecified()
+    {
+        assert!(
+            std::net::TcpStream::connect_timeout(
+                &(local.ip(), port).into(),
+                Duration::from_secs(2)
+            )
+            .is_err(),
+            "the workload's port is published on {}",
+            local.ip()
+        );
+    }
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream.write_all(b"NVX-HOST-PROBE\n").unwrap();
+    stream.shutdown(std::net::Shutdown::Write).unwrap();
+    let output = listener.wait_with_output().unwrap();
+    assert_eq!(output.stdout, b"NVX-HOST-PROBE\n", "{output:?}");
+    wait_until(
+        || !published_on_loopback(port),
+        "the closed listener is withdrawn",
+    );
+}
+
 #[test]
 #[ignore = "requires a hypervisor and NVX guest artifacts; run scripts/nvx.py test-aci-edge-sandboxes"]
 fn network_port_ranges_are_enforced() {

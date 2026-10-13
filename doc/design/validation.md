@@ -71,9 +71,17 @@ rejection of a restore whose policy differs, and pre-boot rejection of an
 invalid IPv6 prefix. The Ubuntu and Azure Linux virtio-net smoke tests also
 verify the IPv6 identity.
 Host-loopback coverage verifies
-general guest-to-host denial, an exact proxy exception, explicit
-localhost-to-guest forwarding under allow, and pre-boot rejection when both
-directions cannot be enforced. Managed lifecycle coverage authenticates the
+general guest-to-host denial with no announcer, an exact proxy exception, and,
+under explicit allow with egress denied but for the guest's connection to a
+host service, that the guest reaches that service through its gateway and that
+the host exchanges TCP lines with a guest server over IPv4 and IPv6 loopback
+and through an explicit forward to the same guest port, and UDP datagrams and
+their replies with guest servers on published ports over IPv4 and IPv6
+loopback. It also verifies that a guest listener on
+guest loopback alone is not published, that no host network address reaches the
+guest, and pre-boot rejection of an explicit allow with a snapshot, of a
+forward under deny, and of a mismatched proxy. Managed lifecycle coverage
+authenticates the
 dedicated control channel, runs multiple workloads in one warm VM across
 reconnects, preserves guest state, reports execution timeout, and stops the VM
 cleanly. Public sandbox coverage drives `nvx.py sandbox` itself: request-scoped

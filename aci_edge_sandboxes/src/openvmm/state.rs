@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, ErrorCode, Result};
 use crate::id::SandboxId;
-use crate::model::NetworkPolicy;
+use crate::model::{HostLoopbackForward, NetworkPolicy};
 
 /// Version of the state files written by this crate, which records the instance's export plan.
 pub(crate) const STATE_FORMAT: u32 = instance::STATE_FORMAT;
@@ -46,6 +46,10 @@ pub(crate) struct SandboxRecord {
     pub(crate) network: Option<NetworkPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) filesystem: Option<ExportPlan>,
+    /// Host loopback ports that OpenVMM forwards to guest ports. A record without forwards keeps
+    /// the form of earlier records, and earlier versions of this crate refuse one with forwards.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) host_loopback_forwards: Vec<HostLoopbackForward>,
     pub(crate) memory_mib: u32,
     pub(crate) workload_uid: u32,
     pub(crate) workload_gid: u32,
@@ -227,6 +231,7 @@ mod tests {
             backend: BACKEND_KEY.to_owned(),
             network: None,
             filesystem: None,
+            host_loopback_forwards: Vec::new(),
             memory_mib: 256,
             workload_uid: 65534,
             workload_gid: 65534,

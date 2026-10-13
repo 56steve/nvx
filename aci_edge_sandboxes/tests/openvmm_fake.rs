@@ -18,8 +18,9 @@ use aci_edge_sandboxes::nvx::Hypervisor;
 use aci_edge_sandboxes::openvmm::OpenVmmConfig;
 use aci_edge_sandboxes::{
     Access, AciEdgeSandbox, EgressPolicy, ErrorCode, ExecFailure, ExecOutcome, ExecOutput,
-    ExecRequest, FilesystemPolicy, NetworkPolicy, NetworkPort, NetworkRule, ProcessSpec, Protocol,
-    ProvisionRequest, SandboxId, StdinMode,
+    ExecRequest, FilesystemPolicy, ForwardProtocol, HostLoopbackForward, NetworkPolicy,
+    NetworkPort, NetworkRule, ProcessSpec, Protocol, ProvisionRequest, SandboxId, SandboxSpec,
+    StdinMode,
 };
 use tempfile::TempDir;
 
@@ -897,16 +898,6 @@ fn unsupported_requests_are_rejected_before_anything_runs() {
             .code(),
         ErrorCode::PolicyValidation
     );
-    // The backend publishes listeners to private networks, but never to the host itself.
-    let mut host_loopback = NetworkPolicy::deny_all();
-    host_loopback.ingress.default = Access::Allow;
-    host_loopback.ingress.host_loopback = Some(Access::Allow);
-    assert_eq!(
-        nvx.provision(&ProvisionRequest::new().with_network(host_loopback))
-            .unwrap_err()
-            .code(),
-        ErrorCode::PolicyValidation
-    );
     let relative = ProvisionRequest::new().with_filesystem(FilesystemPolicy {
         readonly_paths: vec![PathBuf::from("relative")],
         ..FilesystemPolicy::default()
@@ -1389,6 +1380,104 @@ fn launch_arguments_select_the_managed_alpine_guest() {
     assert!(has_pair(&arguments, "--network-egress", "deny"));
     assert!(has_pair(&arguments, "--network-ingress", "allow"));
     assert!(has_pair(&arguments, "--host-loopback", "deny"));
+    nvx.stop(&sandbox_id).unwrap();
+    nvx.deprovision(&sandbox_id).unwrap();
+
+    // Host-loopback access attaches the device under denied egress and ingress, and admits the
+    // host to listeners published to private networks.
+    for ingress in [Access::Deny, Access::Allow] {
+        let mut loopback = NetworkPolicy::deny_all();
+        loopback.ingress.default = ingress;
+        loopback.ingress.host_loopback = Some(Access::Allow);
+        let sandbox_id = nvx
+            .provision(&ProvisionRequest::new().with_network(loopback))
+            .unwrap()
+            .sandbox_id;
+        nvx.start(&sandbox_id).unwrap();
+        let arguments = fixture.launch_arguments(&sandbox_id);
+        assert!(has_pair(&arguments, "--network-egress", "deny"));
+        assert!(has_pair(&arguments, "--network-ingress", ingress.as_str()));
+        assert!(has_pair(&arguments, "--host-loopback", "allow"));
+        nvx.stop(&sandbox_id).unwrap();
+        nvx.deprovision(&sandbox_id).unwrap();
+    }
+
+    // A /30 guest network holds only the gateway and the guest, so OpenVMM has no address at
+    // which to present host peers.
+    let mut loopback = NetworkPolicy::deny_all();
+    loopback.ingress.host_loopback = Some(Access::Allow);
+    let narrow = fixture.nvx_with(|config| config.guest_network = "10.0.0.2/30".to_owned());
+    let error = narrow
+        .provision(&ProvisionRequest::new().with_network(loopback))
+        .unwrap_err();
+    assert_eq!(error.code(), ErrorCode::PolicyValidation);
+    assert!(error.message().contains("/29 or shorter"), "{error}");
+    assert_eq!(fixture.sandbox_dirs(), 0);
+
+    // The spec's forwards reach OpenVMM when the policy lets their replies out.
+    let mut forwarding = NetworkPolicy::egress(Access::Allow);
+    forwarding.ingress.host_loopback = Some(Access::Allow);
+    let request = ProvisionRequest::new().with_network(forwarding);
+    let spec = SandboxSpec::new().with_host_loopback_forward(HostLoopbackForward::new(
+        ForwardProtocol::Tcp,
+        18080,
+        8080,
+    ));
+    let mut without_access = request.clone();
+    without_access
+        .network
+        .as_mut()
+        .unwrap()
+        .ingress
+        .host_loopback = None;
+    let mut closed = request.clone();
+    closed.network.as_mut().unwrap().egress.default = Access::Deny;
+    let mut denied_replies = request.clone();
+    denied_replies
+        .network
+        .as_mut()
+        .unwrap()
+        .egress
+        .deny
+        .push(NetworkRule::to("10.0.0.0/24"));
+    for (rejected, expected) in [
+        (
+            &ProvisionRequest::new(),
+            "network.ingress.hostLoopback: allow",
+        ),
+        (&without_access, "network.ingress.hostLoopback: allow"),
+        (&closed, "network.egress.default: allow"),
+        (&denied_replies, "forward replies"),
+    ] {
+        let error = nvx.provision_with(rejected, &spec).unwrap_err();
+        assert_eq!(error.code(), ErrorCode::PolicyValidation);
+        assert!(error.message().contains(expected), "{error}");
+    }
+    // OpenVMM keeps one forward listener per guest port, so it could not start this sandbox.
+    let shared_guest_port = spec
+        .clone()
+        .with_host_loopback_forward(HostLoopbackForward::new(ForwardProtocol::Tcp, 18081, 8080));
+    let error = nvx
+        .provision_with(&request, &shared_guest_port)
+        .unwrap_err();
+    assert_eq!(error.code(), ErrorCode::PolicyValidation);
+    assert!(
+        error
+            .message()
+            .contains("tcp guest port 8080 more than once"),
+        "{error}"
+    );
+    assert_eq!(fixture.sandbox_dirs(), 0);
+    let sandbox_id = nvx.provision_with(&request, &spec).unwrap().sandbox_id;
+    nvx.start(&sandbox_id).unwrap();
+    let arguments = fixture.launch_arguments(&sandbox_id);
+    assert!(has_pair(&arguments, "--network-ingress", "deny"));
+    assert!(has_pair(&arguments, "--host-loopback", "allow"));
+    assert!(has_pair(
+        &arguments,
+        "--host-loopback-forward",
+        "tcp:18080:8080"
+    ));
     nvx.stop(&sandbox_id).unwrap();
     nvx.deprovision(&sandbox_id).unwrap();
 }

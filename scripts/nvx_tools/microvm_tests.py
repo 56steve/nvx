@@ -204,6 +204,11 @@ HOST_LOOPBACK_DENY_MARKER = b"NVX-HOST-LOOPBACK-DENY-OK"
 HOST_LOOPBACK_UDP_CONTROL_MARKER = b"NVX-HOST-LOOPBACK-UDP-CONTROL-OK"
 HOST_LOOPBACK_ALLOW_MARKER = b"NVX-HOST-LOOPBACK-ALLOW-OK"
 HOST_LOOPBACK_INGRESS_READY_MARKER = b"NVX-HOST-LOOPBACK-INGRESS-READY"
+HOST_LOOPBACK_CHECKED = b"NVX-HOST-LOOPBACK-CHECKED"
+HOST_LOOPBACK_TCP_ACK = b"NVX-HOST-LOOPBACK-TCP-ACK\n"
+HOST_LOOPBACK_TCP_REQUEST = b"NVX-HOST-LOOPBACK-INBOUND\n"
+HOST_LOOPBACK_UDP_REQUEST = b"NVX-HOST-LOOPBACK-UDP\n"
+HOST_LOOPBACK_UDP_REPLY = b"NVX-HOST-LOOPBACK-UDP-REPLY\n"
 HOST_LOOPBACK_PORT_BIND_ATTEMPTS = 16
 # IANA's dynamic port range, which is also Windows' default. The host-loopback
 # scenario draws the port of each TCP and UDP listener pair from it.
@@ -3275,6 +3280,8 @@ def run_host_loopback_policy(
                 GENERAL_PORT=str(denied_general_port),
                 PROXY_PORT=str(proxy_port),
                 GUEST_PORT="0",
+                PRIVATE_GUEST_PORT="0",
+                UDP_IPV6_GUEST_PORT="0",
             ),
             HOST_LOOPBACK_UDP_CONTROL_MARKER,
             timeout=timeout,
@@ -3308,6 +3315,8 @@ def run_host_loopback_policy(
                 GENERAL_PORT=str(denied_general_port),
                 PROXY_PORT=str(proxy_port),
                 GUEST_PORT="0",
+                PRIVATE_GUEST_PORT="0",
+                UDP_IPV6_GUEST_PORT="0",
             ),
             HOST_LOOPBACK_DENY_MARKER,
             timeout=timeout,
@@ -3348,8 +3357,16 @@ def run_host_loopback_policy(
     allowed_general.listen(1)
     allowed_general.settimeout(timeout)
     allowed_general_port = int(allowed_general.getsockname()[1])
-    _, host_forward_port = _available_tcp_address()
-    guest_forward_port = 18081
+    guest_port = _host_loopback_publication_port()
+    while True:
+        # Busybox's UDP server answers only its first peer, so the guest
+        # answers UDP over IPv6 loopback on a port of its own.
+        udp_ipv6_guest_port = _host_loopback_publication_port()
+        _, host_forward_port = _available_tcp_address()
+        _, private_guest_port = _available_tcp_address()
+        ports = {guest_port, udp_ipv6_guest_port, host_forward_port, private_guest_port}
+        if len(ports) == 4:
+            break
     allow_errors: list[Exception] = []
     allow_server = threading.Thread(
         target=_http_server,
@@ -3374,14 +3391,21 @@ def run_host_loopback_policy(
             "quiet loglevel=0",
             network=DIRECTIONAL_NETWORK_CIDR,
         )
+        # Egress admits only the guest's own connection to the general host
+        # service, so the guest's replies to the host pass because host
+        # loopback admits them, not because egress does.
         allow_command.extend(
             (
                 "--host-loopback",
                 "allow",
                 "--network-ingress",
                 "deny",
+                "--network-egress",
+                "deny",
+                "--network-egress-allow",
+                f"{DIRECTIONAL_NETWORK_GATEWAY_IPV4}/32:tcp:{allowed_general_port}",
                 "--host-loopback-forward",
-                f"tcp:{host_forward_port}:{guest_forward_port}",
+                f"tcp:{host_forward_port}:{guest_port}",
             )
         )
         with OpenvmmProcess(
@@ -3399,16 +3423,20 @@ def run_host_loopback_policy(
                     GATEWAY_IPV4=DIRECTIONAL_NETWORK_GATEWAY_IPV4,
                     GENERAL_PORT=str(allowed_general_port),
                     PROXY_PORT="0",
-                    GUEST_PORT=str(guest_forward_port),
+                    GUEST_PORT=str(guest_port),
+                    PRIVATE_GUEST_PORT=str(private_guest_port),
+                    UDP_IPV6_GUEST_PORT=str(udp_ipv6_guest_port),
                 ),
             )
             process.wait_for_line(HOST_LOOPBACK_INGRESS_READY_MARKER, timeout)
-            with socket.create_connection(
-                ("127.0.0.1", host_forward_port), timeout=min(timeout, 5)
-            ) as inbound:
-                inbound.sendall(b"NVX-HOST-LOOPBACK-INBOUND\n")
-                time.sleep(1)
-                inbound.shutdown(socket.SHUT_WR)
+            _verify_host_loopback_publication(
+                guest_port,
+                udp_ipv6_guest_port,
+                host_forward_port,
+                private_guest_port,
+                timeout,
+            )
+            process.send_line(HOST_LOOPBACK_CHECKED.decode())
             process.wait_for_line(HOST_LOOPBACK_ALLOW_MARKER, timeout)
             allowed = process.wait(timeout)
         if allowed.returncode != 0:
@@ -3437,6 +3465,160 @@ def run_host_loopback_policy(
     )
 
 
+def _host_loopback_publication_port() -> int:
+    """Draw a port that OpenVMM can publish on host loopback for TCP and UDP.
+
+    The port is free on every host address too, which Windows checks before
+    it binds a loopback address.
+    """
+    last_error: OSError | None = None
+    for port in _host_loopback_port_candidates():
+        with ExitStack() as sockets:
+            try:
+                for family, address in (
+                    (socket.AF_INET, "0.0.0.0"),
+                    (socket.AF_INET6, "::"),
+                ):
+                    for kind in (socket.SOCK_STREAM, socket.SOCK_DGRAM):
+                        probe = socket.socket(family, kind)
+                        sockets.callback(probe.close)
+                        if family == socket.AF_INET6:
+                            probe.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+                        probe.bind((address, port))
+            except OSError as error:
+                last_error = error
+                continue
+        return port
+    raise RuntimeError(
+        "failed to find a port free for TCP and UDP on every host address"
+    ) from last_error
+
+
+def _holds_loopback(family: int, kind: socket.SocketKind, port: int) -> bool:
+    """Return whether a host socket holds ``port`` on the loopback address of
+    ``family``, as OpenVMM's listener for a guest port published there does."""
+    probe = socket.socket(family, kind)
+    try:
+        if family == socket.AF_INET6:
+            probe.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+        probe.bind(("::1" if family == socket.AF_INET6 else "127.0.0.1", port))
+    except OSError:
+        return True
+    finally:
+        probe.close()
+    return False
+
+
+def _host_loopback_tcp_exchange(address: str, port: int, timeout: float) -> None:
+    """Exchange a line with the guest's TCP server through ``address:port``.
+
+    The guest serves one client at a time, and may withdraw the published port
+    between clients, so a connection that ends before the server's line is
+    retried.
+    """
+    family = socket.AF_INET6 if ":" in address else socket.AF_INET
+    deadline = time.monotonic() + timeout
+    while True:
+        reply = b""
+        try:
+            with socket.socket(family, socket.SOCK_STREAM) as client:
+                client.settimeout(min(timeout, 5))
+                client.connect((address, port))
+                while not reply.endswith(b"\n"):
+                    chunk = client.recv(4096)
+                    if not chunk:
+                        break
+                    reply += chunk
+                if reply == HOST_LOOPBACK_TCP_ACK:
+                    client.sendall(HOST_LOOPBACK_TCP_REQUEST)
+                    client.shutdown(socket.SHUT_WR)
+                    return
+        except OSError as error:
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"guest TCP server did not answer through {address}:{port}"
+                ) from error
+        if reply:
+            raise RuntimeError(f"unexpected guest TCP reply: {reply!r}")
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                f"guest TCP server did not answer through {address}:{port}"
+            )
+        time.sleep(0.1)
+
+
+def _host_loopback_udp_exchange(address: str, port: int, timeout: float) -> None:
+    """Exchange a datagram with the guest's UDP server through ``address:port``.
+
+    The request is repeated until the guest answers it, from the port that it
+    reached, since the guest may still be resolving the address at which it
+    sees the host when the first request arrives.
+    """
+    family = socket.AF_INET6 if ":" in address else socket.AF_INET
+    with socket.socket(family, socket.SOCK_DGRAM) as client:
+        client.bind((address, 0))
+        client.settimeout(0.5)
+        deadline = time.monotonic() + timeout
+        while True:
+            client.sendto(HOST_LOOPBACK_UDP_REQUEST, (address, port))
+            try:
+                reply, source = client.recvfrom(4096)
+                break
+            except (TimeoutError, ConnectionResetError) as error:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"guest UDP server did not answer through {address}:{port}"
+                    ) from error
+    if reply != HOST_LOOPBACK_UDP_REPLY or tuple(source[:2]) != (address, port):
+        raise RuntimeError(f"unexpected guest UDP reply {reply!r} from {source}")
+
+
+def _verify_host_loopback_publication(
+    guest_port: int,
+    udp_ipv6_guest_port: int,
+    host_forward_port: int,
+    private_guest_port: int,
+    timeout: float,
+) -> None:
+    """Verify from the host what explicit host-loopback access publishes."""
+    _wait_until(
+        lambda: (
+            _holds_loopback(socket.AF_INET, socket.SOCK_STREAM, guest_port)
+            and _holds_loopback(socket.AF_INET6, socket.SOCK_STREAM, guest_port)
+            and _holds_loopback(socket.AF_INET, socket.SOCK_DGRAM, guest_port)
+            and _holds_loopback(socket.AF_INET6, socket.SOCK_DGRAM, udp_ipv6_guest_port)
+        ),
+        timeout,
+        f"guest ports {guest_port} and {udp_ipv6_guest_port} were not published "
+        "on host loopback",
+    )
+    # The UDP listener was announced after every other one had started, so a
+    # guest-loopback listener, had it been announced, would be published now.
+    for family in (socket.AF_INET, socket.AF_INET6):
+        if _holds_loopback(family, socket.SOCK_STREAM, private_guest_port):
+            raise RuntimeError("a listener on guest loopback was published")
+    for address in _host_ipv4_addresses():
+        try:
+            unexpected = socket.create_connection((address, guest_port), timeout=1)
+        except OSError:
+            continue
+        unexpected.close()
+        raise RuntimeError(
+            f"host-loopback access published guest port {guest_port} on {address}"
+        )
+    for address, port in (
+        ("127.0.0.1", guest_port),
+        ("::1", guest_port),
+        ("127.0.0.1", host_forward_port),
+    ):
+        _host_loopback_tcp_exchange(address, port, timeout)
+    for address, port in (
+        ("127.0.0.1", guest_port),
+        ("::1", udp_ipv6_guest_port),
+    ):
+        _host_loopback_udp_exchange(address, port, timeout)
+
+
 def run_host_loopback_rejections(
     executable: Path,
     kernel: Path,
@@ -3449,19 +3631,9 @@ def run_host_loopback_rejections(
 ) -> None:
     for name, extra, expected in (
         (
-            "generic-allow",
-            ("--host-loopback", "allow"),
-            b"does not support generic host-loopback connectivity",
-        ),
-        (
-            "generic-allow-with-proxy",
-            (
-                "--host-loopback",
-                "allow",
-                "--network-proxy",
-                f"{DIRECTIONAL_NETWORK_GATEWAY_IPV4}:3128",
-            ),
-            b"does not support generic host-loopback connectivity",
+            "allow-snapshot",
+            ("--host-loopback", "allow", "--snapshot-destination"),
+            b"microVM snapshots do not support --host-loopback allow",
         ),
         (
             "deny-forward",
@@ -3496,8 +3668,14 @@ def run_host_loopback_rejections(
         invalid.extend(extra)
         with tempfile.TemporaryDirectory(prefix="nvx-loopback-rejection-") as temporary:
             pidfile = Path(temporary) / "absent" / "openvmm.pid"
-            if name.startswith("generic-allow"):
-                invalid.extend(("--pidfile", str(pidfile)))
+            if name == "allow-snapshot":
+                invalid.extend(
+                    (
+                        str(Path(temporary) / "absent" / "snapshot"),
+                        "--pidfile",
+                        str(pidfile),
+                    )
+                )
             with OpenvmmProcess(
                 invalid,
                 output_dir / f"host-loopback-{name}.log",
