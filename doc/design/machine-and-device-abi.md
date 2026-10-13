@@ -633,73 +633,393 @@ traffic must establish fresh post-restore flows.
 
 ### Filesystem
 
-The filesystem slot is a no-DAX virtio-fs device with the fixed tag `microvm`,
-one high-priority queue, one request queue, direct I/O, and zero guest cache
-lifetimes. It requires FUSE 7.31 or newer and caps writes at 1 MiB. Without
-`--mount` or `--mount-aggregate`, the slot has no HostFs backend or active
-filesystem policy but remains guest-discoverable. `--mount` may appear once and
-attaches one HostFs server. `--mount-aggregate GUEST_TARGET` with a repeatable
-`--mount-child NAME,HOST_PATH[,ro|rw][,file]` instead attaches an aggregate: a
-synthetic root, mode `0500` and owned by root, which lists one child per host
-directory or, with the `file` flag, regular file under its name and refuses
-every change, and below each child an independent HostFs volume with its own
-access mode and denied, allowed, and writable paths. The flag, not the host
-object, sets a child's kind, and OpenVMM refuses a host path of the other kind.
-A file child serves only its file, as the child
+The filesystem slot shares live host files with the guest through virtio-fs.
+The guest kernel's FUSE client turns system calls on the mounted tag into FUSE
+requests, which travel through virtqueues in guest RAM to HostFs, a FUSE
+server inside OpenVMM. HostFs performs each request on the exported host
+directory, or on the children of an aggregate, and returns the reply through
+the same queue. Unlike a [block device](#block), whose backend sees only
+blocks, HostFs sees names, attributes, and open files: the host owns the
+namespace and the data, while the guest owns its VFS objects, permission
+checks, and locks. Guest writes reach the host files directly, and host changes
+are visible to the guest on its next request.
+
+```mermaid
+%%{init: {"theme": "base", "themeVariables": {"background": "#ffffff"}}}%%
+flowchart TB
+   App["Guest application"]
+   Client["Guest VFS and FUSE client<br/>virtiofs mount of tag microvm"]
+   Queues["High-priority and request virtqueues in guest RAM<br/>MMIO notifications and shared-status IRQ 6"]
+   Device["OpenVMM virtio-fs device<br/>one worker per queue"]
+   Session["FUSE session<br/>INIT negotiation and opcode dispatch"]
+   HostFs["HostFs<br/>nodes, handles, access policy, and host identity"]
+   Volume["Confined host volume<br/>no-follow resolution beneath the export root"]
+   Export["Exported host directory<br/>or aggregate children"]
+
+   App <--> Client
+   Client <--> Queues
+   Queues <--> Device
+   Device <--> Session
+   Session <--> HostFs
+   HostFs <--> Volume
+   Volume <--> Export
+```
+
+#### Device and FUSE session
+
+The slot is a virtio-fs device, device type 26, with the fixed tag `microvm`,
+one high-priority queue, and one request queue. Its configuration space holds
+only the tag and the request-queue count. It offers split rings with indirect
+descriptors and event-index notification suppression. Packed rings and the DAX
+shared-memory window are never offered, so file data always travels through
+the queues. The explicit profile rejects SectionFs, alternate tags, extra
+queues, shared-memory windows, PCI transport, and aggregates whose children
+change after boot.
+
+The guest opens the FUSE session with `INIT`, and every other request fails
+until it succeeds. The device speaks FUSE protocol version 7 and accepts guest
+minor versions 27 and newer, but the microVM contract is FUSE 7.31 or newer: a
+restore rejects a session that negotiated an older minor version. It grants
+what the guest offers from a fixed set: asynchronous reads, parallel directory
+operations, automatic data invalidation, kill-privilege handling, asynchronous
+direct I/O, atomic `O_TRUNC`, big writes with a negotiated page limit, extended
+`INIT`, adaptive `READDIRPLUS`, and, through extended `INIT`, shared mappings
+of direct-I/O files. It negotiates a 1 MiB maximum write, or 256 pages, and
+nanosecond timestamps, and it leaves the guest's background-request limits at
+their defaults. It never grants writeback caching, lock forwarding, or DAX
+mappings.
+
+Every entry and attribute in a reply carries zero cache lifetimes, and every
+file that `OPEN` or `CREATE` opens uses direct I/O. The guest therefore looks up
+each path component again on every walk, fetches attributes with `GETATTR`
+whenever it needs them, and sends every read and write to the host instead of
+its page cache. Host changes are visible on the guest's next request, and a
+guest write has reached the host file when the write completes. Shared
+mappings are the exception: their pages are cached in the guest and written
+back through ordinary `WRITE` requests. The zero lifetimes also make the guest
+drop a name and its inode as soon as nothing uses them and send `FORGET`, so
+it holds nodes only for objects in use and the directories that lead to them,
+such as open files, working directories, and mount and bind points. Because
+lock forwarding is not negotiated, the guest kernel keeps POSIX and BSD locks
+local, and host processes neither see nor honor them. Linux virtio-fs mounts
+enforce `default_permissions`: the guest kernel checks Unix permissions against
+the attributes that the host reports before it sends a request, and the host
+filesystem then checks the operation against the
+[host identity](#host-identity-of-requests) that performs it.
+
+#### Attachments and guest mounts
+
+Without `--mount` or `--mount-aggregate`, the slot is dormant: it has no HostFs
+backend or active filesystem policy but remains guest-discoverable, so a
+snapshot of it can
+[gain a share at restore](#dormant-slot-and-saved-state-versions). A dormant
+slot can complete `INIT`, but it serves no files: its filesystem requests fail
+with `ENOSYS`. `--mount GUEST_TARGET,HOST_PATH[,ro|rw]` may appear once and
+attaches HostFs to one host directory; it exports only a directory, because the
+guest mounts the device's root. `--mount-aggregate GUEST_TARGET` with a
+repeatable `--mount-child NAME,HOST_PATH[,ro|rw][,file]` instead attaches an
+[aggregate](#aggregate-layout) of host directories and regular files.
+`--mount-deny`, `--mount-allow`, `--mount-write`, and `--mount-owner` set the
+[access policy](#confinement-and-access-policy) and
+[host identity](#host-identity-of-requests) of either form.
+
+The attachment adds one `virtfs_dir=`, `virtfs_tag=`, `virtfs_mode=` token
+triplet to the kernel command line, with `virtfs_mode=rw` when the share or any
+child is read-write, and `virtfs_aggregate=1` for an aggregate. On a cold boot,
+the guest init mounts tag `microvm` at `virtfs_dir` with that mode. For an
+aggregate, it then binds each child at the target that an NVX `nvx_share=`
+token names, as
+[Live host shares](sandbox-filesystem-and-agent-architecture.md#live-host-shares)
+describes. Guest mount flags are not a security boundary: HostFs enforces the
+mode and policy of the share or child on every request, whichever guest mount
+or link reaches it, so a second guest mount of the tag changes nothing.
+
+#### Aggregate layout
+
+An aggregate's root is synthetic: a directory with mode `0500`, owned by root,
+that lists one child per `--mount-child` under its name, in option order, and
+refuses every change with `EROFS`. Below each child is an independent HostFs
+volume with its own access mode and denied, allowed, and writable paths. The
+`file` flag, not the host object, sets a child's kind, and OpenVMM refuses a
+host path of the other kind. A file child serves only its file, as the child
 itself: its volume is the file's parent directory, narrowed to the file's name,
 which the guest never reaches, so the guest cannot list or change anything
 beside the file, a lookup below the file fails with `ENOTDIR`, and every
-request fails with `EACCES` while anything but a regular file holds the name.
-A file child takes no policy paths, because its mode applies to the whole file,
-and restore requires each child to be the same kind. `--mount` exports only a
-directory, because the guest mounts the device's root. Policy paths of an
-aggregate are absolute and apply to the
-child whose root contains them. Child names are unique `[A-Za-z0-9._-]`
-names of at most 64 bytes, at most 256 children share at most 128 KiB of
-policy paths, and their host roots must not equal or contain one another, so
-no child can reach the files of another under a different policy, while a file
-child may lie beside a directory child. A rename
-between children fails with `EXDEV`. A hard link between children fails with
-`EROFS` when its destination is read-only, which Linux also reports first, and
-otherwise with `EXDEV`. The attachment adds one
-`virtfs_dir=`, `virtfs_tag=`, `virtfs_mode=` token triplet, `rw` when any child
-is read-write, and `virtfs_aggregate=1` for an aggregate. Its explicit profile
-rejects SectionFs, alternate tags, extra queues, shared-memory windows, PCI
-transport, and aggregates whose children change after boot.
-The host root is pinned by its platform object identity and revalidated when
-the export is opened, and every operation stays confined to the export: on
-Linux, each host operation opens its parent directory without following a
-symbolic link or leaving the root and never follows the final component; on
-Windows, guest-created links are WSL-style reparse points that path resolution
-never follows, and ancestor components that are links or reparse points are
-rejected. A read-write mapping lets the guest create symbolic links with
-exact targets, which only the guest resolves; a read-only mapping rejects
-them. On a Linux host, a rename passes its flags to `renameat2`, so the guest
-can swap two names with `RENAME_EXCHANGE`, and the device swaps the names that
-it tracks for both objects; a Windows host rejects every rename flag with
-`EINVAL` before changing anything. Bounded inode, alias, and handle tables
-fail an operation rather than create untracked host state.
+request fails with `EACCES` while anything but a regular file holds the name. A
+file child takes no policy paths, because its mode applies to the whole file.
+
+Policy paths of an aggregate are absolute and apply to the child whose root
+contains them. Child names are unique `[A-Za-z0-9._-]` names of at most 64
+bytes, at most 256 children share at most 128 KiB of policy paths, and their
+host roots must not equal or contain one another, so no child can reach the
+files of another under a different policy, while a file child may lie beside a
+directory child. The children share one FUSE superblock, so HostFs mixes a
+per-child key into each host inode number to make `st_ino` collisions between
+children unlikely. A rename between children fails with `EXDEV`. A hard link
+between children fails with `EROFS` when its destination is read-only, which
+Linux also reports first, and otherwise with `EXDEV`.
+
+#### Request translation and flow
+
+A guest operation on the mount becomes one or more FUSE requests:
+
+1. A system call reaches the guest VFS, whose FUSE client issues the requests
+   that it needs: `LOOKUP` for each path component, `GETATTR` for attributes,
+   `OPEN` or `CREATE` for a descriptor, and `READ` or `WRITE` for data.
+2. The client places each request in a descriptor chain in guest RAM.
+   Device-readable buffers hold the FUSE input header, with the opcode, request
+   ID, node ID, and the caller's UID, GID, and PID, followed by the opcode's
+   arguments, names, and any write payload. Device-writable buffers receive the
+   reply. `FORGET` notifications use the high-priority queue and have no reply
+   buffers; all other requests use the request queue.
+3. The client publishes the chain and, unless the device has suppressed
+   notifications, notifies the queue. OpenVMM receives the notification through
+   a hypervisor doorbell when the backend provides one and the slot has an
+   attachment, and otherwise by emulating the MMIO write. Either path wakes the
+   queue's worker.
+4. The worker takes the chain, copies the request out of guest memory, and
+   parses its header. In caller mode, it assumes the caller's host identity.
+   The FUSE session then dispatches the opcode to HostFs.
+5. HostFs resolves the request's node ID to a
+   [node](#nodes-handles-and-directory-listings) or its handle ID to an open
+   host object and applies the access mode, access policy, and table bounds.
+6. The confined host volume performs the operation beneath the export root
+   without following symbolic links. A Linux host issues the corresponding
+   system call relative to a pinned parent directory; a Windows host emulates
+   the same Linux semantics through Windows file APIs, without storing Linux
+   ownership or mode metadata.
+7. HostFs encodes the result, which is attributes, entries, data, or a negative
+   errno, after a FUSE output header that carries the request ID, and the worker
+   writes it into the device-writable buffers. The worker then publishes one
+   used-ring entry with the reply length and, unless the guest suppressed the
+   notification, signals the guest through the slot's
+   [shared-status word and edge IRQ](#fixed-virtio-mmio-transport).
+8. The client matches the reply to its request by ID and completes the system
+   call.
+
+Each queue has one worker, which performs one request at a time to completion
+before it takes the next. The request queue therefore serializes guest requests
+in ring order, although the guest may post many at once, while `FORGET`
+notifications proceed independently on the high-priority queue. The device
+does not implement FUSE interrupts, and the Linux driver sends none, so a
+posted request always runs to completion.
+
+`READ` reads into a host buffer of at most 1 MiB and copies the bytes into the
+guest's reply buffers; `WRITE` copies its payload out of guest memory before it
+writes the host file. Requests on an open handle use its host descriptor
+directly, without resolving a path again. A request whose device-readable part
+exceeds the 1 MiB write limit plus a 4 KiB header allowance, or whose header
+cannot be parsed, is completed with no reply. Malformed arguments fail with
+`EIO` or a specific error. An opcode that HostFs does not implement, such as
+`FLUSH`, `FALLOCATE`, `LSEEK`, or `COPY_FILE_RANGE`, fails with `ENOSYS`; Linux
+remembers the failure, stops sending that opcode, and either falls back to
+generic handling or reports the operation as unsupported. A guest `syncfs`
+arrives as `SYNCFS`, which the device acknowledges without flushing the host.
+
+#### Nodes, handles, and directory listings
+
+HostFs identifies host objects to the guest by node ID. Node 1 is the root: the
+share's root directory or an aggregate's synthetic root. A node records its
+volume, the volume-relative names, or aliases, through which the guest has
+reached it, its host inode number, its guest-visible inode number, and a lookup
+count. It holds no host descriptor. Every request on a node first walks each
+recorded name from the export root again without following links, fails with
+`ELOOP` if a name now crosses a symbolic link and with `EACCES` if the policy
+hides it, and then operates on the final component without following it.
+
+Repeated lookups of one host object return the same node and add the new name,
+so hard links share one node. HostFs matches objects by host inode number, or
+by name on volumes, such as FAT, whose inode numbers are not stable. Every reply
+that returns an entry, from `LOOKUP`, `CREATE`, `MKDIR`, `MKNOD`, `SYMLINK`,
+`LINK`, or each `READDIRPLUS` entry, adds one lookup. `FORGET` subtracts the
+count that the guest reports, and the node disappears at zero. `RENAME` and
+`UNLINK` rewrite or remove the recorded names at and below the affected path in
+every node, and `RENAME_EXCHANGE` swaps them.
+
+`OPEN`, `OPENDIR`, and `CREATE` return handles. A handle owns a host descriptor,
+opened without following the final component, and requests that name the
+handle, such as `READ`, `WRITE`, and `FSYNC`, use that descriptor. `RELEASE` and
+`RELEASEDIR` close it. The first `READDIR` or `READDIRPLUS` on a directory
+handle enumerates the host directory once into a listing of at most 4,096
+entries and 64 KiB of names, without the entries that the policy hides, and
+later requests page through that listing; listing a larger directory fails
+with `E2BIG`. Each entry's cookie is its position in the listing, so a listing
+survives a snapshot. `READDIRPLUS` looks each listed name up again and fails if
+it no longer reaches the listed object.
+
+HostFs bounds its state at 4,096 nodes, 4,096 handles, 256 names per node,
+16,384 names in total, 1 MiB of names, and 4,096-byte paths. It checks these
+bounds before it changes the host, so an operation that would exceed them
+fails with `ENOSPC` or `E2BIG` instead of creating host state that the device
+could not track or save.
+
+#### Operation examples
+
+These examples use a single read-write share mounted at `/workspace`, whose
+root is node 1. The diagram follows one file from creation to removal.
+
+```mermaid
+%%{init: {"theme": "base", "themeVariables": {"background": "#ffffff"}}}%%
+sequenceDiagram
+   box rgb(255, 255, 255)
+   participant App as Guest application
+   participant Client as Guest FUSE client
+   participant HostFs as virtio-fs device and HostFs
+   participant Host as Host filesystem
+   end
+
+   rect rgb(255, 255, 255)
+   App->>Client: open /workspace/out.log with O_CREAT and O_RDWR
+   Client->>HostFs: LOOKUP(1, out.log)
+   HostFs->>Host: No-follow lookup beneath the root
+   HostFs-->>Client: ENOENT
+   Client->>HostFs: CREATE(1, out.log, flags, mode)
+   HostFs->>Host: Create and open in the pinned root directory
+   HostFs-->>Client: Node M, handle H, direct I/O
+   App->>Client: write 1 MiB at offset 0
+   Client->>HostFs: WRITE(H, offset 0, 1 MiB)
+   HostFs->>Host: Positional write through H
+   HostFs-->>Client: 1 MiB written
+   App->>Client: read 4 KiB at offset 0
+   Client->>HostFs: READ(H, offset 0, 4 KiB)
+   HostFs->>Host: Positional read through H
+   HostFs-->>Client: 4 KiB of data
+   App->>Client: unlink /workspace/out.log
+   Client->>HostFs: LOOKUP(1, out.log), then UNLINK(1, out.log)
+   HostFs->>Host: No-follow unlink in the pinned root directory
+   HostFs-->>Client: Success, and H still reaches the file
+   App->>Client: close
+   Client->>HostFs: RELEASE(H)
+   HostFs->>Host: Close the descriptor of H
+   Client->>HostFs: FORGET(M, n) on the high-priority queue
+   HostFs->>HostFs: Drop node M
+   end
+```
+
+**Opening a file.** An application calls
+`open("/workspace/src/main.c", O_RDONLY)`.
+
+1. Because no entry stays cached, the guest's path walk sends
+   `LOOKUP(1, "src")` and then `LOOKUP(S, "main.c")`, where `S` is the node that
+   the first reply returned.
+2. For each `LOOKUP`, HostFs revalidates the parent node's names, fails with
+   `EACCES` for a name that the policy hides, and inspects the child beneath
+   the export root without following it. It returns the existing node of a
+   known host object or allocates a new one, records the name, adds a lookup,
+   and replies with the node ID and attributes.
+3. The guest checks the caller's permission against those attributes and sends
+   `OPEN(M, O_RDONLY)` for the file's node `M`.
+4. HostFs revalidates `M`, refuses write access or `O_TRUNC` with `EROFS` when
+   the node is read-only, and opens `src/main.c` beneath the root without
+   following its final component. It rejects a symbolic link with `ELOOP` and
+   replies with a new handle `H` and direct I/O. The guest's descriptor now
+   refers to node `M` and handle `H`.
+
+**Creating a file.** An application calls
+`open("/workspace/out.log", O_WRONLY | O_CREAT | O_EXCL, 0644)`.
+
+1. `LOOKUP(1, "out.log")` fails with `ENOENT`.
+2. The guest sends `CREATE(1, "out.log")` with the flags, the mode with the
+   caller's umask applied, and the umask.
+3. HostFs requires a read-write share or child and, when writable paths exist,
+   that both the parent directory and the new name lie inside one; otherwise
+   the request fails with `EROFS`. It checks its table bounds before it touches
+   the host.
+4. HostFs creates and opens `out.log` in the pinned root directory without
+   following links, as the VMM or, in caller mode, as the caller, and rejects a
+   symbolic link. It registers a node for the name and a handle for the
+   descriptor and replies with both, so one round trip creates and opens the
+   file.
+
+`mkdir`, `mknod`, and `symlink` pass the same checks through `MKDIR`, `MKNOD`,
+and `SYMLINK` and return a node without a handle; `SYMLINK` stores its target
+exactly as the guest gives it.
+
+**Reading.** An application reads 3 MiB from offset 0 of a descriptor whose
+handle is `H`.
+
+1. Direct I/O bypasses the guest page cache, so the guest splits the read into
+   `READ` requests of at most 1 MiB, each naming `H`, an offset, and a size,
+   with guest buffers for the data.
+2. For each request, HostFs reads from the host descriptor of `H` at the
+   offset into a host buffer and copies the bytes into the reply buffers after
+   the output header. A short reply marks the end of the file.
+3. The guest completes the read when every reply has arrived. A later read
+   requests the data again, so it observes any host change.
+
+**Writing.** An application writes 3 MiB at offset 0 through the same
+descriptor.
+
+1. The guest splits the write into `WRITE` requests of at most 1 MiB, each
+   carrying `H`, an offset, and the data in device-readable buffers.
+2. HostFs copies each request, payload included, out of guest memory and
+   refuses it with `EROFS` if the node is read-only, which it checks on every
+   write, not only at open.
+3. HostFs writes the data through the host descriptor of `H` at the offset,
+   as the request's host identity, and replies with the number of bytes
+   written.
+4. When `write` returns, host processes can read the data, but it is not
+   forced to stable storage. `fsync` and `fdatasync` become `FSYNC`, which
+   HostFs performs through `H`. Closing the last descriptor sends
+   `RELEASE(H)`, and HostFs closes the host descriptor.
+
+**Removing a file.** An application calls `unlink("/workspace/out.log")`.
+
+1. `LOOKUP(1, "out.log")` returns node `M`.
+2. The guest sends `UNLINK(1, "out.log")`. HostFs applies the write checks of
+   `CREATE` to the root directory and the name, revalidates the root, and
+   removes the name in the pinned root directory without following it.
+3. HostFs removes the name from every node that recorded it. Node `M` remains
+   while the guest holds lookups on it, and any handle keeps its host
+   descriptor.
+4. When the guest evicts its inode, it sends `FORGET(M, n)` on the
+   high-priority queue with the lookups that it held. The request has no reply;
+   HostFs subtracts `n` and drops the node at zero.
+
+`rmdir` takes the same path through `RMDIR`, which also removes the recorded
+names below the directory.
+
+#### Confinement and access policy
+
+The host root is pinned by its platform object identity, device and inode
+number on Linux or volume and file ID on Windows, and revalidated when the
+export is opened; each aggregate child's root is pinned the same way. Every
+operation stays confined to the export. On Linux, each host operation opens
+its parent directory beneath the root without following a symbolic link or
+leaving the root, through `openat2` when the kernel allows it and one component
+at a time otherwise, and never follows the final component. On Windows,
+guest-created links are WSL-style reparse points that path resolution never
+follows, ancestor components that are links or reparse points are rejected,
+and the volume refuses DOS device names and objects with the hidden, system,
+offline, or recall-on-data-access attribute with `EACCES`. A read-write mapping
+lets the guest create symbolic links with exact targets, which only the guest
+resolves; a read-only mapping rejects them. On a Linux host, a rename passes
+its flags to `renameat2`, so the guest can swap two names with
+`RENAME_EXCHANGE`, and the device swaps the names that it tracks for both
+objects; a Windows host rejects every rename flag with `EINVAL` before changing
+anything.
+
 Read-only mode, of a share or of an aggregate child, rejects mutation in the
 host device before invoking host filesystem operations; read-write mode exposes
-only the supported common host contract.
-Denied host paths are canonicalized into a bounded relative set and enforced
-before HostFs operations. Prefix checks hide complete subtrees, while denied
-root device/inode identities block hard-link, junction, and bind-mount
-aliases. The policy is unchanged by a second guest mount.
-Allowed host paths expose subtrees of denied paths again; the nearest policy
-path that contains a path decides whether the guest can see it, and denied
-and allowed paths alternate, so neither kind is redundant. A denied path may
-name the root of a share or child when allowed paths inside it remain, which
-leaves the root traverse-only. Policy path names may contain spaces, but not
-begin or end with one. A hidden directory
-on the way to an allowed path is traverse-only: the guest can look it up as a
-directory and list only the entries that lead to allowed paths, and its object
-identity is accepted only at its own path. Writable host paths, when present,
-are the only parts of a read-write export that the guest can modify. Every
-namespace mutation checks its directories and the entry paths that it
-creates, removes, or replaces, and every object mutation checks every name
-that the guest has used for the object; refused writes fail with `EROFS`, and
-a hard link to a read-only object from a writable path fails with `EXDEV`.
+only the supported common host contract. Denied host paths are canonicalized
+into a bounded relative set and enforced before HostFs operations. Prefix
+checks hide complete subtrees, while denied root device/inode identities block
+hard-link, junction, and bind-mount aliases. Allowed host paths expose subtrees
+of denied paths again; the nearest policy path that contains a path decides
+whether the guest can see it, and denied and allowed paths alternate, so
+neither kind is redundant. A denied path may name the root of a share or child
+when allowed paths inside it remain, which leaves the root traverse-only.
+Policy path names may contain spaces, but not begin or end with one. A hidden
+directory on the way to an allowed path is traverse-only: the guest can look it
+up as a directory and list only the entries that lead to allowed paths, and its
+object identity is accepted only at its own path. Writable host paths, when
+present, are the only parts of a read-write export that the guest can modify.
+Every namespace mutation checks its directories and the entry paths that it
+creates, removes, or replaces, and every object mutation checks every name that
+the guest has used for the object; refused writes fail with `EROFS`, and a hard
+link to a read-only object from a writable path fails with `EXDEV`.
+
+#### Host identity of requests
 
 The ownership mode selects the host identity of guest operations. By default,
 HostFs performs them as the VMM. With `--mount-owner caller`, a Linux host
@@ -708,38 +1028,129 @@ FUSE header: the queue worker switches only its own thread's filesystem UID
 and GID, clears the supplementary groups and effective capabilities, and
 restores all of them before handling anything else. Session negotiation,
 `FORGET`, and handle release run unchanged. Guest UID 0 and GID 0 are squashed
-to the owner and group of the export root, which therefore must not be UID 0
-or GID 0. A request whose identity cannot be assumed fails with `EPERM` rather
+to the owner and group of the export root, which therefore must not be UID 0 or
+GID 0. A request whose identity cannot be assumed fails with `EPERM` rather
 than running as the VMM. Windows hosts reject the mode.
 
-The exported directory is external live state, not part of the VM snapshot.
-An active capture saves its exact canonical host path, denied, allowed, and
-writable paths, ownership mode, FUSE negotiation, node
-and handle allocation, aliases (including those of symbolic links), lookup
-counts, directory snapshots and cookies, and the identities needed to reopen
-objects. Restore requires the same path,
-target, mode, denied, allowed, and writable paths, ownership mode, root
-identity, and reopenable objects for the captured attachment; for an
-aggregate, the same target and the same children, names, kinds, modes, host
-paths, root identities, and policies, in the same order, and the contract
-records a
-digest of the children's identities, so a restore can neither drop, add, nor
-reorder one. The guest binds each child at a target that OpenVMM does not
-record, so NVX names each child after its index and a digest of its guest
-target: the snapshot then pins each target, and a restore that requests
-another target fails before the guest runs. An aggregate's capture also saves
-each child's volume and the synthetic root's directory state in
-device-private schema version 8, or 9 when a child is a file, which earlier
-releases reject instead of restoring the file child as a directory. A
-caller-owned
-capture records device-private schema version 6, which earlier releases reject
-instead of restoring the attachment as the VMM. A capture with allowed or
-writable paths records its complete access policy in device-private schema
-version 7, which earlier releases reject instead of restoring the attachment
-without its policy, and a restore rejects a handle open for writing outside
-the writable paths. A dormant capture instead
-saves explicit unattached state and may restore with no attachment or bind a
-new HostFs backend. The resumed guest then mounts tag `microvm` explicitly;
-the cold-boot mount hook has already run. Snapshots without this capability
-cannot add an attachment. Native file descriptors and Windows handles are not
-serialized.
+#### Snapshot contents
+
+The exported files are external live state, not part of the VM snapshot:
+neither their contents nor any host descriptor, handle, or cache is captured.
+A snapshot instead preserves the protocol state on both sides of the queues.
+The guest's FUSE client state, including its mount, node IDs, lookup counts,
+and handles, lives in guest RAM and is captured with memory. The device keeps
+the matching state in device-private saved state:
+
+- the negotiated FUSE session;
+- each node's ID, volume, recorded names, including those of symbolic links,
+  lookup count, guest-visible inode number, and object identity of device,
+  inode number, and file type;
+- each handle's ID, node, open flags, object identity, and directory listing
+  with its cookies;
+- the next node and handle IDs; and
+- the fixed device shape, access mode, ownership mode, and root identity, with
+  the access policy of a share that has allowed or writable paths, or, for an
+  aggregate, each child's name, kind, mode, root identity, and policy.
+
+Device-private state names objects relative to the export root and never
+records a host path. The snapshot's machine contract records the host side
+instead: the guest target, access mode, tag, queue counts, direct I/O, cache
+lifetimes, canonical host path, policy paths, ownership mode, and, for an
+aggregate, each child's name, canonical host path, kind, mode, policy, and root
+identity. Its [attachment inventory](host-attachment-model.md) binds
+`fs:microvm0`, with the `live-revalidate` reconnect policy, to the root's
+identity or, for an aggregate, to a digest of its children's names and root
+identities in order, so a restore can neither drop, add, nor reorder a child.
+The guest binds each child at a target that OpenVMM does not record, so NVX
+names each child after its index and a digest of its guest target: the snapshot
+then pins each target, and a restore that requests another target fails before
+the guest runs.
+
+#### Snapshot capture
+
+The device takes part in the [capture boundary](snapshot-and-restore.md#capture-boundary)
+as follows:
+
+1. When capture gates host input, each worker finishes its current request,
+   publishes the reply, and takes no further request. Descriptors that no
+   worker has taken stay on the available ring, in guest memory and the saved
+   queue progress, for the restored device to take.
+2. After the vCPUs stop at the boundary, the queues stop, and the save requires
+   that no request remain in flight.
+3. HostFs inspects every handle through its descriptor and resolves every
+   recorded name beneath the export root again without following links,
+   checking that all names of a node reach one object. Capture fails while the
+   device tracks a node that has no name left, such as a removed file that the
+   guest holds open, or a name that is gone, hidden, crosses a symbolic link,
+   or reaches another object than the node's other names. It also fails when
+   the directory listings of all handles exceed 16,384 entries or 4 MiB of
+   names.
+4. Capture does not flush the host files. Data that the guest wrote before the
+   boundary is already in them and reaches stable storage on the host's
+   schedule unless the guest synced it.
+
+Capture and restore inspect and reopen objects as OpenVMM's user, even in
+caller mode, so they fail while the guest holds an object that only its caller
+can reach or reopen.
+
+#### Snapshot restore
+
+A restore rebuilds the device's side of the session before the guest can use
+it:
+
+1. Before the guest runs, the launcher supplies the attachment again. It must
+   reproduce the snapshot's target, mode, policy, ownership mode, canonical host
+   paths, and root identities, and, for an aggregate, the same children with
+   the same names, kinds, and modes in the same order. Only a dormant slot may
+   instead gain a new attachment.
+2. Before the transport changes any state, the device validates the saved
+   state: a known schema version, the fixed device shape, a FUSE session that
+   the profile would negotiate at FUSE 7.31 or newer, tables within their
+   bounds, unique IDs below the next IDs, and writable handles only where the
+   share or child is read-write and every name of the node is writable.
+3. When the restored device first starts, before it services any request,
+   HostFs rebuilds the node table with the saved node IDs and lookup counts. It
+   resolves every recorded name beneath the supplied attachment without
+   following links and requires the same object, by device, inode number, and
+   file type, with the same guest-visible inode number.
+4. HostFs reopens every handle with its saved open flags, except that it drops
+   `O_CREAT`, `O_EXCL`, and `O_TRUNC`, so a restore never creates or truncates
+   a file. It verifies the identity and kind of each reopened object and
+   restores the handle's directory listing.
+5. HostFs restores the negotiated FUSE session without a new `INIT`.
+
+The guest then continues with its mount, working directories, open
+descriptors, mappings, and directory listings, without remounting. Because it
+caches no entries, attributes, or file data, its next request observes the
+host as it is at restore time: the restore checks only the objects that the
+guest held, and their contents and every other name may have changed since
+capture. A listing in progress continues from the captured listing. Identity,
+not content, binds a restore: a copy of the export, even with identical
+contents, fails it, and so does a held file that host software replaced by
+renaming a new file over its name. Every restore of one snapshot attaches the
+same live host objects; unlike paired scratch, the share is not copied. Native
+file descriptors and Windows handles are not serialized.
+
+#### Dormant slot and saved-state versions
+
+A dormant capture saves explicit unattached state, with no session, nodes,
+handles, root identity, or policy. It requires that the guest have no FUSE
+session on the slot, so the tag must not be mounted; unmounting ends the
+session. A dormant snapshot may restore with no attachment or bind one new
+`--mount` of a directory, but not an aggregate. The resumed guest then mounts
+tag `microvm` explicitly, because the cold-boot mount hook has already run.
+Snapshots without this capability cannot add an attachment, and active state
+cannot restore into a dormant slot.
+
+Capture records the highest saved-state version that applies to the
+attachment. Each version marks state that earlier releases cannot enforce, so
+they reject the snapshot rather than restore a weaker attachment. A restore
+also accepts version 4 from earlier releases.
+
+| Version | Records |
+| ---: | --- |
+| 5 | A dormant slot, or a single share with VMM ownership and no allowed or writable paths |
+| 6 | Caller ownership, so that a release that predates it cannot restore the attachment as the VMM |
+| 7 | The complete access policy of a single share with allowed or writable paths |
+| 8 | An aggregate's children and each node's volume; the synthetic root's listing cookies are positions in the recorded child list |
+| 9 | An aggregate with a file child, whose kind it records, so that a release that predates file children cannot restore it as a directory |
