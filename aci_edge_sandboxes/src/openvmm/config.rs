@@ -4,9 +4,9 @@ use std::time::Duration;
 use aci_edge_sandboxes_model::spec::{is_valid_guest_network, is_valid_hostname};
 use nvx::Hypervisor;
 use nvx::host::artifacts::{Artifacts, absolute};
+use nvx::host::instance::SOCKET_NAME;
 use nvx::host::launch::{self, WorkloadIdentity};
 
-use super::state::SOCKET_NAME;
 use crate::error::{Error, Result};
 
 /// Configuration of the [`OpenVmmBackend`](super::OpenVmmBackend).

@@ -11,7 +11,8 @@
 //! | [`AciEdgeSandbox::deprovision`] | provisioned → (none) | optional metadata; the ID becomes stale |
 //!
 //! Every operation is implemented by a pluggable [`Backend`]. The default backend,
-//! [`openvmm::OpenVmmBackend`], drives the `openvmm` binary directly. [`AciEdgeSandbox`] validates each
+//! [`openvmm::OpenVmmBackend`], drives the `openvmm` binary directly through the [`nvx`] crate,
+//! which this crate re-exports. [`AciEdgeSandbox`] validates each
 //! request in a fixed order before the backend acts on it: structural errors
 //! ([`ErrorCode::MalformedRequest`], [`ErrorCode::MalformedId`]) come first, then requests the
 //! backend cannot honor ([`ErrorCode::PolicyValidation`]), then backend-specific failures.
@@ -53,7 +54,8 @@
 
 // The data model lives in `aci_edge_sandboxes_model`; these keep its modules at their crate paths.
 pub(crate) use aci_edge_sandboxes_model::{capabilities, error, id, model, spec, validate};
-/// The NVX mechanics that the `openvmm` backend builds on.
+/// The NVX mechanics that the `openvmm` backend builds on: artifact discovery, hypervisors,
+/// guest paths, the control protocol, and the supervision of VM instances.
 pub use nvx;
 
 mod backend;

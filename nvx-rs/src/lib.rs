@@ -14,7 +14,55 @@
 //!   hostname and guest network address.
 //! - [`Hypervisor`]: the hypervisors that run the VMs.
 //! - [`host`] (feature `host`): artifact discovery, the OpenVMM command line, the lowering of
-//!   network and filesystem policies, control sessions, and process and platform primitives.
+//!   network and filesystem policies, control sessions, process and platform primitives, and the
+//!   supervision of VM instances: starting, reconciling, executing workloads, and stopping.
+//!
+//! # Example
+//!
+//! ```no_run
+//! # #[cfg(feature = "host")]
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! use std::sync::atomic::AtomicBool;
+//! use std::time::Duration;
+//!
+//! use nvx::host::instance::{self, Instance};
+//! use nvx::host::launch::LaunchSpec;
+//! use nvx::protocol::{Workload, WorkloadEnvironment};
+//! use nvx::{Artifacts, Hypervisor};
+//!
+//! // Locates OpenVMM, the guest kernel, and the Alpine initramfs.
+//! let spec = LaunchSpec::new(Artifacts::discover()?, Hypervisor::from_env_or_default()?);
+//! let directory = std::env::temp_dir().join("nvx-example");
+//! instance::create_private_dir(&directory)?;
+//! let instance = Instance::new(&directory, "example");
+//! let started = instance.start(&spec, Duration::from_secs(60))?;
+//!
+//! let workload = Workload {
+//!     argv: vec!["/bin/echo".to_owned(), "hello".to_owned()],
+//!     timeout_ms: 0,
+//!     cwd: None,
+//!     environment: WorkloadEnvironment::Default,
+//! };
+//! let capability = instance.read_capability()?;
+//! let timeout = Duration::from_secs(60);
+//! let execution = instance.exec(&started.runtime, &capability, &workload, timeout, timeout)?;
+//! let mut stdout = Vec::new();
+//! let outcome = execution.pump(
+//!     &mut |chunk: &[u8]| {
+//!         stdout.extend_from_slice(chunk);
+//!         Ok(())
+//!     },
+//!     &mut |_: &[u8]| Ok(()),
+//!     &AtomicBool::new(false),
+//! )?;
+//! println!("{outcome:?}: {}", String::from_utf8_lossy(&stdout));
+//!
+//! instance.stop(&started.runtime, Duration::from_secs(30))?;
+//! # Ok(())
+//! # }
+//! # #[cfg(not(feature = "host"))]
+//! # fn main() {}
+//! ```
 //!
 //! # Features
 //!

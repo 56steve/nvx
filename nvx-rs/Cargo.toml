@@ -19,7 +19,7 @@ name = "nvx"
 [features]
 default = ["host"]
 # The host side: artifact discovery, launch, network and filesystem lowering, control sessions,
-# and process and platform primitives.
+# process and platform primitives, and the supervision of VM instances.
 host = ["serde", "dep:getrandom", "dep:serde_json", "dep:libc", "dep:windows-sys"]
 # Stages the OpenVMM executable, guest kernel, and control initramfs at build time; see
 # `Artifacts::bundled`. The build script downloads the release pinned in `artifacts.json`, or

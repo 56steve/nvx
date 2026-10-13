@@ -4,7 +4,6 @@
 //! other platforms compile but report NVX as unavailable.
 
 use std::io;
-use std::path::Path;
 use std::time::Duration;
 
 use crate::error::{Error, Result};
@@ -33,21 +32,6 @@ pub use imp::{SUPPORTED, create_private_dir, file_identity, process_start_time};
 /// Fails with [`ErrorKind::Unavailable`](crate::ErrorKind::Unavailable) otherwise.
 pub fn probe_hypervisor(hypervisor: Hypervisor) -> Result<()> {
     imp::probe_hypervisor(hypervisor).map_err(Error::unavailable)
-}
-
-// These two are public until the supervision of VM instances, which calls them, moves here.
-
-/// Returns the control endpoint that OpenVMM listens on for the VM whose Unix socket would be
-/// `socket_path`.
-#[doc(hidden)]
-pub fn control_endpoint(socket_path: &Path) -> io::Result<String> {
-    imp::control_endpoint(socket_path)
-}
-
-/// Returns the process that listens on a control endpoint, or `None` if nothing listens.
-#[doc(hidden)]
-pub fn endpoint_server_pid(endpoint: &str) -> io::Result<Option<u32>> {
-    imp::endpoint_server_pid(endpoint)
 }
 
 /// Byte stream to an OpenVMM control endpoint.
