@@ -474,11 +474,13 @@ OpenVMM publishes on every host address admit the host instead.
 Repeat `--host-loopback-forward tcp:HOST_PORT:GUEST_PORT` or its UDP form, at
 most 64 times, to publish further localhost ports at guest ports of your
 choice, such as host `127.0.0.1:18080` to guest port `8080`; forwards need
-explicit `--host-loopback allow`. The guest answers forwarded traffic at
-addresses that OpenVMM assigns inside its own network, and the egress policy
-filters those replies, so forwarded ports need an egress policy that lets them
-out. Snapshot capture and restore reject explicit `--host-loopback allow`,
-because its listeners are live host attachments.
+explicit `--host-loopback allow`. Each forward of a protocol needs its own host
+port and its own guest port: OpenVMM rejects a repeated host port before it
+starts and fails to start with a repeated guest port. The guest answers
+forwarded traffic at addresses that OpenVMM assigns inside its own network, and
+the egress policy filters those replies, so forwarded ports need an egress
+policy that lets them out. Snapshot capture and restore reject explicit
+`--host-loopback allow`, because its listeners are live host attachments.
 
 ## Migration from the retired profile
 

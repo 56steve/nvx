@@ -1441,6 +1441,20 @@ fn launch_arguments_select_the_managed_alpine_guest() {
         assert_eq!(error.code(), ErrorCode::PolicyValidation);
         assert!(error.message().contains(expected), "{error}");
     }
+    // OpenVMM keeps one forward listener per guest port, so it could not start this sandbox.
+    let shared_guest_port = spec
+        .clone()
+        .with_host_loopback_forward(HostLoopbackForward::new(ForwardProtocol::Tcp, 18081, 8080));
+    let error = nvx
+        .provision_with(&request, &shared_guest_port)
+        .unwrap_err();
+    assert_eq!(error.code(), ErrorCode::PolicyValidation);
+    assert!(
+        error
+            .message()
+            .contains("tcp guest port 8080 more than once"),
+        "{error}"
+    );
     assert_eq!(fixture.sandbox_dirs(), 0);
     let sandbox_id = nvx.provision_with(&request, &spec).unwrap().sandbox_id;
     nvx.start(&sandbox_id).unwrap();

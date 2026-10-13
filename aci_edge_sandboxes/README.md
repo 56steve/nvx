@@ -436,7 +436,8 @@ forwards need host-loopback access allowed.
 - `hostLoopbackForwards` of the sandbox spec (`SandboxSpec::with_host_loopback_forward`, passed
   to `AciEdgeSandbox::provision_with`) publishes up to 64 further guest ports on host loopback:
   OpenVMM listens on `127.0.0.1:hostPort` and relays each TCP connection or UDP datagram to the
-  guest's `guestPort`. Ports are nonzero, and a host port appears at most once per protocol.
+  guest's `guestPort`. Ports are nonzero, and a host port and a guest port each appear at most
+  once per protocol, because OpenVMM keeps one forward listener per guest port.
   Forwarded ports need `network.ingress.hostLoopback: allow`. The guest answers forwarded
   traffic at addresses that OpenVMM assigns inside the guest network, so the egress default
   must be `allow`, which leaves the guest's other egress open, and no deny rule may cover the
@@ -812,10 +813,10 @@ whatever the egress policy; a workload listener on guest loopback stays
 private, and a port that a host process already holds is not published. The
 sandbox spec's `hostLoopbackForwards` (`SandboxSpec::with_host_loopback_forward`,
 passed to `AciEdgeSandbox::provision_with`) publish up to 64 further host
-loopback ports at guest ports of their choice. They need host-loopback access
-allowed, and because the workload answers them at addresses that OpenVMM
-assigns inside the guest network, an egress default of `allow` and no deny rule
-that covers the guest network; see
+loopback ports at guest ports of their choice, one forward per protocol and
+guest port. They need host-loopback access allowed, and because the workload
+answers them at addresses that OpenVMM assigns inside the guest network, an
+egress default of `allow` and no deny rule that covers the guest network; see
 [Host-loopback access](../doc/run.md#host-loopback-access).
 
 ### Idempotence and concurrency

@@ -222,10 +222,10 @@ pub struct NetworkPolicy {
     /// the host instead. With [`Access::Deny`], neither direction is open.
     pub host_loopback: Access,
     /// Ports on host IPv4 loopback forwarded to guest ports, at most [`MAX_LOOPBACK_FORWARDS`],
-    /// each protocol and host port at most once. Forwards need `host_loopback` allowed, and
-    /// because the egress policy filters the guest's replies, which go to addresses that OpenVMM
-    /// assigns inside the guest network, also an `egress` default of [`Access::Allow`] and no
-    /// `deny` rule that covers the guest network.
+    /// each protocol and host port at most once, and each protocol and guest port at most once.
+    /// Forwards need `host_loopback` allowed, and because the egress policy filters the guest's
+    /// replies, which go to addresses that OpenVMM assigns inside the guest network, also an
+    /// `egress` default of [`Access::Allow`] and no `deny` rule that covers the guest network.
     pub host_loopback_forwards: Vec<LoopbackForward>,
 }
 
@@ -352,6 +352,7 @@ fn check_loopback_forwards(policy: &NetworkPolicy, guest_network: &str) -> Resul
         ));
     }
     let mut bindings = HashSet::new();
+    let mut targets = HashSet::new();
     for forward in forwards {
         if forward.host_port == 0 || forward.guest_port == 0 {
             return unsupported(
@@ -363,6 +364,15 @@ fn check_loopback_forwards(policy: &NetworkPolicy, guest_network: &str) -> Resul
                 "host-loopback forwards bind {} host port {} more than once",
                 forward.protocol.as_str(),
                 forward.host_port
+            ));
+        }
+        // OpenVMM keys a forward's listener by its guest port, so a second forward to one guest
+        // port would fail to bind when the VM starts.
+        if !targets.insert((forward.protocol, forward.guest_port)) {
+            return unsupported(format!(
+                "host-loopback forwards reach {} guest port {} more than once",
+                forward.protocol.as_str(),
+                forward.guest_port
             ));
         }
     }
@@ -619,11 +629,13 @@ mod tests {
         let valid = forwarded(vec![
             forward(ForwardProtocol::Tcp, 18080, 8080),
             forward(ForwardProtocol::Udp, 18080, 8081),
+            // One guest port may receive a forward of each protocol.
+            forward(ForwardProtocol::Udp, 18081, 8080),
         ]);
         let arguments = openvmm_arguments(Some(&valid), "10.0.0.2/24").unwrap();
         assert_eq!(
             rules(&arguments, "--host-loopback-forward"),
-            ["tcp:18080:8080", "udp:18080:8081"]
+            ["tcp:18080:8080", "udp:18080:8081", "udp:18081:8080"]
         );
         assert!(has_pair(&arguments, "--host-loopback", "allow"));
 
@@ -638,7 +650,15 @@ mod tests {
                 forward(ForwardProtocol::Tcp, 18080, 8080),
                 forward(ForwardProtocol::Tcp, 18080, 8081),
             ]),
-            "more than once",
+            "bind tcp host port 18080 more than once",
+        );
+        // OpenVMM could not bind a second forward to one guest port.
+        rejected(
+            &forwarded(vec![
+                forward(ForwardProtocol::Udp, 18080, 8080),
+                forward(ForwardProtocol::Udp, 18081, 8080),
+            ]),
+            "reach udp guest port 8080 more than once",
         );
         rejected(
             &forwarded(vec![forward(ForwardProtocol::Udp, 0, 8080)]),

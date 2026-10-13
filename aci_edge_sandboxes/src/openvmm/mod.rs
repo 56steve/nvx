@@ -73,10 +73,10 @@
 //! and admits only the host, whose replies pass whatever the egress policy. A workload listener on
 //! guest loopback stays private. The sandbox spec's `hostLoopbackForwards`
 //! ([`AciEdgeSandbox::provision_with`](crate::AciEdgeSandbox::provision_with)) publish up to 64
-//! further host loopback ports at guest ports of their choice; they need host loopback allowed
-//! and an egress default of `allow`, and no deny rule may cover the guest network, where the
-//! workload answers them. Workloads run as the fixed non-root identity of
-//! [`OpenVmmConfig::workload_uid`] and [`OpenVmmConfig::workload_gid`] (see
+//! further host loopback ports at guest ports of their choice, one forward per protocol and guest
+//! port; they need host loopback allowed and an egress default of `allow`, and no deny rule may
+//! cover the guest network, where the workload answers them. Workloads run as the fixed non-root
+//! identity of [`OpenVmmConfig::workload_uid`] and [`OpenVmmConfig::workload_gid`] (see
 //! [`OpenVmmConfig::map_host_identity`] for Linux hosts) with no capabilities, read end-of-file on
 //! standard input, and may produce at most 1 MiB of combined output.
 //!
