@@ -1,0 +1,47 @@
+{
+  "platform": "linux-mshv-virtual-machine",
+  "runner_name": "azure-mshv-4",
+  "machine_name": "esaurez-nvx-ci-linux-vmss000005",
+  "cpu": {
+    "vendor": "GenuineIntel",
+    "family": 6,
+    "model": 207,
+    "stepping": 2,
+    "brand": "INTEL(R) XEON(R) PLATINUM 8573C",
+    "microcode": "0xffffffff"
+  },
+  "logical_processors": 8,
+  "memory_gib": 30.9,
+  "os": {
+    "system": "Linux",
+    "release": "6.18.34.mshv3-1.azl3",
+    "revision": null
+  },
+  "azure": {
+    "vm_size": "Standard_D8s_v5",
+    "os_disk": {
+      "storage_account_type": "Premium_LRS",
+      "size_gib": 128,
+      "caching": "ReadWrite",
+      "write_accelerator_enabled": false,
+      "ephemeral_option": null
+    }
+  },
+  "volumes": {
+    "workspace": {
+      "volume": "/",
+      "filesystem": "ext4",
+      "system_volume": true
+    },
+    "temporary": {
+      "volume": "/tmp",
+      "filesystem": "tmpfs",
+      "system_volume": false
+    },
+    "scratch": {
+      "volume": "/tmp",
+      "filesystem": "tmpfs",
+      "system_volume": false
+    }
+  }
+}

@@ -1,0 +1,60 @@
+{
+  "platform": "windows-whp-virtual-machine",
+  "runner_name": "azure-windows-5",
+  "machine_name": "vmssvaoan000004",
+  "cpu": {
+    "vendor": "GenuineIntel",
+    "family": 6,
+    "model": 106,
+    "stepping": 6,
+    "brand": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+    "microcode": "0xffffffff"
+  },
+  "logical_processors": 8,
+  "memory_gib": 31.9,
+  "os": {
+    "system": "Windows",
+    "release": "10.0.26100",
+    "revision": 33438
+  },
+  "azure": {
+    "vm_size": "Standard_D8s_v5",
+    "os_disk": {
+      "storage_account_type": "Premium_LRS",
+      "size_gib": 128,
+      "caching": "None",
+      "write_accelerator_enabled": false,
+      "ephemeral_option": null
+    },
+    "data_disks": [
+      {
+        "lun": 0,
+        "storage_account_type": "Premium_LRS",
+        "size_gib": 512,
+        "caching": "None",
+        "write_accelerator_enabled": false,
+        "ephemeral_option": null,
+        "bytes_per_second_throttle": null,
+        "ops_per_second_throttle": null
+      }
+    ],
+    "resource_disk_size_kib": 0
+  },
+  "volumes": {
+    "workspace": {
+      "volume": "C:",
+      "filesystem": "NTFS",
+      "system_volume": true
+    },
+    "temporary": {
+      "volume": "C:",
+      "filesystem": "NTFS",
+      "system_volume": true
+    },
+    "scratch": {
+      "volume": "F:",
+      "filesystem": "NTFS",
+      "system_volume": false
+    }
+  }
+}

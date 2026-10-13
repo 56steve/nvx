@@ -17,7 +17,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import cast
 
-from . import host_telemetry
+from . import benchmark_host, host_telemetry
 from .common import bytes_to_mib, positive_int, sha256_file
 
 LEGACY_CSV_FIELDS = ["commit", "metric", "unit", "direction", "p50"]
@@ -1665,6 +1665,120 @@ def _storage_telemetry_table(document: dict[str, object], backend: str) -> list[
     ]
 
 
+RecordedHost = tuple[Path, dict[str, object]]
+"""A benchmark host identity and the first document that records it."""
+
+
+def _annotation(kind: str, title: str, message: str) -> str:
+    """Return a GitHub Actions workflow command that annotates the job."""
+
+    def escape(text: str) -> str:
+        return text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+    title = escape(title).replace(":", "%3A").replace(",", "%2C")
+    return f"::{kind} title={title}::{escape(message)}"
+
+
+def _read_host(path: Path, platform: str) -> dict[str, object]:
+    try:
+        return benchmark_host.read_host(path, platform)
+    except benchmark_host.HostFileError as error:
+        raise PerformanceError(str(error)) from error
+
+
+def _host_differences(
+    expected: dict[str, object], actual: dict[str, object]
+) -> list[benchmark_host.HostField]:
+    return [
+        field
+        for field in benchmark_host.compare_hosts(expected, actual)
+        if field.result != benchmark_host.MATCH
+    ]
+
+
+def _describe_fields(fields: Sequence[benchmark_host.HostField]) -> str:
+    return "; ".join(field.describe() for field in fields)
+
+
+def _recorded_host(
+    platform: str, sources: Sequence[tuple[Path, object]]
+) -> RecordedHost | None:
+    """Return the host that the benchmark documents ``sources`` record: all
+    of them must record the same host, or none of them may record one."""
+    recorded = [
+        (
+            path,
+            benchmark_host.host_identity(platform, _json_object(host, f"{path}:host")),
+        )
+        for path, host in sources
+        if host is not None
+    ]
+    if not recorded:
+        return None
+    unrecorded = [path for path, host in sources if host is None]
+    if unrecorded:
+        raise PerformanceError(
+            f"{recorded[0][0]} records a host, but {unrecorded[0]} records none"
+        )
+    (first_path, first), *others = recorded
+    for path, host in others:
+        differences = _host_differences(first, host)
+        if differences:
+            raise PerformanceError(
+                f"{first_path} and {path} record different hosts: "
+                + _describe_fields(differences)
+            )
+    return first_path, first
+
+
+def _check_recorded_host(
+    platform: str,
+    output_dir: Path,
+    recorded: RecordedHost | None,
+    output_path: Path,
+) -> None:
+    """Refuse to collect results into a directory whose results of the same
+    platform record another host, or mix results that record a host with
+    results that record none."""
+    path = benchmark_host.host_file(output_dir, platform)
+    if not path.exists():
+        if recorded is not None:
+            unrecorded = [
+                result_path
+                for result_path in sorted(output_dir.glob("*.csv"))
+                if result_path != output_path
+                and any(row.platform == platform for row in read_results(result_path))
+            ]
+            if unrecorded:
+                raise PerformanceError(
+                    f"{unrecorded[0]} holds {platform} results that record no "
+                    f"host, so the results of {recorded[0]} cannot join them"
+                )
+        return
+    if recorded is None:
+        raise PerformanceError(
+            f"the {platform} results record no host, but {path} records the "
+            f"host of the results in {output_dir}"
+        )
+    source, host = recorded
+    differences = _host_differences(_read_host(path, platform), host)
+    if differences:
+        raise PerformanceError(
+            f"{path} records another host than {source}: "
+            + _describe_fields(differences)
+        )
+
+
+def _write_recorded_host(
+    platform: str, output_dir: Path, recorded: RecordedHost | None
+) -> None:
+    if recorded is None:
+        return
+    path = benchmark_host.host_file(output_dir, platform)
+    benchmark_host.write_host(path, recorded[1])
+    print(f"Recorded the {platform} benchmark host: {path}")
+
+
 def collect_openvmm_results(
     platform: str,
     commit: str,
@@ -1675,6 +1789,7 @@ def collect_openvmm_results(
     if not commit:
         raise PerformanceError("commit must not be empty")
     lifecycle = read_lifecycle_data(platform, input_path)
+    host = _recorded_host(platform, [(input_path, lifecycle.document.get("host"))])
     results = [
         Result(
             commit,
@@ -1692,7 +1807,9 @@ def collect_openvmm_results(
         platform, lifecycle.microvm_abi_version, lifecycle.processors
     )
     output_path = output_dir / _result_filename(dimensions)
+    _check_recorded_host(platform, output_dir, host, output_path)
     write_results(output_path, results)
+    _write_recorded_host(platform, output_dir, host)
     if summary_path is not None:
         append_results_summary(summary_path, platform, results)
         append_openvmm_diagnostics(summary_path, platform, lifecycle, input_path)
@@ -1971,6 +2088,17 @@ def collect_results(
             + ")"
         )
 
+    # The workload logs always contribute metrics; without metadata, they
+    # record no host.
+    host_sources: list[tuple[Path, object]] = [
+        (
+            input_dir / BENCHMARK_METADATA_FILENAME,
+            None if workload_metadata is None else workload_metadata.get("host"),
+        )
+    ]
+    if lifecycle is not None and lifecycle_input is not None:
+        host_sources.append((lifecycle_input, lifecycle.document.get("host")))
+    host = _recorded_host(platform, host_sources)
     results = [
         Result(
             commit,
@@ -1985,7 +2113,9 @@ def collect_results(
         for metric, (unit, direction, p50) in sorted(collected.items())
     ]
     output_path = output_dir / _result_filename(dimensions)
+    _check_recorded_host(platform, output_dir, host, output_path)
     write_results(output_path, results)
+    _write_recorded_host(platform, output_dir, host)
     if summary_path is not None:
         append_results_summary(summary_path, platform, results)
         if lifecycle is not None:
@@ -2077,10 +2207,52 @@ def _compatible_baseline_results(
     return compatible
 
 
+def _verify_result_hosts(
+    source_dir: Path, history_dir: Path, platforms: Iterable[str], require_host: bool
+) -> None:
+    """Refuse results whose recorded host, the source's host file, differs
+    from the host of the history, the history's host file, in a required
+    field, and results that record no host for a history that records one.
+    With ``require_host``, both files must exist."""
+    for platform in sorted(platforms):
+        recorded_path = benchmark_host.host_file(source_dir, platform)
+        expected_path = benchmark_host.host_file(history_dir, platform)
+        missing = [
+            path for path in (recorded_path, expected_path) if not path.is_file()
+        ]
+        if missing:
+            if require_host or missing == [recorded_path]:
+                raise PerformanceError(
+                    f"cannot verify the host of the {platform} results: "
+                    f"{missing[0]} does not exist"
+                )
+            continue
+        fields = benchmark_host.compare_hosts(
+            _read_host(expected_path, platform), _read_host(recorded_path, platform)
+        )
+        changed = benchmark_host.mismatches(fields)
+        if changed:
+            raise PerformanceError(
+                f"refusing to persist the {platform} results: their host differs "
+                f"from {expected_path} in required fields: " + _describe_fields(changed)
+            )
+        drifted = benchmark_host.drift(fields)
+        if drifted:
+            print(
+                _annotation(
+                    "warning",
+                    "Benchmark host drift",
+                    f"The host of the {platform} results differs from "
+                    f"{expected_path} in advisory fields: " + _describe_fields(drifted),
+                )
+            )
+
+
 def persist_results(
     source_dir: Path,
     history_dir: Path,
     excluded_metrics: Iterable[str] = (),
+    require_host: bool = False,
 ) -> None:
     source_files = sorted(source_dir.glob("*.csv"))
     if not source_files:
@@ -2091,6 +2263,12 @@ def persist_results(
     for path, results in loaded.items():
         _validate_current_results(path, results)
     _validate_result_files(source_files, loaded)
+    _verify_result_hosts(
+        source_dir,
+        history_dir,
+        {result.platform for results in loaded.values() for result in results},
+        require_host,
+    )
 
     for source_path in source_files:
         source_results = loaded[source_path]
@@ -2176,6 +2354,16 @@ def gate_results(
     for path, results in loaded_targets.items():
         _validate_current_results(path, results)
     _validate_result_files(target_files, loaded_targets)
+    host_changes = _host_changes(
+        baseline_dir,
+        history_reset_dir,
+        {
+            result.platform or path.stem
+            for path, results in loaded_targets.items()
+            for result in results
+        },
+    )
+    unreset: dict[str, int] = defaultdict(int)
 
     checked = 0
     regressions = 0
@@ -2187,9 +2375,21 @@ def gate_results(
         f"lower-is-better millisecond metrics "
         f"must also increase by >{absolute_tolerance_ms:g} ms).",
         "",
-        "| Platform | Metric | PR p50 | Base p50 median | Delta | Result |",
-        "| --- | --- | ---: | ---: | ---: | --- |",
     ]
+    for platform, changed in host_changes.items():
+        summary.extend(
+            (
+                f"This change accepts a new expected host for {platform}, so each "
+                f"of its metrics must restart its warmup: {_describe_fields(changed)}.",
+                "",
+            )
+        )
+    summary.extend(
+        (
+            "| Platform | Metric | PR p50 | Base p50 median | Delta | Result |",
+            "| --- | --- | ---: | ---: | ---: | --- |",
+        )
+    )
 
     for target_path in target_files:
         targets = loaded_targets[target_path]
@@ -2240,6 +2440,20 @@ def gate_results(
                 summary.append(
                     f"| {dimension} | `{target.metric}` | "
                     f"{_format_value(target.p50, target.unit)} | - | - | {status} |"
+                )
+                continue
+            if platform in host_changes:
+                # Persisting this host's results after the previous host's
+                # would mix two hosts in one series.
+                unreset[platform] += 1
+                print(
+                    f"HOST CHANGED: {dimension}/{target.metric} keeps "
+                    f"{len(samples)} base-branch point(s) of the previous host"
+                )
+                summary.append(
+                    f"| {dimension} | `{target.metric}` | "
+                    f"{_format_value(target.p50, target.unit)} | - | - | "
+                    "**Host changed without a history reset** |"
                 )
                 continue
             if len(samples) < minimum_history:
@@ -2303,25 +2517,189 @@ def gate_results(
                 f"{status} |"
             )
 
-    summary.extend(
-        [
-            "",
-            f"Checked {checked} metric(s); found {regressions} regression(s).",
-            "",
-        ]
-    )
+    totals = f"Checked {checked} metric(s); found {regressions} regression(s)."
+    summary.extend(["", totals, ""])
+    # A series with a new host must keep no row of the previous host in any
+    # history file, including metrics that this change no longer measures.
+    kept_history: dict[str, str] = {}
+    for platform in host_changes:
+        assert history_reset_dir is not None
+        rows = _retained_rows(history_reset_dir, platform)
+        if rows:
+            kept_history[platform] = ", ".join(
+                f"{path.name} ({count} row(s))" for path, count in rows.items()
+            )
+        elif unreset[platform]:
+            kept_history[platform] = (
+                f"{unreset[platform]} metric(s) with base-branch history"
+            )
+    for platform, kept in kept_history.items():
+        summary.extend(
+            (
+                f"**The {platform} series keeps the previous host's history**: "
+                f"{kept}. Truncate each of its history files to its header line.",
+                "",
+            )
+        )
     if summary_path is not None:
         summary_path.parent.mkdir(parents=True, exist_ok=True)
         with summary_path.open("a", encoding="utf-8") as output:
             output.write("\n".join(summary))
 
+    for platform, kept in kept_history.items():
+        assert history_reset_dir is not None
+        print(
+            _annotation(
+                "error",
+                "Benchmark host changed without a history reset",
+                f"{benchmark_host.host_file(history_reset_dir, platform)} changes "
+                f"required fields of the {platform} host "
+                f"({_describe_fields(host_changes[platform])}), but the series "
+                f"keeps the previous host's history: {kept}. Truncate each of the "
+                "series' history files to its header line in the same change "
+                '(doc/benchmarks.md, "Expected benchmark hosts").',
+            )
+        )
     print(
         f"Checked {checked} metric(s), found {regressions} regression(s) "
         f"(threshold: >{threshold:g}% vs {window}-point median; "
         f"minimum history: {minimum_history}; "
         f"absolute latency tolerance: {absolute_tolerance_ms:g} ms)."
     )
-    return 1 if regressions else 0
+    return 1 if regressions or kept_history else 0
+
+
+def _retained_rows(directory: Path, platform: str) -> dict[Path, int]:
+    """Count the rows of ``platform`` in each history file in ``directory``."""
+    counts: dict[Path, int] = {}
+    for path in sorted(directory.glob("*.csv")):
+        count = sum(result.platform == platform for result in read_results(path))
+        if count:
+            counts[path] = count
+    return counts
+
+
+def _host_changes(
+    baseline_dir: Path, candidate_dir: Path | None, platforms: Iterable[str]
+) -> dict[str, list[benchmark_host.HostField]]:
+    """Return the required fields in which each platform's expected host in
+    ``candidate_dir`` differs from the base branch's in ``baseline_dir``."""
+    changes: dict[str, list[benchmark_host.HostField]] = {}
+    if candidate_dir is None:
+        return changes
+    for platform in sorted(platforms):
+        base = benchmark_host.host_file(baseline_dir, platform)
+        candidate = benchmark_host.host_file(candidate_dir, platform)
+        if base.is_file() and candidate.is_file():
+            changed = benchmark_host.mismatches(
+                benchmark_host.compare_hosts(
+                    _read_host(base, platform), _read_host(candidate, platform)
+                )
+            )
+            if changed:
+                changes[platform] = changed
+    return changes
+
+
+def check_host(
+    platform: str,
+    history_dir: Path,
+    scratch_dir: Path | None = None,
+    output: Path | None = None,
+    summary_path: Path | None = None,
+) -> int:
+    """Compare this host with the expected host of ``platform``'s series, in
+    ``history_dir``. Return 0 when every required field matches, even with
+    advisory drift, 1 when one differs, and 2 when the expected host is
+    missing or malformed."""
+    provenance = host_telemetry.host_provenance(
+        benchmark_host.benchmark_volumes(scratch_dir)
+    )
+    print("Benchmark host: " + host_telemetry.describe_host_provenance(provenance))
+    actual = benchmark_host.host_identity(platform, provenance)
+    expected_path = benchmark_host.host_file(history_dir, platform)
+    title = PLATFORM_NAMES.get(platform, platform)
+    # Read the expected host first: --output may name the expected host file
+    # itself, and the check must compare with the file as it was.
+    expected: dict[str, object] = {}
+    failure: benchmark_host.HostFileError | None = None
+    try:
+        expected = benchmark_host.read_host(expected_path, platform)
+    except benchmark_host.HostFileError as error:
+        failure = error
+    if output is not None:
+        benchmark_host.write_host(output, actual)
+    if failure is not None:
+        print(
+            _annotation(
+                "error",
+                "Benchmark host",
+                f"{title}: {failure}. Add the series' expected host, such as this "
+                "runner's from the step summary, as doc/benchmarks.md "
+                '("Expected benchmark hosts") describes.',
+            )
+        )
+        print(benchmark_host.format_host(actual), end="")
+        if summary_path is not None:
+            with summary_path.open("a", encoding="utf-8", newline="\n") as summary:
+                summary.write(
+                    "\n".join(
+                        (
+                            "",
+                            f"## Benchmark host check: {title}",
+                            "",
+                            f"**No valid expected host**: {failure}.",
+                            "",
+                            *benchmark_host.actual_host_markdown(actual),
+                        )
+                    )
+                )
+        return 2
+    fields = benchmark_host.compare_hosts(expected, actual)
+    changed = benchmark_host.mismatches(fields)
+    drifted = benchmark_host.drift(fields)
+    for field in fields:
+        print(f"{field.result.upper()}: {field.describe()}")
+    if changed:
+        print(
+            _annotation(
+                "error",
+                "Benchmark host mismatch",
+                f"{title}: this runner differs from {expected_path} in "
+                f"{len(changed)} required field(s): {_describe_fields(changed)}. "
+                "The series' history comes from the expected host; to measure "
+                "it here, accept this host and reset the history "
+                '(doc/benchmarks.md, "Expected benchmark hosts").',
+            )
+        )
+    if drifted:
+        print(
+            _annotation(
+                "warning",
+                "Benchmark host drift",
+                f"{title}: this runner differs from {expected_path} in "
+                f"advisory field(s): {_describe_fields(drifted)}. Update the "
+                "file to acknowledge them; that needs no history reset.",
+            )
+        )
+    if changed or drifted:
+        print(benchmark_host.format_host(actual), end="")
+    if summary_path is not None:
+        with summary_path.open("a", encoding="utf-8", newline="\n") as summary:
+            summary.write(
+                "\n"
+                + benchmark_host.host_check_markdown(
+                    title, expected_path, fields, actual
+                )
+            )
+    if changed:
+        outcome = f"{len(changed)} required field(s) differ"
+    elif drifted:
+        outcome = f"match with {len(drifted)} advisory difference(s)"
+    else:
+        outcome = "match"
+    print(f"Benchmark host check for {platform}: {outcome}")
+    return 1 if changed else 0
 
 
 def _non_negative_float(value: str) -> float:
@@ -2383,14 +2761,21 @@ def configure_parser(parser: argparse.ArgumentParser) -> None:
     collect_openvmm.add_argument("--summary", type=Path)
 
     gate = commands.add_parser("gate", help="check current p50 values for regressions")
-    gate.add_argument("--baseline-dir", type=Path, required=True)
+    gate.add_argument(
+        "--baseline-dir",
+        type=Path,
+        required=True,
+        help="base-branch histories and expected hosts (<platform>-host.json)",
+    )
     gate.add_argument("--target-dir", type=Path, required=True)
     gate.add_argument(
         "--history-reset-dir",
         type=Path,
         help=(
-            "tracked candidate histories; metrics removed from an existing "
-            "history file restart baseline warmup"
+            "tracked candidate histories and expected hosts; metrics removed "
+            "from an existing history file restart baseline warmup, and a "
+            "changed required field of an expected host requires that every "
+            "metric of its series restart"
         ),
     )
     gate.add_argument("--window", type=positive_int, default=10)
@@ -2424,6 +2809,39 @@ def configure_parser(parser: argparse.ArgumentParser) -> None:
         metavar="NAME",
         help="metric to omit from persistence (repeatable)",
     )
+    persist.add_argument(
+        "--require-host",
+        action="store_true",
+        help=(
+            "require each platform's recorded host in --source-dir and expected "
+            "host in --history-dir (<platform>-host.json); without it, only "
+            "hosts that both directories record are compared"
+        ),
+    )
+
+    check = commands.add_parser(
+        "check-host",
+        help="compare this host with the expected host of a performance series",
+    )
+    check.add_argument("--platform", required=True)
+    check.add_argument(
+        "--history-dir",
+        type=Path,
+        required=True,
+        help="directory of the series' expected host, <platform>-host.json",
+    )
+    check.add_argument(
+        "--scratch-dir",
+        type=Path,
+        help=(
+            "benchmark scratch directory that the benchmarks will use "
+            "(default: the system temporary directory)"
+        ),
+    )
+    check.add_argument(
+        "--output", type=Path, help="write this host as a host file to this path"
+    )
+    check.add_argument("--summary", type=Path)
     parser.set_defaults(handler=command_performance)
 
 
@@ -2485,7 +2903,20 @@ def command_performance(args: argparse.Namespace) -> int:
                 minimum_history=args.minimum_history,
                 history_reset_dir=args.history_reset_dir,
             )
-        persist_results(args.source_dir, args.history_dir, args.exclude_metric)
+        if args.performance_command == "check-host":
+            return check_host(
+                args.platform,
+                args.history_dir,
+                scratch_dir=args.scratch_dir,
+                output=args.output,
+                summary_path=args.summary,
+            )
+        persist_results(
+            args.source_dir,
+            args.history_dir,
+            args.exclude_metric,
+            require_host=args.require_host,
+        )
         return 0
     except (PerformanceError, OSError, csv.Error) as error:
         print(f"ERROR: {error}", file=sys.stderr)
