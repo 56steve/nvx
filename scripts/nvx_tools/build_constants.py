@@ -157,14 +157,17 @@ class GuestRustBuildConstants:
     """Pinned inputs and outputs of the Rust guest-binary build."""
 
     DIRECTORY: Final = BuildConstants.REPO_ROOT / "nvx-rs"
-    MANIFEST: Final = DIRECTORY / "Cargo.toml"
-    LOCKFILE: Final = DIRECTORY / "Cargo.lock"
-    BUILD_SCRIPT: Final = DIRECTORY / "build.rs"
-    SOURCE_DIRECTORIES: Final = (DIRECTORY / "src",)
-    BUILD_RECIPE_FILES: Final = (
-        BuildConstants.REPO_ROOT / "scripts" / "nvx_tools" / "build_constants.py",
-        BuildConstants.REPO_ROOT / "scripts" / "nvx_tools" / "guest_binaries.py",
+    # The inputs of every guest executable, relative to a checkout's root: these
+    # files and every file under SOURCE_DIRECTORY outside a `target` tree.
+    SOURCE_FILES: Final = (
+        Path("nvx-rs") / "Cargo.toml",
+        Path("nvx-rs") / "Cargo.lock",
+        Path("nvx-rs") / "build.rs",
+        Path("rust-toolchain.toml"),
+        Path("scripts") / "nvx_tools" / "build_constants.py",
+        Path("scripts") / "nvx_tools" / "guest_binaries.py",
     )
+    SOURCE_DIRECTORY: Final = Path("nvx-rs") / "src"
     TOOLCHAIN_FILE: Final = BuildConstants.REPO_ROOT / "rust-toolchain.toml"
     TOOLCHAIN: Final = OpenVMMBuildConstants.RUST_TOOLCHAIN
     TARGET: Final = OpenVMMBuildConstants.MUSL_RUST_TARGET
@@ -177,6 +180,7 @@ class GuestRustBuildConstants:
     BUILD_MANIFEST_FORMAT: Final = 1
     BUILD_MANIFEST_DOMAIN: Final = "nvx-rust-guest-binary-build"
     OUTPUT_DIRECTORY_NAME: Final = "guest-binaries"
+    SOURCE_PATHS: Final = ("nvx-rs", "rust-toolchain.toml")
     BINARIES: Final = (
         "nvx-console-pending",
         "nvx-mmio-write",
@@ -412,6 +416,7 @@ class ReleaseBuildConstants:
     PROJECT_SOURCE_PATHS: Final = (
         ".github/agents/nvx-adversary.md",
         "guest",
+        "nvx-rs",
         "ubuntu",
         "azurelinux",
         "data/linux-kvm-virtual-machine.csv",
@@ -433,6 +438,7 @@ class ReleaseBuildConstants:
         "requirements-dev.txt",
         "rust-toolchain.toml",
     )
+    PROJECT_SOURCE_EXCLUDES: Final = (Path("nvx-rs") / "target",)
     GUEST_ARTIFACT_NAMES: Final = (
         KernelBuildConstants.BINARY_NAME,
         KernelBuildConstants.CONFIG_NAME,

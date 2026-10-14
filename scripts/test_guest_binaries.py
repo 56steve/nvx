@@ -85,6 +85,11 @@ class GuestBinaryBuildTests(unittest.TestCase):
             path.relative_to(BuildConstants.REPO_ROOT).as_posix()
             for path in guest_binaries.guest_binary_source_files()
         }
+        # The build constants list the inputs that the inventory reads.
+        self.assertLessEqual(
+            {path.as_posix() for path in GuestRustBuildConstants.SOURCE_FILES},
+            relative,
+        )
         self.assertIn("rust-toolchain.toml", relative)
         self.assertIn("nvx-rs/Cargo.toml", relative)
         self.assertIn("nvx-rs/Cargo.lock", relative)
@@ -99,6 +104,50 @@ class GuestBinaryBuildTests(unittest.TestCase):
             guest_binaries.pinned_guest_rust_toolchain(),
             GuestRustBuildConstants.TOOLCHAIN,
         )
+
+    def test_toolchain_pin_must_match_the_guest_build_constants(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "rust-toolchain.toml").write_text(
+                '[toolchain]\nchannel = "9.9.9"\n',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                guest_binaries.ScriptError,
+                "Rust guest build toolchain mismatch",
+            ):
+                guest_binaries.pinned_guest_rust_toolchain(root)
+
+    def test_source_inventory_preserves_the_callers_root_spelling(self):
+        with tempfile.TemporaryDirectory(
+            prefix=".test-guest-binary-root-",
+            dir=BuildConstants.REPO_ROOT,
+        ) as temporary:
+            root = Path(temporary)
+            relative_root = Path(os.path.relpath(root, Path.cwd()))
+            crate = root / "nvx-rs"
+            source = crate / "src"
+            tools = root / "scripts" / "nvx_tools"
+            source.mkdir(parents=True)
+            tools.mkdir(parents=True)
+            for path in (
+                crate / "Cargo.toml",
+                crate / "Cargo.lock",
+                crate / "build.rs",
+                source / "lib.rs",
+                tools / "build_constants.py",
+                tools / "guest_binaries.py",
+                root / "rust-toolchain.toml",
+            ):
+                path.write_text(f"{path.name}\n", encoding="utf-8")
+
+            inventory = guest_binaries.guest_binary_source_files(relative_root)
+
+            self.assertTrue(all(not path.is_absolute() for path in inventory))
+            self.assertEqual(
+                guest_binaries.guest_binary_source_sha256(relative_root),
+                guest_binaries.guest_binary_source_sha256(root),
+            )
 
     def test_build_uses_fresh_remapped_target_and_writes_manifest(self):
         with tempfile.TemporaryDirectory(
@@ -163,21 +212,6 @@ class GuestBinaryBuildTests(unittest.TestCase):
                 patch.object(guest_binaries.sys, "platform", "linux"),
                 patch.object(BuildConstants, "REPO_ROOT", root),
                 patch.object(GuestRustBuildConstants, "DIRECTORY", crate),
-                patch.object(GuestRustBuildConstants, "MANIFEST", crate / "Cargo.toml"),
-                patch.object(GuestRustBuildConstants, "LOCKFILE", crate / "Cargo.lock"),
-                patch.object(
-                    GuestRustBuildConstants, "BUILD_SCRIPT", crate / "build.rs"
-                ),
-                patch.object(
-                    GuestRustBuildConstants,
-                    "SOURCE_DIRECTORIES",
-                    (source,),
-                ),
-                patch.object(
-                    GuestRustBuildConstants,
-                    "BUILD_RECIPE_FILES",
-                    (recipe_constants, recipe_builder),
-                ),
                 patch.object(
                     GuestRustBuildConstants,
                     "TOOLCHAIN_FILE",
