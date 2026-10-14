@@ -39,9 +39,11 @@ pub const MAX_CHILDREN: usize = 256;
 /// Largest number of hidden, allowed, or writable paths that OpenVMM accepts in one exported
 /// directory, and their largest combined length.
 const MAX_POLICY_PATHS: usize = 128;
+/// Largest combined UTF-8 byte length of one exported directory's policy paths.
 const MAX_POLICY_BYTES: usize = 16 * 1024;
 /// Largest length of one such path, and of all of them together.
 const MAX_POLICY_PATH_BYTES: usize = 4096;
+/// Largest combined UTF-8 byte length of all policies in one aggregate export.
 const MAX_AGGREGATE_POLICY_BYTES: usize = 128 * 1024;
 /// Longest guest path, without the terminating NUL.
 const MAX_GUEST_PATH: usize = 4095;
@@ -127,6 +129,7 @@ impl Bind {
     }
 }
 
+/// Joins an aggregate child index and child-relative source into a guest export path.
 fn guest_source(child: usize, source: &str) -> String {
     if source.is_empty() {
         child.to_string()
@@ -758,16 +761,19 @@ fn check_policy_paths(root: &Path, paths: &[PathBuf], action: &str) -> Result<us
 }
 
 #[cfg(windows)]
+/// Returns whether Windows marks `metadata` as a reparse point.
 fn is_reparse_point(metadata: &fs::Metadata) -> bool {
     use std::os::windows::fs::MetadataExt;
     metadata.file_attributes() & 0x400 != 0
 }
 
 #[cfg(not(windows))]
+/// Reports no reparse points on hosts whose metadata has no such Windows attribute.
 fn is_reparse_point(_metadata: &fs::Metadata) -> bool {
     false
 }
 
+/// Returns the stable device-and-file identity of `path` for rename detection.
 fn identity(path: &Path) -> Result<FileIdentity> {
     platform::file_identity(path)
         .map(|(device, index)| FileIdentity { device, index })
@@ -786,14 +792,21 @@ fn relative_text(root: &Path, path: &Path) -> Option<String> {
     Some(parts.join("/"))
 }
 
+/// Canonicalized, validated form of one requested host mapping.
 struct Mapped {
+    /// Host path exactly as the caller supplied it, for diagnostics.
     given: PathBuf,
+    /// Link-resolved host path used to construct the export.
     canonical: PathBuf,
+    /// Absolute guest destination of the bind mount.
     target: String,
+    /// Whether the guest must mount this path read-only.
     read_only: bool,
+    /// Whether the mapped host object is a directory rather than a regular file.
     directory: bool,
 }
 
+/// Returns whether `path` is `directory` or one of its descendants.
 fn within(path: &str, directory: &str) -> bool {
     path == directory
         || path
@@ -801,6 +814,7 @@ fn within(path: &str, directory: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('/'))
 }
 
+/// Counts the nonempty components of an absolute guest path.
 fn depth(path: &str) -> usize {
     path.split('/').filter(|part| !part.is_empty()).count()
 }
@@ -847,6 +861,7 @@ fn canonicalize_lenient(path: &Path) -> std::io::Result<(PathBuf, bool)> {
 }
 
 #[cfg(windows)]
+/// Removes a local Windows verbatim prefix and rejects UNC paths.
 fn strip_verbatim(path: &Path) -> Option<PathBuf> {
     let text = path.to_str()?;
     match text.strip_prefix(r"\\?\") {
@@ -858,10 +873,12 @@ fn strip_verbatim(path: &Path) -> Option<PathBuf> {
 }
 
 #[cfg(not(windows))]
+/// Returns the unchanged path on hosts without Windows verbatim prefixes.
 fn strip_verbatim(path: &Path) -> Option<PathBuf> {
     Some(path.to_path_buf())
 }
 
+/// Returns a lossily decoded path for user-facing diagnostics.
 fn display_path(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }

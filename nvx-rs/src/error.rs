@@ -57,8 +57,11 @@ impl fmt::Display for ErrorKind {
 /// errors onto their own classifications by [`kind`](Self::kind) alone.
 #[derive(Debug)]
 pub struct Error {
+    /// Stable classification that callers use when mapping the failure.
     kind: ErrorKind,
+    /// Complete, user-facing description without a trailing period.
     message: String,
+    /// Underlying implementation error, when retaining it aids diagnostics.
     source: Option<Box<dyn std::error::Error + Send + Sync + 'static>>,
 }
 

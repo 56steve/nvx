@@ -8,7 +8,9 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 /// Networks order by address, IPv4 before IPv6, and then by prefix length.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Cidr {
+    /// First address of the network, with every host bit clear.
     address: IpAddr,
+    /// Number of leading network bits, from zero through the address-family width.
     prefix: u8,
 }
 
@@ -68,10 +70,12 @@ impl Cidr {
         self.contains(other) || other.contains(self)
     }
 
+    /// Returns the bit width of this network's address family.
     fn width(self) -> u8 {
         if self.is_ipv6() { 128 } else { 32 }
     }
 
+    /// Returns the network address as an integer, with IPv4 in the low 32 bits.
     fn bits(self) -> u128 {
         match self.address {
             IpAddr::V4(address) => u128::from(u32::from(address)),
@@ -88,6 +92,7 @@ impl Cidr {
         Self { address, prefix }
     }
 
+    /// Splits this network into its equally sized low and high child networks.
     fn halves(self) -> [Self; 2] {
         let prefix = self.prefix + 1;
         [
@@ -133,6 +138,7 @@ impl Cidr {
             && high.subtract_sorted(&excluded[split..], limit, remainder)
     }
 
+    /// Clears the host bits and returns the resulting network address.
     fn network(self) -> IpAddr {
         self.with_bits(mask(self.bits(), self.prefix, self.width()), self.prefix)
             .address

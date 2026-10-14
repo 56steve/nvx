@@ -41,15 +41,18 @@ use crate::hypervisor::Hypervisor;
 /// Whether this host can run NVX microVMs.
 pub const SUPPORTED: bool = true;
 
+/// Encodes `value` as a NUL-terminated UTF-16 string for Win32.
 fn wide(value: impl AsRef<OsStr>) -> Vec<u16> {
     value.as_ref().encode_wide().chain([0]).collect()
 }
 
+/// Returns the calling thread's Win32 last-error code.
 fn last_error() -> u32 {
     // SAFETY: GetLastError has no preconditions.
     unsafe { GetLastError() }
 }
 
+/// Takes ownership of a newly returned valid Win32 `handle`.
 fn owned(handle: HANDLE) -> Option<OwnedHandle> {
     if handle.is_null() || handle == INVALID_HANDLE_VALUE {
         None
@@ -59,15 +62,18 @@ fn owned(handle: HANDLE) -> Option<OwnedHandle> {
     }
 }
 
+/// Borrows an owned handle in the form expected by `windows-sys`.
 fn raw(handle: &OwnedHandle) -> HANDLE {
     handle.as_raw_handle() as HANDLE
 }
 
+/// Opens process `pid` with `access`, returning `None` on any Win32 failure.
 fn open_process(pid: u32, access: u32) -> Option<OwnedHandle> {
     // SAFETY: OpenProcess has no memory-safety preconditions.
     owned(unsafe { OpenProcess(access, 0, pid) })
 }
 
+/// Returns the process creation `FILETIME`, used with the PID as a stable identity.
 fn creation_time(process: &OwnedHandle) -> io::Result<u64> {
     let mut created = FILETIME {
         dwLowDateTime: 0,
@@ -93,6 +99,7 @@ fn creation_time(process: &OwnedHandle) -> io::Result<u64> {
     }
 }
 
+/// Polls `process` without waiting and reports whether it has exited.
 fn has_exited(process: &OwnedHandle) -> io::Result<bool> {
     // SAFETY: the handle has synchronize access; a zero timeout only polls.
     match unsafe { WaitForSingleObject(raw(process), 0) } {
@@ -160,11 +167,14 @@ pub(crate) fn kill_process(pid: u32, start_time: u64) -> io::Result<()> {
 
 /// An OpenVMM process launched by this caller, held through its process handle.
 pub(crate) struct LaunchedProcess {
+    /// Process handle retained for termination and waiting.
     process: OwnedHandle,
+    /// Numeric process identifier reported to instance state.
     pid: u32,
 }
 
 impl LaunchedProcess {
+    /// Returns the numeric process identifier.
     pub(crate) fn id(&self) -> u32 {
         self.pid
     }
@@ -181,11 +191,12 @@ impl LaunchedProcess {
 
 /// Owns an initialized process-thread attribute list.
 struct AttributeList {
-    // Backing storage, kept `usize`-aligned for the opaque list structure.
+    /// Backing storage, kept `usize`-aligned for the opaque list structure.
     buffer: Vec<usize>,
 }
 
 impl AttributeList {
+    /// Allocates and initializes a list with room for `count` attributes.
     fn new(count: u32) -> io::Result<Self> {
         let mut size = 0;
         // SAFETY: a null list with a size pointer only queries the required size.
@@ -201,6 +212,7 @@ impl AttributeList {
         Ok(Self { buffer })
     }
 
+    /// Returns the mutable opaque-list pointer used by Win32 process APIs.
     fn as_ptr(&mut self) -> LPPROC_THREAD_ATTRIBUTE_LIST {
         self.buffer.as_mut_ptr().cast()
     }
@@ -320,6 +332,7 @@ fn command_line(program: &OsStr, arguments: &[OsString]) -> io::Result<Vec<u16>>
     Ok(line)
 }
 
+/// Appends one argument using the Microsoft C runtime's backslash-and-quote rules.
 fn append_argument(line: &mut Vec<u16>, argument: &OsStr, always_quote: bool) -> io::Result<()> {
     let units: Vec<u16> = argument.encode_wide().collect();
     if units.contains(&0) {
@@ -550,8 +563,11 @@ pub(crate) fn endpoint_server_pid(endpoint: &str) -> io::Result<Option<u32>> {
     }
 }
 
+/// Overlapped byte transport over OpenVMM's named-pipe control endpoint.
 struct PipeTransport {
+    /// Connected named-pipe client handle.
     pipe: OwnedHandle,
+    /// Manual event reused to wait for each overlapped operation.
     event: OwnedHandle,
 }
 
@@ -597,6 +613,7 @@ impl PipeTransport {
     }
 }
 
+/// Maps a completed pipe operation's Win32 status to Rust I/O semantics.
 fn completion_error(error: u32, transferred: usize, timed_out: bool) -> io::Result<usize> {
     match error {
         ERROR_OPERATION_ABORTED if timed_out => Err(io::ErrorKind::TimedOut.into()),

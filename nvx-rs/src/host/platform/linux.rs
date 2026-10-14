@@ -181,6 +181,7 @@ pub(crate) fn mark_listed_descriptors_close_on_exec() -> io::Result<()> {
     result
 }
 
+/// Marks the descriptors enumerated by the open `/proc/self/fd` `directory` close-on-exec.
 fn mark_directory_entries(directory: RawFd) -> io::Result<()> {
     #[repr(C, align(8))]
     struct Records([u8; 4096]);
@@ -329,6 +330,7 @@ pub(crate) fn endpoint_server_pid(endpoint: &str) -> io::Result<Option<u32>> {
     }
 }
 
+/// Connects to the Unix socket at `path` without waiting in a full listen backlog.
 fn connect_nonblocking(path: &str) -> io::Result<UnixStream> {
     // SAFETY: socket has no memory-safety preconditions.
     let descriptor = unsafe {
@@ -368,6 +370,7 @@ fn connect_nonblocking(path: &str) -> io::Result<UnixStream> {
     Ok(stream)
 }
 
+/// Returns the Linux peer credential's process ID for a connected Unix stream.
 fn peer_pid(stream: &UnixStream) -> io::Result<u32> {
     let mut credentials = libc::ucred {
         pid: 0,
@@ -392,14 +395,18 @@ fn peer_pid(stream: &UnixStream) -> io::Result<u32> {
     u32::try_from(credentials.pid).map_err(io::Error::other)
 }
 
+/// Blocking Unix-domain stream adapted to the control transport's deadline API.
 struct UnixTransport {
+    /// Connected stream to OpenVMM's control socket.
     stream: UnixStream,
 }
 
+/// Clamps a present socket timeout to the nonzero duration accepted by `std`.
 fn socket_timeout(timeout: Option<Duration>) -> Option<Duration> {
     timeout.map(|timeout| timeout.max(Duration::from_millis(1)))
 }
 
+/// Normalizes socket would-block and timeout errors to [`io::ErrorKind::TimedOut`].
 fn map_timeout(error: io::Error) -> io::Error {
     if matches!(
         error.kind(),

@@ -79,10 +79,12 @@ impl fmt::Display for ProtocolError {
 
 impl std::error::Error for ProtocolError {}
 
+/// Constructs a protocol error whose message describes the violated wire contract.
 fn violation(message: impl Into<String>) -> ProtocolError {
     ProtocolError(message.into())
 }
 
+/// Copies an exactly `N`-byte wire field into an array for integer decoding.
 fn array<const N: usize>(bytes: &[u8]) -> [u8; N] {
     let mut output = [0u8; N];
     output.copy_from_slice(bytes);

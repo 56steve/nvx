@@ -12,7 +12,9 @@ use std::time::{Duration, Instant};
 use super::platform;
 use crate::protocol::CAPABILITY_LEN;
 
+/// Longest wait for a terminated OpenVMM process to exit.
 const KILL_TIMEOUT: Duration = Duration::from_secs(10);
+/// Interval at which process shutdown and identity are polled.
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// An OpenVMM process this caller launched and has not released yet.
@@ -20,8 +22,10 @@ const POLL_INTERVAL: Duration = Duration::from_millis(25);
 /// Release it with [`detach_child`], or terminate it with [`kill_child`].
 pub struct Launched {
     #[cfg(not(windows))]
+    /// Child process retained until it is detached or terminated.
     child: Child,
     #[cfg(windows)]
+    /// Owned Windows process handle and identifier.
     process: platform::LaunchedProcess,
 }
 
