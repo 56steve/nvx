@@ -26,7 +26,7 @@ esac
 runtime=/run/nvx
 container_cgroup=/sys/fs/cgroup/container
 scratch_mount=$runtime/scratch
-# Restore packet v4 flags (doc/design/time-abi.md).
+# Restore packet v4 flags (doc/design/5.5-restore-protocol.md).
 PACKET_MEMORY_TARGET=2
 PACKET_ACK_REQUIRED=4
 container_frozen=false
@@ -287,7 +287,7 @@ esac
 export NVX_VM_GENERATION_ID="$generation_id"
 entropy=$runtime/restore-entropy
 
-# Restore steps 9 to 13 of the time ABI (doc/design/time-abi.md). nvx-time
+# Guest repair steps 4 to 7 (doc/design/5.5-restore-protocol.md). nvx-time
 # capture has already read restore packet v4, checked its generation, set
 # the wall clock, and written the entropy. Its metadata is FLAGS,
 # ONLINE_VP_COUNT, RANGE_COUNT, and the new generation ID, followed by START

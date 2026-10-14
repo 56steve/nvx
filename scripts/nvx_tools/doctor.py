@@ -1,6 +1,6 @@
 """Host qualification for the NVX time ABI (``nvx.py doctor``).
 
-doc/design/time-abi.md ("Host qualification") defines checks H1 to H7. Each
+doc/ci.md ("Host qualification") describes checks H1 to H7. Each
 check prints one ``NVX-DOCTOR: check=<id> status=<pass|fail> detail="..."``
 line, and qualification fails closed if any selected check fails. A failure
 that matches a time ABI failure code starts its detail with that code in
@@ -70,7 +70,7 @@ PROBE_PREFIX = "NVX-HOST-TIME-PROBE "
 VERIFY_PREFIX = "NVX-TIME-ABI-VERIFY:"
 CPU_PROFILE_PREFIX = "NVX-CPU-PROFILE:"
 RUST_ESCAPE = re.compile(r"\\(u\{[0-9a-fA-F]{1,6}\}|.)")
-# doc/design/time-abi.md, "Rate stability (H4)".
+# H4's rate stability bounds (doc/ci.md, "Host qualification").
 RATE_UNCERTAINTY_PPM = 0.25
 RATE_AGREEMENT_PPM = 1.0
 RATE_TOLERANCE_PPM = 100.0
@@ -88,8 +88,8 @@ class Schedule:
     warp_gaps: tuple[str, ...]
 
 
-# doc/design/time-abi.md, "Rate stability (H4)" and "Warp schedules": doctor
-# qualifies on the long schedules, and CI on the short ones.
+# H4's rate samples and H6's warp gaps (doc/ci.md, "Host qualification"):
+# doctor qualifies on the long schedules, and CI on the short ones.
 QUALIFICATION_SCHEDULE = Schedule(13, 10_000, QUALIFICATION_WARP_GAPS)
 CI_SCHEDULE = Schedule(3, 1_000, CI_WARP_GAPS)
 # Qualification gates only on measured properties, alike on every backend:
@@ -1135,8 +1135,7 @@ def default_probe_directory() -> Path:
 
 def configure_parser(parser: argparse.ArgumentParser) -> None:
     parser.description = (
-        "Qualify this host for the NVX time ABI (doc/design/time-abi.md, "
-        "'Host qualification')."
+        "Qualify this host for the NVX time ABI (doc/ci.md, 'Host qualification')."
     )
     parser.add_argument("--backend", choices=OPENVMM_TEST_BACKENDS, required=True)
     parser.add_argument(

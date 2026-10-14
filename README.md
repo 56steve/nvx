@@ -71,11 +71,16 @@ python scripts\nvx.py run
 
 ### Development
 
-- [Design](doc/design.md) - Current microVM architecture and ABI.
+- [Design](doc/design/README.md) - Architecture of the NVX microVM and its single-workload guest
+  runtime.
+- [Ubuntu guest support](doc/guests/ubuntu-guest.md) - How NVX runs Ubuntu userland on its own
+  kernel.
+- [Azure Linux guest support](doc/guests/azurelinux-guest.md) - How NVX runs Azure Linux userland
+  on its own kernel.
 - [Project structure](doc/project-structure.md) - Overview of the NVX repository layout.
 - [Continuous integration](doc/ci.md) - Instructions for running and maintaining NVX CI.
-- [Copilot-driven adversarial testing](doc/design/copilot-adversarial-testing.md) - Bounded
-  adaptive stress and containment campaigns.
+- [Copilot-driven adversarial testing](doc/adversarial-testing.md) - Bounded adaptive stress and
+  containment campaigns.
 - [Package and source delivery](doc/distribution.md) - Instructions for packaging and distributing
 	NVX.
 - [Contributing](doc/contribute.md) - Guidelines for contributing to NVX.

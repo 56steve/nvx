@@ -751,7 +751,7 @@ Systemd entrypoints are explicitly unsupported and do not relax the non-root,
 drop-all-capabilities sandbox policy.
 
 This is the cold-filesystem bootstrap described in
-[the sandbox design](design/sandbox-filesystem-and-agent-architecture.md#implemented-filesystem-bootstrap), not the final
+[the sandbox design](design/4.1-guest-filesystem-and-image-model.md#411-layered-sandbox-root), not the final
 production agent. It accepts no environment variables or secrets and does not
 expose sandbox snapshot capture or restore, the configuration region, or runtime RPC.
 Arguments are individual kernel-command-line tokens and therefore cannot

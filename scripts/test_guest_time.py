@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Spec-derived tests for the guest time component, guest/common/nvx-time.c.
 
-The fixtures are encoded here from doc/design/time-abi.md, independently of
-the C decoders, so the tests check the guest against the specification.
+The fixtures encode the time ABI's guest-visible formats, such as the restore
+packet (doc/design/5.5-restore-protocol.md) and the time sample
+(doc/design/3.2-clock-and-time.md), independently of the C decoders, so the
+tests check the guest against the specification.
 """
 
 from __future__ import annotations

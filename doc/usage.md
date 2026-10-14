@@ -318,8 +318,8 @@ python3 scripts/nvx.py doctor
     [--timeout SECONDS]
 ```
 
-Qualifies this host for the [time ABI](design/time-abi.md#host-qualification).
-It runs the selected checks in spec order, prints one
+Qualifies this host for the [time ABI](design/3.2-clock-and-time.md).
+It runs the selected checks in order, prints one
 `NVX-DOCTOR: check=<id> status=<pass|fail> detail="..."` line per check, and
 exits with status 1 if any check fails. A check fails, and never passes, when
 it can't read a fact it gates on. [CI](ci.md#host-qualification) describes each
@@ -328,7 +328,7 @@ check and the subset that CI runs.
 | Option | Default | Description |
 | --- | --- | --- |
 | `--backend {kvm,mshv,whp}` | required | Select the backend to qualify. |
-| `--checks ID ...` | `H1` to `H7` | Run only these checks, from `H1` to `H7`, in spec order. |
+| `--checks ID ...` | `H1` to `H7` | Run only these checks, from `H1` to `H7`, in order. |
 | `--openvmm PATH` | `openvmm/target/release/openvmm[.exe]` | Select the OpenVMM binary for `H2`, `H3`, and `H6`. |
 | `--kernel PATH` | `build/vmlinux` | Select the guest kernel for `H3` and `H6`. |
 | `--initrd PATH` | `build/initramfs.cpio.gz` | Select the guest initramfs for `H3` and `H6`. |
@@ -421,7 +421,7 @@ must use a separate disposable executor through `--executor-command`; local
 mode cannot reliably classify a target-host crash. Local target logs are kept
 under the short `build/adv` state root to avoid Windows path-length failures;
 the run summary records their absolute location. See
-[Copilot-driven adversarial testing](design/copilot-adversarial-testing.md)
+[Copilot-driven adversarial testing](adversarial-testing.md)
 for the trust boundary, wrapper contract, artifacts, and CI policy.
 
 ## Download and run
@@ -639,7 +639,7 @@ snapshot/configuration limitations.
 
 Every microVM presents a CPU profile to its guest: the complete CPUID surface
 of one CPU generation, which OpenVMM pins and every backend shares (see the
-[time ABI](design/time-abi.md#cpu-profiles)). By default, OpenVMM selects the
+[CPU profile design](design/2.2-cpu-and-topology.md#221-cpu-profiles)). By default, OpenVMM selects the
 built-in profile of the host's CPU generation:
 
 | Profile | Generation | CPUs (display family/model) |

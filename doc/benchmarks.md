@@ -273,7 +273,7 @@ OpenVMM owns `BASE`; each `--cmdline` value below is appended to it. Restore pha
 command line and resume the one captured in the snapshot. OpenVMM also appends device-discovery
 tokens (`virtio_mmio.device=...` for an attached mount or NIC) and may replace `console=hvc0` with
 `console=hvc1` when a virtio console is selected. It appends no clock token: under the
-[time ABI](design/time-abi.md#rates) the NVX kernel reads the TSC and LAPIC timer rates from the
+[time ABI](design/3.2-clock-and-time.md#324-rates) the NVX kernel reads the TSC and LAPIC timer rates from the
 hypervisor identity's frequency MSRs and never calibrates either clock, and OpenVMM rejects a
 supplied `tsc_early_khz=` or `lapic_timer_hz=` token (`E_CMDLINE_CLOCK_TOKEN`). No benchmark
 command line tunes the clock or clocksource, except the `cold_start_clocksource` variant below.

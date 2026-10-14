@@ -1,12 +1,10 @@
 # Azure Linux guest support
 
-[Design index](../design.md)
-
 NVX runs Azure Linux 3.0 userland on its own Linux kernel. It builds one
 artifact, `initramfs-azurelinux.cpio.gz`, which `nvx.py run --guest azurelinux`
 boots for an interactive shell or a workload. The artifact boots no Azure Linux
 kernel, firmware, or systemd, and it does not change the
-[machine and device ABI](../design/machine-and-device-abi.md).
+[machine and device ABI](../design/2-virtual-machine-architecture.md).
 
 [Build](../build.md), [Run](../run.md), and the
 [command-line reference](../usage.md) cover the commands. This chapter
@@ -82,10 +80,10 @@ automated check compares two Azure Linux rebuilds.
 
 The Azure Linux initramfs boots like the Alpine one at the machine level:
 OpenVMM loads the kernel and initramfs through the
-[Linux direct MP-table loader](../design/cold-boot.md#linux-direct-mp-table-loader),
+[Linux direct MP-table loader](../design/5.1-boot-protocol.md#511-linux-direct-loader),
 and the common [`/init`](../../guest/common/init) runs as PID 1. It runs the
 same boot steps as for the other guests, including the
-[time ABI](../design/time-abi.md) boot step, and then runs an `nvx_exec`
+[time ABI](../design/3.2-clock-and-time.md) boot step, and then runs an `nvx_exec`
 workload, starts the managed agent, or opens a shell. The managed agent runs
 the workload directly in the initramfs root, not in a separate layer. On the
 shell path, `/init` reads the guest identity from `/etc/os-release`, stops on

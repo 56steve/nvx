@@ -167,7 +167,7 @@ runs:
           throw "Hyper-V SVGA firmware was not found: $svgaFirmware"
         }
 
-    # Host time. The time ABI host qualification (doc/design/time-abi.md,
+    # Host time. The time ABI host qualification (doc/ci.md,
     # "Host qualification") checks the backend, the CPU fingerprint and
     # generation, and the TSC rate stability on its short CI schedule, and,
     # in jobs that downloaded OpenVMM, its CPU profile check (H2) and

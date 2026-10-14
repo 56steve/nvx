@@ -1,11 +1,12 @@
 //! Host TSC probe for NVX time ABI host qualification.
 //!
 //! `nvx.py doctor` builds this file with `rustc` and runs it for the host
-//! checks of doc/design/time-abi.md: H2 (the CPU identity and the host's
-//! invariant-TSC bit), H4 (sleep-separated samples of the TSC against the
-//! host's monotonic clocks), and H5 (cross-CPU TSC skew between pinned
-//! threads). It has no dependencies and prints `NVX-HOST-TIME-PROBE` lines of
-//! `key=value` fields; the doctor applies the bounds.
+//! checks that doc/ci.md ("Host qualification") describes: H2 (the CPU
+//! identity and the host's invariant-TSC bit), H4 (sleep-separated samples of
+//! the TSC against the host's monotonic clocks), and H5 (cross-CPU TSC skew
+//! between pinned threads). It has no dependencies and prints
+//! `NVX-HOST-TIME-PROBE` lines of `key=value` fields; the doctor applies the
+//! bounds.
 
 use std::process::ExitCode;
 use std::sync::Arc;
