@@ -6,10 +6,13 @@
 //! wrappers that establish their pointer, lifetime, and ownership invariants. Errors are `nix`'s
 //! [`Errno`], whose descriptions the tools print.
 
+#[cfg(target_arch = "x86_64")]
+mod clock;
 mod fd;
 mod ioctl;
 mod mapping;
 mod process;
+mod socket;
 
 use std::ffi::CString;
 use std::io::{self, Write};
@@ -17,12 +20,15 @@ use std::os::unix::ffi::OsStringExt;
 
 pub(crate) use nix::errno::Errno;
 
+#[cfg(target_arch = "x86_64")]
+pub(crate) use clock::monotonic_ns;
 #[cfg(test)]
 pub(crate) use fd::create_fifo;
 pub(crate) use fd::{FileDescriptor, FileLock, Mode, OpenFlags, create_directory, open, page_size};
 pub(crate) use ioctl::{console_pending, reseed_random};
 pub(crate) use mapping::MemoryMapping;
-pub(crate) use process::{Stdout, restore_sigpipe};
+pub(crate) use process::{DirectStdout, Stdout, restore_sigpipe};
+pub(crate) use socket::connect_datagram;
 
 /// Returns the process arguments, program name first, as the C strings that `main` received.
 ///
@@ -161,5 +167,35 @@ pub(crate) mod tests {
             assert_eq!(try_lock().map(|_| ()).unwrap_err().1, Errno::EWOULDBLOCK);
         }
         assert!(try_lock().is_ok());
+    }
+
+    #[test]
+    fn truncate_and_sync_resize_a_file() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let path = std::ffi::CString::new(file.path().to_str().unwrap()).unwrap();
+        let descriptor = open(&path, OpenFlags::O_RDWR, Mode::empty()).unwrap();
+        assert_eq!(descriptor.truncate(8192), Ok(()));
+        assert_eq!(descriptor.sync(), Ok(()));
+        assert_eq!(std::fs::metadata(file.path()).unwrap().len(), 8192);
+        let read_only = open(&path, OpenFlags::O_RDONLY, Mode::empty()).unwrap();
+        assert!(read_only.truncate(0).is_err());
+    }
+
+    #[test]
+    fn connected_datagrams_wait_for_and_receive_echoes() {
+        let server = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let std::net::SocketAddr::V4(peer) = server.local_addr().unwrap() else {
+            panic!("an IPv4 server");
+        };
+        let client = connect_datagram(peer).unwrap();
+        assert_eq!(client.wait_readable(1), Ok(false));
+        assert_eq!(client.write(b"echo"), Ok(4));
+        let mut buffer = [0; 8];
+        let (length, source) = server.recv_from(&mut buffer).unwrap();
+        assert_eq!(&buffer[..length], b"echo");
+        server.send_to(b"back", source).unwrap();
+        assert_eq!(client.wait_readable(5_000), Ok(true));
+        assert_eq!(client.read(&mut buffer), Ok(4));
+        assert_eq!(&buffer[..4], b"back");
     }
 }

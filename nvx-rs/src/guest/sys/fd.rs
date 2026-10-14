@@ -5,6 +5,7 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 
 pub(crate) use nix::fcntl::OFlag as OpenFlags;
 use nix::fcntl::{Flock, FlockArg};
+use nix::poll::{PollFd, PollFlags};
 pub(crate) use nix::sys::stat::Mode;
 
 use super::Errno;
@@ -43,6 +44,33 @@ impl FileDescriptor {
     /// Writes at `offset` once, preserving the C cast from `u64` to `off_t`.
     pub(crate) fn pwrite(&self, bytes: &[u8], offset: u64) -> Result<usize, Errno> {
         nix::sys::uio::pwrite(&self.0, bytes, offset as _)
+    }
+
+    /// Sets the file's size to `length` bytes, preserving the C cast from `u64` to `off_t`.
+    pub(crate) fn truncate(&self, length: u64) -> Result<(), Errno> {
+        nix::unistd::ftruncate(&self.0, length as _)
+    }
+
+    /// Writes the file's modified data and metadata to its storage device.
+    pub(crate) fn sync(&self) -> Result<(), Errno> {
+        nix::unistd::fsync(&self.0)
+    }
+
+    /// Waits at most `timeout_ms` milliseconds for data to read, with one `poll` call.
+    ///
+    /// Returns whether `poll` reported `POLLIN`. An interrupted call is an error, not a retry.
+    pub(crate) fn wait_readable(&self, timeout_ms: u16) -> Result<bool, Errno> {
+        let mut descriptors = [PollFd::new(self.0.as_fd(), PollFlags::POLLIN)];
+        let ready = nix::poll::poll(&mut descriptors, timeout_ms)?;
+        Ok(ready > 0
+            && descriptors[0]
+                .revents()
+                .is_some_and(|events| events.contains(PollFlags::POLLIN)))
+    }
+
+    /// Takes ownership of a descriptor that another wrapper in this module tree created.
+    pub(super) fn from_owned(descriptor: OwnedFd) -> Self {
+        Self(descriptor)
     }
 
     /// Takes an exclusive advisory lock on the descriptor, retrying after `EINTR`.

@@ -29,6 +29,10 @@ mod sys;
 
 pub mod console_pending;
 #[cfg(target_arch = "x86_64")]
+pub mod device_io;
+#[cfg(target_arch = "x86_64")]
+pub mod exit;
+#[cfg(target_arch = "x86_64")]
 pub mod mmio_write;
 pub mod port_io;
 pub mod reseed;

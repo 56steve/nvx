@@ -28,6 +28,8 @@ fn binary(name: &str) -> PathBuf {
         "nvx-mmio-write" => env!("CARGO_BIN_EXE_nvx-mmio-write"),
         "nvx-port-io" => env!("CARGO_BIN_EXE_nvx-port-io"),
         "nvx-reseed" => env!("CARGO_BIN_EXE_nvx-reseed"),
+        "nvx-exit" => env!("CARGO_BIN_EXE_nvx-exit"),
+        "nvx-device-io" => env!("CARGO_BIN_EXE_nvx-device-io"),
         _ => panic!("no guest binary {name}"),
     })
 }
@@ -357,4 +359,210 @@ fn reseed_needs_privileges_to_reseed() {
             format!("nvx-reseed: random ioctl: {}\n", Errno::EPERM.desc()).into_bytes()
         )
     );
+}
+
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn exit_fails_silently_without_dev_port() {
+    if device_error("/dev/port", false, true).is_none() {
+        return;
+    }
+    for arguments in [&["0"][..], &[], &["256", "extra"]] {
+        assert_eq!(
+            run("nvx-exit", arguments),
+            (Some(1), Vec::new(), Vec::new()),
+            "{arguments:?}"
+        );
+    }
+}
+
+/// Runs `nvx-device-io` with `arguments`, checks that it exits with `expected` and writes nothing
+/// to stderr, and returns its result line, which must be the only output.
+#[cfg(target_arch = "x86_64")]
+fn device_io<I, S>(arguments: I, expected: i32) -> Option<serde_json::Value>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let Output {
+        status,
+        stdout,
+        stderr,
+    } = output_of(
+        Command::new(binary("nvx-device-io"))
+            .args(arguments)
+            .stdout(Stdio::piped()),
+    );
+    assert!(
+        status.code() == Some(expected) && stderr.is_empty(),
+        "expected exit status {expected} and no stderr, got {status}, stdout {:?}, stderr {:?}",
+        String::from_utf8_lossy(&stdout),
+        String::from_utf8_lossy(&stderr),
+    );
+    if stdout.is_empty() {
+        return None;
+    }
+    let line = String::from_utf8(stdout).unwrap();
+    let keys = [
+        r#"{"device":""#,
+        r#"","operation":""#,
+        r#"","operations":"#,
+        r#","bytes_per_operation":"#,
+        r#","elapsed_ns":"#,
+        "}\n",
+    ];
+    let mut rest = line.as_str();
+    for key in keys {
+        let position = rest.find(key).unwrap_or_else(|| panic!("{key} in {line}"));
+        rest = &rest[position + key.len()..];
+    }
+    assert_eq!(rest, "", "{line}");
+    Some(serde_json::from_str(&line).unwrap())
+}
+
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn device_io_usage() {
+    for arguments in [
+        &[][..],
+        &["file"],
+        &["disk", "x"],
+        &["file", "f", "read", "0", "4096", "buffered", "create"],
+        &["file", "f", "read", "1", "4095", "buffered", "create"],
+        &["file", "f", "copy", "1", "4096", "buffered", "create"],
+        &["file", "f", "read", "1", "4096", "cached", "create"],
+        &[
+            "file", "f", "read", "1", "4096", "buffered", "create", "extra",
+        ],
+        &["network", "127.0.0.1", "0", "1"],
+        &["network", "127.0.0.1", "65536", "1"],
+        &["network", "127.0.0.256", "1", "1"],
+        &["network", "127.0.0.1", "1", "0"],
+    ] {
+        assert_eq!(device_io(arguments, 2), None, "{arguments:?}");
+    }
+}
+
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn device_io_measures_a_file() {
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("disk");
+    let arguments = |operation: &str, creation: &str| {
+        let path = file.to_str().unwrap();
+        ["file", path, operation, "50", "65536", "buffered", creation].map(str::to_owned)
+    };
+    for (operation, creation) in [("write", "create"), ("read", "existing")] {
+        let result = device_io(arguments(operation, creation), 0).expect("a result line");
+        assert_eq!(result["device"], "file");
+        assert_eq!(result["operation"], operation);
+        assert_eq!(result["bytes_per_operation"], 4096);
+        assert!(result["operations"].as_u64().unwrap() > 0, "{result}");
+        assert!(
+            result["elapsed_ns"].as_u64().unwrap() >= 50_000_000,
+            "{result}"
+        );
+    }
+    assert_eq!(fs::metadata(&file).unwrap().len(), 65536);
+    let contents = fs::read(&file).unwrap();
+    let pattern: Vec<u8> = (0..4096_usize)
+        .map(|index| (index * 31 + 17) as u8)
+        .collect();
+    // The first offset of a 64 KiB file is its first block.
+    assert_eq!(&contents[..4096], pattern);
+
+    // A missing file cannot open, and an empty one cannot transfer a block.
+    let missing = directory.path().join("missing");
+    let mut arguments = arguments("read", "existing");
+    arguments[1] = missing.to_str().unwrap().to_owned();
+    assert_eq!(device_io(&arguments, 3), None);
+    fs::write(&missing, b"").unwrap();
+    arguments[4] = "4096".to_owned();
+    assert_eq!(device_io(&arguments, 4), None);
+}
+
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn device_io_measures_a_network_round_trip() {
+    use std::net::UdpSocket;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let port = socket.local_addr().unwrap().port();
+    let (first, received) = mpsc::channel();
+    let echo = thread::spawn(move || {
+        let mut buffer = [0; 128];
+        let mut count = 0;
+        // The benchmark sends until its duration passes and stops when its socket closes, so
+        // the echo stops at the first silence, when a receive times out. Linux does not restart
+        // a receive with a timeout that a signal interrupts, as the SIGCHLD of a child of a
+        // concurrent test can, so an interrupted receive starts over.
+        loop {
+            let (length, peer) = match socket.recv_from(&mut buffer) {
+                Ok(received) => received,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("the echo cannot receive: {error}"),
+            };
+            if count == 0 {
+                first.send(buffer[..length].to_vec()).unwrap();
+            }
+            count += 1;
+            socket.send_to(&buffer[..length], peer).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_millis(500)))
+                .unwrap();
+        }
+    });
+    let port = port.to_string();
+    let result = device_io(["network", "127.0.0.1", &port, "100"], 0).expect("a result line");
+    assert_eq!(result["device"], "network");
+    assert_eq!(result["operation"], "roundtrip");
+    assert_eq!(result["bytes_per_operation"], 64);
+    assert!(result["operations"].as_u64().unwrap() > 0, "{result}");
+    assert!(
+        result["elapsed_ns"].as_u64().unwrap() >= 100_000_000,
+        "{result}"
+    );
+    let payload: Vec<u8> = (1..=64).collect();
+    assert_eq!(received.recv().unwrap(), payload);
+    echo.join().unwrap();
+}
+
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn device_io_exits_255_when_it_cannot_print() {
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("disk");
+    let output = output_of(
+        Command::new(binary("nvx-device-io"))
+            .args([
+                "file",
+                file.to_str().unwrap(),
+                "write",
+                "1",
+                "4096",
+                "buffered",
+            ])
+            .arg("create")
+            .stdout(fs::File::create("/dev/full").unwrap()),
+    );
+    assert_eq!(
+        (output.status.code(), output.stderr),
+        (Some(255), Vec::new())
+    );
+    // A closed pipe raises SIGPIPE, whose default disposition the program keeps.
+    use std::os::unix::process::ExitStatusExt;
+    let path = file.to_str().unwrap();
+    let arguments = ["file", path, "read", "1", "4096", "buffered", "existing"];
+    let (status, stderr) = run_to("nvx-device-io", arguments, broken_pipe());
+    assert_eq!((status.signal(), stderr), (Some(13), Vec::new()));
+    // With inherited SIG_IGN, write reports EPIPE and the tool returns its output-failure status.
+    let (status, stderr) = run_to_ignoring_sigpipe("nvx-device-io", arguments, broken_pipe());
+    assert_eq!((status.code(), stderr), (Some(255), Vec::new()));
 }

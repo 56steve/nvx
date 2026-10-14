@@ -78,3 +78,20 @@ impl Write for Stdout {
         Ok(())
     }
 }
+
+/// Standard output written with direct `write` calls, whose every failure is reported.
+///
+/// `nvx-device-io`'s C program wrote its result with its own `write` loop rather than stdio. The
+/// loop retried only `EINTR`, and failed on any other error or on a write that wrote nothing.
+/// [`Write::write_all`] over this adapter does the same.
+pub(crate) struct DirectStdout;
+
+impl Write for DirectStdout {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        nix::unistd::write(io::stdout(), bytes).map_err(io::Error::from)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}

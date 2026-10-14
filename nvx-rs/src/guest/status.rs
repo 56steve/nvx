@@ -5,7 +5,8 @@ use std::process::ExitCode;
 /// Process exit statuses of the guest programs.
 ///
 /// A program exits with [`Success`](Self::Success), or with the status that its
-/// [`CommandError`] selects.
+/// [`CommandError`] selects. Only `nvx-device-io` exits with the benchmark statuses 3, 4, and
+/// 255.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub(crate) enum ExitStatus {
@@ -15,6 +16,12 @@ pub(crate) enum ExitStatus {
     Failure = 1,
     /// The command line was invalid.
     Usage = 2,
+    /// A benchmark could not open, connect, size, or time its device.
+    SetupFailure = 3,
+    /// A benchmark transfer or send was incomplete.
+    TransferFailure = 4,
+    /// A benchmark could not write its result.
+    OutputFailure = 255,
 }
 
 /// Typed failure of a guest program, which selects its exit status.
@@ -24,6 +31,12 @@ pub(crate) enum CommandError {
     Usage,
     /// An operation failed. A program that reports failures has printed why.
     Operation,
+    /// A benchmark could not open, connect, size, or time its device.
+    Setup,
+    /// A benchmark transfer or send was incomplete.
+    Transfer,
+    /// A benchmark could not write its result.
+    Output,
 }
 
 impl From<Result<(), CommandError>> for ExitStatus {
@@ -32,6 +45,9 @@ impl From<Result<(), CommandError>> for ExitStatus {
             Ok(()) => Self::Success,
             Err(CommandError::Usage) => Self::Usage,
             Err(CommandError::Operation) => Self::Failure,
+            Err(CommandError::Setup) => Self::SetupFailure,
+            Err(CommandError::Transfer) => Self::TransferFailure,
+            Err(CommandError::Output) => Self::OutputFailure,
         }
     }
 }
@@ -52,6 +68,9 @@ mod tests {
             (Ok(()), 0),
             (Err(CommandError::Operation), 1),
             (Err(CommandError::Usage), 2),
+            (Err(CommandError::Setup), 3),
+            (Err(CommandError::Transfer), 4),
+            (Err(CommandError::Output), 255),
         ];
         for (result, code) in cases {
             assert_eq!(ExitStatus::from(result) as u8, code, "{result:?}");

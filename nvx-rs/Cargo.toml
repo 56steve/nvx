@@ -41,6 +41,17 @@ serde_json = { version = "1.0.120", optional = true }
 [target.'cfg(unix)'.dependencies]
 libc = { version = "0.2.160", optional = true }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", optional = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { version = "0.31.3", default-features = false, optional = true, features = [
     "fs",
@@ -57,17 +68,6 @@ nix = { version = "0.31.3", default-features = false, optional = true, features 
     "time",
     "uio",
     "user",
-] }
-
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", optional = true, features = [
-    "Win32_Foundation",
-    "Win32_Security",
-    "Win32_Storage_FileSystem",
-    "Win32_System_IO",
-    "Win32_System_LibraryLoader",
-    "Win32_System_Pipes",
-    "Win32_System_Threading",
 ] }
 
 [build-dependencies]
@@ -110,6 +110,20 @@ test = false
 [[bin]]
 name = "nvx-reseed"
 path = "src/bin/nvx-reseed.rs"
+required-features = ["guest"]
+doc = false
+test = false
+
+[[bin]]
+name = "nvx-exit"
+path = "src/bin/nvx-exit.rs"
+required-features = ["guest"]
+doc = false
+test = false
+
+[[bin]]
+name = "nvx-device-io"
+path = "src/bin/nvx-device-io.rs"
 required-features = ["guest"]
 doc = false
 test = false

@@ -164,6 +164,8 @@ executables as `/sbin/nvx-*`.
 | `nvx-mmio-write ADDRESS VALUE` | Stores a 32-bit value at a physical address through `/dev/mem` (x86_64) |
 | `nvx-port-io COMMAND ...` | Reads or writes an I/O port through `/dev/port`, or reads the VM generation ID |
 | `nvx-reseed [--generation-only] SEED_FILE [PREVIOUS]`, `nvx-reseed --sample` | Reseeds the kernel's random number generator from a seed file and checks its VM generation ID, or prints a random sample |
+| `nvx-exit [CODE]` | Stops the VM with an 8-bit exit code through OpenVMM's control port 0x604 (x86_64) |
+| `nvx-device-io file ...`, `nvx-device-io network ...` | The benchmark helper that measures file and UDP round-trip I/O and prints one JSON line (x86_64) |
 
 Each binary's command line, exit statuses, and byte output are compatibility
 contracts; the [`nvx::guest`](src/guest/mod.rs) documentation describes each
