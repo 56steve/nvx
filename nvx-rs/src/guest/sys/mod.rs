@@ -1,34 +1,59 @@
-//! Safe operating-system interface shared by the guest tools.
+//! Safe operating-system interface shared by the guest programs.
 //!
 //! Guest program modules deny unsafe code. This module is their only boundary to the operating
 //! system, through `nix`: it owns descriptors and mappings, and its submodules confine the few
-//! unsafe `nix` operations, such as ioctls, memory mappings, and signal dispositions, behind
-//! wrappers that establish their pointer, lifetime, and ownership invariants. Errors are `nix`'s
-//! [`Errno`], whose descriptions the tools print.
+//! unsafe `nix` operations, such as ioctls, memory mappings, signal dispositions, and `fork`,
+//! behind wrappers that establish their pointer, lifetime, and ownership invariants. Errors are
+//! `nix`'s [`Errno`], whose descriptions the programs print.
+//!
+//! The managed agent needs a few operations that `nix` cannot provide, which reach libc through
+//! `nix`'s re-export: its forked child, which may neither allocate nor drop an owner, closes,
+//! executes, and exits through libc; its wait-status decoding keeps the real-time signals that
+//! `nix`'s `Signal` cannot represent; and its execution helper duplicates the descriptor that it
+//! inherits by number, which it cannot borrow before it knows that the descriptor is open. Each
+//! such call says why.
 
 #[cfg(target_arch = "x86_64")]
 mod clock;
 mod fd;
+mod filesystem;
 mod ioctl;
 mod mapping;
+mod poll;
 mod process;
 mod socket;
+mod spawn;
+mod terminal;
 
 use std::ffi::CString;
 use std::io::{self, Write};
 use std::os::unix::ffi::OsStringExt;
 
 pub(crate) use nix::errno::Errno;
+pub(crate) use nix::sys::signal::Signal;
 
 #[cfg(target_arch = "x86_64")]
 pub(crate) use clock::monotonic_ns;
-#[cfg(test)]
-pub(crate) use fd::create_fifo;
-pub(crate) use fd::{FileDescriptor, Mode, OpenFlags, open, page_size};
+pub(crate) use fd::{
+    FileDescriptor, Mode, OpenFlags, create_directory, create_fifo, create_memfd, create_pipe,
+    open, page_size, unlink,
+};
+pub(crate) use filesystem::{
+    MountFlags, change_directory, chmod, chown, current_directory, mount, path_c_string,
+};
 pub(crate) use ioctl::{console_pending, reseed_random};
 pub(crate) use mapping::MemoryMapping;
-pub(crate) use process::{DirectStdout, Stdout, restore_sigpipe};
+pub(crate) use poll::readable_or_hung_up;
+#[cfg(test)]
+pub(crate) use process::sigpipe_disposition;
+pub(crate) use process::{
+    ChildStatus, DirectStdout, ProcessId, Stdout, exec, has_exited, kill_process_group,
+    reap_any_nonblocking, restore_sigpipe, take_inherited_descriptor, wait, with_sigpipe_ignored,
+    write_port_diagnostic, write_standard_error,
+};
 pub(crate) use socket::connect_datagram;
+pub(crate) use spawn::{CHILD_STAGE_CWD, PhysicalPwd, SpawnDescriptors, SpawnPlan, spawn};
+pub(crate) use terminal::{configure_raw, drain};
 
 /// Returns the process arguments, program name first, as the C strings that `main` received.
 ///
@@ -39,6 +64,11 @@ pub(crate) fn args() -> Vec<CString> {
     std::env::args_os()
         .map(|argument| CString::new(argument.into_vec()).expect("arguments are C strings"))
         .collect()
+}
+
+/// Converts arbitrary bytes into a C string, or `EINVAL` if they contain a NUL.
+pub(crate) fn c_string(bytes: &[u8]) -> Result<CString, Errno> {
+    CString::new(bytes).map_err(|_| Errno::EINVAL)
 }
 
 /// Writes the concatenation of `parts` to `stream` in one write.
@@ -61,7 +91,7 @@ pub(crate) fn print(stream: &mut dyn Write, bytes: &[u8]) -> Result<(), Errno> {
 ///
 /// A write that made no progress has no OS error, so it maps to `EIO`, matching the guest tools'
 /// generic I/O-failure treatment.
-fn errno_of(error: &io::Error) -> Errno {
+pub(crate) fn errno_of(error: &io::Error) -> Errno {
     error.raw_os_error().map_or(Errno::EIO, Errno::from_raw)
 }
 
