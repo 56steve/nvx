@@ -38,7 +38,7 @@ python3 scripts/nvx.py performance gate --help
 | `classify-ci-changes` | Select the CI suites that a list of changed files runs. |
 | `kernel-patch-identity` | Print the digest of the kernel patch paths and contents that keys the kernel cache. |
 | `check-required-ci` | Validate required GitHub Actions job results. |
-| `check-static-elf` | Check that executables are static ELF files without an interpreter. |
+| `check-static-elf` | Check that executables are static ELF files without an interpreter or an executable stack. |
 | `test-openvmm-unit` | Run the OpenVMM workspace unit and documentation tests. |
 | `test-openvmm` | Run OpenVMM Petri VMM tests. |
 | `test-microvm` | Run NVX Linux and device correctness tests through OpenVMM. |
@@ -147,9 +147,10 @@ python3 scripts/nvx.py check-static-elf PATH [PATH ...]
 Prints each executable's ELF type, size, and linkage, and fails unless every
 one is a 64-bit little-endian ELF executable without a program interpreter
 (`PT_INTERP`) or needed libraries (`DT_NEEDED`), so that it runs in a guest
-without a dynamic loader. A static position-independent executable passes. The
-`nvx-rs` CI job checks the [guest binaries](../nvx-rs/README.md#guest-binaries)
-with it.
+without a dynamic loader. A static position-independent executable passes. It
+also fails for an executable stack: a `PT_GNU_STACK` program header with
+`PF_X`. The `nvx-rs` CI job checks the
+[guest binaries](../nvx-rs/README.md#guest-binaries) with it.
 
 ### `check-guest-binaries`
 

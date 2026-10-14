@@ -1151,7 +1151,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
     static_elf = subparsers.add_parser(
         "check-static-elf",
-        help="check that executables are static ELF files without an interpreter",
+        help=(
+            "check that executables are static ELF files without an interpreter "
+            "or an executable stack"
+        ),
     )
     static_elf.add_argument("paths", nargs="+", type=Path, metavar="PATH")
     static_elf.set_defaults(handler=command_check_static_elf)
