@@ -48,6 +48,17 @@ pub(crate) fn restore_sigpipe() {
     let _ = unsafe { nix::sys::signal::signal(Signal::SIGPIPE, handler) };
 }
 
+/// Ignores SIGINT and SIGHUP for the rest of the process, as `nvx-ingress`'s C program did before
+/// it started announcing.
+///
+/// Like the C program, it ignores failures, which `signal` reports only for an invalid signal.
+pub(crate) fn ignore_interrupt_and_hangup() {
+    for signal in [Signal::SIGINT, Signal::SIGHUP] {
+        // SAFETY: `SIG_IGN` installs no Rust callback.
+        let _ = unsafe { nix::sys::signal::signal(signal, SigHandler::SigIgn) };
+    }
+}
+
 /// Returns an owned, close-on-exec duplicate of the descriptor whose decimal number `text`
 /// names, which this process inherited across `exec`, and makes that descriptor close-on-exec
 /// too, so that the next `exec` closes it, as the C helper closed it before its own.
