@@ -684,6 +684,12 @@ mod tests {
 
     use super::*;
 
+    fn hook(arguments: &[&[u8]]) -> Vec<u8> {
+        let mut out = Vec::new();
+        run(arguments, &mut out).unwrap();
+        out
+    }
+
     #[test]
     fn cpuid_values_are_32_bit_decimal_or_hexadecimal() {
         assert_eq!(cpuid_value(b"0x40000006"), Ok(0x4000_0006));
@@ -742,6 +748,114 @@ mod tests {
     }
 
     #[test]
+    fn console_lines_preserve_synchronous_and_asynchronous_boundaries() {
+        let line = b"NVX-TIME-ABI-VIOLATION: v=1 code=G_RCU_STALL source=watcher\n";
+        assert_eq!(hook(&[b"console", line, b"sync"]), line);
+        assert_eq!(
+            hook(&[b"console", line, b"async"]),
+            [b"\n".as_slice(), line].concat()
+        );
+    }
+
+    #[test]
+    fn exhaustive_hooks_preserve_leaf_rules_and_report_formats() {
+        let out_of_range: [&[u8]; 4] = [b"0x00000d0b", b"0x00000001", b"0x00000002", b"0x00000003"];
+        let zero: [&[u8]; 4] = [b"0", b"0", b"0", b"0"];
+        let leaf = |number: &[u8], value: [&[u8]; 4]| {
+            hook(&[
+                b"exhaustive-leaf",
+                number,
+                value[0],
+                value[1],
+                value[2],
+                value[3],
+                out_of_range[0],
+                out_of_range[1],
+                out_of_range[2],
+                out_of_range[3],
+            ])
+        };
+        assert_eq!(leaf(b"0x40000006", zero), b"pass\n");
+        assert_eq!(leaf(b"0x40000010", out_of_range), b"pass\n");
+        assert_eq!(leaf(b"0x40000100", zero), b"pass\n");
+        assert_eq!(leaf(b"0x40000100", out_of_range), b"pass\n");
+
+        let explicit = String::from_utf8(leaf(b"0x40000081", out_of_range)).unwrap();
+        assert!(
+            explicit.starts_with("fail leaf 0x40000081 is "),
+            "{explicit}"
+        );
+        assert!(explicit.ends_with("expected zero\n"), "{explicit}");
+        let kvm = [
+            b"0x40000101".as_slice(),
+            b"0x4b4d564b",
+            b"0x564b4d56",
+            b"0x0000004d",
+        ];
+        let signature = String::from_utf8(leaf(b"0x40000100", kvm)).unwrap();
+        assert!(
+            signature.contains("(signature \"KVMKVMKVM...\")"),
+            "{signature}"
+        );
+        assert!(
+            signature.ends_with("or the highest basic leaf\n"),
+            "{signature}"
+        );
+
+        assert_eq!(
+            hook(&[b"exhaustive-report", b"X3", b"2", b"pass", b"ok"]),
+            concat!(
+                "NVX-TIME-ABI-EXHAUSTIVE: v=1 check=X3 cpu=2 status=pass detail=\"ok\"\n",
+                "failures=0\n"
+            )
+            .as_bytes()
+        );
+        assert_eq!(
+            hook(&[
+                b"exhaustive-report",
+                b"X2",
+                b"7",
+                b"fail",
+                b"base 0x40000100 \"KVMKVMKVM\" \\ x\ty",
+            ]),
+            concat!(
+                "NVX-TIME-ABI-EXHAUSTIVE: v=1 check=X2 cpu=7 status=fail ",
+                "detail=\"base 0x40000100 \\\"KVMKVMKVM\\\" \\\\ x\\x09y\"\n",
+                "failures=1\n"
+            )
+            .as_bytes()
+        );
+        assert_eq!(
+            hook(&[b"exhaustive-summary", b"4", b"0"]),
+            concat!(
+                "NVX-TIME-ABI-EXHAUSTIVE: v=1 status=ok cpus=4 failures=0\n",
+                "exit=0\n"
+            )
+            .as_bytes()
+        );
+        assert_eq!(
+            hook(&[b"exhaustive-summary", b"8", b"3"]),
+            concat!(
+                "NVX-TIME-ABI-EXHAUSTIVE: v=1 status=fail cpus=8 failures=3\n",
+                "exit=1\n"
+            )
+            .as_bytes()
+        );
+    }
+
+    #[test]
+    fn accepted_cmdline_and_clocksource_hooks_print_ok() {
+        assert_eq!(
+            hook(&[
+                b"cmdline",
+                b"earlycon=xe9 console=hvc0 quiet clocksource=tsc tsc=reliable",
+            ]),
+            b"ok\n"
+        );
+        assert_eq!(hook(&[b"clocksource", b"tsc\n", b"tsc \n"]), b"ok\n");
+    }
+
+    #[test]
     fn corrections_print_the_kernel_modes() {
         let mut out = Vec::new();
         run(&[b"correction", b"128000000", b"10", b"fast"], &mut out).unwrap();
@@ -751,5 +865,40 @@ mod tests {
             "step modes=0x2100 sec=0 nsec=128000000\n\
              slew modes=0x203d offset=-5 status=0x2001 constant=6 maxerror=1 esterror=1\n"
         );
+    }
+
+    #[test]
+    fn ported_corrections_print_exact_results() {
+        let mut out = Vec::new();
+        run(&[b"correction", b"127999999", b"10002", b"fast"], &mut out).unwrap();
+        run(&[b"correction", b"-500", b"20", b"slow"], &mut out).unwrap();
+        run(&[b"correction", b"128000000", b"10", b"fast"], &mut out).unwrap();
+        run(&[b"correction", b"-1128000000", b"10", b"slow"], &mut out).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "slew modes=0x203d offset=127999999 status=0x2001 constant=4 \
+             maxerror=128011 esterror=11\n\
+             slew modes=0x203d offset=-500 status=0x2001 constant=6 maxerror=1 esterror=1\n\
+             step modes=0x2100 sec=0 nsec=128000000\n\
+             step modes=0x2100 sec=-2 nsec=872000000\n"
+        );
+    }
+
+    #[test]
+    fn pairing_and_frequency_hooks_preserve_signed_arithmetic() {
+        assert_eq!(
+            hook(&[b"pair", b"10000", b"10400", b"9000"]),
+            b"theta_ns=-1200 epsilon_ns=200\n"
+        );
+        for (deviation, expected) in [
+            (
+                b"13107200".as_slice(),
+                b"frequency=-13107200 ppb=-200000\n".as_slice(),
+            ),
+            (b"-40000000", b"frequency=32768000 ppb=500000\n"),
+            (b"-65536", b"frequency=65536 ppb=1000\n"),
+        ] {
+            assert_eq!(hook(&[b"frequency", deviation]), expected);
+        }
     }
 }
