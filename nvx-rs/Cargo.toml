@@ -29,6 +29,9 @@ bundled = ["host", "dep:sha2"]
 testing = ["dep:getrandom", "dep:serde", "dep:serde_json", "dep:libc", "dep:windows-sys"]
 # The serde form of `Hypervisor`. The `host` feature enables it.
 serde = ["dep:serde"]
+# The programs that run in Linux guests: the `guest` module and the `nvx-*` guest binaries. Build
+# them with `--no-default-features --features guest` and the `guest` profile; see README.md.
+guest = ["dep:nix", "dep:getrandom"]
 
 [dependencies]
 getrandom = { version = "0.4", optional = true }
@@ -37,6 +40,24 @@ serde_json = { version = "1.0.120", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { version = "0.2.160", optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { version = "0.31.3", default-features = false, optional = true, features = [
+    "fs",
+    "ioctl",
+    "mman",
+    "mount",
+    "net",
+    "poll",
+    "process",
+    "sched",
+    "signal",
+    "socket",
+    "term",
+    "time",
+    "uio",
+    "user",
+] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", optional = true, features = [
@@ -63,6 +84,46 @@ name = "nvx-fake-openvmm"
 path = "src/bin/nvx-fake-openvmm.rs"
 required-features = ["testing"]
 doc = false
+
+# The guest binaries. Their unit tests live in the library, so the binaries have no test harness.
+[[bin]]
+name = "nvx-console-pending"
+path = "src/bin/nvx-console-pending.rs"
+required-features = ["guest"]
+doc = false
+test = false
+
+[[bin]]
+name = "nvx-mmio-write"
+path = "src/bin/nvx-mmio-write.rs"
+required-features = ["guest"]
+doc = false
+test = false
+
+[[bin]]
+name = "nvx-port-io"
+path = "src/bin/nvx-port-io.rs"
+required-features = ["guest"]
+doc = false
+test = false
+
+[[bin]]
+name = "nvx-reseed"
+path = "src/bin/nvx-reseed.rs"
+required-features = ["guest"]
+doc = false
+test = false
+
+# The guest binaries: small, static, and stripped.
+[profile.guest]
+inherits = "release"
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+debug = false
+incremental = false
 
 [lints.rust]
 missing_docs = "warn"

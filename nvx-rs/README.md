@@ -28,7 +28,8 @@ nvx-rs/
 │   ├── host/        feature `host` (default): artifacts, launch, network, filesystem, session,
 │   │                process, platform, VM instances, and outcome reports
 │   ├── testing/     feature `testing`: the fake OpenVMM
-│   └── bin/         nvx-fake-openvmm
+│   ├── guest/       feature `guest`: the programs that run in Linux guests
+│   └── bin/         nvx-fake-openvmm and the guest binaries
 ├── build.rs         bundled-release staging
 └── artifacts.json   the NVX release that the `bundled` feature stages
 ```
@@ -46,6 +47,7 @@ nvx-rs/
 | `nvx::host::instance` | `Instance`: a VM in a directory of its own. It starts OpenVMM with a fresh capability and waits until the guest is ready and has mounted the mapped paths, reconciles recorded state, recovers interrupted launches, runs workloads and pumps their output, and stops the VM with a forced fallback |
 | `nvx::host::session`, `process`, `platform`, `report` | The authenticated control session, OpenVMM processes, Linux and Windows primitives, and OpenVMM's outcome report |
 | `nvx::testing::fake_openvmm` | A fake OpenVMM that serves the control console and runs scripted workloads without a VM |
+| `nvx::guest` | The programs that run in Linux guests; see [Guest binaries](#guest-binaries) |
 
 Lowering functions take the names by which messages refer to their inputs, such
 as `EgressRules::name` and `PathList::name`, so callers' messages name their own
@@ -59,10 +61,12 @@ fields.
 | `bundled` | Stages a release at build time; see [Bundled artifacts](#bundled-artifacts) |
 | `testing` | The fake OpenVMM and the `nvx-fake-openvmm` binary |
 | `serde` | The serde form of `Hypervisor` |
+| `guest` | The `guest` module and the guest binaries; see [Guest binaries](#guest-binaries) |
 
 Without default features, the crate has only `protocol`, `contract`, `net`,
 `Hypervisor`, and `Error`, and depends on nothing but `serde` when `serde` is
-enabled; `aci_edge_sandboxes_model` uses it that way.
+enabled and `nix` and `getrandom` when `guest` is; `aci_edge_sandboxes_model`
+uses it that way.
 
 ## Example
 
@@ -147,6 +151,32 @@ must match its pinned digest, and the release must declare the control contract
 of `nvx::contract`. The build scripts of dependents receive the staged
 directory as `DEP_NVX_ARTIFACTS_DIR` and can ship it next to their executables
 as `nvx/`.
+
+## Guest binaries
+
+The `guest` feature adds the programs that run in NVX's Linux guests: the
+`nvx::guest` module and one binary per program. Guest images install these
+executables as `/sbin/nvx-*`.
+
+| Binary | Program |
+| --- | --- |
+| `nvx-console-pending DEVICE` | Prints the number of bytes waiting to be read from a device, such as a console |
+| `nvx-mmio-write ADDRESS VALUE` | Stores a 32-bit value at a physical address through `/dev/mem` (x86_64) |
+| `nvx-port-io COMMAND ...` | Reads or writes an I/O port through `/dev/port`, or reads the VM generation ID |
+| `nvx-reseed [--generation-only] SEED_FILE [PREVIOUS]`, `nvx-reseed --sample` | Reseeds the kernel's random number generator from a seed file and checks its VM generation ID, or prints a random sample |
+
+Each binary's command line, exit statuses, and byte output are compatibility
+contracts; the [`nvx::guest`](src/guest/mod.rs) documentation describes each
+program. Guests run them as static `x86_64-unknown-linux-musl` executables. On
+Linux, with the musl target and a C compiler driver, `cc`, Cargo builds them
+into `target/x86_64-unknown-linux-musl/guest/`:
+
+```bash
+cd nvx-rs
+rustup target add x86_64-unknown-linux-musl
+cargo build --locked --profile guest --target x86_64-unknown-linux-musl \
+  --no-default-features --features guest --bins
+```
 
 ## Testing
 
