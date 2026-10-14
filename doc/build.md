@@ -171,9 +171,9 @@ the static `nvx-time-probe` guest time probe, and the
 static `nvx-time` guest time component under `/sbin`. The probe measures TSC and
 clock read latency, reports the guest's clock, clocksource, TSC flags, and
 hypervisor identity, and runs the cross-vCPU warp test that the
-[time ABI](design/time-abi.md#cross-vcpu-skew-bound) uses to enforce its 1 µs
+[time ABI](design/3.2-clock-and-time.md#327-cross-processor-consistency) uses to enforce its 1 µs
 skew bound. `nvx-time` implements the time ABI's
-[guest obligations](design/time-abi.md#guest-obligations): the conformance
+[guest obligations](design/3.2-clock-and-time.md#3210-guest-obligations): the conformance
 checks, the violation watcher, the restore packet v4 and time-sample parsers,
 the snapshot agent's time steps, and the wall-clock discipline. Before
 shell-ready it only steps the clock to host UTC; the other boot checks run in
@@ -246,12 +246,12 @@ live in `KernelBuildConstants` in
 
 | Group | Required settings | Purpose |
 | --- | --- | --- |
-| Direct boot | ACPI and PVH off; MP-table parsing, local APIC, IOAPIC, and virtio-mmio devices from the command line | Boot through the [ACPI-free MP-table loader](design/cold-boot.md#linux-direct-mp-table-loader) |
-| Virtio console | Virtio console and HVC driver over virtio-mmio | Drive the [virtio consoles](design/machine-and-device-abi.md#console) |
-| Sandbox | virtio-blk; ext4; EROFS with zstd compression; overlayfs that does not always follow redirects; memory and PID cgroups; BPF and cgroup BPF; seccomp filters; Unix-domain sockets; network namespaces and veth | Layer EROFS over ext4 scratch and confine the workload in the [sandbox bootstrap](design/sandbox-filesystem-and-agent-architecture.md#implemented-filesystem-bootstrap) |
-| Network | IPv4; IPv6 without the SIT tunnel driver; virtio-net | Configure the dual-stack NIC of the [portable network profile](design/machine-and-device-abi.md#network); SIT would add an `sit0` device that decapsulates IPv6 from IPv4 packets |
-| Shared interrupt status | `CONFIG_VIRTIO_MMIO_SHARED_STATUS` from the kernel patches | Read [shared virtio interrupt status](design/machine-and-device-abi.md#fixed-virtio-mmio-transport) |
-| Time ABI | Hypervisor-guest and paravirtualization support on; Hyper-V, KVM guest, and cpufreq off | Meet the [time ABI](design/time-abi.md), as described above |
+| Direct boot | ACPI and PVH off; MP-table parsing, local APIC, IOAPIC, and virtio-mmio devices from the command line | Boot through the [ACPI-free MP-table loader](design/5.1-boot-protocol.md#511-linux-direct-loader) |
+| Virtio console | Virtio console and HVC driver over virtio-mmio | Drive the [virtio consoles](design/3.3-consoles.md) |
+| Sandbox | virtio-blk; ext4; EROFS with zstd compression; overlayfs that does not always follow redirects; memory and PID cgroups; BPF and cgroup BPF; seccomp filters; Unix-domain sockets; network namespaces and veth | Layer EROFS over ext4 scratch and confine the workload in the [sandbox bootstrap](design/4.1-guest-filesystem-and-image-model.md#411-layered-sandbox-root) |
+| Network | IPv4; IPv6 without the SIT tunnel driver; virtio-net | Configure the dual-stack NIC of the [portable network profile](design/3.5-network.md); SIT would add an `sit0` device that decapsulates IPv6 from IPv4 packets |
+| Shared interrupt status | `CONFIG_VIRTIO_MMIO_SHARED_STATUS` from the kernel patches | Read [shared virtio interrupt status](design/2.4-interrupt-and-io-architecture.md#244-shared-interrupt-status) |
+| Time ABI | Hypervisor-guest and paravirtualization support on; Hyper-V, KVM guest, and cpufreq off | Meet the [time ABI](design/3.2-clock-and-time.md), as described above |
 | Hardening | Strict kernel and module RWX with read-only executable memory, the ITS mitigation, an empty modprobe path, trimmed symbol exports, the boot-time W+X audit, and no option built as a module | Keep runtime code read-only, as described above |
 | Watchdogs | Soft-lockup and hung-task detectors off, or on in the [CI debug kernel](#ci-debug-kernel) | Keep the detectors out of production kernels |
 
@@ -284,8 +284,8 @@ the production RCU stall timeouts and turns off the debug options that
 detectors are missing from the generated config. CI can shorten the soft-lockup
 and hung-task thresholds for one boot with `watchdog_thresh=` and
 `sysctl.kernel.hung_task_timeout_secs=`. The RCU stall timeout stays at the
-production value because the time ABI's
-[conformance check C8](design/time-abi.md#conformance-checks-and-the-nvx-time-abi-marker)
+production value because the time ABI's conformance check C8, which covers
+the [stall-detector settings](design/3.2-clock-and-time.md#3210-guest-obligations),
 requires it.
 
 The variant builds in `build/linux-debug`, so it never invalidates the

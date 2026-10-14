@@ -1,13 +1,11 @@
 # Ubuntu guest support
 
-[Design index](../design.md)
-
 NVX runs Ubuntu userland on its own Linux kernel. It builds two artifacts from
 one pinned Ubuntu Base root filesystem: an initramfs that `nvx.py run` boots
 for an interactive Ubuntu shell, and an EROFS `distro` layer that
 `nvx.py sandbox` runs as a non-root workload. Neither artifact boots an Ubuntu
 kernel, firmware, or systemd, and neither changes the
-[machine and device ABI](../design/machine-and-device-abi.md).
+[machine and device ABI](../design/2-virtual-machine-architecture.md).
 
 [Build](../build.md), [Run](../run.md), and the
 [command-line reference](../usage.md) cover the commands. This chapter
@@ -97,9 +95,9 @@ order, so a rebuild from the same inputs is byte-identical.
 
 The Ubuntu initramfs boots like the Alpine one at the machine level: OpenVMM
 loads the kernel and initramfs through the
-[Linux direct MP-table loader](../design/cold-boot.md#linux-direct-mp-table-loader),
+[Linux direct MP-table loader](../design/5.1-boot-protocol.md#511-linux-direct-loader),
 and the common [`/init`](../../guest/common/init) runs as PID 1. It disables
-module loading, runs the [time ABI](../design/time-abi.md) boot step, and then
+module loading, runs the [time ABI](../design/3.2-clock-and-time.md) boot step, and then
 either runs an `nvx_exec` workload or mounts the HostFs share, configures
 static networking, and starts the managed agent or an interactive shell. For
 Ubuntu that shell is Bash, whose startup file prints
@@ -150,8 +148,7 @@ supplementary groups, no capabilities, and `no_new_privs`.
 
 The sandbox rejects systemd entrypoints, and it rejects a distro layer whose
 manifest lists the `systemd` package. Systemd needs a separate compatibility
-profile; see
-[workload compatibility](../design/remaining-production-work.md#workload-compatibility-and-volumes-proposed).
+profile.
 
 ## Provenance and corresponding source
 

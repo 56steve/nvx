@@ -1,7 +1,5 @@
 # Copilot-driven adversarial testing
 
-[Design index](../design.md)
-
 NVX has a separate adversarial harness that uses GitHub Copilot CLI only as an
 adaptive strategist. Copilot selects deterministic guest-side probes. A typed
 broker, credential-free executor, independent watchdog, and existing microVM

@@ -236,7 +236,7 @@ satisfy this prerequisite.
 Production campaigns also require an administrator-owned, no-argument
 executor wrapper that provisions a separate disposable target and forwards
 the bounded executor protocol. See
-[Copilot-driven adversarial testing](design/copilot-adversarial-testing.md)
+[Copilot-driven adversarial testing](adversarial-testing.md)
 for the containment and credential requirements.
 
 Apply the configured Python and POSIX shell formatters with:

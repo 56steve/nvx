@@ -3,10 +3,10 @@
 
 // nvx-time: the guest time component of NVX time ABI v1.
 //
-// doc/design/time-abi.md ("Guest obligations") is the contract this helper
-// enforces. It runs the conformance checks, the violation watcher and the
-// wall-clock discipline (one daemon), and the snapshot agent's time steps. It
-// prints nothing on success: checks record their result in the state file,
+// doc/design/3.2-clock-and-time.md ("Guest Obligations") is the contract this
+// helper enforces. It runs the conformance checks, the violation watcher and
+// the wall-clock discipline (one daemon), and the snapshot agent's time steps.
+// It prints nothing on success: checks record their result in the state file,
 // and only violation events reach the console.
 //
 //   boot                       initial clock step (C12), then the other boot

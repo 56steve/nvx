@@ -69,12 +69,12 @@ nvx/
 |-- docker/
 |   `-- Dockerfile               Reproducible guest build environment
 |-- doc/                         User and contributor documentation
+|   |-- adversarial-testing.md   Copilot-driven adversarial testing
 |   |-- benchmarks.md            Benchmark commands and measurement methodology
 |   |-- build.md                 Guest and OpenVMM build workflows
 |   |-- ci.md                    Continuous integration overview
 |   |-- contribute.md            Contribution guidelines
-|   |-- design.md                Design index
-|   |-- design/                  MicroVM, sandbox, and snapshot design chapters
+|   |-- design/                  Architecture of the microVM and its guest runtime
 |   |-- distribution.md          Packaging and source delivery
 |   |-- guests/                  Guest userland chapters (Ubuntu and Azure Linux)
 |   |-- openvmm-upstream-roadmap.md Plan for upstreaming the OpenVMM fork's microVM commits

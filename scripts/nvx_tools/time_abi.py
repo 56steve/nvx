@@ -1,10 +1,11 @@
 """Harness checks of the NVX time ABI v1 guest obligations.
 
-doc/design/time-abi.md defines what a conforming guest prints and how it fails:
-the ``NVX-TIME-ABI`` marker of each conformance check, the
-``NVX-TIME-ABI-VIOLATION`` event, and the power-off statuses 193 (conformance),
-194 (runtime violation), and 195 (restore repair). It also fixes the warp
-probe's 1 us skew bound and the CPU generation names used in reports.
+A conforming guest reports each conformance check with an ``NVX-TIME-ABI``
+marker and each runtime violation with an ``NVX-TIME-ABI-VIOLATION`` event, and
+fails with the power-off statuses 193 (conformance), 194 (runtime violation),
+and 195 (restore repair). doc/design/3.2-clock-and-time.md describes these
+guest obligations and the 1 us cross-CPU skew bound that the warp probe checks,
+and doc/design/2.2-cpu-and-topology.md the CPU generations named in reports.
 """
 
 from __future__ import annotations
@@ -37,16 +38,15 @@ LAPIC_HZ: Mapping[str, int] = {
 }
 MIN_TSC_HZ = 500_000_000
 MAX_TSC_HZ = 10_000_000_000
-# doc/design/time-abi.md, "Performance expectations and acceptance gate",
-# "cpu_us budgets": each backend has a CPU-time (cpu_us) budget per phase
-# (boot, capture, and restore): a base plus an increment per additional online
-# CPU, in microseconds, held per sample. These are the spec's final values, each
-# at least 1.2 times the largest sample from all fleet validation (bare metal
-# and Azure, production and debug kernels). Triaged outliers don't count, and
-# neither does the first capture after a rolled-back capture, which the spec
-# exempts and CI never makes. This table is the one place the harness reads
-# them. The checks' wall time (elapsed_us) has no budget. CI reports both and
-# gates on neither: the performance gate is the A/B comparison outside CI.
+# Each backend has a CPU-time (cpu_us) budget per phase (boot, capture, and
+# restore): a base plus an increment per additional online CPU, in
+# microseconds, held per sample. Each budget is at least 1.2 times the largest
+# sample from all fleet validation (bare metal and Azure, production and debug
+# kernels). Triaged outliers don't count, and neither does the first capture
+# after a rolled-back capture, which is exempt and which CI never makes. This
+# table is the one place the harness reads them. The checks' wall time
+# (elapsed_us) has no budget. CI reports both and gates on neither: the
+# performance gate is the A/B comparison outside CI.
 CHECK_CPU_BUDGET_US: Mapping[str, Mapping[str, tuple[int, int]]] = {
     "kvm": {"boot": (6_000, 2_000), "capture": (1_500, 400), "restore": (7_000, 2_000)},
     "mshv": {"boot": (3_000, 1_000), "capture": (1_000, 400), "restore": (2_500, 500)},
@@ -66,16 +66,17 @@ WARP_PROBE_FAILURE_STATUS = 97
 # The idle-inducing warp schedule: probe rounds separated by halted vCPUs.
 WARP_PROBE_ROUNDS = 2
 WARP_PROBE_IDLE_SECONDS = 1
-# Idle gaps between probe rounds, in seconds (doc/design/time-abi.md, "Warp
-# schedules"): CI's schedule after boot and every restore, and H6's.
+# Idle gaps between probe rounds, in seconds: CI's schedule after boot and
+# every restore, and H6's (doc/ci.md).
 CI_WARP_GAPS: tuple[str, ...] = (str(WARP_PROBE_IDLE_SECONDS),) * (
     WARP_PROBE_ROUNDS - 1
 )
 QUALIFICATION_WARP_GAPS: tuple[str, ...] = ("0.1", "1", "5", "1")
 PROFILE_VENDORS: Mapping[str, str] = {"GenuineIntel": "intel", "AuthenticAMD": "amd"}
 # The generation of every host profile, which `openvmm --cpu-profile host`
-# derives from the host it runs on (doc/design/time-abi.md, "Selection"). No
-# pinned profile uses it, and host qualification never accepts one.
+# derives from the host it runs on (doc/design/2.2-cpu-and-topology.md, "CPU
+# Profile Selection"). No pinned profile uses it, and host qualification never
+# accepts one.
 HOST_PROFILE_GENERATION = "host"
 _PROFILE_ID = re.compile(r"([a-z0-9-]+)\.([a-z0-9-]+)\.v[1-9][0-9]*")
 
@@ -238,7 +239,8 @@ PROFILE_HOST_UNKNOWN = "E_PROFILE_HOST_UNKNOWN"
 HOST_PROFILE_VENDORS = frozenset({"GenuineIntel", "AuthenticAMD"})
 # OpenVMM leads the warning of every cold boot whose `--cpu-profile auto` falls
 # back to a host profile with this marker, followed by the host CPU and the
-# profile with its digest (doc/design/time-abi.md, "Selection").
+# profile with its digest (doc/design/2.2-cpu-and-topology.md, "CPU Profile
+# Selection").
 CPU_PROFILE_FALLBACK_MARKER = "NVX-CPU-PROFILE-FALLBACK:"
 _CPU_PROFILE_FALLBACK = re.compile(
     rf"{re.escape(CPU_PROFILE_FALLBACK_MARKER)} .*?, so --cpu-profile auto fell back"
@@ -246,7 +248,7 @@ _CPU_PROFILE_FALLBACK = re.compile(
 )
 # The issues that track built-in CPU profiles for more Intel and more AMD CPUs.
 # No issue tracks the CPUs of other vendors, which the time ABI does not serve
-# (doc/design/time-abi.md, "Non-goals").
+# (doc/design/2.2-cpu-and-topology.md, "CPU Profile Selection").
 CPU_SUPPORT_ISSUES: Mapping[str, tuple[str, str]] = {
     "GenuineIntel": ("Intel", "https://github.com/microsoft/nvx/issues/408"),
     "AuthenticAMD": ("AMD", "https://github.com/microsoft/nvx/issues/409"),

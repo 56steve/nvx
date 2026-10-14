@@ -35,7 +35,7 @@ one-vCPU smoke set, under the same time ABI checks; the debug-kernel jobs skip
 it, as they skip the Ubuntu tests. Failure logs from the NVX layer are uploaded
 per backend.
 Every harness launch, in the tests and the benchmarks, scans the OpenVMM
-console for the guest's [time ABI](design/time-abi.md) output, and the tests
+console for the guest's [time ABI](design/3.2-clock-and-time.md) output, and the tests
 scan every virtio console they read over TCP the same way, to its end. An
 `NVX-TIME-ABI-VIOLATION` event or a failed `NVX-TIME-ABI` conformance line
 fails the scenario at once with the guest's code and detail. Guests keep the
@@ -69,7 +69,7 @@ online CPUs after each boot or restore, in two rounds with all vCPUs halted
 for 1 s between them, so that a host without an invariant TSC corrects the
 guest TSC as idle host CPUs wake (#265). Every pair in every round must stay
 within the time ABI's 1 µs
-[cross-vCPU skew bound](design/time-abi.md#cross-vcpu-skew-bound) for both the
+[cross-vCPU skew bound](design/3.2-clock-and-time.md#327-cross-processor-consistency) for both the
 backward TSC step and the ping-pong offset; a stalled pair or an inconclusive
 measurement also fails. `smp` boots each requested processor
 count. `smp-snapshot` captures one snapshot per requested count and restores
@@ -148,11 +148,10 @@ boot, restore after a restore, and capture after `snapshot-core`'s released
 request), the exhaustive check's summary, and the
 `restore-downtime` stall counts. Where the guest reports a check's CPU time
 (`cpu_us`), the line also gives its range and how many checks exceed the
-backend's [CPU-time budget](design/time-abi.md#performance-expectations-and-acceptance-gate)
-for their phase, which the spec sets from guest measurements. The spec exempts
-the first capture after a rolled-back capture in the same VM process; CI never
-makes one, because each VM process sends OpenVMM at most one snapshot request
-and a failed capture fails its scenario.
+backend's CPU-time budget for their phase. The budgets come from guest
+measurements and exempt the first capture after a rolled-back capture in the
+same VM process; CI never makes one, because each VM process sends OpenVMM at
+most one snapshot request and a failed capture fails its scenario.
 `CHECK_CPU_BUDGET_US` in `scripts/nvx_tools/time_abi.py` holds the budgets, one
 per backend and phase. `elapsed_us` is wall time, including waits behind the
 workload, and has no budget. CI gates on neither: the performance gate is the
@@ -466,12 +465,12 @@ cache keys, and fail when a pattern misses one.
 ## Host qualification
 
 `python3 scripts/nvx.py doctor --backend <kvm|mshv|whp>` qualifies a host for
-the [time ABI](design/time-abi.md#host-qualification). It runs checks H1 to H7
+the [time ABI](design/3.2-clock-and-time.md). It runs checks H1 to H7
 in order, prints one `NVX-DOCTOR: check=<id> status=<pass|fail> detail="..."`
 line per check, and exits with status 1 if any check fails. `--checks` selects
 a subset, and `--summary` appends a Markdown table with the CPU generation,
 profile, rates, and skew metrics to a file such as `$GITHUB_STEP_SUMMARY`. H4
-and H6 run on the spec's long qualification schedules, which take about three
+and H6 run on long qualification schedules, which take about three
 minutes; `--ci-schedule` selects CI's short ones. A failure that matches a time
 ABI failure code starts its detail with the code in brackets, for example
 `[E_PROFILE_HOST_UNKNOWN]`. A check fails, and never passes, when it can't
@@ -611,7 +610,7 @@ Normal Actions artifacts contain only the guest-text-free public summary,
 catalogued case identifiers, and replay manifest. The external provisioner
 must collect controller transcripts and complete target logs into
 access-controlled security storage. See
-[Copilot-driven adversarial testing](design/copilot-adversarial-testing.md)
+[Copilot-driven adversarial testing](adversarial-testing.md)
 for the architecture and operational contract.
 
 ## Copilot environments

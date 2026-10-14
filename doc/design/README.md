@@ -6,8 +6,7 @@ concept rather than by implementation component.
 
 Implementation status, current limitations, validation procedures, test
 coverage, and delivery plans are intentionally outside this architecture
-guide. The existing material under [`../design`](../design/) remains in place
-and is not replaced by this directory.
+guide.
 
 ## Contents
 
