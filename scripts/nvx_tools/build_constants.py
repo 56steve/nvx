@@ -153,6 +153,39 @@ class OpenVMMBuildConstants:
     CONTROL_CONTRACT_REVISION: Final = "nvx-microvm-v2-control-v2"
 
 
+class GuestRustBuildConstants:
+    """Pinned inputs and outputs of the Rust guest-binary build."""
+
+    DIRECTORY: Final = BuildConstants.REPO_ROOT / "nvx-rs"
+    MANIFEST: Final = DIRECTORY / "Cargo.toml"
+    LOCKFILE: Final = DIRECTORY / "Cargo.lock"
+    BUILD_SCRIPT: Final = DIRECTORY / "build.rs"
+    SOURCE_DIRECTORIES: Final = (DIRECTORY / "src",)
+    BUILD_RECIPE_FILES: Final = (
+        BuildConstants.REPO_ROOT / "scripts" / "nvx_tools" / "build_constants.py",
+        BuildConstants.REPO_ROOT / "scripts" / "nvx_tools" / "guest_binaries.py",
+    )
+    TOOLCHAIN_FILE: Final = BuildConstants.REPO_ROOT / "rust-toolchain.toml"
+    TOOLCHAIN: Final = OpenVMMBuildConstants.RUST_TOOLCHAIN
+    TARGET: Final = OpenVMMBuildConstants.MUSL_RUST_TARGET
+    PROFILE: Final = "guest"
+    FEATURE: Final = "guest"
+    BINARIES_VARIABLE: Final = "NVX_GUEST_BINARIES"
+    SOURCE_DIGEST_FORMAT: Final = 1
+    SOURCE_DIGEST_DOMAIN: Final = "nvx-rust-guest-binaries"
+    BUILD_MANIFEST_NAME: Final = "manifest.json"
+    BUILD_MANIFEST_FORMAT: Final = 1
+    BUILD_MANIFEST_DOMAIN: Final = "nvx-rust-guest-binary-build"
+    BINARIES: Final = (
+        "nvx-console-pending",
+        "nvx-mmio-write",
+        "nvx-port-io",
+        "nvx-reseed",
+        "nvx-exit",
+        "nvx-device-io",
+    )
+
+
 class AlpineBuildConstants:
     GUEST_NAME: Final = "alpine"
     GUEST_DIRECTORY: Final = Path("guest") / GUEST_NAME

@@ -24,6 +24,9 @@ python3 scripts/nvx.py performance gate --help
 | --- | --- |
 | `init` | Initialize the OpenVMM submodule and its nested submodules. |
 | `build-guest` | Build the Linux kernel and selected guest artifacts. |
+| `check-guest-binaries` | Lint and test the Rust guest executables for musl. |
+| `build-guest-binaries` | Build and digest the pinned Rust executables for Linux guests. |
+| `test-guest-binaries` | Run the musl integration tests against prebuilt Rust guest executables. |
 | `build-kernel` | Build the pinned and patched Linux kernel natively. |
 | `build-initramfs` | Build the selected Alpine, Ubuntu, or Azure Linux initramfs. |
 | `build-distro-layer` | Build a deterministic Ubuntu EROFS distro layer. |
@@ -34,6 +37,7 @@ python3 scripts/nvx.py performance gate --help
 | `setup-cross-os-cache` | Install GNU tar and zstd for GitHub Actions cross-OS caches. |
 | `classify-ci-changes` | Select the CI suites that a list of changed files runs. |
 | `check-required-ci` | Validate required GitHub Actions job results. |
+| `check-static-elf` | Check that executables are static ELF files without an interpreter. |
 | `test-openvmm-unit` | Run the OpenVMM workspace unit and documentation tests. |
 | `test-openvmm` | Run OpenVMM Petri VMM tests. |
 | `test-microvm` | Run NVX Linux and device correctness tests through OpenVMM. |
@@ -120,6 +124,57 @@ variables. CI supplies the `true` or `false` suite flags that
 `classify-ci-changes` reports. The command expects successful results for jobs
 enabled by the event, repository, and suite flags, and `skipped` for jobs that
 are not enabled; mismatches are reported as errors and cause a nonzero exit.
+
+### `check-static-elf`
+
+```text
+python3 scripts/nvx.py check-static-elf PATH [PATH ...]
+```
+
+Prints each executable's ELF type, size, and linkage, and fails unless every
+one is a 64-bit little-endian ELF executable without a program interpreter
+(`PT_INTERP`) or needed libraries (`DT_NEEDED`), so that it runs in a guest
+without a dynamic loader. A static position-independent executable passes. The
+`nvx-rs` CI job checks the [guest binaries](../nvx-rs/README.md#guest-binaries)
+with it.
+
+### `check-guest-binaries`
+
+```text
+python3 scripts/nvx.py check-guest-binaries [--toolchain TOOLCHAIN]
+```
+
+The Linux-only check command adds the `x86_64-unknown-linux-musl` target to the
+Rust toolchain that `--toolchain` names, by default the exact
+`rust-toolchain.toml` pin. It then runs Clippy with warnings denied on every
+target of the `guest` feature, and the feature's musl tests, whose static test
+executables run on the host. It ignores an inherited `NVX_GUEST_BINARIES`, so
+that the integration tests run the binaries that Cargo builds from the
+checkout. The `nvx-rs` CI job runs it with the toolchain that its action
+selects, before it builds the binaries.
+
+### `build-guest-binaries`
+
+```text
+python3 scripts/nvx.py build-guest-binaries --output DIRECTORY
+```
+
+The Linux-only build command checks the exact `rust-toolchain.toml` pin and
+builds the six PR 1 guest executables for `x86_64-unknown-linux-musl` with one
+`cargo build` of the `guest` profile, a fresh target directory, Cargo's locked
+mode, incremental compilation disabled, inherited Cargo profile overrides
+removed, remapped source paths, and no linker build IDs. It runs the static-ELF
+check and writes `manifest.json` with the source and executable SHA-256 digests.
+
+### `test-guest-binaries`
+
+```text
+python3 scripts/nvx.py test-guest-binaries --binaries DIRECTORY
+```
+
+The Linux-only test command validates the six binaries and build manifest,
+sets `NVX_GUEST_BINARIES`, and runs the musl `guest_tools` integration test
+against that exact directory.
 
 See [Setup](setup.md) for host prerequisites.
 

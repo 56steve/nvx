@@ -170,14 +170,12 @@ executables as `/sbin/nvx-*`.
 Each binary's command line, exit statuses, and byte output are compatibility
 contracts; the [`nvx::guest`](src/guest/mod.rs) documentation describes each
 program. Guests run them as static `x86_64-unknown-linux-musl` executables. On
-Linux, with the musl target and a C compiler driver, `cc`, Cargo builds them
-into `target/x86_64-unknown-linux-musl/guest/`:
+Linux, with the musl target and a C compiler driver, `cc`, `nvx.py` builds them:
 
 ```bash
-cd nvx-rs
 rustup target add x86_64-unknown-linux-musl
-cargo build --locked --profile guest --target x86_64-unknown-linux-musl \
-  --no-default-features --features guest --bins
+python3 scripts/nvx.py build-guest-binaries \
+  --output build/nvx-rs-guest-binaries
 ```
 
 ## Testing
@@ -189,10 +187,21 @@ NVX_BUNDLE=skip cargo test --all-features   # unit, golden-fixture, and fake-Ope
 
 The tests need no hypervisor. The fake-OpenVMM test drives `Instance` end to end
 against `nvx-fake-openvmm`, and the protocol tests compare the wire constants
-with the guest agent's source in `guest/common/nvx-managed-agent.c`. The
+with the guest agent's source in `guest/common/nvx-managed-agent.c`. On Linux,
+`nvx.py` also lints and tests the guest binaries, and runs their integration
+tests against a build of them:
+
+```bash
+python3 ../scripts/nvx.py check-guest-binaries
+python3 ../scripts/nvx.py test-guest-binaries \
+  --binaries ../build/nvx-rs-guest-binaries
+```
+
+The
 [`check-nvx-rs`](../.github/actions/check-nvx-rs/action.yml) action runs
 rustfmt, Clippy with warnings denied for every feature and for the library
 without default features, the tests, a synthetic-release `bundled` test,
 rustdoc with warnings denied, the minimum supported Rust version (1.89), and a
-macOS check. `python3 scripts/nvx.py test-aci-edge-sandboxes --backend kvm`
+macOS check. On Linux, it also lints, builds, and tests the guest binaries
+through `nvx.py`. `python3 scripts/nvx.py test-aci-edge-sandboxes --backend kvm`
 exercises the crate on a real hypervisor through `aci_edge_sandboxes`.
