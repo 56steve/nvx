@@ -349,13 +349,64 @@ class GuestBinaryBuildTests(unittest.TestCase):
             self.assertEqual(manifest["binaries"], result.binaries)
             self.assertFalse(any(root.glob(".output.work-*")))
 
+    def test_rebuild_adds_an_executable_that_an_earlier_build_lacked(self):
+        # Otherwise, an output could lack an executable that no build installs.
+        self.assertTrue(
+            set(GuestRustBuildConstants.ADDED_BINARIES).issubset(
+                GuestRustBuildConstants.BINARIES
+            )
+        )
+        earlier = tuple(
+            binary
+            for binary in GuestRustBuildConstants.BINARIES
+            if binary not in GuestRustBuildConstants.ADDED_BINARIES
+        )
+        for case, previous in (
+            ("build without the added executables", earlier),
+            ("build from before nvx-port-io retired", (*earlier, "nvx-port-io")),
+        ):
+            with (
+                self.subTest(case),
+                tempfile.TemporaryDirectory(
+                    prefix=".test-guest-binary-added-",
+                    dir=BuildConstants.REPO_ROOT,
+                ) as temporary,
+            ):
+                root = Path(temporary)
+                output = root / "output"
+                _write_build_output(output, previous, recorded=previous)
+                with _fake_guest_build():
+                    result = guest_binaries.build_guest_binaries(output)
+                self.assertEqual(
+                    {path.name for path in output.iterdir()},
+                    {
+                        GuestRustBuildConstants.BUILD_MANIFEST_NAME,
+                        *GuestRustBuildConstants.BINARIES,
+                    },
+                )
+                for binary in GuestRustBuildConstants.BINARIES:
+                    self.assertEqual((output / binary).read_bytes(), binary.encode())
+                manifest = json.loads(
+                    (output / GuestRustBuildConstants.BUILD_MANIFEST_NAME).read_text(
+                        encoding="utf-8"
+                    )
+                )
+                self.assertEqual(manifest["binaries"], result.binaries)
+                self.assertFalse(any(root.glob(".output.work-*")))
+
     def test_rebuild_refuses_unrecorded_or_unrelated_files(self):
         current = GuestRustBuildConstants.BINARIES
         previous = (*current, "nvx-port-io")
         unrelated = (*previous, "uncommitted.txt")
+        earlier = tuple(
+            binary
+            for binary in current
+            if binary not in GuestRustBuildConstants.ADDED_BINARIES
+        )
         for case, binaries, recorded in (
             ("unrecorded retired executable", previous, current),
             ("recorded unrelated file", unrelated, unrelated),
+            ("recorded missing added executable", earlier, current),
         ):
             with (
                 self.subTest(case),

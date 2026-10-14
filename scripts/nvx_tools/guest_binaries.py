@@ -164,7 +164,8 @@ def _validate_owned_output(output: Path) -> tuple[str, ...]:
     """Require an existing output to be a complete build owned by this tool.
 
     Return the retired executables that the output holds, which its build manifest
-    must record.
+    must record. The output may lack added executables, which its build manifest
+    must not record.
     """
     if not output.is_dir():
         raise ScriptError(
@@ -176,9 +177,17 @@ def _validate_owned_output(output: Path) -> tuple[str, ...]:
         for binary in GuestRustBuildConstants.RETIRED_BINARIES
         if binary in actual
     )
+    missing = tuple(
+        binary
+        for binary in GuestRustBuildConstants.ADDED_BINARIES
+        if binary not in actual
+    )
+    present = tuple(
+        binary for binary in GuestRustBuildConstants.BINARIES if binary not in missing
+    )
     expected = {
         GuestRustBuildConstants.BUILD_MANIFEST_NAME,
-        *GuestRustBuildConstants.BINARIES,
+        *present,
         *retired,
     }
     if actual != expected:
@@ -202,15 +211,19 @@ def _validate_owned_output(output: Path) -> tuple[str, ...]:
         raise ScriptError(
             f"guest binary output has an unrecognized build manifest: {manifest_path}"
         )
-    if retired:
+    if retired or missing:
         recorded = manifest.get("binaries")
-        if not isinstance(recorded, dict) or not all(
-            binary in cast(dict[str, object], recorded) for binary in retired
+        if (
+            not isinstance(recorded, dict)
+            or not all(
+                binary in cast(dict[str, object], recorded) for binary in retired
+            )
+            or any(binary in cast(dict[str, object], recorded) for binary in missing)
         ):
             raise ScriptError(
                 f"guest binary output is not owned by this builder: {output}"
             )
-    for binary in (*GuestRustBuildConstants.BINARIES, *retired):
+    for binary in (*present, *retired):
         path = output / binary
         if not path.is_file() or path.is_symlink():
             raise ScriptError(f"guest binary output has an invalid executable: {path}")
