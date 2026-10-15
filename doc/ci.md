@@ -112,12 +112,12 @@ The `time-abi-conformance` scenario boots the largest requested vCPU count and
 runs the guest's exhaustive CI check, `/sbin/nvx-time exhaustive`, which the
 boot check leaves to CI. On every online CPU it checks every leaf
 `0x40000006..=0x400000ff` and every base `0x40000100..=0x4000ff00` for another
-hypervisor signature, every `C3` MSR, the write rules of
-`HV_X64_MSR_TSC_INVARIANT_CONTROL`, writes to the read-only identity MSRs, and
-reads of `IA32_TSC_ADJUST` and `IA32_TSC_DEADLINE` (checks `X1` to `X6`). The
-harness requires a passing `NVX-TIME-ABI-EXHAUSTIVE` line for every check on
-every CPU, a summary with `status=ok`, the requested CPU count, and no
-failures, and exit status 0; a failure lists each failing check with the
+hypervisor signature, every identity MSR that the boot check reads, the write
+rules of `HV_X64_MSR_TSC_INVARIANT_CONTROL`, writes to the read-only identity
+MSRs, and reads of `IA32_TSC_ADJUST` and `IA32_TSC_DEADLINE` (checks `X1` to
+`X6`). The harness requires a passing `NVX-TIME-ABI-EXHAUSTIVE` line for every
+check on every CPU, a summary with `status=ok`, the requested CPU count, and
+no failures, and exit status 0; a failure lists each failing check with the
 guest's detail. The guest command fits on one console line, so the console's
 echo of it ends before the check prints.
 The `cpu-profile-fallback` scenario covers `--cpu-profile auto`'s fallback to a
@@ -175,7 +175,7 @@ deferred checks and must report a passing restore line, so no restore leaves
 its checks pending. The one exception is `snapshot-tiers`' gate-timeout check,
 whose guest OpenVMM stops at the restore gate on purpose. The harness refuses
 a kernel whose `vmlinux-debug.config` lacks the detectors, because the guest's
-`C11` check passes vacuously without them. To bound the cost, pull requests
+boot check of those detectors passes vacuously. To bound the cost, pull requests
 run the debug kernel on KVM only and `dev` pushes run it on every backend;
 each job takes about five minutes on its own runner, in parallel with the
 other microVM jobs. The jobs gate the required status check, the development

@@ -142,8 +142,9 @@ SANDBOX_CONTROL_SCENARIOS = frozenset(
 # the guest-artifact build produces and packages omit, so they run only when
 # named.
 PUBLIC_SANDBOX_SCENARIOS = frozenset(("managed-exec-config", "sandbox-lifecycle"))
-# The spec runs the same-host restore cases on the CI debug kernel, whose
-# soft-lockup and hung-task detectors the guest's time ABI watcher reports.
+# The same-host restore cases also run on the CI debug kernel (doc/ci.md),
+# whose soft-lockup and hung-task detectors the guest's time ABI watcher
+# reports.
 DEBUG_KERNEL_SCENARIOS = (
     "smp",
     "smp-snapshot",
@@ -302,8 +303,8 @@ TIME_ABI_RESTORE_FINISH_SECONDS = 30.0
 # Every scenario captures a cold-booted guest (generation 0), and OpenVMM
 # cannot capture a restored one, so every restore carries generation 1.
 RESTORED_GENERATION = 1
-# The spec's long-downtime case: longer than the 21 s RCU stall timeout, at 1
-# and 8 vCPUs, with and without expedited grace periods.
+# The time ABI's long-downtime case (doc/ci.md): longer than the 21 s RCU
+# stall timeout, at 1 and 8 vCPUs, with and without expedited grace periods.
 RESTORE_DOWNTIME_SECONDS = 30.0
 RESTORE_DOWNTIME_PROCESSORS = (1, 8)
 RESTORE_DOWNTIME_COMPLETION_MARKER = b"NVX-RESTORE-DOWNTIME-OK"

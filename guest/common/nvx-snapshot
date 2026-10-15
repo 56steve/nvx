@@ -391,10 +391,11 @@ post_restore() {
     finish_restore "$packet_flags"
 }
 
-# Restore steps 12 and 13: the acknowledgement when the host gated its input,
-# then the daemon's step 11 restore checks and grace-period release, which
-# run off the restore latency path. A second argument of "quiet" omits the
-# stage and completion lines of a plain untiered restore.
+# Guest repair steps 6 and 7 (doc/design/5.5-restore-protocol.md): the
+# acknowledgement when the host gated its input, then the daemon's restore
+# checks and grace-period release, which run off the restore latency path. A
+# second argument of "quiet" omits the stage and completion lines of a plain
+# untiered restore.
 finish_restore() {
     [ "${2:-}" = quiet ] ||
         console_status "NVX-POST-RESTORE-STAGE: acknowledge"
@@ -440,9 +441,10 @@ elif [ "$scratch_policy" = fresh ]; then
     exit 1
 fi
 
-# Capture steps 1 to 3: the capture checks and the stall-detector
-# suppression. They never wait, though nvx-time first lets pending boot
-# checks finish: they start the daemon that the capture checks require.
+# Guest preparation steps 1 and 2 (doc/design/5.3-snapshot-protocol.md): the
+# capture checks and the stall-detector suppression. They never wait, though
+# nvx-time first lets pending boot checks finish: they start the daemon that
+# the capture checks require.
 /sbin/nvx-time pre-capture || exit 1
 stall_detectors_suppressed=true
 
