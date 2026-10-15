@@ -159,36 +159,33 @@ pub fn kill(pid: u32, start_time: u64) -> io::Result<bool> {
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
-    use std::io::Read;
+    use std::fs;
     use std::os::fd::AsRawFd;
     use std::os::unix::process::CommandExt;
-    use std::sync::mpsc;
 
     use super::*;
 
     /// Spawns a long-running child while this process holds an inheritable pipe writer, as a
     /// descriptor that the caller's parent or native code left without close-on-exec would be.
-    /// Returns whether the child keeps a copy, which shows as the reader not reaching end-of-file
-    /// once this process closes its own.
-    fn child_keeps_inherited_writer(spawn: impl FnOnce() -> Child) -> bool {
-        let (mut reader, writer) = io::pipe().unwrap();
-        // SAFETY: clearing FD_CLOEXEC only changes the flags of a descriptor this test owns.
-        assert_eq!(
-            unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_SETFD, 0) },
-            0
-        );
-        let mut child = spawn();
-        drop(writer);
-        let (finished, received) = mpsc::channel();
-        let drain = thread::spawn(move || {
-            let _ = reader.read_to_end(&mut Vec::new());
-            let _ = finished.send(());
-        });
-        let reached_end = received.recv_timeout(Duration::from_secs(2)).is_ok();
-        child.kill().unwrap();
-        child.wait().unwrap();
-        drain.join().unwrap();
-        !reached_end
+    /// Returns whether the child holds a copy, as its own descriptor table shows. Unlike the
+    /// pipe reaching end-of-file, that cannot depend on the children of concurrent tests, which
+    /// may inherit the writer too.
+    fn child_inherits_writer(spawn: impl FnOnce() -> Child) -> bool {
+        let (pipe, child) = {
+            let (_, writer) = io::pipe().unwrap();
+            // SAFETY: clearing FD_CLOEXEC only changes the flags of a descriptor this test owns.
+            assert_eq!(
+                unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_SETFD, 0) },
+                0
+            );
+            let pipe = fs::read_link(format!("/proc/self/fd/{}", writer.as_raw_fd())).unwrap();
+            (pipe, Reaped(spawn()))
+        };
+        // `spawn` returns once the child has executed its program, which closed the child's
+        // close-on-exec copies, so a copy that remains was inherited.
+        fs::read_dir(format!("/proc/{}/fd", child.0.id()))
+            .unwrap()
+            .any(|entry| fs::read_link(entry.unwrap().path()).is_ok_and(|target| target == pipe))
     }
 
     fn sleeper() -> Command {
@@ -201,7 +198,7 @@ mod tests {
     fn openvmm_inherits_no_descriptor_beyond_its_standard_streams() {
         // A plain child keeps the writer, which shows that the check detects a leak.
         let plain = || sleeper().spawn().unwrap();
-        assert!(child_keeps_inherited_writer(plain));
+        assert!(child_inherits_writer(plain));
 
         let directory = tempfile::tempdir().unwrap();
         let openvmm = || {
@@ -218,7 +215,7 @@ mod tests {
             );
             launched.unwrap().child
         };
-        assert!(!child_keeps_inherited_writer(openvmm));
+        assert!(!child_inherits_writer(openvmm));
 
         // Kernels without CLOSE_RANGE_CLOEXEC take the /proc/self/fd fallback.
         let fallback = || {
@@ -227,7 +224,7 @@ mod tests {
             unsafe { command.pre_exec(platform::mark_listed_descriptors_close_on_exec) };
             command.spawn().unwrap()
         };
-        assert!(!child_keeps_inherited_writer(fallback));
+        assert!(!child_inherits_writer(fallback));
     }
 
     #[test]
