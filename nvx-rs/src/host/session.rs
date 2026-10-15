@@ -132,11 +132,17 @@ pub enum ExecEvent {
 /// Received bytes are buffered until a whole record is available, so a read that times out
 /// loses nothing and callers can poll with short deadlines.
 pub struct ControlSession {
+    /// Platform transport connected to OpenVMM's control endpoint.
     transport: Box<dyn Transport>,
+    /// Bytes received beyond the last complete outer record.
     received: Vec<u8>,
+    /// Random instance identity assigned by the broker during attachment.
     instance_id: [u8; 16],
+    /// Broker connection epoch assigned during attachment.
     epoch: u64,
+    /// Sequence number of the next host-to-guest outer record.
     send_sequence: u64,
+    /// Sequence number expected on the next guest-to-host outer record.
     receive_sequence: u64,
 }
 
@@ -325,6 +331,7 @@ impl ControlSession {
         Ok(())
     }
 
+    /// Encodes and sends one application frame in the next sequenced outer record.
     fn send_app(
         &mut self,
         kind: u8,
@@ -345,6 +352,7 @@ impl ControlSession {
         Ok(())
     }
 
+    /// Reads and validates the next application frame, advancing the receive sequence.
     fn read_app(
         &mut self,
         deadline: Option<Instant>,
@@ -372,6 +380,7 @@ impl ControlSession {
         ))
     }
 
+    /// Buffers transport bytes until one complete outer record can be returned.
     fn read_outer(
         &mut self,
         deadline: Option<Instant>,
@@ -423,6 +432,7 @@ fn remaining(deadline: Option<Instant>) -> Result<Option<Duration>, SessionError
     }
 }
 
+/// Generates a random nonzero request identifier.
 fn request_id() -> Result<u64, SessionError> {
     loop {
         let mut bytes = [0u8; 8];

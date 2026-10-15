@@ -114,3 +114,22 @@ runs:
         rustup target add --toolchain "${{ steps.toolchains.outputs.toolchain }}" aarch64-apple-darwin
         cargo "+${{ steps.toolchains.outputs.toolchain }}" check --locked --all-targets --all-features \
           --target aarch64-apple-darwin
+
+    # The guest binaries are static x86_64-unknown-linux-musl executables; see the README's
+    # guest binaries section. This step also adds the musl target that the build step needs.
+    - name: Lint and test the guest binaries
+      if: runner.os == 'Linux'
+      shell: bash
+      run: >-
+        python3 scripts/nvx.py check-guest-binaries
+        --toolchain "${{ steps.toolchains.outputs.toolchain }}"
+
+    - name: Build and check the guest binaries
+      if: runner.os == 'Linux'
+      shell: bash
+      working-directory: nvx-rs
+      run: |
+        set -euo pipefail
+        directory="${PWD}/../build/nvx-rs-guest-binaries"
+        python3 ../scripts/nvx.py build-guest-binaries --output "${directory}"
+        python3 ../scripts/nvx.py test-guest-binaries --binaries "${directory}"

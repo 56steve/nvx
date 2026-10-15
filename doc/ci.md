@@ -579,6 +579,17 @@ instead of downloading the pinned release, and the `aci_edge_sandboxes` action
 also sets `ACI_EDGE_SANDBOXES_AGENT_BUNDLE=skip`, so that `agent-bundled` does
 not download an edge agent bundle.
 
+On Linux, the `nvx-rs` job also lints and tests the
+[guest binaries](../nvx-rs/README.md#guest-binaries) for
+`x86_64-unknown-linux-musl`, the target that guests run, and builds them with
+the `guest` profile. The action delegates the musl lint and tests to
+[`nvx.py check-guest-binaries`](usage.md#check-guest-binaries), the fresh,
+path-remapped build, static-ELF check, and digest manifest to
+[`nvx.py build-guest-binaries`](usage.md#build-guest-binaries),
+and the prebuilt-binary integration run to
+`nvx.py test-guest-binaries`. The guests ship the C programs in
+`guest/common/` until their build switches to these binaries.
+
 The development release job depends on `aci-edge-sandboxes` and `nvx-rs` and
 requires their combined Linux/Windows results to be successful; failed,
 cancelled, or skipped crate checks cannot publish a release.

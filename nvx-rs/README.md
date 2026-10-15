@@ -28,7 +28,8 @@ nvx-rs/
 │   ├── host/        feature `host` (default): artifacts, launch, network, filesystem, session,
 │   │                process, platform, VM instances, and outcome reports
 │   ├── testing/     feature `testing`: the fake OpenVMM
-│   └── bin/         nvx-fake-openvmm
+│   ├── guest/       feature `guest`: the programs that run in Linux guests
+│   └── bin/         nvx-fake-openvmm and the guest binaries
 ├── build.rs         bundled-release staging
 └── artifacts.json   the NVX release that the `bundled` feature stages
 ```
@@ -46,6 +47,7 @@ nvx-rs/
 | `nvx::host::instance` | `Instance`: a VM in a directory of its own. It starts OpenVMM with a fresh capability and waits until the guest is ready and has mounted the mapped paths, reconciles recorded state, recovers interrupted launches, runs workloads and pumps their output, and stops the VM with a forced fallback |
 | `nvx::host::session`, `process`, `platform`, `report` | The authenticated control session, OpenVMM processes, Linux and Windows primitives, and OpenVMM's outcome report |
 | `nvx::testing::fake_openvmm` | A fake OpenVMM that serves the control console and runs scripted workloads without a VM |
+| `nvx::guest` | The programs that run in Linux guests; see [Guest binaries](#guest-binaries) |
 
 Lowering functions take the names by which messages refer to their inputs, such
 as `EgressRules::name` and `PathList::name`, so callers' messages name their own
@@ -59,10 +61,12 @@ fields.
 | `bundled` | Stages a release at build time; see [Bundled artifacts](#bundled-artifacts) |
 | `testing` | The fake OpenVMM and the `nvx-fake-openvmm` binary |
 | `serde` | The serde form of `Hypervisor` |
+| `guest` | The `guest` module and the guest binaries; see [Guest binaries](#guest-binaries) |
 
 Without default features, the crate has only `protocol`, `contract`, `net`,
 `Hypervisor`, and `Error`, and depends on nothing but `serde` when `serde` is
-enabled; `aci_edge_sandboxes_model` uses it that way.
+enabled and `nix` and `getrandom` when `guest` is; `aci_edge_sandboxes_model`
+uses it that way.
 
 ## Example
 
@@ -148,6 +152,32 @@ of `nvx::contract`. The build scripts of dependents receive the staged
 directory as `DEP_NVX_ARTIFACTS_DIR` and can ship it next to their executables
 as `nvx/`.
 
+## Guest binaries
+
+The `guest` feature adds the programs that run in NVX's Linux guests: the
+`nvx::guest` module and one binary per program. Guest images install these
+executables as `/sbin/nvx-*`.
+
+| Binary | Program |
+| --- | --- |
+| `nvx-console-pending DEVICE` | Prints the number of bytes waiting to be read from a device, such as a console |
+| `nvx-mmio-write ADDRESS VALUE` | Stores a 32-bit value at a physical address through `/dev/mem` (x86_64) |
+| `nvx-port-io COMMAND ...` | Reads or writes an I/O port through `/dev/port`, or reads the VM generation ID |
+| `nvx-reseed [--generation-only] SEED_FILE [PREVIOUS]`, `nvx-reseed --sample` | Reseeds the kernel's random number generator from a seed file and checks its VM generation ID, or prints a random sample |
+| `nvx-exit [CODE]` | Stops the VM with an 8-bit exit code through OpenVMM's control port 0x604 (x86_64) |
+| `nvx-device-io file ...`, `nvx-device-io network ...` | The benchmark helper that measures file and UDP round-trip I/O and prints one JSON line (x86_64) |
+
+Each binary's command line, exit statuses, and byte output are compatibility
+contracts; the [`nvx::guest`](src/guest/mod.rs) documentation describes each
+program. Guests run them as static `x86_64-unknown-linux-musl` executables. On
+Linux, with the musl target and a C compiler driver, `cc`, `nvx.py` builds them:
+
+```bash
+rustup target add x86_64-unknown-linux-musl
+python3 scripts/nvx.py build-guest-binaries \
+  --output build/nvx-rs-guest-binaries
+```
+
 ## Testing
 
 ```bash
@@ -157,10 +187,21 @@ NVX_BUNDLE=skip cargo test --all-features   # unit, golden-fixture, and fake-Ope
 
 The tests need no hypervisor. The fake-OpenVMM test drives `Instance` end to end
 against `nvx-fake-openvmm`, and the protocol tests compare the wire constants
-with the guest agent's source in `guest/common/nvx-managed-agent.c`. The
+with the guest agent's source in `guest/common/nvx-managed-agent.c`. On Linux,
+`nvx.py` also lints and tests the guest binaries, and runs their integration
+tests against a build of them:
+
+```bash
+python3 ../scripts/nvx.py check-guest-binaries
+python3 ../scripts/nvx.py test-guest-binaries \
+  --binaries ../build/nvx-rs-guest-binaries
+```
+
+The
 [`check-nvx-rs`](../.github/actions/check-nvx-rs/action.yml) action runs
 rustfmt, Clippy with warnings denied for every feature and for the library
 without default features, the tests, a synthetic-release `bundled` test,
 rustdoc with warnings denied, the minimum supported Rust version (1.89), and a
-macOS check. `python3 scripts/nvx.py test-aci-edge-sandboxes --backend kvm`
+macOS check. On Linux, it also lints, builds, and tests the guest binaries
+through `nvx.py`. `python3 scripts/nvx.py test-aci-edge-sandboxes --backend kvm`
 exercises the crate on a real hypervisor through `aci_edge_sandboxes`.

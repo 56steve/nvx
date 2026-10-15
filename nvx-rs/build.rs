@@ -27,6 +27,7 @@ fn main() {
 mod contract;
 
 #[cfg(feature = "bundled")]
+/// Stages and verifies the release bundle selected for the build.
 mod bundle {
     use std::collections::HashMap;
     use std::env;
@@ -38,13 +39,20 @@ mod bundle {
     use serde_json::Value;
     use sha2::{Digest, Sha256};
 
+    /// Environment variable whose presence suppresses bundle staging.
     const SKIP: &str = "NVX_BUNDLE";
+    /// Environment variable that selects an existing extracted release.
     const SOURCE_DIR: &str = "NVX_BUNDLE_DIR";
+    /// Environment variable that selects the KVM or MSHV Linux package.
     const HYPERVISOR: &str = "NVX_BUNDLE_HYPERVISOR";
+    /// Name of the release's source and compatibility manifest.
     const MANIFEST: &str = "SOURCE-MANIFEST.json";
+    /// Name of the release's SHA-256 checksum list.
     const CHECKSUMS: &str = "SHA256SUMS";
+    /// Guest artifacts copied into every bundle.
     const GUEST: [&str; 2] = ["guest/vmlinux", "guest/initramfs.cpio.gz"];
 
+    /// Resolves the requested release, verifies it, and exposes the staged path to Cargo.
     pub(crate) fn run() {
         println!("cargo::rerun-if-changed=artifacts.json");
         for name in [SKIP, SOURCE_DIR, HYPERVISOR] {
@@ -282,10 +290,12 @@ mod bundle {
             .is_ok_and(|output| output.status.success() && output.stdout.starts_with(b"bsdtar"))
     }
 
+    /// Runs `command` and reports whether it exited successfully.
     fn succeeds(command: &mut Command) -> bool {
         command.output().is_ok_and(|output| output.status.success())
     }
 
+    /// Runs `command`, or terminates the build with its stderr on failure.
     fn execute(command: &mut Command) {
         let output = command
             .output()
@@ -299,6 +309,7 @@ mod bundle {
         }
     }
 
+    /// Parses the checksum file at `path` into release path-to-digest entries.
     fn read_checksums(path: &Path) -> HashMap<String, String> {
         let text = fs::read_to_string(path)
             .unwrap_or_else(|error| fail(format!("cannot read {}: {error}", path.display())));
@@ -314,6 +325,7 @@ mod bundle {
             .collect()
     }
 
+    /// Returns the lowercase SHA-256 digest of the file at `path`.
     fn sha256(path: &Path) -> String {
         let file = File::open(path)
             .unwrap_or_else(|error| fail(format!("cannot open {}: {error}", path.display())));
@@ -336,6 +348,7 @@ mod bundle {
             .collect()
     }
 
+    /// Stops the build with a bundle-specific `message`.
     fn fail(message: String) -> ! {
         panic!("nvx bundled artifacts: {message}");
     }

@@ -186,6 +186,7 @@ impl Artifacts {
     pub const BESIDE_EXE_DIR: &'static str = "nvx";
 }
 
+/// Implements artifact discovery with injectable environment and bundle sources for tests.
 fn discover_with(
     variable: impl Fn(&str) -> Option<OsString>,
     exe_dir: Option<&Path>,
@@ -251,6 +252,7 @@ pub fn absolute(path: &Path) -> Result<PathBuf> {
     })
 }
 
+/// Reads and parses the JSON file at `path`, naming it with `description` in errors.
 fn read_json(path: &Path, description: &str) -> Result<Value> {
     let text = fs::read_to_string(path).map_err(|error| {
         Error::unavailable(format!("cannot read {description} {}", path.display()))

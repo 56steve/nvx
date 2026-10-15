@@ -66,6 +66,7 @@ use crate::protocol::{
     encode_outer,
 };
 
+/// Largest workload-output frame emitted by the fake guest.
 const OUTPUT_CHUNK_BYTES: usize = 32 * 1024;
 
 /// Control features of the current guest: cancellation, workload accounts, workload
@@ -138,22 +139,37 @@ fn atoi(value: &str) -> i32 {
     }
 }
 
+/// Parsed OpenVMM-compatible command line and fake-specific test controls.
 struct Options {
     /// Name of the executable, which prefixes the fake's diagnostics.
     program: String,
+    /// Control endpoint at which the fake accepts host sessions.
     endpoint: String,
+    /// Path to the synthetic OpenVMM outcome report.
     report: PathBuf,
+    /// Backend name recorded in the synthetic report.
     hypervisor: String,
+    /// Path that receives the parsed command-line dump.
     args_dump: PathBuf,
+    /// Path that receives the mounted-host-path dump.
     maps_dump: PathBuf,
+    /// Status with which to stop immediately after launch, when requested.
     exit_on_start: Option<u8>,
+    /// Artificial delay before the fake guest becomes ready.
     boot_delay: Duration,
+    /// Artificial delay before the fake OpenVMM crashes, when requested.
     crash_after: Option<Duration>,
+    /// Whether stop requests are deliberately left unanswered.
     ignore_stop: bool,
+    /// Whether cancellation requests are deliberately ignored.
     ignore_cancel: bool,
+    /// Whether the guest omits feature negotiation like an older image.
     legacy_guest: bool,
+    /// Whether host-mapping requests are deliberately refused.
     refuse_maps: bool,
+    /// UID whose account and environment the fake guest models.
     workload_uid: u32,
+    /// Feature mask returned during guest feature negotiation.
     guest_features: GuestFeatures,
     /// Host directories of the aggregate export, in child order.
     children: Vec<PathBuf>,
@@ -229,6 +245,7 @@ fn program_name() -> String {
         .unwrap_or_else(|| "nvx-fake-openvmm".to_owned())
 }
 
+/// Parses the OpenVMM command line plus fake controls, rejecting unsupported combinations.
 fn parse(program: &str, arguments: &[String]) -> Result<Options, String> {
     const VALUED: [&str; 24] = [
         "--mount-aggregate",
@@ -454,6 +471,7 @@ fn parse(program: &str, arguments: &[String]) -> Result<Options, String> {
     })
 }
 
+/// Reads exactly one nonzero control capability from standard input.
 fn read_capability() -> Result<[u8; CAPABILITY_LEN], String> {
     let mut stdin = io::stdin().lock();
     let mut capability = [0u8; CAPABILITY_LEN];
@@ -472,6 +490,7 @@ fn read_capability() -> Result<[u8; CAPABILITY_LEN], String> {
 
 /// Guest state that lives in memory until the VM stops.
 struct Guest {
+    /// Values exposed by the fake's scripted `get` and `set` commands.
     values: BTreeMap<String, String>,
     /// Environment that workloads inherit unless they replace it.
     default_environment: Environment,
@@ -484,6 +503,7 @@ struct Guest {
 }
 
 impl Guest {
+    /// Constructs the initial guest environment and filesystem model from `options`.
     fn new(options: &Options) -> Self {
         // The Alpine image resolves the default identity to `nobody`; for any other host-selected
         // identity, the managed init creates the `nvx` account homed in /tmp.
@@ -567,15 +587,21 @@ impl Guest {
     }
 }
 
+/// Whether the fake should accept another control session or terminate.
 enum Flow {
+    /// Keep the fake VM running after the current session.
     Continue,
+    /// Stop the fake VM after a successful stop request.
     Exit,
 }
 
 /// Outcome of control traffic observed while a workload runs.
 enum Interrupt {
+    /// No control request is waiting.
     None,
+    /// The workload's matching cancellation request arrived.
     Cancel,
+    /// The host disconnected and abandoned the workload.
     Disconnected,
 }
 
@@ -633,6 +659,7 @@ fn control_record(record_type: u8, instance: &[u8; 16], epoch: u64) -> Vec<u8> {
     encode_outer(record_type, instance, epoch, 0, &[]).expect("an empty payload fits a record")
 }
 
+/// Decoded outer header paired with its owned payload.
 type Record = (OuterHeader, Vec<u8>);
 
 /// Reads one outer record, returning `None` at end of stream.
@@ -651,16 +678,24 @@ fn read_record<S: Read>(stream: &mut S) -> io::Result<Option<Record>> {
 
 /// One authenticated host session over a connected stream.
 struct Session<'a, S> {
+    /// Connected transport to the host.
     stream: &'a mut S,
+    /// Executable name used to prefix diagnostics.
     program: &'a str,
+    /// Random identity assigned to this attachment.
     instance: [u8; 16],
+    /// Monotonic attachment epoch.
     epoch: u64,
+    /// Sequence number of the next guest record.
     guest_sequence: u64,
+    /// Sequence number expected from the next host record.
     host_sequence: u64,
+    /// Whether matching cancellation requests are ignored for fault injection.
     ignore_cancel: bool,
 }
 
 impl<S: Read + Write + Pending> Session<'_, S> {
+    /// Encodes and sends one sequenced guest application frame.
     fn send(&mut self, kind: u8, request_id: u64, status: i32, payload: &[u8]) -> io::Result<()> {
         let frame = encode_app(kind, request_id, status, payload);
         let record = encode_outer(
@@ -692,6 +727,7 @@ impl<S: Read + Write + Pending> Session<'_, S> {
         Ok(Some((frame.kind, frame.request_id, frame.payload.to_vec())))
     }
 
+    /// Serves requests until the host disconnects or asks the VM to stop.
     fn run(&mut self, options: &Options, guest: &mut Guest) -> io::Result<Flow> {
         loop {
             let Some((kind, request_id, payload)) = self.request()? else {
@@ -749,6 +785,7 @@ impl<S: Read + Write + Pending> Session<'_, S> {
             .map(|outcome| outcome.is_some())
     }
 
+    /// Interprets one fake-workload script and emits the same records a guest agent would.
     fn exec_script(
         &mut self,
         request_id: u64,
@@ -926,6 +963,7 @@ impl<S: Read + Write + Pending> Session<'_, S> {
         self.exit(request_id, status, ExitCategory::Exit)
     }
 
+    /// Sends one frame and adapts success to the optional value expected by script execution.
     fn send_some(
         &mut self,
         kind: u8,
@@ -1009,6 +1047,7 @@ fn serve_client<S: Read + Write + Pending>(
     }
 }
 
+/// Writes the successful synthetic OpenVMM outcome report if the destination is new.
 fn write_report(options: &Options) {
     let report = serde_json::json!({
         "schema_version": 1,
@@ -1027,6 +1066,7 @@ fn write_report(options: &Options) {
 }
 
 #[cfg(unix)]
+/// Serves the fake control endpoint as a Unix-domain socket until a stop request.
 fn serve(options: &Options, capability: &[u8; CAPABILITY_LEN]) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener;
@@ -1047,6 +1087,7 @@ fn serve(options: &Options, capability: &[u8; CAPABILITY_LEN]) -> io::Result<()>
 }
 
 #[cfg(windows)]
+/// Serves the fake control endpoint as a Windows named pipe until a stop request.
 fn serve(options: &Options, capability: &[u8; CAPABILITY_LEN]) -> io::Result<()> {
     use std::fs::File;
     use std::os::windows::ffi::OsStrExt;

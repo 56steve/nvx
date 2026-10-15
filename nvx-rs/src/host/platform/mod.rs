@@ -10,10 +10,12 @@ use crate::error::{Error, Result};
 use crate::hypervisor::Hypervisor;
 
 #[cfg(target_os = "linux")]
+/// Linux implementations of host process, socket, and hypervisor primitives.
 mod linux;
 #[cfg(not(any(target_os = "linux", windows)))]
 mod other;
 #[cfg(windows)]
+/// Windows implementations of host process, pipe, and hypervisor primitives.
 mod windows;
 
 #[cfg(target_os = "linux")]

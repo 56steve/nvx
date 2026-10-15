@@ -1,0 +1,82 @@
+//! Numeric command-line arguments: decimal, or hexadecimal after `0x`.
+//!
+//! The C programs parsed these with `strtoull(text, &end, 0)`, which also accepts leading
+//! whitespace, a sign, and octal after a leading zero. No caller passes those forms, so the
+//! programs reject them as usage errors rather than read them differently.
+
+use std::ffi::CStr;
+
+/// Parses a whole, nonempty decimal number, or a hexadecimal one after a `0x` or `0X` prefix.
+///
+/// Returns `None` for an empty argument, any other character, a decimal number with a leading
+/// zero, which C read as octal, or a value above `u64::MAX`.
+pub(crate) fn parse_u64(text: &CStr) -> Option<u64> {
+    let text = text.to_str().ok()?;
+    let (digits, radix) = match text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
+        Some(digits) => (digits, 16),
+        None if text.len() > 1 && text.starts_with('0') => return None,
+        None => (text, 10),
+    };
+    // `from_str_radix` alone would also accept a leading `+`.
+    if digits.is_empty() || !digits.chars().all(|digit| digit.is_digit(radix)) {
+        return None;
+    }
+    u64::from_str_radix(digits, radix).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::CString;
+
+    use super::*;
+
+    fn parse(text: &[u8]) -> Option<u64> {
+        parse_u64(&CString::new(text).unwrap())
+    }
+
+    #[test]
+    fn parses_decimal_and_hexadecimal_numbers() {
+        let cases: &[(&[u8], u64)] = &[
+            (b"0", 0),
+            (b"7", 7),
+            (b"4096", 4096),
+            (b"18446744073709551615", u64::MAX),
+            (b"0x0", 0),
+            (b"0x10", 16),
+            (b"0XfF", 255),
+            (b"0x00ff", 255),
+            (b"0xffffffffffffffff", u64::MAX),
+        ];
+        for &(text, expected) in cases {
+            assert_eq!(parse(text), Some(expected), "{}", text.escape_ascii());
+        }
+    }
+
+    #[test]
+    fn rejects_every_other_form() {
+        for text in [
+            &b""[..],
+            b"0x",
+            b"0X",
+            b"00",
+            b"010",
+            b"08",
+            b"+1",
+            b"-1",
+            b" 1",
+            b"1 ",
+            b"1a",
+            b"0x1g",
+            b"0x+1",
+            b"0x-1",
+            b"1_000",
+            b"0b1",
+            b"18446744073709551616",
+            b"0x10000000000000000",
+            b"\xa01",
+            "\u{661}".as_bytes(),
+        ] {
+            assert_eq!(parse(text), None, "{}", text.escape_ascii());
+        }
+    }
+}

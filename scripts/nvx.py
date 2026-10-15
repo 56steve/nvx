@@ -82,6 +82,12 @@ from nvx_tools.create_linux_source_archive import (
 from nvx_tools.doctor import configure_parser as configure_doctor_parser
 from nvx_tools.doctor import host_cpu_signature
 from nvx_tools.egress_policy import compile_policy_file
+from nvx_tools.elf import check_static_executables
+from nvx_tools.guest_binaries import (
+    build_guest_binaries,
+    check_guest_binaries,
+    test_guest_binaries,
+)
 from nvx_tools.guests import GUEST_NAMES, guest_descriptor
 from nvx_tools.microvm_tests import configure_parser as configure_microvm_test_parser
 from nvx_tools.performance import configure_parser as configure_performance_parser
@@ -298,6 +304,28 @@ def command_build_guest(args: argparse.Namespace) -> None:
     build_guest(_build_config(args))
 
 
+def command_check_guest_binaries(args: argparse.Namespace) -> None:
+    check_guest_binaries(args.toolchain)
+
+
+def command_build_guest_binaries(args: argparse.Namespace) -> None:
+    result = build_guest_binaries(args.output)
+    print(
+        json.dumps(
+            {
+                "source_sha256": result.source_sha256,
+                "binaries": result.binaries,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
+
+
+def command_test_guest_binaries(args: argparse.Namespace) -> None:
+    test_guest_binaries(args.binaries)
+
+
 def command_build_kernel(args: argparse.Namespace) -> None:
     build_kernel(
         KernelBuildConfig.debug_variant()
@@ -380,6 +408,10 @@ def command_check_required_ci(args: argparse.Namespace) -> None:
         for failure in failures:
             print(f"::error::{failure}")
         raise ScriptError(f"{len(failures)} required CI job result(s) did not match")
+
+
+def command_check_static_elf(args: argparse.Namespace) -> None:
+    check_static_executables(args.paths)
 
 
 def command_test_openvmm(args: argparse.Namespace) -> None:
@@ -942,6 +974,30 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     _add_guest_options(guest, allow_all=True)
     guest.set_defaults(handler=command_build_guest)
 
+    guest_binary_checks = subparsers.add_parser(
+        "check-guest-binaries",
+        help="lint and test the Rust guest binaries for musl",
+    )
+    guest_binary_checks.add_argument(
+        "--toolchain",
+        help="Rust toolchain to use (default: the rust-toolchain.toml pin)",
+    )
+    guest_binary_checks.set_defaults(handler=command_check_guest_binaries)
+
+    guest_binaries = subparsers.add_parser(
+        "build-guest-binaries",
+        help="build the pinned Rust executables for Linux guests",
+    )
+    guest_binaries.add_argument("--output", type=Path, required=True)
+    guest_binaries.set_defaults(handler=command_build_guest_binaries)
+
+    guest_binary_tests = subparsers.add_parser(
+        "test-guest-binaries",
+        help="test prebuilt Rust guest executables",
+    )
+    guest_binary_tests.add_argument("--binaries", type=Path, required=True)
+    guest_binary_tests.set_defaults(handler=command_test_guest_binaries)
+
     kernel = subparsers.add_parser(
         "build-kernel",
         help="fetch, patch, and build the pinned kernel natively on Linux",
@@ -1076,6 +1132,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--run-openvmm-vmm-tests", choices=("false", "true"), required=True
     )
     required_ci.set_defaults(handler=command_check_required_ci)
+
+    static_elf = subparsers.add_parser(
+        "check-static-elf",
+        help="check that executables are static ELF files without an interpreter",
+    )
+    static_elf.add_argument("paths", nargs="+", type=Path, metavar="PATH")
+    static_elf.set_defaults(handler=command_check_static_elf)
 
     openvmm_unit_tests = subparsers.add_parser(
         "test-openvmm-unit",

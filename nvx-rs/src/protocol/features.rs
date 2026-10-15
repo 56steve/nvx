@@ -46,6 +46,7 @@ impl GuestFeatures {
             | Self::HOST_MAPPING_TABLE.0,
     );
 
+    /// Human-readable names of every required feature, used in compatibility errors.
     pub(crate) const NAMES: [(Self, &'static str); 6] = [
         (Self::CANCEL, "cancellation"),
         (Self::WORKLOAD_ACCOUNT, "workload accounts"),

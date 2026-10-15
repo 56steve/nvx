@@ -127,6 +127,7 @@ pub struct LaunchRecord {
 /// Held advisory lock. Dropping it releases the lock.
 #[derive(Debug)]
 pub struct LockGuard {
+    /// Open locked file whose lifetime holds the operating-system lock.
     _file: File,
 }
 
@@ -150,10 +151,12 @@ pub fn create_private_dir(path: &Path) -> io::Result<()> {
     platform::create_private_dir(path)
 }
 
+/// Builds an error mapper that preserves an I/O source under `context`.
 fn io_error(context: String) -> impl FnOnce(io::Error) -> Error {
     move |error| Error::io(context).with_source(error)
 }
 
+/// Returns create-and-write options that request owner-only permissions on Unix.
 fn private_options() -> OpenOptions {
     let mut options = OpenOptions::new();
     options.write(true).create(true);
@@ -278,7 +281,9 @@ pub struct Stopped {
 /// One VM instance in a directory of its own.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Instance {
+    /// Private directory containing runtime state, logs, and the control endpoint.
     dir: PathBuf,
+    /// Sandbox name used in diagnostics.
     name: String,
 }
 
@@ -495,6 +500,7 @@ impl Instance {
         }
     }
 
+    /// Describes why this instance did not start and points the caller to its log.
     fn start_failure(&self, kind: ErrorKind, reason: &str) -> Error {
         Error::new(
             kind,
@@ -679,6 +685,7 @@ impl Instance {
         })
     }
 
+    /// Maps a control-session failure onto an instance-facing error and message.
     fn session_error(&self, error: SessionError, control_timeout: Duration) -> Error {
         match error {
             SessionError::ProcessExited => {
@@ -830,9 +837,13 @@ pub enum WorkloadOutcome {
 
 /// A workload that [`Instance::exec`] started.
 pub struct Execution {
+    /// Exclusive control session that carries this workload's traffic.
     session: ControlSession,
+    /// Identifier correlating requests, output, cancellation, and the final outcome.
     request_id: u64,
+    /// Workload response deadline, absent for a workload without a timeout.
     deadline: Option<Instant>,
+    /// Maximum time allowed for control traffic after cancellation or failure.
     control_timeout: Duration,
 }
 
