@@ -3,18 +3,23 @@
 
 """Tests for benchmark host provenance and storage telemetry."""
 
+import contextlib
 import http.client
+import http.server
 import json
 import os
 import platform
+import socket
 import struct
 import sys
 import tempfile
+import threading
 import time
 import unittest
+import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -257,6 +262,12 @@ class AzureProvenanceTests(unittest.TestCase):
             def read(self, _size: int) -> bytes:
                 return b'{"vmSize": "Standard_D4s_v5"}'
 
+            payload = b'{"vmSize": "Standard_D4s_v5"}'
+
+            def read1(self, _size: int) -> bytes:
+                chunk, self.payload = self.payload, b""
+                return chunk
+
         opener = MagicMock()
         opener.open.return_value = Response()
         with patch.object(
@@ -273,6 +284,108 @@ class AzureProvenanceTests(unittest.TestCase):
         self.assertEqual(request.get_header("Metadata"), "true")
         self.assertEqual(opener.open.call_args.kwargs, {"timeout": 1.5})
         self.assertEqual(document, {"vmSize": "Standard_D4s_v5"})
+
+    def test_metadata_read_gives_up_at_the_deadline_on_a_trickling_response(self):
+        body = b'{"vmSize": "Standard_D4s_v5", "pad": "' + b"x" * 400 + b'"}'
+
+        class TrickleResponse:
+            # Each piece arrives within the socket timeout, so only an
+            # end-to-end deadline can stop the read.
+            def __enter__(self) -> "TrickleResponse":
+                return self
+
+            def __exit__(self, *_: object) -> None:
+                return None
+
+            def read(self, _size: int) -> bytes:
+                time.sleep(0.02)
+                return body
+
+            def read1(self, _size: int) -> bytes:
+                time.sleep(0.02)
+                return body[:1]
+
+        opener = MagicMock()
+        opener.open.return_value = TrickleResponse()
+        started = time.monotonic()
+        with (
+            patch.object(
+                host_telemetry.urllib.request, "build_opener", return_value=opener
+            ),
+            self.assertRaises(TimeoutError),
+        ):
+            host_telemetry.read_azure_compute_metadata(timeout=0.1)
+        self.assertLess(time.monotonic() - started, 1.0)
+
+    def test_metadata_open_gives_up_at_the_deadline_when_headers_trickle(self):
+        class Response:
+            def __enter__(self) -> "Response":
+                return self
+
+            def __exit__(self, *_: object) -> None:
+                return None
+
+            def read1(self, _size: int) -> bytes:
+                return b""
+
+        def trickle_headers(*_args: object, **_kwargs: object) -> Response:
+            # The status line and headers are read inside opener.open(), so a
+            # deadline checked only while reading the body cannot stop them.
+            time.sleep(1.0)
+            return Response()
+
+        opener = MagicMock()
+        opener.open.side_effect = trickle_headers
+        started = time.monotonic()
+        with (
+            patch.object(
+                host_telemetry.urllib.request, "build_opener", return_value=opener
+            ),
+            self.assertRaises(TimeoutError),
+        ):
+            host_telemetry.read_azure_compute_metadata(timeout=0.1)
+        self.assertLess(time.monotonic() - started, 0.5)
+
+    def test_metadata_request_is_aborted_at_the_deadline(self):
+        server = socket.create_server(("127.0.0.1", 0))
+        self.addCleanup(server.close)
+        aborted = threading.Event()
+
+        def trickle_headers() -> None:
+            # Each header line arrives within the socket timeout, and no blank
+            # line ends the header block, so the client stays in opener.open().
+            connection, _ = server.accept()
+            with connection:
+                connection.sendall(b"HTTP/1.1 200 OK\r\n")
+                try:
+                    for _ in range(100):
+                        connection.sendall(b"X-Pad: 0123456789\r\n")
+                        time.sleep(0.05)
+                except OSError:
+                    aborted.set()
+
+        threading.Thread(target=trickle_headers, daemon=True).start()
+        url = f"http://127.0.0.1:{server.getsockname()[1]}/metadata"
+        # Workers left running by earlier tests are not this request's worker.
+        earlier = set(threading.enumerate())
+        started = time.monotonic()
+        with (
+            patch.object(host_telemetry, "AZURE_IMDS_URL", url),
+            self.assertRaises(TimeoutError),
+        ):
+            host_telemetry.read_azure_compute_metadata(timeout=0.2)
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertTrue(aborted.wait(2), "the metadata connection was left open")
+        workers = [
+            t
+            for t in threading.enumerate()
+            if t.name == "azure-imds" and t not in earlier and t.is_alive()
+        ]
+        self.assertEqual(
+            workers,
+            [],
+            "the metadata worker is still running after the request was aborted",
+        )
 
 
 class HostProvenanceTests(unittest.TestCase):
@@ -1094,6 +1207,92 @@ class PlatformTelemetryTests(unittest.TestCase):
                 {"scratch": Path(tempfile.gettempdir())}, 0
             )
         )
+
+
+class AzureMetadataRequestTests(unittest.TestCase):
+    def test_a_redirect_is_not_followed(self):
+        served: list[str] = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                served.append(self.path)
+                if self.path == "/redirect":
+                    self.send_response(302)
+                    self.send_header("Location", "/elsewhere")
+                else:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+            def log_message(self, format: str, *args: object) -> None:
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.addCleanup(server.server_close)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        url = f"http://127.0.0.1:{server.server_port}/redirect"
+
+        with patch.object(host_telemetry, "AZURE_IMDS_URL", url):
+            with self.assertRaises(urllib.error.HTTPError) as refused:
+                host_telemetry.read_azure_compute_metadata(timeout=2)
+            refused.exception.close()
+
+        self.assertEqual(served, ["/redirect"])
+
+    def test_a_refused_connection_closes_its_socket(self):
+        created: list[socket.socket] = []
+        real_socket = socket.socket
+
+        class RefusingSocket(real_socket):
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                super().__init__(*args, **kwargs)
+                created.append(self)
+
+            def connect(self, address: object) -> None:
+                raise ConnectionRefusedError("refused")
+
+        with (
+            patch.object(socket, "socket", RefusingSocket),
+            patch.object(
+                host_telemetry, "AZURE_IMDS_URL", "http://127.0.0.1:9/compute"
+            ),
+        ):
+            with self.assertRaises(OSError):
+                host_telemetry.read_azure_compute_metadata(timeout=2)
+
+        self.assertEqual(len(created), 1)
+        self.assertEqual(created[0].fileno(), -1, "the refused socket was left open")
+
+    def test_a_connect_still_in_progress_is_shut_down_at_the_deadline(self):
+        blocked = threading.Event()
+        released = threading.Event()
+        real_socket = socket.socket
+
+        class BlockingSocket(real_socket):
+            def connect(self, address: object) -> None:
+                blocked.set()
+                if not released.wait(5):
+                    raise OSError("the pending connect was never shut down")
+                raise OSError("connect shut down")
+
+            def shutdown(self, how: int) -> None:
+                released.set()
+                with contextlib.suppress(OSError):
+                    super().shutdown(how)
+
+        with (
+            patch.object(socket, "socket", BlockingSocket),
+            patch.object(
+                host_telemetry, "AZURE_IMDS_URL", "http://127.0.0.1:9/compute"
+            ),
+        ):
+            with self.assertRaises(TimeoutError):
+                host_telemetry.read_azure_compute_metadata(timeout=0.2)
+
+        self.assertTrue(blocked.is_set())
+        self.assertTrue(released.is_set(), "the pending connect was never shut down")
 
 
 if __name__ == "__main__":

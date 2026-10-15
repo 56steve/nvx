@@ -23,6 +23,7 @@ WMI data block enables, GetSystemTimes, and NtQuerySystemInformation.
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import ctypes
 import functools
@@ -33,10 +34,12 @@ import os
 import platform
 import re
 import shutil
+import socket
 import struct
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 import uuid
 from collections.abc import Callable, Mapping, Sequence
@@ -286,14 +289,126 @@ def may_be_azure_vm() -> bool:
         return False
 
 
+AZURE_IMDS_CUT_OFF_GRACE_SECONDS = 0.1
+
+
+class _MetadataSockets:
+    """The sockets of one metadata request, so the request can be cut off at its deadline."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._sockets: list[socket.socket] = []
+        self._cut_off = False
+
+    def add(self, sock: socket.socket) -> bool:
+        with self._lock:
+            if self._cut_off:
+                return False
+            self._sockets.append(sock)
+            return True
+
+    def cut_off(self) -> None:
+        with self._lock:
+            self._cut_off = True
+            sockets = list(self._sockets)
+        for sock in sockets:
+            with contextlib.suppress(OSError):
+                sock.shutdown(socket.SHUT_RDWR)
+
+
+def _metadata_opener(
+    sockets: _MetadataSockets, deadline: float
+) -> urllib.request.OpenerDirector:
+    class Connection(http.client.HTTPConnection):
+        def connect(self) -> None:
+            # Register the socket before connecting, so cut_off can interrupt a
+            # connect that has not finished. Each connection gets only what is
+            # left of the request's deadline.
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            if not sockets.add(sock):
+                sock.close()
+                raise TimeoutError("metadata response did not finish in time")
+            try:
+                remaining = max(0.001, deadline - time.monotonic())
+                sock.settimeout(
+                    remaining if self.timeout is None else min(self.timeout, remaining)
+                )
+                sock.connect((self.host, self.port))
+            except BaseException:
+                # self.sock is not assigned yet, so close() cannot release this socket.
+                sock.close()
+                raise
+            self.sock = sock
+
+    class Handler(urllib.request.HTTPHandler):
+        def http_open(self, req: urllib.request.Request) -> http.client.HTTPResponse:
+            return self.do_open(Connection, req)
+
+    class NoRedirects(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[no-untyped-def]
+            # The endpoint is fixed, so a redirect is refused and surfaces as an HTTPError.
+            return None
+
+    class PlainHttpOnly(urllib.request.HTTPSHandler):
+        def https_open(self, req: urllib.request.Request) -> http.client.HTTPResponse:
+            raise urllib.error.URLError("the metadata service is plain HTTP only")
+
+    # The link-local metadata service must never be reached through a proxy.
+    return urllib.request.build_opener(
+        urllib.request.ProxyHandler({}), Handler(), NoRedirects(), PlainHttpOnly()
+    )
+
+
 def read_azure_compute_metadata(
     timeout: float = AZURE_IMDS_TIMEOUT_SECONDS,
 ) -> object:
     request = urllib.request.Request(AZURE_IMDS_URL, headers={"Metadata": "true"})
-    # The link-local metadata service must never be reached through a proxy.
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    deadline = time.monotonic() + timeout
+    sockets = _MetadataSockets()
+    opener = _metadata_opener(sockets, deadline)
+    # The socket timeout only bounds each wait, so a trickling peer could
+    # otherwise hold the request open indefinitely. The request runs on a
+    # daemon thread. At the end-to-end deadline its sockets are shut down, which
+    # also ends opener.open() reading the status line and headers, and the
+    # thread is joined so that no worker outlives the call.
+    outcome: dict[str, object] = {}
+
+    def fetch() -> None:
+        try:
+            outcome["document"] = _fetch_compute_metadata(
+                opener, request, timeout, deadline
+            )
+        except Exception as error:
+            outcome["error"] = error
+
+    worker = threading.Thread(target=fetch, name="azure-imds", daemon=True)
+    worker.start()
+    worker.join(max(0.0, deadline - time.monotonic()))
+    if worker.is_alive():
+        sockets.cut_off()
+        worker.join(AZURE_IMDS_CUT_OFF_GRACE_SECONDS)
+        raise TimeoutError("metadata response did not finish in time")
+    if "error" in outcome:
+        raise cast(Exception, outcome["error"])
+    return outcome["document"]
+
+
+def _fetch_compute_metadata(
+    opener: urllib.request.OpenerDirector,
+    request: urllib.request.Request,
+    timeout: float,
+    deadline: float,
+) -> object:
     with opener.open(request, timeout=timeout) as response:
-        return json.loads(response.read(MIB).decode("utf-8"))
+        body = bytearray()
+        while len(body) < MIB:
+            if time.monotonic() >= deadline:
+                raise TimeoutError("metadata response did not finish in time")
+            chunk = response.read1(MIB - len(body))
+            if not chunk:
+                break
+            body += chunk
+        return json.loads(body.decode("utf-8"))
 
 
 def azure_compute_provenance(compute: object) -> dict[str, object]:
