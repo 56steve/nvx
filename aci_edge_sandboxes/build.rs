@@ -60,6 +60,7 @@ mod agent_bundle {
     use std::io::{BufReader, Read};
     use std::path::{Component, Path, PathBuf};
     use std::process::Command;
+    use std::time::{Duration, SystemTime};
 
     use serde_json::Value;
     use sha2::{Digest, Sha256};
@@ -98,6 +99,8 @@ mod agent_bundle {
     }
 
     pub(crate) fn run() {
+        // `install` dates the files that it writes before this time.
+        let started = SystemTime::now();
         for name in [SKIP, URL, DIR, ARCHIVE_SHA256] {
             println!("cargo::rerun-if-env-changed={name}");
         }
@@ -178,7 +181,7 @@ mod agent_bundle {
                 short(expected)
             ));
         }
-        install(&staged, &out_dir, &bundle);
+        install(&staged, &out_dir, &bundle, started);
         println!(
             "cargo::rustc-env=ACI_EDGE_SANDBOXES_BUNDLED_AGENT_MANIFEST_SHA256={}",
             bundle.manifest_sha256
@@ -230,22 +233,40 @@ mod agent_bundle {
 
         /// Runs the build script again when HEAD moves to another commit.
         fn watch(&self) {
-            // HEAD's reflog records every move, including a commit to a branch that only
-            // `packed-refs` held, which creates a loose ref that no earlier run could watch. The
-            // other files cover repositories without reflogs and the reftable format.
+            // HEAD's reflog records every move. Without reflogs, the loose branch ref and
+            // `packed-refs` do, and the reftable format has its own table list.
+            let branch = git(&self.directory, &["symbolic-ref", "--quiet", "HEAD"]);
             let mut references = ["HEAD", "logs/HEAD", "packed-refs", "reftable/tables.list"]
                 .map(str::to_owned)
                 .to_vec();
-            references.extend(git(&self.directory, &["symbolic-ref", "--quiet", "HEAD"]));
+            references.extend(branch.clone());
             for reference in references {
-                if let Some(path) = git(&self.directory, &["rev-parse", "--git-path", &reference]) {
-                    let path = self.directory.join(path);
-                    // Cargo runs a build script on every build while a watched path is missing.
-                    if path.is_file() {
-                        println!("cargo::rerun-if-changed={}", path.display());
-                    }
+                let Some(path) = self.git_path(&reference) else {
+                    continue;
+                };
+                // Cargo runs a build script on every build while a watched path is missing.
+                if path.is_file() {
+                    println!("cargo::rerun-if-changed={}", path.display());
+                } else if branch.as_ref() == Some(&reference)
+                    && let Some(heads) = self.git_path("refs/heads")
+                    && let Some(directory) = path
+                        .ancestors()
+                        .skip(1)
+                        .take_while(|directory| directory.starts_with(&heads))
+                        .find(|directory| directory.is_dir())
+                {
+                    // A branch that only `packed-refs` holds gets a loose ref on its next commit,
+                    // which, without a reflog, changes no watched file. Cargo notices a new file in
+                    // a watched directory.
+                    println!("cargo::rerun-if-changed={}", directory.display());
                 }
             }
+        }
+
+        /// Returns the path of `name` in the git directory.
+        fn git_path(&self, name: &str) -> Option<PathBuf> {
+            git(&self.directory, &["rev-parse", "--git-path", name])
+                .map(|path| self.directory.join(path))
         }
     }
 
@@ -547,6 +568,15 @@ mod agent_bundle {
                 "{BUNDLE_MANIFEST} consumer.sandboxAbiVersion is not a number"
             ))
         });
+        // The crate's compile-time check would also reject the bundle, but only after the bundle
+        // had replaced the installed one that earlier executables use.
+        let expected_abi = aci_edge_sandboxes_model::wire::SANDBOX_ABI_VERSION;
+        if sandbox_abi != u64::from(expected_abi) {
+            fail(format!(
+                "the bundle's agent library speaks sandbox ABI {sandbox_abi}, but this crate \
+                 speaks {expected_abi}"
+            ));
+        }
         let revision = manifest
             .pointer("/sources/nvx/revision")
             .and_then(Value::as_str)
@@ -562,8 +592,9 @@ mod agent_bundle {
     }
 
     /// Copies the staged bundle beside the executables that Cargo builds, replacing only the files
-    /// that differ, where `agent::BundledAgent::discover` finds it.
-    fn install(staged: &Path, out_dir: &Path, bundle: &Bundle) {
+    /// that differ, where `agent::BundledAgent::discover` finds it, and runs this script again
+    /// when that copy is replaced or removed.
+    fn install(staged: &Path, out_dir: &Path, bundle: &Bundle, started: SystemTime) {
         // `OUT_DIR` is `<profile>/build/<package>-<hash>/out`. Cargo builds executables into
         // `<profile>`, `<profile>/examples`, and `<profile>/deps`.
         let profile = Some(out_dir)
@@ -592,6 +623,13 @@ mod agent_bundle {
             .map(|(name, digest)| (name.as_str(), digest.clone()))
             .collect();
         files.push((CHECKSUMS, sha256(&staged.join(CHECKSUMS))));
+        // Cargo runs this script again when the manifest that it watches below is newer than the
+        // script's last start, which every file written now would be. Dating the files a second
+        // before this run started avoids that, and still dates them after the start of any
+        // earlier run of another feature configuration's script.
+        let dated = started
+            .checked_sub(Duration::from_secs(1))
+            .unwrap_or(started);
         for (name, digest) in files {
             let target = inside(&installed, name);
             if fs::symlink_metadata(&target).is_ok_and(|metadata| metadata.is_file())
@@ -601,6 +639,11 @@ mod agent_bundle {
             }
             let partial = PathBuf::from(format!("{}.partial", target.display()));
             copy(&inside(staged, name), &partial);
+            // At worst, a file that keeps the current time runs this script once more.
+            let _ = File::options()
+                .write(true)
+                .open(&partial)
+                .and_then(|file| file.set_modified(dated));
             fs::rename(&partial, &target).unwrap_or_else(|error| {
                 let _ = fs::remove_file(&partial);
                 fail(format!(
@@ -609,6 +652,13 @@ mod agent_bundle {
                 ))
             });
         }
+        // Cargo caches the output of this script separately for each feature configuration of the
+        // crate, so another configuration may install a different bundle here, and the copy may be
+        // removed. Running this script again then restores the bundle that this build pins.
+        println!(
+            "cargo::rerun-if-changed={}",
+            installed.join(SOURCE_MANIFEST).display()
+        );
     }
 
     /// Fails if `directory` holds a link at any depth: a bundle holds only files and directories.

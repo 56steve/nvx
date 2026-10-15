@@ -388,7 +388,10 @@ used. It fails if none has one or if the commit cannot be told (no git checkout 
 Releases publish no bundle for Linux, so a Linux build needs one of the variables below. Other
 targets, where the agent library cannot run, stage nothing, as `bundled` does. The build script
 runs again when `HEAD` moves to another commit or a variable below changes; run
-`cargo clean -p aci_edge_sandboxes` to pick up a bundle published later for the same commit.
+`cargo clean -p aci_edge_sandboxes` to pick up a bundle published later for the same commit. It
+also runs again when the copy beside the executables (see below) is replaced or removed, for
+example by a build of another feature configuration that uses a different bundle, and restores
+the bundle that the configuration being built pins.
 
 | Build variable | Effect |
 | --- | --- |
