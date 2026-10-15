@@ -16,6 +16,10 @@
 //! With the `agent-bundled` feature, the build script stages an edge agent bundle beside the
 //! executables, and [`AgentConfig::bundled`] uses it without any path or digest from the caller.
 
+// The names and pins that the build script shares with this crate.
+#[cfg(feature = "agent-bundled")]
+#[allow(dead_code)]
+mod bundle_contract;
 #[cfg(feature = "agent-bundled")]
 mod bundled;
 mod library;

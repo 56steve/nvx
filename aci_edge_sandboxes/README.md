@@ -979,14 +979,17 @@ conversion, without the exec case, turns any `nvx::Error` into an `Error`.
 
 ```bash
 cargo test --all-features   # unit, mock, and fake-OpenVMM tests; no hypervisor needed
+python3 scripts/nvx.py test-agent-bundling   # agent bundle staging (repository root)
 python3 scripts/nvx.py test-aci-edge-sandboxes --backend kvm   # real VM (repository root)
 ```
 
 Set `NVX_BUNDLE=skip` and `ACI_EDGE_SANDBOXES_AGENT_BUNDLE=skip` for `--all-features` builds
-that should not download the pinned release or the edge agent bundle. The
+that should not download the pinned release or the edge agent bundle.
+`nvx.py test-agent-bundling`, which the
 [`check-aci-edge-sandboxes`](../.github/actions/check-aci-edge-sandboxes/action.yml) action
-also stages a synthetic agent bundle through `ACI_EDGE_SANDBOXES_AGENT_BUNDLE_DIR`, which the
-bundled-agent tests must find, and checks that the build rejects broken copies of it. The NVX
+runs, stages a synthetic agent bundle through `ACI_EDGE_SANDBOXES_AGENT_BUNDLE_DIR`, which the
+bundled-agent tests must find, and checks that the build rejects broken copies of it; it needs
+neither a hypervisor nor an agent library that runs. The NVX
 mechanics are tested in [`nvx-rs`](../nvx-rs/README.md)
 as well, with their own unit tests, golden protocol fixtures, and a
 fake-OpenVMM lifecycle test.

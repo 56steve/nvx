@@ -108,7 +108,8 @@ mechanics, such as the golden fixtures of the control protocol, belong in
 `nvx-rs`, and tests of the ACI Edge Sandboxes contract in
 `aci_edge_sandboxes`. The `scripts/nvx.py test-aci-edge-sandboxes --backend
 BACKEND` command runs all ignored `openvmm_e2e` tests on a real hypervisor,
-which exercises both crates. [Continuous integration](ci.md)
+which exercises both crates, and `scripts/nvx.py test-agent-bundling` checks
+the crate's agent bundle staging without one. [Continuous integration](ci.md)
 describes what the OpenVMM VMM tests and the NVX microVM suite cover.
 
 ## OpenVMM

@@ -39,6 +39,7 @@ python3 scripts/nvx.py performance gate --help
 | `test-microvm` | Run NVX Linux and device correctness tests through OpenVMM. |
 | `doctor` | Qualify this host for the NVX time ABI. |
 | `test-aci-edge-sandboxes` | Run the `aci_edge_sandboxes` Rust crate lifecycle test on a real hypervisor. |
+| `test-agent-bundling` | Check the `aci_edge_sandboxes` crate's agent bundle staging without a hypervisor. |
 | `test-adversarial` | Run a brokered Copilot-driven adversarial campaign. |
 | `build` | Build the guest artifacts and OpenVMM. |
 | `download` | Install the selected platform package built from this checkout or a released first-parent ancestor. |
@@ -366,6 +367,29 @@ The sandboxes keep their state in a temporary directory, which the command delet
 only once every sandbox has been deprovisioned. If the test is interrupted or fails
 to stop or deprovision a sandbox, the command keeps the directory and names each
 remaining sandbox with the OpenVMM process ID that may still run.
+
+### `test-agent-bundling`
+
+```text
+python3 scripts/nvx.py test-agent-bundling
+    [--cargo CARGO]
+    [--toolchain TOOLCHAIN]
+```
+
+Checks how the [`aci_edge_sandboxes` crate](../aci_edge_sandboxes/README.md)
+stages edge agent bundles with its `agent-bundled` feature, without a
+hypervisor or an agent library that runs. The command writes a synthetic bundle
+for this host's platform, whose files hold their own names, stages it through
+`ACI_EDGE_SANDBOXES_AGENT_BUNDLE_DIR`, and requires the crate's bundled-agent
+unit tests to find it with the digests that the build compiled in. It then
+requires the build to reject copies of the bundle with a tampered file, a
+runtime manifest that pins another file as the kernel, another sandbox ABI, and
+a link in place of a directory: a symbolic link, or a junction on Windows. It
+reads the variable names from the crate's `src/agent/bundle_contract.rs` and the
+sandbox ABI from its data model, and clears the crate's other bundle variables
+from the environment of the builds. `--cargo` selects the Cargo executable and
+`--toolchain` the Rust toolchain that rustup runs it with. CI runs the command
+on Linux and Windows.
 
 ### `test-adversarial`
 
