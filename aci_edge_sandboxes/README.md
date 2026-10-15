@@ -375,24 +375,25 @@ use aci_edge_sandboxes::agent::AgentConfig;
 let client = AciEdgeSandbox::agent(AgentConfig::bundled("C:\\nvx-edge-state")?)?;
 ```
 
-`BundledAgent::locate` returns the bundle's directory, runtime, library, and digests, for a setup
-of one's own: `bundle.config(bundle.setup(state_root).with_cpu_profile(...))`.
+`BundledAgent::discover` returns the bundle's directory, runtime, library, and digests, for a
+setup of one's own: `bundle.config(bundle.setup(state_root).with_cpu_profile(...))`.
 
 By default the build script downloads the `aci-edge-sandboxes.zip` asset of the release of the
 commit being built, `v<VERSION>-dev.<first 12 hex digits>`. Releases do not publish the bundle
 for every commit, so when that release has none, the build uses the release of the nearest
 first-parent ancestor that does, searching at most 32 commits, and warns which one it used. It
-fails if none has one, if the commit cannot be told (no git checkout or no `git` on `PATH`), or
-for a target other than Windows, for which releases publish no bundle. The build script runs
-again when `HEAD` moves to another commit or a variable below changes; run
+fails if none has one or if the commit cannot be told (no git checkout or no `git` on `PATH`).
+Releases publish no bundle for Linux, so a Linux build needs one of the variables below. Other
+targets, where the agent library cannot run, stage nothing, as `bundled` does. The build script
+runs again when `HEAD` moves to another commit or a variable below changes; run
 `cargo clean -p aci_edge_sandboxes` to pick up a bundle published later for the same commit.
 
-| Variable | Effect |
+| Build variable | Effect |
 | --- | --- |
-| `ACI_EDGE_SANDBOXES_AGENT_BUNDLE_URL` | Downloads this bundle ZIP instead, from any URL that `curl` reads, such as a mirror or a `file://` URL |
-| `ACI_EDGE_SANDBOXES_AGENT_BUNDLE_DIR` | Stages an extracted bundle or a bundle ZIP on the build host instead, for offline builds or locally built bundles |
+| `ACI_EDGE_SANDBOXES_AGENT_BUNDLE_URL` | Downloads this bundle ZIP instead, from any URL that `curl` reads, such as a mirror; a `file://` URL names a ZIP on the build host |
+| `ACI_EDGE_SANDBOXES_AGENT_BUNDLE_DIR` | Stages this extracted bundle instead, for offline builds or locally built bundles |
 | `ACI_EDGE_SANDBOXES_AGENT_BUNDLE_SHA256` | Requires the ZIP to have this SHA-256 |
-| `ACI_EDGE_SANDBOXES_AGENT_BUNDLE=skip` | Stages nothing; `BundledAgent::locate` then fails with `backend_unavailable`. CI sets it for `--all-features` builds |
+| `ACI_EDGE_SANDBOXES_AGENT_BUNDLE=skip` | Stages nothing, as when the feature is disabled; `BundledAgent::discover` then fails with `backend_unavailable`. CI sets it for `--all-features` builds |
 
 The build fails unless every file that `SHA256SUMS` lists matches it, the bundle holds no links,
 `SOURCE-MANIFEST.json` is a format-2 manifest of the `edge` profile whose pins match
@@ -406,17 +407,22 @@ is intact, not that it is authorized: the trust comes from the download source, 
 Extracting the ZIP needs bsdtar (Windows' own `tar`) or `unzip` on the build host.
 
 The build script stages the bundle in its output directory, which the build scripts of
-dependents read as `DEP_ACI_EDGE_SANDBOXES_AGENT_BUNDLE_DIR`, and copies it to an
+dependents read as `DEP_ACI_EDGE_SANDBOXES_AGENT_ARTIFACTS_DIR`, and copies it to an
 `aci-edge-sandboxes` directory in Cargo's profile directory, such as `target/release`, beside
 the executables that Cargo builds. The crate compiles in only the SHA-256 digests of the
-bundle's `SOURCE-MANIFEST.json` and library, and `BundledAgent::locate` looks for
-`aci-edge-sandboxes/` beside the running executable, then beside its directory, which serves
-Cargo's `examples/` and `deps/`. An executable therefore keeps working when it is copied
-elsewhere together with the `aci-edge-sandboxes` directory, as long as their relative positions
-stay the same; the host refuses a bundle whose files differ from the digests that were compiled
-in. A Cargo `build-dir` outside the target directory leaves no profile directory to copy to; the
-build script then warns, and the bundle has to be copied from
-`DEP_ACI_EDGE_SANDBOXES_AGENT_BUNDLE_DIR`.
+bundle's `SOURCE-MANIFEST.json` and library. `BundledAgent::discover` uses, in this order:
+
+1. The directory that `ACI_EDGE_SANDBOXES_AGENT_ARTIFACTS_DIR` names, when it is set and not
+   empty. The directory must then hold a copy of the bundle; discovery does not fall back.
+2. An `aci-edge-sandboxes/` directory next to the current executable, if it holds the bundle.
+3. One next to the executable's directory, which serves Cargo's `examples/` and `deps/`.
+
+An executable therefore keeps working when it is copied elsewhere together with the
+`aci-edge-sandboxes` directory, as long as their relative positions stay the same, and the
+host refuses a bundle whose files differ from the digests that were compiled in. When Cargo's
+`build-dir` is not the target directory, the copy goes there and serves only test executables;
+for the others, copy the bundle from `DEP_ACI_EDGE_SANDBOXES_AGENT_ARTIFACTS_DIR` next to the
+executable or set `ACI_EDGE_SANDBOXES_AGENT_ARTIFACTS_DIR`.
 
 Built with `agent-bundled`, [`examples/agent_lifecycle.rs`](examples/agent_lifecycle.rs) runs
 without any option:

@@ -347,7 +347,7 @@ impl Defaults {
             ..Self::default()
         };
         if bundle {
-            let staged = BundledAgent::locate().map_err(describe)?;
+            let staged = BundledAgent::discover().map_err(describe)?;
             eprintln!("using the agent bundle in {}", staged.directory().display());
             defaults.runtime = Some(staged.runtime());
             defaults.library = Some((staged.library().to_path_buf(), staged.library_sha256()));

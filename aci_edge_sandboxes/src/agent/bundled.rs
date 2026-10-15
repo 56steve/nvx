@@ -2,11 +2,12 @@
 //!
 //! The build script verifies the bundle, copies it into an `aci-edge-sandboxes` directory beside
 //! the executables that Cargo builds, and compiles in the SHA-256 digests of the bundle's
-//! `SOURCE-MANIFEST.json` and agent library. [`BundledAgent::locate`] finds the directory relative
-//! to the running executable, so an executable and its bundle directory keep working when they
-//! are copied elsewhere together.
+//! `SOURCE-MANIFEST.json` and agent library. [`BundledAgent::discover`] finds the directory
+//! relative to the running executable, so an executable and its bundle directory keep working
+//! when they are copied elsewhere together.
 
 use std::env;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use aci_edge_sandboxes_model::hex;
@@ -64,7 +65,7 @@ const fn decimal(text: &str) -> u32 {
 /// // Every setup field but the state root at its default:
 /// let client = AciEdgeSandbox::agent(AgentConfig::bundled("C:\\edge-state")?)?;
 /// // Or a setup of one's own:
-/// let bundle = BundledAgent::locate()?;
+/// let bundle = BundledAgent::discover()?;
 /// let setup = bundle.setup("C:\\edge-state").with_cpu_profile(CpuProfile::Host);
 /// let client = AciEdgeSandbox::agent(bundle.config(setup))?;
 /// # Ok(())
@@ -79,33 +80,36 @@ pub struct BundledAgent {
 }
 
 impl BundledAgent {
-    /// Name of the directory that holds the bundle, which the build script creates beside the
-    /// executables that Cargo builds.
-    pub const DIRECTORY: &'static str = "aci-edge-sandboxes";
+    /// Environment variable naming a directory that holds a copy of the staged bundle.
+    pub const ENV_DIR: &'static str = "ACI_EDGE_SANDBOXES_AGENT_ARTIFACTS_DIR";
+    /// Name of the bundle directory that [`discover`](Self::discover) looks for beside the
+    /// executable, and that the build script creates beside the executables that Cargo builds.
+    pub const BESIDE_EXE_DIR: &'static str = "aci-edge-sandboxes";
 
-    /// Locates the bundle relative to the current executable: in a [`DIRECTORY`](Self::DIRECTORY)
-    /// beside it or, for the executables that Cargo builds into `examples/` and `deps/`, beside
-    /// its directory.
+    /// Locates the staged bundle on this host.
     ///
-    /// Fails with [`ErrorCode::BackendUnavailable`](crate::ErrorCode::BackendUnavailable) if the
-    /// build staged no bundle or neither directory holds one.
-    pub fn locate() -> Result<Self> {
+    /// Sources are tried in this order:
+    ///
+    /// 1. The [`ENV_DIR`](Self::ENV_DIR) variable, when it is set and not empty, naming a
+    ///    directory that must then hold a copy of the bundle; there is no fallback.
+    /// 2. A [`BESIDE_EXE_DIR`](Self::BESIDE_EXE_DIR) directory next to the current executable,
+    ///    if it holds the bundle.
+    /// 3. One next to the executable's directory, which serves the executables that Cargo builds
+    ///    into `examples/` and `deps/`.
+    ///
+    /// The bundle must have the files that the build verified: the host checks them against the
+    /// compiled-in digests. Fails with
+    /// [`ErrorCode::BackendUnavailable`](crate::ErrorCode::BackendUnavailable) if the build
+    /// staged no bundle, the variable names a directory without a bundle, or no directory holds
+    /// one.
+    pub fn discover() -> Result<Self> {
         pins()?;
-        let executable = env::current_exe().map_err(|error| {
-            Error::backend_unavailable("cannot locate the current executable").with_source(error)
-        })?;
-        let directory = executable.parent().ok_or_else(|| {
-            Error::backend_unavailable("the current executable is not in a directory")
-        })?;
-        match find(directory) {
-            Some(bundle) => Self::from_dir(bundle),
-            None => Err(Error::backend_unavailable(format!(
-                "no agent bundle is beside {}: copy the {} directory that the build staged \
-                 beside it, or beside its directory",
-                executable.display(),
-                Self::DIRECTORY
-            ))),
-        }
+        let executable = env::current_exe().ok();
+        let directory = discover_with(
+            |name| env::var_os(name),
+            executable.as_deref().and_then(Path::parent),
+        )?;
+        Self::from_dir(directory)
     }
 
     /// Uses the copy of the staged bundle in `directory`. The host checks its files against the
@@ -170,14 +174,43 @@ impl BundledAgent {
     }
 }
 
-/// Returns the bundle directory that [`BundledAgent::locate`] uses for an executable in
-/// `directory`: the first of the candidates that holds a runtime manifest.
-fn find(directory: &Path) -> Option<PathBuf> {
+/// Returns the bundle directory that [`BundledAgent::discover`] uses, given the environment and
+/// the directory of the current executable.
+fn discover_with(
+    variable: impl Fn(&str) -> Option<OsString>,
+    executable_directory: Option<&Path>,
+) -> Result<PathBuf> {
+    if let Some(directory) = variable(BundledAgent::ENV_DIR).filter(|value| !value.is_empty()) {
+        let directory = PathBuf::from(directory);
+        if directory.join(MANIFEST_NAME).is_file() {
+            return Ok(directory);
+        }
+        return Err(Error::backend_unavailable(format!(
+            "{} names {}, which holds no agent bundle",
+            BundledAgent::ENV_DIR,
+            directory.display()
+        )));
+    }
+    let directory = executable_directory.ok_or_else(|| {
+        Error::backend_unavailable(format!(
+            "cannot locate the current executable; set {}",
+            BundledAgent::ENV_DIR
+        ))
+    })?;
     [Some(directory), directory.parent()]
         .into_iter()
         .flatten()
-        .map(|candidate| candidate.join(BundledAgent::DIRECTORY))
+        .map(|candidate| candidate.join(BundledAgent::BESIDE_EXE_DIR))
         .find(|candidate| candidate.join(MANIFEST_NAME).is_file())
+        .ok_or_else(|| {
+            Error::backend_unavailable(format!(
+                "no agent bundle is beside {}: copy the {} directory that the build staged next \
+                 to the executable or its directory, or set {}",
+                directory.display(),
+                BundledAgent::BESIDE_EXE_DIR,
+                BundledAgent::ENV_DIR
+            ))
+        })
 }
 
 /// Returns the digests and library path that the build script compiled in.
@@ -192,8 +225,8 @@ fn pins() -> Result<([u8; 32], &'static str, [u8; 32])> {
             Ok((digest(manifest)?, library, digest(library_sha256)?))
         }
         _ => Err(Error::backend_unavailable(
-            "this build staged no agent bundle: build with the agent-bundled feature, without \
-             ACI_EDGE_SANDBOXES_AGENT_BUNDLE=skip",
+            "this build staged no agent bundle: build for Windows or Linux with the \
+             agent-bundled feature, without ACI_EDGE_SANDBOXES_AGENT_BUNDLE=skip",
         )),
     }
 }
@@ -205,30 +238,80 @@ mod tests {
     use super::*;
     use crate::error::ErrorCode;
 
+    fn bundle_in(directory: &Path) -> PathBuf {
+        fs::create_dir_all(directory).unwrap();
+        fs::write(directory.join(MANIFEST_NAME), "{}").unwrap();
+        directory.to_path_buf()
+    }
+
+    fn no_variables(_: &str) -> Option<OsString> {
+        None
+    }
+
     #[test]
     fn the_bundle_is_beside_the_executable_or_beside_its_directory() {
         let root = tempfile::tempdir().unwrap();
         let examples = root.path().join("examples");
         fs::create_dir(&examples).unwrap();
-        assert_eq!(find(&examples), None);
+        let missing = discover_with(no_variables, Some(&examples)).unwrap_err();
+        assert_eq!(missing.code(), ErrorCode::BackendUnavailable);
+        assert!(missing.message().contains(BundledAgent::ENV_DIR));
 
-        let parent = root.path().join(BundledAgent::DIRECTORY);
+        let parent = root.path().join(BundledAgent::BESIDE_EXE_DIR);
         fs::create_dir(&parent).unwrap();
-        assert_eq!(find(&examples), None, "a directory without a manifest");
-        fs::write(parent.join(MANIFEST_NAME), "{}").unwrap();
-        assert_eq!(find(&examples), Some(parent));
+        assert!(
+            discover_with(no_variables, Some(&examples)).is_err(),
+            "a directory without a manifest"
+        );
+        bundle_in(&parent);
+        assert_eq!(
+            discover_with(no_variables, Some(&examples)).unwrap(),
+            parent
+        );
 
-        let beside = examples.join(BundledAgent::DIRECTORY);
-        fs::create_dir(&beside).unwrap();
-        fs::write(beside.join(MANIFEST_NAME), "{}").unwrap();
-        assert_eq!(find(&examples), Some(beside));
+        let beside = bundle_in(&examples.join(BundledAgent::BESIDE_EXE_DIR));
+        assert_eq!(
+            discover_with(no_variables, Some(&examples)).unwrap(),
+            beside
+        );
     }
 
     #[test]
-    fn a_located_bundle_names_its_library_and_runtime() {
+    fn the_directory_variable_comes_first_and_must_hold_a_bundle() {
+        let root = tempfile::tempdir().unwrap();
+        let executables = root.path().join("bin");
+        bundle_in(&executables.join(BundledAgent::BESIDE_EXE_DIR));
+        let elsewhere = bundle_in(&root.path().join("elsewhere"));
+        let variable = |value: &Path| {
+            let value = value.as_os_str().to_owned();
+            move |name: &str| (name == BundledAgent::ENV_DIR).then(|| value.clone())
+        };
+
+        assert_eq!(
+            discover_with(variable(&elsewhere), Some(&executables)).unwrap(),
+            elsewhere
+        );
+        assert_eq!(
+            discover_with(variable(&elsewhere), None).unwrap(),
+            elsewhere
+        );
+        let empty =
+            discover_with(variable(&root.path().join("empty")), Some(&executables)).unwrap_err();
+        assert_eq!(empty.code(), ErrorCode::BackendUnavailable);
+        assert!(empty.message().contains(BundledAgent::ENV_DIR));
+        // An empty variable is unset.
+        assert_eq!(
+            discover_with(variable(Path::new("")), Some(&executables)).unwrap(),
+            executables.join(BundledAgent::BESIDE_EXE_DIR)
+        );
+        assert!(discover_with(no_variables, None).is_err());
+    }
+
+    #[test]
+    fn a_discovered_bundle_names_its_library_and_runtime() {
         // Unit tests run from `<profile>/deps`, beside the bundle that the build script copied
         // into `<profile>`. A build that skipped staging has no bundle.
-        let bundle = match BundledAgent::locate() {
+        let bundle = match BundledAgent::discover() {
             Ok(bundle) => bundle,
             Err(error) => {
                 assert!(MANIFEST_SHA256.is_none(), "{error}");

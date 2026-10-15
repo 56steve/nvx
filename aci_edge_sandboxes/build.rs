@@ -33,7 +33,7 @@ fn main() {
 /// searching a bounded number of commits.
 ///
 /// The bundle is verified and staged in `OUT_DIR/aci-edge-sandboxes`, which dependent build
-/// scripts read as `DEP_ACI_EDGE_SANDBOXES_AGENT_BUNDLE_DIR`, and copied to an
+/// scripts read as `DEP_ACI_EDGE_SANDBOXES_AGENT_ARTIFACTS_DIR`, and copied to an
 /// `aci-edge-sandboxes` directory in the Cargo profile directory, beside the executables that
 /// Cargo builds. The crate compiles in the SHA-256 digests of the bundle's runtime manifest and
 /// agent library and finds the directory relative to the executable at run time, so no absolute
@@ -41,12 +41,14 @@ fn main() {
 ///
 /// Environment variables:
 ///
-/// - `ACI_EDGE_SANDBOXES_AGENT_BUNDLE_URL`: a bundle ZIP to download instead of the release's.
-/// - `ACI_EDGE_SANDBOXES_AGENT_BUNDLE_DIR`: an extracted bundle or a bundle ZIP on the build host,
-///   for offline builds or locally built bundles.
+/// - `ACI_EDGE_SANDBOXES_AGENT_BUNDLE_URL`: a bundle ZIP to download instead of the release's; a
+///   `file://` URL names a ZIP on the build host.
+/// - `ACI_EDGE_SANDBOXES_AGENT_BUNDLE_DIR`: an extracted bundle to stage instead of downloading
+///   one, for offline builds or locally built bundles.
 /// - `ACI_EDGE_SANDBOXES_AGENT_BUNDLE_SHA256`: the approved SHA-256 of the ZIP.
-/// - `ACI_EDGE_SANDBOXES_AGENT_BUNDLE=skip`: stages nothing.
+/// - `ACI_EDGE_SANDBOXES_AGENT_BUNDLE=skip`: stages nothing, as when the feature is disabled.
 ///
+/// Targets other than Linux and Windows, where the agent library cannot run, stage nothing.
 /// Every staged file must match the bundle's `SHA256SUMS`, the bundle may hold no links, and the
 /// manifests must agree with the files and name an agent library for the target platform. A
 /// bundle whose library speaks another sandbox ABI fails the crate's build.
@@ -73,7 +75,7 @@ mod agent_bundle {
     /// How many first-parent commits, counting the one being built, may be searched for a release
     /// that has the bundle.
     const SEARCH_DEPTH: usize = 32;
-    /// The directory that holds the bundle; `agent::BundledAgent::DIRECTORY`.
+    /// The directory that holds the bundle; `agent::BundledAgent::BESIDE_EXE_DIR`.
     const DIRECTORY: &str = "aci-edge-sandboxes";
     const CHECKSUMS: &str = "SHA256SUMS";
     const SOURCE_MANIFEST: &str = "SOURCE-MANIFEST.json";
@@ -102,8 +104,12 @@ mod agent_bundle {
         if env::var_os(SKIP).is_some_and(|value| value == "skip") {
             return;
         }
-        let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set"));
         let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+        if target_os != "windows" && target_os != "linux" {
+            // The agent library runs on Linux and Windows hosts only.
+            return;
+        }
+        let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set"));
         let downloads = out_dir.join("agent-bundle-download");
         let staged = out_dir.join(DIRECTORY);
         let checkout = Checkout::find();
@@ -116,20 +122,33 @@ mod agent_bundle {
             (Some(_), Some(_)) => fail(format!("set {DIR} or {URL}, not both")),
             (Some(path), None) => {
                 let path = PathBuf::from(path);
-                if path.is_dir() {
-                    if variable(ARCHIVE_SHA256).is_some() {
+                if !path.is_dir() {
+                    fail(format!(
+                        "{DIR} must name an extracted bundle; set {URL} to the file:// URL of a \
+                         local ZIP instead"
+                    ));
+                }
+                if variable(ARCHIVE_SHA256).is_some() {
+                    fail(format!(
+                        "{ARCHIVE_SHA256} applies to the ZIP that {URL} names, not to {DIR}"
+                    ));
+                }
+                println!("cargo::rerun-if-changed={}", path.join(CHECKSUMS).display());
+                copy_listed(&path, &staged);
+            }
+            (None, Some(url)) => match local_path(&url) {
+                Some(archive) => {
+                    if !archive.is_file() {
                         fail(format!(
-                            "{ARCHIVE_SHA256} applies to a ZIP, but {DIR} names a directory"
+                            "{URL} names {}, which is not a file",
+                            archive.display()
                         ));
                     }
-                    println!("cargo::rerun-if-changed={}", path.join(CHECKSUMS).display());
-                    copy_listed(&path, &staged);
-                } else {
-                    println!("cargo::rerun-if-changed={}", path.display());
-                    unpack(&path, &staged);
+                    println!("cargo::rerun-if-changed={}", archive.display());
+                    unpack(&archive, &staged);
                 }
-            }
-            (None, Some(url)) => unpack(&download(&url, &downloads), &staged),
+                None => unpack(&download(&url, &downloads), &staged),
+            },
             (None, None) => {
                 if target_os != "windows" {
                     fail(format!(
@@ -176,7 +195,7 @@ mod agent_bundle {
             "cargo::rustc-env=ACI_EDGE_SANDBOXES_BUNDLED_AGENT_SANDBOX_ABI={}",
             bundle.sandbox_abi
         );
-        println!("cargo::metadata=agent_bundle_dir={}", staged.display());
+        println!("cargo::metadata=agent_artifacts_dir={}", staged.display());
     }
 
     /// The git checkout that is being built.
@@ -320,7 +339,7 @@ mod agent_bundle {
         execute(
             Command::new("curl")
                 .args(["--fail", "--silent", "--show-error", "--location"])
-                .args(["--retry", "5", "--retry-delay", "5"])
+                .args(["--retry", "5", "--retry-delay", "5", "--retry-all-errors"])
                 .arg("--output")
                 .arg(&partial)
                 .arg(url),
@@ -479,10 +498,10 @@ mod agent_bundle {
                 "{BUNDLE_MANIFEST} and {CHECKSUMS} disagree about {library}"
             ));
         }
-        let suffix = match target_os {
-            "windows" => ".dll",
-            "linux" => ".so",
-            _ => fail(format!("the agent library does not run on {target_os}")),
+        let suffix = if target_os == "windows" {
+            ".dll"
+        } else {
+            ".so"
         };
         if !library.ends_with(suffix) {
             fail(format!(
@@ -537,7 +556,7 @@ mod agent_bundle {
     }
 
     /// Copies the staged bundle beside the executables that Cargo builds, replacing only the files
-    /// that differ, where `agent::BundledAgent::locate` finds it.
+    /// that differ, where `agent::BundledAgent::discover` finds it.
     fn install(staged: &Path, out_dir: &Path, bundle: &Bundle) {
         // `OUT_DIR` is `<profile>/build/<package>-<hash>/out`. Cargo builds executables into
         // `<profile>`, `<profile>/examples`, and `<profile>/deps`.
@@ -697,6 +716,52 @@ mod agent_bundle {
         env::var(name).ok().filter(|value| !value.is_empty())
     }
 
+    /// Returns the path on the build host that a `file:` URL names, or `None` for another URL.
+    fn local_path(url: &str) -> Option<PathBuf> {
+        const SCHEME: &str = "file://";
+        fn hex(digit: u8) -> Option<u8> {
+            match digit {
+                b'0'..=b'9' => Some(digit - b'0'),
+                b'a'..=b'f' => Some(digit - b'a' + 10),
+                b'A'..=b'F' => Some(digit - b'A' + 10),
+                _ => None,
+            }
+        }
+        let rest = url
+            .get(..SCHEME.len())
+            .filter(|scheme| scheme.eq_ignore_ascii_case(SCHEME))
+            .map(|_| &url[SCHEME.len()..])?;
+        // A URL without a host, or with `localhost`, names a path on the build host; `curl`
+        // handles others.
+        let encoded = if rest.starts_with('/') {
+            rest
+        } else {
+            rest.strip_prefix("localhost")
+                .filter(|path| path.starts_with('/'))?
+        };
+        let mut bytes = Vec::with_capacity(encoded.len());
+        let mut rest = encoded.as_bytes();
+        while let Some((&byte, tail)) = rest.split_first() {
+            rest = tail;
+            if byte == b'%'
+                && let [high, low, after @ ..] = tail
+                && let (Some(high), Some(low)) = (hex(*high), hex(*low))
+            {
+                bytes.push((high << 4) | low);
+                rest = after;
+            } else {
+                bytes.push(byte);
+            }
+        }
+        let path = String::from_utf8(bytes)
+            .unwrap_or_else(|_| fail(format!("{URL} names a path that is not UTF-8")));
+        // `file:///C:/bundle.zip` names `C:/bundle.zip` on Windows.
+        Some(PathBuf::from(match path.as_bytes() {
+            [b'/', drive, b':', ..] if cfg!(windows) && drive.is_ascii_alphabetic() => &path[1..],
+            _ => &path[..],
+        }))
+    }
+
     /// Returns the abbreviated form of a commit hash that release tags use.
     fn short(commit: &str) -> &str {
         commit.get(..12).unwrap_or(commit)
@@ -768,10 +833,10 @@ mod agent_bundle {
     }
 
     fn warn(message: String) {
-        println!("cargo::warning=agent bundle: {message}");
+        println!("cargo::warning=agent: {message}");
     }
 
     fn fail(message: String) -> ! {
-        panic!("agent bundle: {message}");
+        panic!("agent bundled artifacts: {message}");
     }
 }

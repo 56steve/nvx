@@ -80,11 +80,11 @@ impl AgentConfig {
     }
 
     /// Opens a host for `state_root`, with every other setup field at its default, through the
-    /// bundle that the build staged beside the executable with the `agent-bundled` feature; see
-    /// [`BundledAgent::locate`].
+    /// bundle that the build staged with the `agent-bundled` feature; see
+    /// [`BundledAgent::discover`].
     #[cfg(feature = "agent-bundled")]
     pub fn bundled(state_root: impl Into<PathBuf>) -> Result<Self> {
-        let bundle = BundledAgent::locate()?;
+        let bundle = BundledAgent::discover()?;
         Ok(bundle.config(bundle.setup(state_root)))
     }
 }
