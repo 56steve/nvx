@@ -39,6 +39,7 @@ import struct
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 import uuid
 from collections.abc import Callable, Mapping, Sequence
@@ -315,34 +316,53 @@ class _MetadataSockets:
                 sock.shutdown(socket.SHUT_RDWR)
 
 
-def _metadata_opener(sockets: _MetadataSockets) -> urllib.request.OpenerDirector:
+def _metadata_opener(
+    sockets: _MetadataSockets, deadline: float
+) -> urllib.request.OpenerDirector:
     class Connection(http.client.HTTPConnection):
         def connect(self) -> None:
-            super().connect()
-            if self.sock is not None and not sockets.add(self.sock):
-                self.sock.close()
+            # Register the socket before connecting, so cut_off can interrupt a
+            # connect that has not finished. Each connection gets only what is
+            # left of the request's deadline.
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            if not sockets.add(sock):
+                sock.close()
                 raise TimeoutError("metadata response did not finish in time")
+            sock.settimeout(max(0.001, min(self.timeout, deadline - time.monotonic())))
+            sock.connect((self.host, self.port))
+            self.sock = sock
 
     class Handler(urllib.request.HTTPHandler):
         def http_open(self, req: urllib.request.Request) -> http.client.HTTPResponse:
             return self.do_open(Connection, req)
 
+    class NoRedirects(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[no-untyped-def]
+            # The endpoint is fixed, so a redirect is refused and surfaces as an HTTPError.
+            return None
+
+    class PlainHttpOnly(urllib.request.HTTPSHandler):
+        def https_open(self, req: urllib.request.Request) -> http.client.HTTPResponse:
+            raise urllib.error.URLError("the metadata service is plain HTTP only")
+
     # The link-local metadata service must never be reached through a proxy.
-    return urllib.request.build_opener(urllib.request.ProxyHandler({}), Handler())
+    return urllib.request.build_opener(
+        urllib.request.ProxyHandler({}), Handler(), NoRedirects(), PlainHttpOnly()
+    )
 
 
 def read_azure_compute_metadata(
     timeout: float = AZURE_IMDS_TIMEOUT_SECONDS,
 ) -> object:
     request = urllib.request.Request(AZURE_IMDS_URL, headers={"Metadata": "true"})
+    deadline = time.monotonic() + timeout
     sockets = _MetadataSockets()
-    opener = _metadata_opener(sockets)
+    opener = _metadata_opener(sockets, deadline)
     # The socket timeout only bounds each wait, so a trickling peer could
     # otherwise hold the request open indefinitely. The request runs on a
     # daemon thread. At the end-to-end deadline its sockets are shut down, which
     # also ends opener.open() reading the status line and headers, and the
     # thread is joined so that no worker outlives the call.
-    deadline = time.monotonic() + timeout
     outcome: dict[str, object] = {}
 
     def fetch() -> None:

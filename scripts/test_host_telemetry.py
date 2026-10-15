@@ -3,7 +3,9 @@
 
 """Tests for benchmark host provenance and storage telemetry."""
 
+import contextlib
 import http.client
+import http.server
 import json
 import os
 import platform
@@ -14,6 +16,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import cast
@@ -1204,6 +1207,66 @@ class PlatformTelemetryTests(unittest.TestCase):
                 {"scratch": Path(tempfile.gettempdir())}, 0
             )
         )
+
+
+class AzureMetadataRequestTests(unittest.TestCase):
+    def test_a_redirect_is_not_followed(self):
+        served: list[str] = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                served.append(self.path)
+                if self.path == "/redirect":
+                    self.send_response(302)
+                    self.send_header("Location", "/elsewhere")
+                else:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+            def log_message(self, *args: object) -> None:
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.addCleanup(server.server_close)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        url = f"http://127.0.0.1:{server.server_port}/redirect"
+
+        with patch.object(host_telemetry, "AZURE_IMDS_URL", url):
+            with self.assertRaises(urllib.error.HTTPError) as refused:
+                host_telemetry.read_azure_compute_metadata(timeout=2)
+            refused.exception.close()
+
+        self.assertEqual(served, ["/redirect"])
+
+    def test_a_connect_still_in_progress_is_shut_down_at_the_deadline(self):
+        blocked = threading.Event()
+        released = threading.Event()
+        real_socket = socket.socket
+
+        class BlockingSocket(real_socket):
+            def connect(self, address: object) -> None:
+                blocked.set()
+                if not released.wait(5):
+                    raise OSError("the pending connect was never shut down")
+                raise OSError("connect shut down")
+
+            def shutdown(self, how: int) -> None:
+                released.set()
+                with contextlib.suppress(OSError):
+                    super().shutdown(how)
+
+        with (
+            patch.object(socket, "socket", BlockingSocket),
+            patch.object(host_telemetry, "AZURE_IMDS_URL", "http://127.0.0.1:9/compute"),
+        ):
+            with self.assertRaises(TimeoutError):
+                host_telemetry.read_azure_compute_metadata(timeout=0.2)
+
+        self.assertTrue(blocked.is_set())
+        self.assertTrue(released.is_set(), "the pending connect was never shut down")
 
 
 if __name__ == "__main__":
