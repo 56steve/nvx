@@ -4067,7 +4067,8 @@ class MicrovmTests(unittest.TestCase):
             'memtotal_kib=$memtotal_kib elapsed_us=0"',
             snapshot,
         )
-        # Capture steps 1 to 3 precede the barriers and the request.
+        # Guest preparation steps 1 and 2 (doc/design/5.3-snapshot-protocol.md)
+        # precede the barriers and the request.
         pre_capture = snapshot.index("/sbin/nvx-time pre-capture || exit 1")
         freeze = snapshot.index('echo 1 >"$container_cgroup/cgroup.freeze"')
         capture = snapshot.index("/sbin/nvx-time capture")

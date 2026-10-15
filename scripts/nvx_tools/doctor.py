@@ -901,7 +901,7 @@ def check_guest_warp(context: DoctorContext) -> CheckResult:
         boots.append(boot)
         rounds.extend(count_rounds)
         # The boot check's wall time and, where the guest reports it, its CPU
-        # time, which the spec budgets; both are evidence only.
+        # time, which CHECK_CPU_BUDGET_US budgets; both are evidence only.
         cpu_us = f" boot_cpu_us={boot['cpu_us']}" if "cpu_us" in boot else ""
         runs.append(
             f"vcpus={count} rounds={len(count_rounds)} "
@@ -1015,7 +1015,7 @@ CHECKS: Mapping[str, Callable[[DoctorContext], CheckResult]] = {
 
 
 def run_checks(context: DoctorContext, checks: Sequence[str]) -> list[CheckResult]:
-    """Run checks in spec order; an exception fails only its own check."""
+    """Run checks in ID order; an exception fails only its own check."""
     results: list[CheckResult] = []
     for check in CHECK_IDS:
         if check not in checks:
@@ -1143,7 +1143,7 @@ def configure_parser(parser: argparse.ArgumentParser) -> None:
         nargs="+",
         choices=CHECK_IDS,
         metavar="ID",
-        help="checks to run, in spec order (default: H1 to H7)",
+        help="checks to run, in ID order (default: H1 to H7)",
     )
     parser.add_argument(
         "--openvmm", type=Path, help="OpenVMM binary for H2, H3, and H6"

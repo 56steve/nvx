@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Spec-derived tests for the guest time component, guest/common/nvx-time.c.
+"""Tests for the guest time component, guest/common/nvx-time.c.
 
-The fixtures encode the time ABI's guest-visible formats, such as the restore
-packet (doc/design/5.5-restore-protocol.md) and the time sample
-(doc/design/3.2-clock-and-time.md), independently of the C decoders, so the
-tests check the guest against the specification.
+The fixtures encode the guest-visible formats independently of the C decoders.
+The restore packet (doc/design/5.5-restore-protocol.md) and the time sample
+(doc/design/3.2-clock-and-time.md) follow the guide; the other fixtures, such
+as the exhaustive check's lines and the state file, pin the formats that
+nvx-time.c defines.
 """
 
 from __future__ import annotations
@@ -47,7 +48,7 @@ def encode_packet(
     reserved: int = 0,
     entropy: bytes = ENTROPY,
 ) -> bytes:
-    """Encode a restore packet v4 (spec: "Restore packet")."""
+    """Encode a restore packet v4 (guide: 5.5.5 "Restore Packet")."""
     count = len(ranges) if range_count is None else range_count
     header = magic + bytes((version, flags, online, count, reserved))
     header += struct.pack("<IiQQ", generation, rate_deviation, downtime_ns, utc_ns)
@@ -64,7 +65,7 @@ def encode_sample(
     generation: int = 0,
     utc_ns: int = UTC_NS,
 ) -> bytes:
-    """Encode a time sample (spec: "Time sample")."""
+    """Encode a time sample (guide: 3.2.9 "Time Samples")."""
     return struct.pack("<BBHIQ", version, flags, reserved, generation, utc_ns)
 
 
@@ -585,9 +586,9 @@ class GuestTimeTests(unittest.TestCase):
         self.assertIn('(signature "KVMKVMKVM...")', signature)
         self.assertTrue(signature.endswith("or the highest basic leaf"), signature)
 
-    def test_exhaustive_report_lines_follow_the_spec(self):
-        # The spec's exhaustive check prints one line per check and CPU, with
-        # an escaped detail, then a summary.
+    def test_exhaustive_report_format(self):
+        # The exhaustive check prints one line per check and CPU, with an
+        # escaped detail, then a summary.
         line = re.compile(
             r"^NVX-TIME-ABI-EXHAUSTIVE: v=1 check=X[1-6] cpu=\d+ "
             r'status=(pass|fail) detail="(?:[^"\\]|\\.)*"$'
@@ -734,7 +735,7 @@ class GuestTimeTests(unittest.TestCase):
         self.assertTrue(long_line.endswith('\\x02"\n'))
 
     def test_state_file_round_trip(self):
-        # The keys and their order follow the spec's state file table.
+        # The fixture lists every key, in the order that nvx-time writes them.
         text = (
             "version=1\ngeneration=2\nboot_status=ok\ncapture_status=ok\n"
             "restore_status=pending\nboot_cpus=8\ncapture_cpus=8\nrestore_cpus=0\n"
@@ -853,20 +854,20 @@ class GuestTimeTests(unittest.TestCase):
         self.assertEqual(report[4], "ok=0")
 
     def test_deferred_work_starts_150_ms_late_and_is_promoted_100_ms_later(self):
-        # Step 13 and the asynchronous boot checks start 150 ms after the
-        # acknowledgement or the boot step and leave SCHED_IDLE 100 ms after
-        # they start.
+        # Guest repair step 7 and the asynchronous boot checks start 150 ms
+        # after the acknowledgement or the boot step and leave SCHED_IDLE
+        # 100 ms after they start.
         self.assertEqual(
             self.run_test("deferral"), "deferred_start_ms=150 idle_bound_ms=100\n"
         )
 
-    def test_restore_cpu_time_is_step_13_with_the_daemons_fork(self):
-        # The worker's step 13 CPU time adds the daemon's preparation before
-        # the fork, the fork's cost to the daemon, which arrives on a pipe
-        # after the worker's copy of the timing was taken, and its own.
+    def test_restore_cpu_time_is_the_deferred_work_with_the_daemons_fork(self):
+        # The worker's repair step 7 CPU time adds the daemon's preparation
+        # before the fork, the fork's cost to the daemon, which arrives on a
+        # pipe after the worker's copy of the timing was taken, and its own.
         fields = dict(
             field.split("=")
-            for field in self.run_test("step13-cpu", "20", "30", "10").split()
+            for field in self.run_test("deferred-restore-cpu", "20", "30", "10").split()
         )
         self.assertGreaterEqual(int(fields["prior_ms"]), 20)
         self.assertLess(int(fields["prior_ms"]), 30)

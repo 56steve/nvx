@@ -284,9 +284,9 @@ the production RCU stall timeouts and turns off the debug options that
 detectors are missing from the generated config. CI can shorten the soft-lockup
 and hung-task thresholds for one boot with `watchdog_thresh=` and
 `sysctl.kernel.hung_task_timeout_secs=`. The RCU stall timeout stays at the
-production value because the time ABI's conformance check C8, which covers
-the [stall-detector settings](design/3.2-clock-and-time.md#3210-guest-obligations),
-requires it.
+production value because the time ABI's conformance checks cover the
+[stall-detector settings](design/3.2-clock-and-time.md#3210-guest-obligations)
+and require it.
 
 The variant builds in `build/linux-debug`, so it never invalidates the
 production object cache, and it produces:

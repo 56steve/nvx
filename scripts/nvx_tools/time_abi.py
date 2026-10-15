@@ -100,7 +100,10 @@ class CpuModel:
 
 @dataclass(frozen=True)
 class CpuGeneration:
-    """One CPU generation of the spec's CPU profile catalog."""
+    """One CPU generation of the CPU profile catalog.
+
+    doc/design/2.2-cpu-and-topology.md defines the CPU profiles.
+    """
 
     name: str
     vendor: str
@@ -959,8 +962,9 @@ def check_warp_probe(
 ) -> list[dict[str, str]]:
     """Validate every warp probe summary in console output.
 
-    The spec bounds both the backward step and the ping-pong offset by 1 us
-    and forbids stalled pairs; an inconclusive measurement proves nothing.
+    Both the backward step and the ping-pong offset must stay within the time
+    ABI's 1 us cross-CPU skew bound (doc/design/3.2-clock-and-time.md), and no
+    pair may stall; an inconclusive measurement proves nothing.
     ``rounds``, when given, is the exact number of probe rounds expected.
     """
     summaries: list[dict[str, str]] = []
