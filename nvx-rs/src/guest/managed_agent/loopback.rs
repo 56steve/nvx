@@ -142,7 +142,7 @@ impl BrokerCore {
         self.epoch = self
             .epoch
             .checked_add(1)
-            .ok_or_else(|| io::Error::from_raw_os_error(libc::EOVERFLOW))?;
+            .ok_or_else(|| io::Error::from(Errno::EOVERFLOW))?;
         self.host_output.clear();
         self.receive_credit = 0;
         self.reset_guest()?;
@@ -347,7 +347,7 @@ fn spawn_unprivileged(request: SpawnRequest<'_>) -> Result<ProcessId, Errno> {
 }
 
 fn protocol_error() -> io::Error {
-    io::Error::from_raw_os_error(libc::EPROTO)
+    io::Error::from(Errno::EPROTO)
 }
 
 fn timeout_error(error: io::Error) -> io::Error {
@@ -498,7 +498,7 @@ mod tests {
             signal,
             ExecEvent::Exit {
                 category: ExitCategory::Signal,
-                status: 128 + libc::SIGTERM
+                status: 128 + sys::Signal::SIGTERM as i32
             }
         );
         let (_, _, realtime_signal) = run_exec(&mut session, &workload("kill -40 $$", 0));
@@ -536,7 +536,7 @@ mod tests {
                 .unwrap(),
             ExecEvent::Exit {
                 category: ExitCategory::Cancelled,
-                status: 128 + libc::SIGKILL
+                status: 128 + sys::Signal::SIGKILL as i32
             }
         );
 
