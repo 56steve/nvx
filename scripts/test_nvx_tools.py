@@ -39,6 +39,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 import nvx  # noqa: E402
 from nvx_tools import (  # noqa: E402
     aci_edge_sandboxes_tests,
+    agent_bundling_tests,
     archive,
     azurelinux,
     benchmark,
@@ -12016,6 +12017,195 @@ while True:
     finally:
         close(connection)
 """
+
+
+class AgentBundlingTests(unittest.TestCase):
+    def test_cli_registers_the_bundling_check(self):
+        args = nvx.parse_args(["test-agent-bundling", "--toolchain", "1.95.0"])
+
+        self.assertEqual(args.toolchain, "1.95.0")
+        self.assertEqual(args.cargo, "cargo")
+        self.assertIs(args.handler, agent_bundling_tests.command_test_agent_bundling)
+
+    def test_names_and_the_sandbox_abi_come_from_the_crate(self):
+        names = agent_bundling_tests.contract_names()
+
+        self.assertEqual(names["BUNDLE_DIR_ENV"], "ACI_EDGE_SANDBOXES_AGENT_BUNDLE_DIR")
+        self.assertEqual(names["SOURCE_MANIFEST"], "SOURCE-MANIFEST.json")
+        for name in agent_bundling_tests.OTHER_SOURCES:
+            self.assertIn(name, names)
+        self.assertGreaterEqual(agent_bundling_tests.sandbox_abi_version(), 1)
+
+    def test_sources_without_the_constants_are_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "empty.rs"
+            source.write_text("pub const OTHER: u32 = 1;\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(common.ScriptError, "SANDBOX_ABI_VERSION"):
+                agent_bundling_tests.sandbox_abi_version(source)
+            with self.assertRaisesRegex(common.ScriptError, "declares no names"):
+                agent_bundling_tests.contract_names(source)
+
+    def test_bundles_list_and_pin_every_file(self):
+        for platform, library in (
+            ("win32", "bin/aci_edge_agent.dll"),
+            ("linux", "bin/libaci_edge_agent.so"),
+        ):
+            layout = agent_bundling_tests.BundleLayout.for_platform(platform)
+            with self.subTest(platform=platform), tempfile.TemporaryDirectory() as temp:
+                bundle = Path(temp)
+                agent_bundling_tests.write_bundle(
+                    bundle, layout, "SOURCE-MANIFEST.json", 7
+                )
+
+                listed: dict[str, str] = {}
+                for line in (bundle / "SHA256SUMS").read_text().splitlines():
+                    digest, name = line.split("  ", 1)
+                    listed[name] = digest
+                self.assertEqual(
+                    set(listed),
+                    {*layout.files(), "SOURCE-MANIFEST.json", "bundle-manifest.json"},
+                )
+                for name, digest in listed.items():
+                    self.assertEqual(common.sha256_file(bundle / name), digest, name)
+                source = json.loads((bundle / "SOURCE-MANIFEST.json").read_text())
+                self.assertEqual(source["format"], 2)
+                self.assertEqual(
+                    source["linux"]["kernel_sha256"], listed["guest/vmlinux"]
+                )
+                self.assertEqual(source["agent"]["library_sha256"], listed[library])
+                manifest = json.loads((bundle / "bundle-manifest.json").read_text())
+                consumer = manifest["consumer"]
+                self.assertEqual(consumer["backendLibrary"], library)
+                self.assertEqual(
+                    consumer["runtimeBundleManifestSha256"],
+                    listed["SOURCE-MANIFEST.json"],
+                )
+                self.assertEqual(consumer["sandboxAbiVersion"], 7)
+
+    def test_a_bundle_can_pin_another_file_as_its_kernel(self):
+        layout = agent_bundling_tests.BundleLayout.for_platform("linux")
+        initramfs = agent_bundling_tests.INITRAMFS
+        with tempfile.TemporaryDirectory() as temporary:
+            bundle = Path(temporary)
+            agent_bundling_tests.write_bundle(
+                bundle, layout, "SOURCE-MANIFEST.json", 1, kernel=initramfs
+            )
+
+            source = json.loads((bundle / "SOURCE-MANIFEST.json").read_text())
+            self.assertEqual(
+                source["linux"]["kernel_sha256"], common.sha256_file(bundle / initramfs)
+            )
+
+    def test_cargo_commands_select_the_crate_feature_and_toolchain(self):
+        command = agent_bundling_tests.cargo_command("cargo", "1.95.0", "test", "x")
+
+        self.assertEqual(command[:3], ["cargo", "+1.95.0", "test"])
+        self.assertEqual(
+            Path(command[command.index("--manifest-path") + 1]),
+            BuildConstants.REPO_ROOT / "aci_edge_sandboxes" / "Cargo.toml",
+        )
+        self.assertIn("--locked", command)
+        self.assertEqual(command[-4:], ["--lib", "--features", "agent-bundled", "x"])
+        self.assertEqual(
+            agent_bundling_tests.cargo_command("cargo", None, "check")[:2],
+            ["cargo", "check"],
+        )
+
+    def test_the_synthetic_bundle_is_the_only_bundle_source(self):
+        names = agent_bundling_tests.contract_names()
+        inherited = {
+            names[name]: "inherited" for name in agent_bundling_tests.OTHER_SOURCES
+        }
+        inherited[names["BUNDLE_DIR_ENV"]] = "elsewhere"
+        with patch.dict(os.environ, inherited):
+            environment = agent_bundling_tests.bundle_environment(names, Path("x"))
+
+        self.assertEqual(environment[names["BUNDLE_DIR_ENV"]], "x")
+        for name in agent_bundling_tests.OTHER_SOURCES:
+            self.assertNotIn(names[name], environment)
+
+    def test_directory_links_need_no_privilege(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "target").mkdir()
+            (root / "target" / "file").write_text("content", encoding="utf-8")
+
+            agent_bundling_tests.link_directory(root / "link", root / "target")
+
+            self.assertEqual((root / "link" / "file").read_text(), "content")
+            # A link, not a copy: only links have a target to read.
+            self.assertTrue(os.readlink(root / "link"))
+
+    def _outcomes(self, **overrides: tuple[int, str]) -> dict[str, tuple[int, str]]:
+        """Returns the status and output of cargo for each bundle that the check builds,
+        as the build script reports them, with `overrides`."""
+        abi = agent_bundling_tests.sandbox_abi_version()
+        outcomes = {
+            "good": (0, ""),
+            "tampered": (101, "SHA-256 mismatch for guest/vmlinux: SHA256SUMS lists"),
+            "pinned": (101, "pins /linux/kernel_sha256 to another digest than"),
+            "other-abi": (101, f"library speaks sandbox ABI {abi + 1}, but this"),
+            "linked": (101, "guest is a link; a bundle holds only files"),
+        }
+        outcomes.update(
+            {name.replace("_", "-"): outcome for name, outcome in overrides.items()}
+        )
+        return outcomes
+
+    def _check(self, outcomes: dict[str, tuple[int, str]]) -> tuple[int, list[str]]:
+        """Runs the check with cargo replaced by `outcomes`, and returns its status and
+        the cargo subcommand and bundle of each command that it ran."""
+        names = agent_bundling_tests.contract_names()
+        calls: list[str] = []
+
+        def fake_run(
+            command: list[str], *, env: dict[str, str], check: bool, **_: object
+        ) -> subprocess.CompletedProcess[str]:
+            self.assertFalse(check)
+            subcommand = command[command.index("--manifest-path") - 1]
+            bundle = Path(env[names["BUNDLE_DIR_ENV"]]).name
+            calls.append(f"{subcommand} {bundle}")
+            status, output = outcomes[bundle]
+            return subprocess.CompletedProcess(command, status, output, "")
+
+        args = argparse.Namespace(cargo="cargo", toolchain="1.95.0")
+        with (
+            patch.object(agent_bundling_tests.subprocess, "run", fake_run),
+            patch.object(agent_bundling_tests, "link_directory"),
+            patch("sys.stdout", io.StringIO()),
+            patch("sys.stderr", io.StringIO()),
+        ):
+            return agent_bundling_tests.command_test_agent_bundling(args), calls
+
+    def test_check_requires_the_tests_and_every_rejection(self):
+        status, calls = self._check(self._outcomes())
+
+        self.assertEqual(status, 0)
+        self.assertEqual(
+            calls,
+            [
+                "test good",
+                "check tampered",
+                "check pinned",
+                "check other-abi",
+                "check linked",
+            ],
+        )
+
+    def test_check_returns_the_status_of_failing_tests(self):
+        status, calls = self._check(self._outcomes(good=(3, "")))
+
+        self.assertEqual(status, 3)
+        self.assertEqual(calls, ["test good"])
+
+    def test_check_fails_when_the_build_accepts_a_broken_bundle(self):
+        with self.assertRaisesRegex(common.ScriptError, "accepted the tampered bundle"):
+            self._check(self._outcomes(tampered=(0, "")))
+
+    def test_check_fails_when_a_rejection_reports_another_cause(self):
+        with self.assertRaisesRegex(common.ScriptError, "/linux/kernel_sha256"):
+            self._check(self._outcomes(pinned=(101, "cannot read the bundle")))
 
 
 class SandboxTests(unittest.TestCase):

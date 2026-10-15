@@ -19,6 +19,9 @@ from nvx_tools.aci_edge_sandboxes_tests import (
     configure_parser as configure_aci_edge_sandboxes_test_parser,
 )
 from nvx_tools.adversarial import configure_parser as configure_adversarial_parser
+from nvx_tools.agent_bundling_tests import (
+    configure_parser as configure_agent_bundling_test_parser,
+)
 from nvx_tools.benchmark import configure_parser as configure_benchmark_parser
 from nvx_tools.benchmark import positive_float
 from nvx_tools.benchmark import run as run_benchmark
@@ -1108,6 +1111,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="run the aci_edge_sandboxes crate lifecycle test on a real hypervisor",
     )
     configure_aci_edge_sandboxes_test_parser(aci_edge_sandboxes_tests)
+
+    agent_bundling_tests = subparsers.add_parser(
+        "test-agent-bundling",
+        help="check the aci_edge_sandboxes agent bundle staging without a hypervisor",
+    )
+    configure_agent_bundling_test_parser(agent_bundling_tests)
 
     adversarial_tests = subparsers.add_parser(
         "test-adversarial",

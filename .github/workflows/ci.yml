@@ -56,6 +56,12 @@ jobs:
         with:
           persist-credentials: false
 
+      # The release that the self-hosted runners provide, for `nvx.py test-agent-bundling`.
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
       - name: Check aci_edge_sandboxes
         uses: ./.github/actions/check-aci-edge-sandboxes
 

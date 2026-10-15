@@ -12,7 +12,16 @@
 //! one sandbox. Everything that outlives one call stays in the library for the life of the
 //! process, so a caller can create a backend per operation and pay for verifying the runtime
 //! files and attaching to a guest only once.
+//!
+//! With the `agent-bundled` feature, the build script stages an edge agent bundle beside the
+//! executables, and [`AgentConfig::bundled`] uses it without any path or digest from the caller.
 
+// The names and pins that the build script shares with this crate.
+#[cfg(feature = "agent-bundled")]
+#[allow(dead_code)]
+mod bundle_contract;
+#[cfg(feature = "agent-bundled")]
+mod bundled;
 mod library;
 
 use std::io::{self, Read};
@@ -30,6 +39,9 @@ pub use aci_edge_sandboxes_model::{
     ImageDigest, ImageId, ImageSettings, ReferenceSettings, RegisteredImage, RuntimeDigests,
     RuntimeFiles, RuntimeSource, SandboxDefaults, SetupConfig, Timeouts,
 };
+
+#[cfg(feature = "agent-bundled")]
+pub use self::bundled::BundledAgent;
 
 use self::library::{Event, Library};
 use crate::backend::{Backend, ExecControl, ExecIo, OutputCloser, OutputSink};
@@ -69,6 +81,15 @@ impl AgentConfig {
             library: library.into(),
             library_sha256,
         }
+    }
+
+    /// Opens a host for `state_root`, with every other setup field at its default, through the
+    /// bundle that the build staged with the `agent-bundled` feature; see
+    /// [`BundledAgent::discover`].
+    #[cfg(feature = "agent-bundled")]
+    pub fn bundled(state_root: impl Into<PathBuf>) -> Result<Self> {
+        let bundle = BundledAgent::discover()?;
+        Ok(bundle.config(bundle.setup(state_root)))
     }
 }
 

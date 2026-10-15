@@ -26,6 +26,17 @@ bundled = ["openvmm", "nvx-rs/bundled"]
 async = ["dep:tokio"]
 # A thin client of an explicitly supplied native agent library that owns the sandbox lifecycle.
 agent = ["dep:libloading", "dep:sha2"]
+# Downloads and verifies the edge agent bundle at build time and stages it beside the
+# executables, so that `agent::AgentConfig::bundled` needs no paths or digests. The build script
+# downloads `aci-edge-sandboxes.zip` from the release of the commit being built, or of its nearest
+# first-parent ancestor that has one; see `agent::BundledAgent`.
+agent-bundled = [
+    "agent",
+    "dep:serde_json",
+    "dep:sha2",
+    "dep:aci_edge_sandboxes_model",
+    "dep:static_assertions",
+]
 # Test doubles: an in-memory `MockBackend` and the `aci-edge-sandboxes-fake-openvmm` binary.
 testing = ["nvx-rs/testing"]
 
@@ -36,6 +47,8 @@ libloading = { version = "0.8", optional = true }
 sha2 = { version = "0.10", optional = true }
 serde = { version = "1.0.200", features = ["derive"] }
 serde_json = "1.0.120"
+# Checks at compile time that a staged agent bundle speaks this crate's sandbox ABI.
+static_assertions = { version = "1.1.0", optional = true }
 tokio = { version = "1.40", default-features = false, features = ["rt", "sync"], optional = true }
 
 [target.'cfg(unix)'.dependencies]
@@ -51,6 +64,13 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Pipes",
     "Win32_System_Threading",
 ] }
+
+[build-dependencies]
+# Only the `agent-bundled` build script reads the bundle's manifests and digests, and it checks the
+# bundle's sandbox ABI against the model's before installing the bundle.
+aci_edge_sandboxes_model = { path = "model", version = "0.1.0", optional = true }
+serde_json = { version = "1.0.120", optional = true }
+sha2 = { version = "0.10", optional = true }
 
 [dev-dependencies]
 tempfile = "3.10"

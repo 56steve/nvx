@@ -134,8 +134,9 @@ Enable `agent` to use `AciEdgeSandbox::agent(AgentConfig)`. This backend is a th
 separately supplied native library, `aci_edge_agent.dll` (`libaci_edge_agent.so` on Linux),
 which owns the whole sandbox lifecycle: the state root and its records, the OpenVMM processes
 and their boot consoles, the guest sessions, and the guest images. The default direct-OpenVMM
-backend and its Alpine guest are unchanged. The crate does **not** build, download, or publish
-the library.
+backend and its Alpine guest are unchanged. The crate does **not** build or publish the library,
+and it downloads one only with the `agent-bundled` feature; see
+[Bundled agent](#bundled-agent-agent-bundled).
 
 `AgentConfig` names the library, the SHA-256 of the library that the caller's own policy
 approved, and a `SetupConfig`, which the library applies once per process:
@@ -289,7 +290,9 @@ Snapshot/restore and guest-side image pulls are not part of this profile.
 
 [`examples/agent_lifecycle.rs`](examples/agent_lifecycle.rs) runs one lifecycle. It needs
 `--host-library`, `--host-sha256`, `--state-root`, either `--image` or `--image-ref`, and either `--openvmm`, `--kernel`,
-and `--initrd` or `--bundle` and `--bundle-sha256`, and the command after `--`. `--image-sha256`
+and `--initrd` or `--bundle` and `--bundle-sha256`, and the command after `--`, unless it is built
+with `agent-bundled`, which gives each of them a default; see
+[Bundled agent](#bundled-agent-agent-bundled). `--image-sha256`
 requires a local image's digest when it is registered. `--image-ref` requires a bundle;
 `--registry-auth-file PATH` selects its credentials file and `--pull-timeout-ms` sets its pull
 deadline. `--hypervisor`, `--cpu-profile auto|host`,
@@ -347,7 +350,8 @@ before `--`; `nvx::resolve_guest_path` gives the guest paths, here `/mnt/c/work/
 `--egress allow --host-loopback allow --host-loopback-forward tcp:18080:8080`.
 
 Build the native library and the static edge initramfs separately from their matching sources;
-this example neither fetches nor builds them. Use the pinned OpenVMM, which includes the
+this example neither fetches nor builds them unless it is built with `agent-bundled`. Use the
+pinned OpenVMM, which includes the
 scratchless RAM-overlay topology, and the NVX kernel that its time ABI requires, such as a
 release's `guest/vmlinux`. OpenVMM selects a [CPU profile](../doc/usage.md#cpu-profiles) at
 every cold boot, so start fails with `backend_error` on a host that none of its built-in
@@ -356,6 +360,86 @@ error names gives the reason. On such a development host, `cpuProfile: "host"` (
 `--cpu-profile host`) boots the guests on a host profile, which OpenVMM derives from the host's
 hypervisor at every cold boot and does not pin. On Linux, supply a matching
 `libaci_edge_agent.so` and OpenVMM build and select `--hypervisor mshv`.
+
+### Bundled agent (`agent-bundled`)
+
+The `agent-bundled` feature enables `agent` and makes the build script download, verify, and
+stage a complete edge agent bundle: the agent library, OpenVMM, the edge guest kernel and
+initramfs, the image tool, their manifests, and `SHA256SUMS`. A program built with it needs no
+paths or digests:
+
+```rust
+use aci_edge_sandboxes::AciEdgeSandbox;
+use aci_edge_sandboxes::agent::AgentConfig;
+
+let client = AciEdgeSandbox::agent(AgentConfig::bundled("C:\\nvx-edge-state")?)?;
+```
+
+`BundledAgent::discover` returns the bundle's directory, runtime, library, and digests, for a
+setup of one's own: `bundle.config(bundle.setup(state_root).with_cpu_profile(...))`.
+
+By default the build script downloads the `aci-edge-sandboxes.zip` asset of the release of the
+commit being built, `v<VERSION>-dev.<first 12 hex digits>`, where `<VERSION>` is what that
+commit's `VERSION` file holds. Releases do not publish the bundle for every commit, so when that
+release has none, the build uses the release of the nearest first-parent ancestor that does,
+named with the ancestor's own `VERSION`, searching at most 32 commits, and warns which one it
+used. It fails if none has one or if the commit cannot be told (no git checkout or no `git` on
+`PATH`).
+Releases publish no bundle for Linux, so a Linux build needs one of the variables below. Other
+targets, where the agent library cannot run, stage nothing, as `bundled` does. The build script
+runs again when `HEAD` moves to another commit or a variable below changes; run
+`cargo clean -p aci_edge_sandboxes` to pick up a bundle published later for the same commit. It
+also runs again when the copy beside the executables (see below) is replaced, changed, or
+removed, for example by a build of another feature configuration that uses a different bundle,
+and restores the bundle that the configuration being built pins.
+
+| Build variable | Effect |
+| --- | --- |
+| `ACI_EDGE_SANDBOXES_AGENT_BUNDLE_URL` | Downloads this bundle ZIP instead, from any URL that `curl` reads, such as a mirror; a `file://` URL names a ZIP on the build host |
+| `ACI_EDGE_SANDBOXES_AGENT_BUNDLE_DIR` | Stages this extracted bundle instead, for offline builds or locally built bundles |
+| `ACI_EDGE_SANDBOXES_AGENT_BUNDLE_SHA256` | Requires the ZIP to have this SHA-256 |
+| `ACI_EDGE_SANDBOXES_AGENT_BUNDLE=skip` | Stages nothing, as when the feature is disabled; `BundledAgent::discover` then fails with `backend_unavailable`. CI sets it for `--all-features` builds |
+
+The build fails unless every file that `SHA256SUMS` lists matches it, the bundle holds no links,
+`SOURCE-MANIFEST.json` is a format-2 manifest of the `edge` profile whose pins match
+`bin/openvmm[.exe]`, `guest/vmlinux`, `guest/initramfs-edge.cpio.gz`,
+`bin/direct-images[.exe]`, and the library, `bundle-manifest.json` describes a complete bundle
+whose consumer section names that manifest and an agent library for the target platform with
+the digests found, and the library speaks this crate's sandbox ABI. It warns when the bundle
+records an NVX commit other than the one it should come from. These checks prove that the bundle
+is intact, not that it is authorized: the trust comes from the download source, which
+`ACI_EDGE_SANDBOXES_AGENT_BUNDLE_SHA256` can pin.
+Extracting the ZIP needs bsdtar (Windows' own `tar`) or `unzip` on the build host.
+
+The build script stages the bundle in its output directory, which the build scripts of
+dependents read as `DEP_ACI_EDGE_SANDBOXES_AGENT_ARTIFACTS_DIR`, and copies it to an
+`aci-edge-sandboxes` directory in Cargo's profile directory, such as `target/release`, beside
+the executables that Cargo builds. The crate compiles in only the SHA-256 digests of the
+bundle's `SOURCE-MANIFEST.json` and library. `BundledAgent::discover` uses, in this order:
+
+1. The directory that `ACI_EDGE_SANDBOXES_AGENT_ARTIFACTS_DIR` names, when it is set and not
+   empty. The directory must then hold a copy of the bundle; discovery does not fall back.
+2. An `aci-edge-sandboxes/` directory next to the current executable, if it holds the bundle.
+3. One next to the executable's directory, which serves Cargo's `examples/` and `deps/`.
+
+An executable therefore keeps working when it is copied elsewhere together with the
+`aci-edge-sandboxes` directory, as long as their relative positions stay the same, and the
+host refuses a bundle whose files differ from the digests that were compiled in. When Cargo's
+`build-dir` is not the target directory, the copy goes there and serves only test executables;
+for the others, copy the bundle from `DEP_ACI_EDGE_SANDBOXES_AGENT_ARTIFACTS_DIR` next to the
+executable or set `ACI_EDGE_SANDBOXES_AGENT_ARTIFACTS_DIR`.
+
+Built with `agent-bundled`, [`examples/agent_lifecycle.rs`](examples/agent_lifecycle.rs) runs
+without any option:
+
+```powershell
+cargo run --release --locked --features agent-bundled --example agent_lifecycle
+```
+
+It uses the staged bundle and library, keeps its state in `aci-edge-sandboxes-state/` beside
+the executable, boots `mcr.microsoft.com/azurelinux/base/core:3.0`, and runs
+`printf READY; echo; head -n 2 /etc/os-release`. Every option still overrides its default, and
+`--bundle`, `--openvmm`, or `--host-library` options replace the staged runtime or library.
 
 ### Native host paths and network
 
@@ -895,11 +979,18 @@ conversion, without the exec case, turns any `nvx::Error` into an `Error`.
 
 ```bash
 cargo test --all-features   # unit, mock, and fake-OpenVMM tests; no hypervisor needed
+python3 scripts/nvx.py test-agent-bundling   # agent bundle staging (repository root)
 python3 scripts/nvx.py test-aci-edge-sandboxes --backend kvm   # real VM (repository root)
 ```
 
-Set `NVX_BUNDLE=skip` for `--all-features` builds that should not download the
-pinned release. The NVX mechanics are tested in [`nvx-rs`](../nvx-rs/README.md)
+Set `NVX_BUNDLE=skip` and `ACI_EDGE_SANDBOXES_AGENT_BUNDLE=skip` for `--all-features` builds
+that should not download the pinned release or the edge agent bundle.
+`nvx.py test-agent-bundling`, which the
+[`check-aci-edge-sandboxes`](../.github/actions/check-aci-edge-sandboxes/action.yml) action
+runs, stages a synthetic agent bundle through `ACI_EDGE_SANDBOXES_AGENT_BUNDLE_DIR`, which the
+bundled-agent tests must find, and checks that the build rejects broken copies of it; it needs
+neither a hypervisor nor an agent library that runs. The NVX
+mechanics are tested in [`nvx-rs`](../nvx-rs/README.md)
 as well, with their own unit tests, golden protocol fixtures, and a
 fake-OpenVMM lifecycle test.
 

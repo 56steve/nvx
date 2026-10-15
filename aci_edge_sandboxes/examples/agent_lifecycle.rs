@@ -1,10 +1,16 @@
 //! Runs one sandbox lifecycle through a separately supplied native agent library.
+//!
+//! Built with the `agent-bundled` feature, every option has a default: the bundle that the build
+//! staged beside this executable, a state root beside this executable, a public image reference,
+//! and a command that prints `READY` and the guest's OS release.
 
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
+#[cfg(feature = "agent-bundled")]
+use aci_edge_sandboxes::agent::BundledAgent;
 use aci_edge_sandboxes::agent::{
     AgentBackend, AgentConfig, BundleSource, CpuProfile, Diagnostics, Hypervisor, ImageDigest,
     ImageSettings, ReferenceSettings, RuntimeFiles, RuntimeSource, SandboxDefaults, SetupConfig,
@@ -111,18 +117,32 @@ fn run() -> Result<(), String> {
     }
     let required =
         |name: &str, value: Option<String>| value.ok_or_else(|| format!("missing required {name}"));
-    let runtime = match (bundle, bundle_digest) {
-        (Some(path), Some(manifest_sha256)) => RuntimeSource::Bundle(BundleSource {
+    let runtime_given = bundle.is_some()
+        || bundle_digest.is_some()
+        || openvmm.is_some()
+        || kernel.is_some()
+        || initrd.is_some();
+    let library_given = library.is_some() || digest.is_some();
+    let defaults = Defaults::new(!runtime_given || !library_given)?;
+    let runtime = match (bundle, bundle_digest, defaults.runtime) {
+        (Some(path), Some(manifest_sha256), _) => RuntimeSource::Bundle(BundleSource {
             path: path.into(),
             manifest_sha256,
         }),
-        (None, None) => RuntimeSource::Files(RuntimeFiles {
+        (None, None, Some(staged)) if !runtime_given => staged,
+        (None, None, _) => RuntimeSource::Files(RuntimeFiles {
             openvmm: required("--openvmm", openvmm)?.into(),
             kernel: required("--kernel", kernel)?.into(),
             initrd: required("--initrd", initrd)?.into(),
             approved_sha256: None,
         }),
         _ => return Err("--bundle and --bundle-sha256 go together".to_owned()),
+    };
+    let image_ref = match (&image, image_ref, defaults.image) {
+        (None, None, Some(reference)) if matches!(&runtime, RuntimeSource::Bundle(_)) => {
+            Some(reference.to_owned())
+        }
+        (_, image_ref, _) => image_ref,
     };
     let image = parse_image_source(image, image_ref)?;
     if matches!(&image, ImageSource::Reference(_)) {
@@ -135,11 +155,21 @@ fn run() -> Result<(), String> {
     } else if pull_timeout_ms.is_some() || registry_auth_file.is_some() {
         return Err("--pull-timeout-ms and --registry-auth-file require --image-ref".to_owned());
     }
-    let library = required("--host-library", library)?;
-    let root = required("--state-root", root)?;
-    let digest = digest.ok_or("missing required --host-sha256")?;
+    let (library, digest) = match (library, digest, defaults.library) {
+        (None, None, Some(staged)) => staged,
+        (library, digest, _) => (
+            PathBuf::from(required("--host-library", library)?),
+            digest.ok_or("missing required --host-sha256")?,
+        ),
+    };
+    let root = match (root, defaults.state_root) {
+        (Some(root), _) => PathBuf::from(root),
+        (None, Some(staged)) => staged,
+        (None, None) => return Err("missing required --state-root".to_owned()),
+    };
     let command = command
         .filter(|command| !command.is_empty())
+        .or(defaults.command.map(str::to_owned))
         .ok_or("pass the guest command after --")?;
     let mut request = ProvisionRequest::new();
     if !filesystem.is_empty() {
@@ -279,6 +309,57 @@ fn run() -> Result<(), String> {
         return Err(format!("guest command {}", output.outcome));
     }
     Ok(())
+}
+
+/// Directory beside this executable that holds the state of a build with `agent-bundled`.
+#[cfg(feature = "agent-bundled")]
+const STATE_DIRECTORY: &str = "aci-edge-sandboxes-state";
+/// Image that a build with `agent-bundled` boots unless `--image` or `--image-ref` is given.
+#[cfg(feature = "agent-bundled")]
+const IMAGE: &str = "mcr.microsoft.com/azurelinux/base/core:3.0";
+/// Command that a build with `agent-bundled` runs unless one is given after `--`.
+#[cfg(feature = "agent-bundled")]
+const COMMAND: &str = "printf READY; echo; head -n 2 /etc/os-release";
+
+/// What a build with the `agent-bundled` feature uses for an option that is not given.
+#[derive(Default)]
+struct Defaults {
+    runtime: Option<RuntimeSource>,
+    library: Option<(PathBuf, [u8; 32])>,
+    state_root: Option<PathBuf>,
+    image: Option<&'static str>,
+    command: Option<&'static str>,
+}
+
+impl Defaults {
+    /// Returns the defaults, with the runtime and library of the staged bundle if `bundle` is
+    /// set.
+    #[cfg(feature = "agent-bundled")]
+    fn new(bundle: bool) -> Result<Self, String> {
+        let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+        let directory = executable
+            .parent()
+            .ok_or("this executable is not in a directory")?;
+        let mut defaults = Self {
+            state_root: Some(directory.join(STATE_DIRECTORY)),
+            image: Some(IMAGE),
+            command: Some(COMMAND),
+            ..Self::default()
+        };
+        if bundle {
+            let staged = BundledAgent::discover().map_err(describe)?;
+            eprintln!("using the agent bundle in {}", staged.directory().display());
+            defaults.runtime = Some(staged.runtime());
+            defaults.library = Some((staged.library().to_path_buf(), staged.library_sha256()));
+        }
+        Ok(defaults)
+    }
+
+    /// Returns no defaults: without `agent-bundled`, every option is required.
+    #[cfg(not(feature = "agent-bundled"))]
+    fn new(_bundle: bool) -> Result<Self, String> {
+        Ok(Self::default())
+    }
 }
 
 fn parse_image_source(

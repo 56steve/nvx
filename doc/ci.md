@@ -559,7 +559,12 @@ runs rustfmt, Clippy with warnings denied, and rustdoc, all on the Rust
 release that `rust-toolchain.toml` pins. It also runs the unit, mock, and fake-OpenVMM
 integration tests, checks the declared minimum Rust version, and cross-checks
 the macOS build that MXC compiles. The fake-OpenVMM tests drive the real
-OpenVMM backend through its control protocol without a hypervisor.
+OpenVMM backend through its control protocol without a hypervisor. It also runs
+`nvx.py test-agent-bundling`, which validates edge agent bundle staging with a
+synthetic bundle, which the bundled-agent tests must find with the digests that
+were compiled in, and checks that the build rejects a tampered file, a wrong
+pin, another sandbox ABI, and a link: a symbolic link on Linux and a junction
+on Windows.
 
 The required `nvx-rs` job checks the [`nvx-rs` crate](../nvx-rs/README.md),
 which holds the NVX mechanics that the backend builds on, on the same runners
@@ -570,7 +575,9 @@ protocol-fixture, and fake-OpenVMM instance tests, rustdoc with warnings
 denied, the minimum Rust version check, and the macOS cross-check. It also
 validates bundled artifact staging with a fixture package. Both actions set
 `NVX_BUNDLE=skip` for `--all-features` builds, so that `bundled` stages nothing
-instead of downloading the pinned release.
+instead of downloading the pinned release, and the `aci_edge_sandboxes` action
+also sets `ACI_EDGE_SANDBOXES_AGENT_BUNDLE=skip`, so that `agent-bundled` does
+not download an edge agent bundle.
 
 The development release job depends on `aci-edge-sandboxes` and `nvx-rs` and
 requires their combined Linux/Windows results to be successful; failed,
