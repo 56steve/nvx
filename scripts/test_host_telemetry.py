@@ -19,7 +19,7 @@ import unittest
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -1225,7 +1225,7 @@ class AzureMetadataRequestTests(unittest.TestCase):
                 self.end_headers()
                 self.wfile.write(b"{}")
 
-            def log_message(self, *args: object) -> None:
+            def log_message(self, format: str, *args: object) -> None:
                 pass
 
         server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
@@ -1246,7 +1246,7 @@ class AzureMetadataRequestTests(unittest.TestCase):
         real_socket = socket.socket
 
         class RefusingSocket(real_socket):
-            def __init__(self, *args: object, **kwargs: object) -> None:
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
                 super().__init__(*args, **kwargs)
                 created.append(self)
 
@@ -1255,7 +1255,9 @@ class AzureMetadataRequestTests(unittest.TestCase):
 
         with (
             patch.object(socket, "socket", RefusingSocket),
-            patch.object(host_telemetry, "AZURE_IMDS_URL", "http://127.0.0.1:9/compute"),
+            patch.object(
+                host_telemetry, "AZURE_IMDS_URL", "http://127.0.0.1:9/compute"
+            ),
         ):
             with self.assertRaises(OSError):
                 host_telemetry.read_azure_compute_metadata(timeout=2)
@@ -1282,7 +1284,9 @@ class AzureMetadataRequestTests(unittest.TestCase):
 
         with (
             patch.object(socket, "socket", BlockingSocket),
-            patch.object(host_telemetry, "AZURE_IMDS_URL", "http://127.0.0.1:9/compute"),
+            patch.object(
+                host_telemetry, "AZURE_IMDS_URL", "http://127.0.0.1:9/compute"
+            ),
         ):
             with self.assertRaises(TimeoutError):
                 host_telemetry.read_azure_compute_metadata(timeout=0.2)
