@@ -28,9 +28,9 @@ fn main() {
 /// The bundle is the `aci-edge-sandboxes.zip` asset of an NVX release: the agent library, OpenVMM,
 /// the edge guest kernel and initramfs, the image tool, `SOURCE-MANIFEST.json`,
 /// `bundle-manifest.json`, and `SHA256SUMS`. By default the build script downloads it from the
-/// release of the commit being built (`v<VERSION>-dev.<12 hex digits>`) or, if that release has
-/// none, from the release of the nearest of the commit's first-parent ancestors that has one,
-/// searching a bounded number of commits.
+/// release of the commit being built (`v<VERSION>-dev.<12 hex digits>`, with the version in that
+/// commit's `VERSION` file) or, if that release has none, from the release of the nearest of the
+/// commit's first-parent ancestors that has one, searching a bounded number of commits.
 ///
 /// The bundle is verified and staged in `OUT_DIR/aci-edge-sandboxes`, which dependent build
 /// scripts read as `DEP_ACI_EDGE_SANDBOXES_AGENT_ARTIFACTS_DIR`, and copied to an
@@ -204,8 +204,6 @@ mod agent_bundle {
         directory: PathBuf,
         /// The commit being built, then its first-parent ancestors.
         commits: Vec<String>,
-        /// The NVX version in release tags.
-        version: String,
     }
 
     impl Checkout {
@@ -220,17 +218,14 @@ mod agent_bundle {
             if commits.is_empty() {
                 return None;
             }
-            let root = PathBuf::from(git(&directory, &["rev-parse", "--show-toplevel"])?);
-            let version = fs::read_to_string(root.join("VERSION"))
-                .ok()
-                .map(|version| version.trim().to_owned())
-                .filter(|version| !version.is_empty())
-                .unwrap_or_else(|| env::var("CARGO_PKG_VERSION").expect("Cargo sets the version"));
-            Some(Self {
-                directory,
-                commits,
-                version,
-            })
+            Some(Self { directory, commits })
+        }
+
+        /// Returns the NVX version that `commit` records in the repository's `VERSION` file, which
+        /// the tag of its release carries, or `None` if it records none.
+        fn version_at(&self, commit: &str) -> Option<String> {
+            let blob = format!("{commit}:VERSION");
+            git(&self.directory, &["cat-file", "blob", &blob]).filter(|version| !version.is_empty())
         }
 
         /// Runs the build script again when HEAD moves to another commit.
@@ -274,12 +269,15 @@ mod agent_bundle {
         create_dir(downloads);
         let headers = downloads.join("probe");
         let head = short(&checkout.commits[0]);
+        let mut versioned = 0;
         for (distance, commit) in checkout.commits.iter().enumerate() {
-            let url = format!(
-                "{RELEASES}/v{}-dev.{}/{ASSET}",
-                checkout.version,
-                short(commit)
-            );
+            // A release's tag carries the version of its own commit, which can differ from the
+            // version of the commit being built.
+            let Some(version) = checkout.version_at(commit) else {
+                continue;
+            };
+            versioned += 1;
+            let url = format!("{RELEASES}/v{version}-dev.{}/{ASSET}", short(commit));
             if exists(&url, &headers) {
                 if distance > 0 {
                     warn(format!(
@@ -290,6 +288,13 @@ mod agent_bundle {
                 }
                 return (url, commit.clone());
             }
+        }
+        if versioned == 0 {
+            fail(format!(
+                "cannot name the releases of {head} and the {} first-parent commit(s) before it, \
+                 which have no VERSION file; set {URL} or {DIR}",
+                checkout.commits.len() - 1
+            ));
         }
         fail(format!(
             "no release of {head} or of the {} first-parent commit(s) before it has {ASSET}; \
@@ -414,8 +419,9 @@ mod agent_bundle {
     }
 
     /// Copies the files that the `SHA256SUMS` of `source` lists, and the list itself, into a new
-    /// `staged` directory.
+    /// `staged` directory. Fails if `source` holds a link, which copying would follow.
     fn copy_listed(source: &Path, staged: &Path) {
+        reject_links(source);
         let files = read_checksums(&source.join(CHECKSUMS));
         recreate(staged);
         for name in files.keys().map(String::as_str).chain([CHECKSUMS]) {
@@ -574,6 +580,10 @@ mod agent_bundle {
             return;
         };
         let installed = profile.join(DIRECTORY);
+        // Cleanup never follows a link, not even one in place of the directory itself.
+        if fs::symlink_metadata(&installed).is_ok_and(|metadata| !metadata.is_dir()) {
+            remove_entry(&installed);
+        }
         create_dir(&installed);
         remove_unlisted(&installed, &installed, &bundle.files);
         let mut files: Vec<(&str, String)> = bundle
@@ -636,14 +646,17 @@ mod agent_bundle {
                 .collect::<Vec<_>>()
                 .join("/");
             if kind.is_symlink() || (name != CHECKSUMS && !files.contains_key(&name)) {
-                // A link to a directory is removed as a directory on Windows.
-                fs::remove_file(&path)
-                    .or_else(|_| fs::remove_dir(&path))
-                    .unwrap_or_else(|error| {
-                        fail(format!("cannot remove {}: {error}", path.display()))
-                    });
+                remove_entry(&path);
             }
         }
+    }
+
+    /// Removes the file or link at `path`. A link is removed, never what it points to.
+    fn remove_entry(path: &Path) {
+        // A link to a directory, including a junction, is removed as a directory on Windows.
+        fs::remove_file(path)
+            .or_else(|_| fs::remove_dir(path))
+            .unwrap_or_else(|error| fail(format!("cannot remove {}: {error}", path.display())));
     }
 
     /// Returns the entries of `directory` with their types, without following links.

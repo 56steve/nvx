@@ -379,10 +379,12 @@ let client = AciEdgeSandbox::agent(AgentConfig::bundled("C:\\nvx-edge-state")?)?
 setup of one's own: `bundle.config(bundle.setup(state_root).with_cpu_profile(...))`.
 
 By default the build script downloads the `aci-edge-sandboxes.zip` asset of the release of the
-commit being built, `v<VERSION>-dev.<first 12 hex digits>`. Releases do not publish the bundle
-for every commit, so when that release has none, the build uses the release of the nearest
-first-parent ancestor that does, searching at most 32 commits, and warns which one it used. It
-fails if none has one or if the commit cannot be told (no git checkout or no `git` on `PATH`).
+commit being built, `v<VERSION>-dev.<first 12 hex digits>`, where `<VERSION>` is what that
+commit's `VERSION` file holds. Releases do not publish the bundle for every commit, so when that
+release has none, the build uses the release of the nearest first-parent ancestor that does,
+named with the ancestor's own `VERSION`, searching at most 32 commits, and warns which one it
+used. It fails if none has one or if the commit cannot be told (no git checkout or no `git` on
+`PATH`).
 Releases publish no bundle for Linux, so a Linux build needs one of the variables below. Other
 targets, where the agent library cannot run, stage nothing, as `bundled` does. The build script
 runs again when `HEAD` moves to another commit or a variable below changes; run
