@@ -485,53 +485,49 @@ fn device_io_measures_a_file() {
 #[cfg(target_arch = "x86_64")]
 fn device_io_measures_a_network_round_trip() {
     use std::net::UdpSocket;
-    use std::sync::mpsc;
     use std::thread;
-    use std::time::Duration;
 
     let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
-    socket
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
-    let port = socket.local_addr().unwrap().port();
-    let (first, received) = mpsc::channel();
+    let address = socket.local_addr().unwrap();
+    // Echoes datagrams until the test sends an empty one after the benchmark exits, and returns
+    // the first.
     let echo = thread::spawn(move || {
         let mut buffer = [0; 128];
-        let mut count = 0;
-        // The benchmark sends until its duration passes and stops when its socket closes, so
-        // the echo stops at the first silence, when a receive times out. Linux does not restart
-        // a receive with a timeout that a signal interrupts, as the SIGCHLD of a child of a
-        // concurrent test can, so an interrupted receive starts over.
+        let mut first = None;
         loop {
             let (length, peer) = match socket.recv_from(&mut buffer) {
                 Ok(received) => received,
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
                 Err(error) => panic!("the echo cannot receive: {error}"),
             };
-            if count == 0 {
-                first.send(buffer[..length].to_vec()).unwrap();
+            if length == 0 {
+                return first;
             }
-            count += 1;
+            if first.is_none() {
+                first = Some(buffer[..length].to_vec());
+            }
             socket.send_to(&buffer[..length], peer).unwrap();
-            socket
-                .set_read_timeout(Some(Duration::from_millis(500)))
-                .unwrap();
         }
     });
-    let port = port.to_string();
-    let result = device_io(["network", "127.0.0.1", &port, "100"], 0).expect("a result line");
+    // On a heavily loaded host, the echo thread can wait longer for a processor than a shorter
+    // benchmark runs.
+    let port = address.port().to_string();
+    let result = device_io(["network", "127.0.0.1", &port, "1000"], 0).expect("a result line");
+    UdpSocket::bind("127.0.0.1:0")
+        .unwrap()
+        .send_to(&[], address)
+        .unwrap();
+    let first = echo.join().unwrap();
     assert_eq!(result["device"], "network");
     assert_eq!(result["operation"], "roundtrip");
     assert_eq!(result["bytes_per_operation"], 64);
     assert!(result["operations"].as_u64().unwrap() > 0, "{result}");
     assert!(
-        result["elapsed_ns"].as_u64().unwrap() >= 100_000_000,
+        result["elapsed_ns"].as_u64().unwrap() >= 1_000_000_000,
         "{result}"
     );
     let payload: Vec<u8> = (1..=64).collect();
-    assert_eq!(received.recv().unwrap(), payload);
-    echo.join().unwrap();
+    assert_eq!(first, Some(payload));
 }
 
 #[test]
