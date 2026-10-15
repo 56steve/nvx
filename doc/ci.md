@@ -570,7 +570,9 @@ protocol-fixture, and fake-OpenVMM instance tests, rustdoc with warnings
 denied, the minimum Rust version check, and the macOS cross-check. It also
 validates bundled artifact staging with a fixture package. Both actions set
 `NVX_BUNDLE=skip` for `--all-features` builds, so that `bundled` stages nothing
-instead of downloading the pinned release.
+instead of downloading the pinned release, and the `aci_edge_sandboxes` action
+also sets `ACI_EDGE_SANDBOXES_AGENT_BUNDLE=skip`, so that `agent-bundled` does
+not download an edge agent bundle.
 
 The development release job depends on `aci-edge-sandboxes` and `nvx-rs` and
 requires their combined Linux/Windows results to be successful; failed,

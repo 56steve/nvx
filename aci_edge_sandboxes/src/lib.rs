@@ -50,6 +50,8 @@
 //! - `async`: Tokio wrappers ([`AsyncAciEdgeSandbox`], [`AsyncExecution`]) around the synchronous core.
 //! - `agent`: the [`agent`] backend, a thin client of a separately supplied native library
 //!   that owns the sandbox lifecycle.
+//! - `agent-bundled`: `agent`, with an edge agent bundle that the build script downloads and
+//!   stages beside the executables; see `agent::BundledAgent`.
 //! - `testing`: an in-memory [`testing::MockBackend`] for consumers' own tests, and the fake
 //!   OpenVMM of `nvx::testing`.
 
