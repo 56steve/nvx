@@ -328,8 +328,13 @@ def _metadata_opener(
             if not sockets.add(sock):
                 sock.close()
                 raise TimeoutError("metadata response did not finish in time")
-            sock.settimeout(max(0.001, min(self.timeout, deadline - time.monotonic())))
-            sock.connect((self.host, self.port))
+            try:
+                sock.settimeout(max(0.001, min(self.timeout, deadline - time.monotonic())))
+                sock.connect((self.host, self.port))
+            except BaseException:
+                # self.sock is not assigned yet, so close() cannot release this socket.
+                sock.close()
+                raise
             self.sock = sock
 
     class Handler(urllib.request.HTTPHandler):

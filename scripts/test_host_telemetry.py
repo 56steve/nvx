@@ -1241,6 +1241,28 @@ class AzureMetadataRequestTests(unittest.TestCase):
 
         self.assertEqual(served, ["/redirect"])
 
+    def test_a_refused_connection_closes_its_socket(self):
+        created: list[socket.socket] = []
+        real_socket = socket.socket
+
+        class RefusingSocket(real_socket):
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                super().__init__(*args, **kwargs)
+                created.append(self)
+
+            def connect(self, address: object) -> None:
+                raise ConnectionRefusedError("refused")
+
+        with (
+            patch.object(socket, "socket", RefusingSocket),
+            patch.object(host_telemetry, "AZURE_IMDS_URL", "http://127.0.0.1:9/compute"),
+        ):
+            with self.assertRaises(OSError):
+                host_telemetry.read_azure_compute_metadata(timeout=2)
+
+        self.assertEqual(len(created), 1)
+        self.assertEqual(created[0].fileno(), -1, "the refused socket was left open")
+
     def test_a_connect_still_in_progress_is_shut_down_at_the_deadline(self):
         blocked = threading.Event()
         released = threading.Event()
