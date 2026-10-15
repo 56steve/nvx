@@ -67,6 +67,78 @@ runs:
         cargo "+${{ steps.toolchains.outputs.toolchain }}" test --locked --workspace --all-features
         cargo "+${{ steps.toolchains.outputs.toolchain }}" test --locked --workspace
 
+    # Stages a synthetic edge agent bundle, which the bundled-agent tests then require to find with
+    # the digests that were compiled in, and checks that the build rejects broken copies of it.
+    # Neither needs an agent library that runs or a hypervisor.
+    - name: Check agent bundling
+      shell: bash
+      working-directory: aci_edge_sandboxes
+      env:
+        TOOLCHAIN: ${{ steps.toolchains.outputs.toolchain }}
+      run: |
+        set -euo pipefail
+        root=$(mktemp -d)
+        executable=''
+        library=bin/libaci_edge_agent.so
+        if [[ "${RUNNER_OS}" == Windows ]]; then
+          executable=.exe
+          library=bin/aci_edge_agent.dll
+        fi
+        abi=$(sed -n 's/^pub const SANDBOX_ABI_VERSION: u32 = \([0-9]*\);.*/\1/p' model/src/wire.rs)
+        test -n "${abi}"
+        native() {
+          if [[ "${RUNNER_OS}" == Windows ]]; then cygpath -w "$1"; else printf '%s' "$1"; fi
+        }
+        # Writes a bundle into $1 whose files hold their own names. $2 names the file whose digest
+        # the manifest pins as the kernel's, and $3 is the sandbox ABI that it declares.
+        bundle() {
+          local directory=$1 kernel=${2:-guest/vmlinux} bundle_abi=${3:-${abi}}
+          local files=("bin/openvmm${executable}" "bin/direct-images${executable}" "${library}"
+            guest/vmlinux guest/initramfs-edge.cpio.gz)
+          mkdir -p "${directory}/bin" "${directory}/guest"
+          for file in "${files[@]}"; do printf '%s' "${file}" > "${directory}/${file}"; done
+          digest() { sha256sum "${directory}/$1" | cut -d ' ' -f 1; }
+          printf '{"format": 2, "profile": "edge", "openvmm": {"executable_sha256": "%s"}, "linux": {"kernel_sha256": "%s"}, "edge": {"initramfs_sha256": "%s"}, "direct_images": {"executable_sha256": "%s"}, "agent": {"library_sha256": "%s"}}\n' \
+            "$(digest "bin/openvmm${executable}")" "$(digest "${kernel}")" \
+            "$(digest guest/initramfs-edge.cpio.gz)" "$(digest "bin/direct-images${executable}")" \
+            "$(digest "${library}")" > "${directory}/SOURCE-MANIFEST.json"
+          printf '{"status": {"complete": true}, "consumer": {"runtimeBundleManifest": "SOURCE-MANIFEST.json", "runtimeBundleManifestSha256": "%s", "backendLibrary": "%s", "backendLibrarySha256": "%s", "sandboxAbiVersion": %s}}\n' \
+            "$(digest SOURCE-MANIFEST.json)" "${library}" "$(digest "${library}")" "${bundle_abi}" \
+            > "${directory}/bundle-manifest.json"
+          (cd "${directory}" && sha256sum "${files[@]}" SOURCE-MANIFEST.json bundle-manifest.json > SHA256SUMS)
+        }
+        # Fails unless the build rejects the bundle in $1 with a message that contains $2.
+        rejects() {
+          local output
+          if output=$(ACI_EDGE_SANDBOXES_AGENT_BUNDLE_DIR="$(native "$1")" \
+            cargo "+${TOOLCHAIN}" check --locked --lib --features agent-bundled 2>&1); then
+            echo "the build accepted $1" >&2
+            return 1
+          fi
+          if ! grep -qF -- "$2" <<< "${output}"; then
+            printf '%s\n' "${output}" >&2
+            echo "the build rejected $1 without reporting: $2" >&2
+            return 1
+          fi
+        }
+        bundle "${root}/good"
+        ACI_EDGE_SANDBOXES_AGENT_BUNDLE_DIR="$(native "${root}/good")" \
+          cargo "+${TOOLCHAIN}" test --locked --lib --features agent-bundled bundled
+        cp -R "${root}/good" "${root}/tampered"
+        printf x >> "${root}/tampered/guest/vmlinux"
+        rejects "${root}/tampered" 'SHA-256 mismatch'
+        bundle "${root}/pinned" guest/initramfs-edge.cpio.gz
+        rejects "${root}/pinned" 'pins /linux/kernel_sha256 to another digest'
+        bundle "${root}/abi" guest/vmlinux "$((abi + 1))"
+        rejects "${root}/abi" "speaks sandbox ABI $((abi + 1))"
+        # Git for Windows cannot make links without privileges.
+        if [[ "${RUNNER_OS}" != Windows ]]; then
+          cp -R "${root}/good" "${root}/linked"
+          mv "${root}/linked/guest" "${root}/guest"
+          ln -s "${root}/guest" "${root}/linked/guest"
+          rejects "${root}/linked" 'is a link'
+        fi
+
     - name: Build documentation
       shell: bash
       working-directory: aci_edge_sandboxes

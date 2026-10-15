@@ -78,6 +78,8 @@ mod agent_bundle {
     const SEARCH_DEPTH: usize = 32;
     /// The directory that holds the bundle; `agent::BundledAgent::BESIDE_EXE_DIR`.
     const DIRECTORY: &str = "aci-edge-sandboxes";
+    /// The file in `OUT_DIR` that records which bundle this feature configuration installed.
+    const RECORD: &str = "installed-agent-bundle";
     const CHECKSUMS: &str = "SHA256SUMS";
     const SOURCE_MANIFEST: &str = "SOURCE-MANIFEST.json";
     const BUNDLE_MANIFEST: &str = "bundle-manifest.json";
@@ -593,7 +595,7 @@ mod agent_bundle {
 
     /// Copies the staged bundle beside the executables that Cargo builds, replacing only the files
     /// that differ, where `agent::BundledAgent::discover` finds it, and runs this script again
-    /// when that copy is replaced or removed.
+    /// when that copy is replaced, changed, or removed.
     fn install(staged: &Path, out_dir: &Path, bundle: &Bundle, started: SystemTime) {
         // `OUT_DIR` is `<profile>/build/<package>-<hash>/out`. Cargo builds executables into
         // `<profile>`, `<profile>/examples`, and `<profile>/deps`.
@@ -616,34 +618,36 @@ mod agent_bundle {
             remove_entry(&installed);
         }
         create_dir(&installed);
+        // `SHA256SUMS` lists every other file of a bundle with its digest, so its own digest
+        // identifies the bundle.
+        let identity = sha256(&staged.join(CHECKSUMS));
+        let listing = inside(&installed, CHECKSUMS);
+        let replaced = !(fs::symlink_metadata(&listing).is_ok_and(|metadata| metadata.is_file())
+            && sha256(&listing) == identity);
         remove_unlisted(&installed, &installed, &bundle.files);
         let mut files: Vec<(&str, String)> = bundle
             .files
             .iter()
             .map(|(name, digest)| (name.as_str(), digest.clone()))
             .collect();
-        files.push((CHECKSUMS, sha256(&staged.join(CHECKSUMS))));
-        // Cargo runs this script again when the manifest that it watches below is newer than the
-        // script's last start, which every file written now would be. Dating the files a second
-        // before this run started avoids that, and still dates them after the start of any
-        // earlier run of another feature configuration's script.
+        files.push((CHECKSUMS, identity.clone()));
+        // Cargo runs this script again when a file that it watches is newer than the script's last
+        // start, which every file written now would be. Dating the installed files a minute
+        // before this run keeps its own writes from running it again.
         let dated = started
-            .checked_sub(Duration::from_secs(1))
-            .unwrap_or(started);
-        for (name, digest) in files {
+            .checked_sub(Duration::from_secs(60))
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        for (name, digest) in &files {
             let target = inside(&installed, name);
             if fs::symlink_metadata(&target).is_ok_and(|metadata| metadata.is_file())
-                && sha256(&target) == digest
+                && sha256(&target) == *digest
             {
                 continue;
             }
             let partial = PathBuf::from(format!("{}.partial", target.display()));
             copy(&inside(staged, name), &partial);
             // At worst, a file that keeps the current time runs this script once more.
-            let _ = File::options()
-                .write(true)
-                .open(&partial)
-                .and_then(|file| file.set_modified(dated));
+            let _ = set_modified(&partial, dated);
             fs::rename(&partial, &target).unwrap_or_else(|error| {
                 let _ = fs::remove_file(&partial);
                 fail(format!(
@@ -652,13 +656,53 @@ mod agent_bundle {
                 ))
             });
         }
+        // A changed or removed file of the copy runs this script again, which restores it.
+        for (name, _) in &files {
+            println!(
+                "cargo::rerun-if-changed={}",
+                inside(&installed, name).display()
+            );
+        }
         // Cargo caches the output of this script separately for each feature configuration of the
-        // crate, so another configuration may install a different bundle here, and the copy may be
-        // removed. Running this script again then restores the bundle that this build pins.
-        println!(
-            "cargo::rerun-if-changed={}",
-            installed.join(SOURCE_MANIFEST).display()
-        );
+        // crate, and the configurations may stage different bundles. Each records the bundle that
+        // it installed, and replacing that bundle makes the records of the others newer than their
+        // scripts' last runs, so that their next builds restore their bundles.
+        if replaced {
+            outdate_other_records(&profile.join("build"), out_dir, &identity);
+        }
+        let record = out_dir.join(RECORD);
+        fs::write(&record, &identity)
+            .unwrap_or_else(|error| fail(format!("cannot write {}: {error}", record.display())));
+        // Only another configuration's installation dates the record after this run.
+        let _ = set_modified(&record, SystemTime::UNIX_EPOCH);
+        println!("cargo::rerun-if-changed={}", record.display());
+    }
+
+    /// Marks the records of this crate's other feature configurations that installed a bundle
+    /// other than `identity` as changed now, after their scripts' last runs, so that their next
+    /// builds run their scripts again. `builds` holds the build directories of the profile's
+    /// packages, one of which is `OUT_DIR`'s parent.
+    fn outdate_other_records(builds: &Path, out_dir: &Path, identity: &str) {
+        let own = out_dir.join(RECORD);
+        let prefix = format!("{}-", env::var("CARGO_PKG_NAME").unwrap_or_default());
+        let now = SystemTime::now();
+        for entry in fs::read_dir(builds).into_iter().flatten().flatten() {
+            let record = entry.path().join("out").join(RECORD);
+            if record != own
+                && entry.file_name().to_string_lossy().starts_with(&prefix)
+                && fs::read_to_string(&record).is_ok_and(|other| other != identity)
+                && let Err(error) = set_modified(&record, now)
+            {
+                warn(format!(
+                    "cannot mark {} as outdated: {error}",
+                    record.display()
+                ));
+            }
+        }
+    }
+
+    fn set_modified(path: &Path, time: SystemTime) -> std::io::Result<()> {
+        File::options().write(true).open(path)?.set_modified(time)
     }
 
     /// Fails if `directory` holds a link at any depth: a bundle holds only files and directories.

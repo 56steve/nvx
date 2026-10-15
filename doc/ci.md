@@ -559,7 +559,11 @@ runs rustfmt, Clippy with warnings denied, and rustdoc, all on the Rust
 release that `rust-toolchain.toml` pins. It also runs the unit, mock, and fake-OpenVMM
 integration tests, checks the declared minimum Rust version, and cross-checks
 the macOS build that MXC compiles. The fake-OpenVMM tests drive the real
-OpenVMM backend through its control protocol without a hypervisor.
+OpenVMM backend through its control protocol without a hypervisor. It also
+validates edge agent bundle staging with a synthetic bundle, which the
+bundled-agent tests must find with the digests that were compiled in, and
+checks that the build rejects a tampered file, a wrong pin, another sandbox
+ABI, and, on Linux, a link.
 
 The required `nvx-rs` job checks the [`nvx-rs` crate](../nvx-rs/README.md),
 which holds the NVX mechanics that the backend builds on, on the same runners

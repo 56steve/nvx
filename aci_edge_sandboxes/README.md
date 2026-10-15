@@ -389,9 +389,9 @@ Releases publish no bundle for Linux, so a Linux build needs one of the variable
 targets, where the agent library cannot run, stage nothing, as `bundled` does. The build script
 runs again when `HEAD` moves to another commit or a variable below changes; run
 `cargo clean -p aci_edge_sandboxes` to pick up a bundle published later for the same commit. It
-also runs again when the copy beside the executables (see below) is replaced or removed, for
-example by a build of another feature configuration that uses a different bundle, and restores
-the bundle that the configuration being built pins.
+also runs again when the copy beside the executables (see below) is replaced, changed, or
+removed, for example by a build of another feature configuration that uses a different bundle,
+and restores the bundle that the configuration being built pins.
 
 | Build variable | Effect |
 | --- | --- |
@@ -983,8 +983,11 @@ python3 scripts/nvx.py test-aci-edge-sandboxes --backend kvm   # real VM (reposi
 ```
 
 Set `NVX_BUNDLE=skip` and `ACI_EDGE_SANDBOXES_AGENT_BUNDLE=skip` for `--all-features` builds
-that should not download the pinned release or the edge agent bundle. The NVX mechanics are
-tested in [`nvx-rs`](../nvx-rs/README.md)
+that should not download the pinned release or the edge agent bundle. The
+[`check-aci-edge-sandboxes`](../.github/actions/check-aci-edge-sandboxes/action.yml) action
+also stages a synthetic agent bundle through `ACI_EDGE_SANDBOXES_AGENT_BUNDLE_DIR`, which the
+bundled-agent tests must find, and checks that the build rejects broken copies of it. The NVX
+mechanics are tested in [`nvx-rs`](../nvx-rs/README.md)
 as well, with their own unit tests, golden protocol fixtures, and a
 fake-OpenVMM lifecycle test.
 

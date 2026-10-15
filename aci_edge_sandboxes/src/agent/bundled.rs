@@ -235,6 +235,8 @@ fn pins() -> Result<([u8; 32], &'static str, [u8; 32])> {
 mod tests {
     use std::fs;
 
+    use sha2::{Digest, Sha256};
+
     use super::*;
     use crate::error::ErrorCode;
 
@@ -310,7 +312,16 @@ mod tests {
     #[test]
     fn a_discovered_bundle_names_its_library_and_runtime() {
         // Unit tests run from `<profile>/deps`, beside the bundle that the build script copied
-        // into `<profile>`. A build that skipped staging has no bundle.
+        // into `<profile>`. Only a build that skipped staging, or a target where the agent
+        // library cannot run, has no bundle.
+        let skipped =
+            env::var_os("ACI_EDGE_SANDBOXES_AGENT_BUNDLE").is_some_and(|value| value == "skip");
+        if !skipped && (cfg!(target_os = "linux") || cfg!(windows)) {
+            assert!(
+                MANIFEST_SHA256.is_some(),
+                "the build staged no agent bundle"
+            );
+        }
         let bundle = match BundledAgent::discover() {
             Ok(bundle) => bundle,
             Err(error) => {
@@ -322,7 +333,12 @@ mod tests {
         assert!(bundle.directory().is_absolute());
         assert!(bundle.directory().join(MANIFEST_NAME).is_file());
         assert!(bundle.library().starts_with(bundle.directory()));
-        assert!(bundle.library().is_file());
+        let digest = |path: &Path| -> [u8; 32] { Sha256::digest(fs::read(path).unwrap()).into() };
+        assert_eq!(
+            digest(&bundle.directory().join(MANIFEST_NAME)),
+            bundle.manifest_sha256()
+        );
+        assert_eq!(digest(bundle.library()), bundle.library_sha256());
         let setup = bundle.setup("state");
         assert_eq!(
             setup.runtime,
