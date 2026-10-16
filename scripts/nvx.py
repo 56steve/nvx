@@ -1119,7 +1119,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     patch_identity.add_argument(
         "--root",
         type=Path,
-        default=BuildConstants.REPO_ROOT / "kernel" / "patches",
+        default=BuildConstants.REPO_ROOT / KernelBuildConstants.PATCH_DIRECTORY,
     )
     patch_identity.set_defaults(handler=command_kernel_patch_identity)
 
