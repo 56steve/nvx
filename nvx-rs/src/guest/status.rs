@@ -5,8 +5,8 @@ use std::process::ExitCode;
 /// Process exit statuses of the guest programs.
 ///
 /// A program exits with [`Success`](Self::Success), or with the status that its
-/// [`CommandError`] selects. Only `nvx-device-io` exits with the benchmark statuses 3, 4, and
-/// 255, and only `nvx-managed-agent` exits with 125.
+/// [`CommandError`] selects. Only `nvx-device-io` and `nvx-time-probe` exit with 3, only
+/// `nvx-device-io` with the benchmark statuses 4 and 255, and only `nvx-managed-agent` with 125.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub(crate) enum ExitStatus {
@@ -16,7 +16,8 @@ pub(crate) enum ExitStatus {
     Failure = 1,
     /// The command line was invalid.
     Usage = 2,
-    /// A benchmark could not open, connect, size, or time its device.
+    /// A benchmark could not open, connect, size, or time its device, or a diagnostic could not
+    /// prepare or run its measurement.
     SetupFailure = 3,
     /// A benchmark transfer or send was incomplete.
     TransferFailure = 4,
@@ -33,7 +34,8 @@ pub(crate) enum CommandError {
     Usage,
     /// An operation failed. A program that reports failures has printed why.
     Operation,
-    /// A benchmark could not open, connect, size, or time its device.
+    /// A benchmark could not open, connect, size, or time its device, or a diagnostic could not
+    /// prepare or run its measurement.
     Setup,
     /// A benchmark transfer or send was incomplete.
     Transfer,

@@ -161,6 +161,16 @@ pub(crate) fn current_process() -> ProcessId {
     ProcessId::from_pid(nix::unistd::getpid())
 }
 
+/// Calls `getpid` with the system call itself and returns the identifier.
+///
+/// The latency probe measures this system call, which libc's `getpid` may answer without one,
+/// so this makes it through libc's `syscall`.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn syscall_process_id() -> u64 {
+    // SAFETY: `getpid` has no arguments.
+    unsafe { nix::libc::syscall(nix::libc::SYS_getpid) as u64 }
+}
+
 /// Returns whether `process` exists, which includes a zombie, by sending it no signal.
 pub(crate) fn process_exists(process: ProcessId) -> bool {
     kill(process.0, None).is_ok()

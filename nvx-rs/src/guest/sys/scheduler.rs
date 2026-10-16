@@ -19,6 +19,29 @@ const THREAD_DIRECTORY: &str = "/proc/self/task";
 /// thread that an idle thread started while the first pass read the directory.
 const PROMOTION_PASSES: usize = 2;
 
+/// A CPU affinity mask.
+#[derive(Clone, Debug)]
+pub(crate) struct CpuAffinity(CpuSet);
+
+impl CpuAffinity {
+    /// Returns whether the mask contains `cpu`.
+    pub(crate) fn contains(&self, cpu: usize) -> bool {
+        self.0.is_set(cpu).unwrap_or(false)
+    }
+
+    /// Returns the CPUs of the mask in ascending order.
+    pub(crate) fn cpus(&self) -> Vec<usize> {
+        (0..CpuSet::count())
+            .filter(|&cpu| self.contains(cpu))
+            .collect()
+    }
+}
+
+/// Returns the calling thread's CPU affinity mask.
+pub(crate) fn current_affinity() -> Result<CpuAffinity, Errno> {
+    sched_getaffinity(CALLING_THREAD).map(CpuAffinity)
+}
+
 /// Pins the calling thread to `cpu`, and checks that it then runs there, which it does unless
 /// the CPU is offline or outside the process's cpuset. A thread that does not is `EINVAL`.
 pub(crate) fn pin_current_thread(cpu: usize) -> Result<(), Errno> {
@@ -164,31 +187,30 @@ impl Drop for IdlePriority {
     }
 }
 
+/// Yields the calling thread's CPU, and returns whether the call failed, which it never does on
+/// Linux.
+pub(crate) fn yield_now() -> bool {
+    nix::sched::sched_yield().is_err()
+}
+
 #[cfg(test)]
 mod tests {
     //! Checks of affinity and scheduling in this test's thread.
 
     use super::*;
 
-    /// Returns the CPUs of the calling thread's affinity mask in ascending order.
-    fn allowed_cpus() -> Vec<usize> {
-        let set = sched_getaffinity(CALLING_THREAD).unwrap();
-        (0..CpuSet::count())
-            .filter(|&cpu| set.is_set(cpu).unwrap_or(false))
-            .collect()
-    }
-
     #[test]
     fn pinning_moves_the_thread_and_the_guard_restores_its_mask() {
-        let cpus = allowed_cpus();
+        let original = current_affinity().unwrap();
+        let cpus = original.cpus();
         assert!(!cpus.is_empty());
         {
             let _guard = AffinityGuard::save().unwrap();
             pin_current_thread(cpus[0]).unwrap();
             assert_eq!(current_cpu().unwrap(), cpus[0]);
-            assert_eq!(allowed_cpus(), [cpus[0]]);
+            assert_eq!(current_affinity().unwrap().cpus(), [cpus[0]]);
         }
-        assert_eq!(allowed_cpus(), cpus);
+        assert_eq!(current_affinity().unwrap().cpus(), cpus);
         assert_eq!(pin_current_thread(CpuSet::count()), Err(Errno::EINVAL));
     }
 
@@ -212,5 +234,6 @@ mod tests {
             "{policy}"
         );
         assert!(thread_count().unwrap() >= 1);
+        assert!(!yield_now());
     }
 }

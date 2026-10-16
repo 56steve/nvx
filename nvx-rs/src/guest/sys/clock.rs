@@ -1,5 +1,7 @@
 //! The kernel's clocks: reading them and sleeping on them.
 
+use std::time::Duration;
+
 use nix::sys::time::TimeSpec;
 use nix::time::{ClockId, ClockNanosleepFlags, clock_gettime, clock_nanosleep};
 
@@ -18,6 +20,11 @@ pub(crate) enum Clock {
     Realtime,
     /// The time since boot, without suspend, which the wall clock's discipline slews.
     Monotonic,
+    /// The time since boot, without suspend or discipline.
+    MonotonicRaw,
+    /// The monotonic clock as the kernel saved it at the last scheduler tick, which a read
+    /// returns without reading the clocksource, so that it advances once per tick.
+    MonotonicCoarse,
     /// The time since boot, with suspend.
     Boottime,
     /// The CPU time of every thread of the process, exited threads' included.
@@ -30,6 +37,8 @@ impl Clock {
         match self {
             Self::Realtime => ClockId::CLOCK_REALTIME,
             Self::Monotonic => ClockId::CLOCK_MONOTONIC,
+            Self::MonotonicRaw => ClockId::CLOCK_MONOTONIC_RAW,
+            Self::MonotonicCoarse => ClockId::CLOCK_MONOTONIC_COARSE,
             Self::Boottime => ClockId::CLOCK_BOOTTIME,
             Self::ProcessCpuTime => ClockId::CLOCK_PROCESS_CPUTIME_ID,
         }
@@ -97,11 +106,42 @@ pub(crate) fn sleep_until_monotonic(deadline_ns: i64) {
     {}
 }
 
+/// Sleeps for `duration` on the monotonic clock with one call, which a signal ends early.
+pub(crate) fn sleep_once(duration: Duration) {
+    let _ = clock_nanosleep(
+        ClockId::CLOCK_MONOTONIC,
+        ClockNanosleepFlags::empty(),
+        &TimeSpec::from_duration(duration),
+    );
+}
+
+/// Reads the monotonic clock with the `clock_gettime` system call itself and returns the
+/// nanoseconds within the second.
+///
+/// The latency probe measures this system call. `nix` and the C library read the clock through
+/// the vDSO, without one, so this makes it through libc's `syscall`.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn syscall_monotonic_nanoseconds() -> u64 {
+    let mut time = nix::libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: the system call writes one `timespec` to `time`, which outlives it.
+    unsafe {
+        nix::libc::syscall(
+            nix::libc::SYS_clock_gettime,
+            nix::libc::CLOCK_MONOTONIC,
+            &raw mut time,
+        )
+    };
+    time.tv_nsec as u64
+}
+
 #[cfg(test)]
 mod tests {
     //! Checks of the clocks against the standard library's.
 
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
     use super::*;
 
@@ -135,6 +175,8 @@ mod tests {
         for clock in [
             Clock::Realtime,
             Clock::Monotonic,
+            Clock::MonotonicRaw,
+            Clock::MonotonicCoarse,
             Clock::Boottime,
             Clock::ProcessCpuTime,
         ] {
@@ -158,5 +200,14 @@ mod tests {
         sleep_until_monotonic(deadline);
         assert!(clock_time(Clock::Monotonic).unwrap().wrapping_nanoseconds() >= deadline);
         sleep_until_monotonic(start);
+        let instant = Instant::now();
+        sleep_once(Duration::from_millis(1));
+        assert!(instant.elapsed() >= Duration::from_millis(1));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn the_system_call_reads_nanoseconds_within_the_second() {
+        assert!(syscall_monotonic_nanoseconds() < NANOSECONDS_PER_SECOND);
     }
 }

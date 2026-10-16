@@ -1,10 +1,13 @@
 //! The x86-64 instructions that the time tools execute, through the `core::arch` intrinsics.
 //!
-//! The `CPUID` intrinsic compiles to the single instruction, which is safe to execute in user
-//! mode on every x86-64 processor. It became a safe function after the crate's minimum Rust
-//! version, so its call allows an unused `unsafe` block.
+//! The intrinsics compile to the single instructions that their names give: `CPUID`, `RDTSC`,
+//! `RDTSCP`, and `LFENCE`. `LFENCE` also orders the compiler's memory accesses, so a fenced read
+//! of the time-stamp counter stays where the caller put it. Each intrinsic is safe to execute in
+//! user mode on every x86-64 processor, except `RDTSCP`, whose CPUID bit the callers check
+//! first. Some of the intrinsics became safe functions after the crate's minimum Rust version,
+//! so their calls allow an unused `unsafe` block.
 
-use core::arch::x86_64::{__cpuid_count, CpuidResult};
+use core::arch::x86_64::{__cpuid_count, __rdtscp, _mm_lfence, _rdtsc, CpuidResult};
 
 /// CPUID leaves of the architecture and of Hyper-V, and the bits of their registers, that the
 /// time tools read.
@@ -32,6 +35,8 @@ pub(crate) mod cpuid {
     /// First leaf of the hypervisor range, whose EAX is the highest hypervisor leaf and whose
     /// EBX, ECX, and EDX hold the hypervisor's vendor signature.
     pub(crate) const LEAF_HYPERVISOR: u32 = 0x4000_0000;
+    /// Hyper-V leaf of the partition's privileges and features.
+    pub(crate) const LEAF_HYPERV_FEATURES: u32 = 0x4000_0003;
 
     /// Leaf 1 ECX bit set when the processor runs under a hypervisor.
     pub(crate) const FEATURES_ECX_HYPERVISOR: u32 = 31;
@@ -43,6 +48,14 @@ pub(crate) mod cpuid {
     pub(crate) const FEATURES_EDX_TSC: u32 = 4;
     /// Leaf 6 EAX bit of the always-running APIC timer.
     pub(crate) const POWER_MANAGEMENT_EAX_ARAT: u32 = 2;
+    /// Leaf 6 EAX bit of hardware-controlled performance states.
+    pub(crate) const POWER_MANAGEMENT_EAX_HWP: u32 = 7;
+    /// Leaf 6 ECX bit of the `APERF` and `MPERF` effective-frequency MSRs.
+    pub(crate) const POWER_MANAGEMENT_ECX_APERFMPERF: u32 = 0;
+    /// Bits of leaf 0xA's EAX that hold the version of architectural performance monitoring.
+    pub(crate) const PERFORMANCE_MONITORING_VERSION_MASK: u32 = 0xff;
+    /// Bits of each of leaf 0x16's registers that hold a frequency in MHz.
+    pub(crate) const FREQUENCY_MHZ_MASK: u32 = 0xffff;
     /// Leaf 7 subleaf 0 EBX bit of the `IA32_TSC_ADJUST` MSR.
     pub(crate) const STRUCTURED_FEATURES_EBX_TSC_ADJUST: u32 = 1;
     /// Leaf 0x80000001 EDX bit of the `RDTSCP` instruction.
@@ -65,11 +78,53 @@ pub(crate) mod cpuid {
     pub(crate) const fn bit(register: u32, bit: u32) -> bool {
         (register >> bit) & 1 != 0
     }
+
+    /// The processor's display family, display model, and stepping, which leaf 1's EAX encodes.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) struct Signature {
+        /// The family, with the extended family added for family 0xF.
+        pub(crate) family: u32,
+        /// The model, with the extended model for families 6 and 0xF.
+        pub(crate) model: u32,
+        /// The stepping.
+        pub(crate) stepping: u32,
+    }
+
+    impl Signature {
+        /// Decodes leaf 1's EAX as Intel's and AMD's manuals define the display family and model.
+        pub(crate) const fn decode(eax: u32) -> Self {
+            /// Bits of each of the signature's four-bit fields.
+            const NIBBLE: u32 = 0xf;
+            /// Bits of the extended family.
+            const BYTE: u32 = 0xff;
+            /// The family whose display family adds the extended family.
+            const EXTENDED_FAMILY: u32 = 0xf;
+            /// The other family whose display model includes the extended model.
+            const EXTENDED_MODEL_FAMILY: u32 = 0x6;
+            let family = (eax >> 8) & NIBBLE;
+            let mut model = (eax >> 4) & NIBBLE;
+            if family == EXTENDED_MODEL_FAMILY || family == EXTENDED_FAMILY {
+                model |= ((eax >> 16) & NIBBLE) << 4;
+            }
+            let family = if family == EXTENDED_FAMILY {
+                family + ((eax >> 20) & BYTE)
+            } else {
+                family
+            };
+            Self {
+                family,
+                model,
+                stepping: eax & NIBBLE,
+            }
+        }
+    }
 }
 
-/// Model-specific registers of the architecture and of Hyper-V that the time tools read or
-/// write.
+/// Model-specific registers of the architecture, of Hyper-V, and of KVM that the time tools
+/// read or write.
 pub(crate) mod msr {
+    /// `IA32_TIME_STAMP_COUNTER`.
+    pub(crate) const IA32_TSC: u32 = 0x10;
     /// `IA32_TSC_ADJUST`.
     pub(crate) const IA32_TSC_ADJUST: u32 = 0x3b;
     /// `IA32_TSC_DEADLINE`.
@@ -88,6 +143,8 @@ pub(crate) mod msr {
     pub(crate) const HV_APIC_FREQUENCY: u32 = 0x4000_0023;
     /// Hyper-V's `HV_X64_MSR_TSC_INVARIANT_CONTROL`.
     pub(crate) const HV_TSC_INVARIANT_CONTROL: u32 = 0x4000_0118;
+    /// KVM's `MSR_KVM_SYSTEM_TIME_NEW`.
+    pub(crate) const KVM_SYSTEM_TIME_NEW: u32 = 0x4b56_4d01;
 }
 
 /// Runs `CPUID` with `leaf` and `subleaf` and returns EAX, EBX, ECX, and EDX.
@@ -98,6 +155,56 @@ pub(crate) fn cpuid(leaf: u32, subleaf: u32) -> [u32; 4] {
     [eax, ebx, ecx, edx]
 }
 
+/// Reads the time-stamp counter without a fence.
+#[inline]
+#[allow(unused_unsafe)]
+pub(crate) fn rdtsc() -> u64 {
+    // SAFETY: RDTSC executes in user mode unless the kernel sets CR4.TSD, which Linux does not.
+    unsafe { _rdtsc() }
+}
+
+/// Reads the time-stamp counter with `RDTSCP`, which waits for the preceding instructions.
+///
+/// On a processor without the instruction, which CPUID leaf 0x80000001 EDX bit 27 reports, it
+/// raises the same invalid-opcode fault as the C probe did, so callers check the bit first.
+#[inline]
+#[allow(unused_unsafe)]
+pub(crate) fn rdtscp() -> u64 {
+    let mut processor = 0;
+    // SAFETY: the callers checked the CPUID bit, and `processor` is writable for the call.
+    unsafe { __rdtscp(&mut processor) }
+}
+
+/// Reads the time-stamp counter after `LFENCE`, as Linux's `rdtsc_ordered` does.
+#[inline]
+#[allow(unused_unsafe)]
+pub(crate) fn rdtsc_lfence() -> u64 {
+    // SAFETY: LFENCE and RDTSC execute in user mode on every x86-64 processor.
+    unsafe {
+        _mm_lfence();
+        _rdtsc()
+    }
+}
+
+/// Reads the time-stamp counter between two `LFENCE`s, which bracket a timed region.
+#[inline]
+#[allow(unused_unsafe)]
+pub(crate) fn rdtsc_fenced() -> u64 {
+    // SAFETY: LFENCE and RDTSC execute in user mode on every x86-64 processor.
+    unsafe {
+        _mm_lfence();
+        let counter = _rdtsc();
+        _mm_lfence();
+        counter
+    }
+}
+
+/// Tells the processor that the caller spins: the `PAUSE` instruction on x86-64.
+#[inline]
+pub(crate) fn pause() {
+    std::hint::spin_loop();
+}
+
 #[cfg(test)]
 mod tests {
     //! Checks of the instructions on the build host.
@@ -105,9 +212,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_time_stamp_counter_advances_through_every_read() {
+        let first = rdtsc_fenced();
+        let second = rdtsc_lfence();
+        let third = rdtsc();
+        assert!(
+            first <= second && second <= third,
+            "{first} {second} {third}"
+        );
+        let maximum = cpuid(cpuid::LEAF_EXTENDED_MAXIMUM, 0)[0];
+        if maximum >= cpuid::LEAF_EXTENDED_FEATURES
+            && cpuid::bit(
+                cpuid(cpuid::LEAF_EXTENDED_FEATURES, 0)[3],
+                cpuid::EXTENDED_FEATURES_EDX_RDTSCP,
+            )
+        {
+            assert!(rdtscp() >= third);
+        }
+    }
+
+    #[test]
     fn cpuid_reports_the_time_stamp_counter() {
         let features = cpuid(cpuid::LEAF_FEATURES, 0);
         assert!(cpuid::bit(features[3], cpuid::FEATURES_EDX_TSC));
         assert!(!cpuid::bit(0, 0) && cpuid::bit(1 << 31, 31));
+    }
+
+    #[test]
+    fn signatures_decode_the_display_family_and_model() {
+        // An Intel Xeon Platinum 8573C, family 6 model 0xCF stepping 2.
+        let intel = cpuid::Signature::decode(0x000c_06f2);
+        assert_eq!((intel.family, intel.model, intel.stepping), (6, 0xcf, 2));
+        // An AMD EPYC 7763, family 0x19 model 1 stepping 1.
+        let amd = cpuid::Signature::decode(0x00a0_0f11);
+        assert_eq!((amd.family, amd.model, amd.stepping), (0x19, 1, 1));
+        // Other families keep the base model.
+        let other = cpuid::Signature::decode(0x0001_0521);
+        assert_eq!((other.family, other.model, other.stepping), (5, 2, 1));
     }
 }

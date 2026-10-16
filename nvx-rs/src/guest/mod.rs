@@ -3,12 +3,13 @@
 //! Each module holds one program, and the crate's binary of the same name runs its `main`. The
 //! programs keep the command lines, exit statuses, and output of the C programs that they
 //! replace, except that numeric arguments are plain decimal, or `0x`-prefixed hexadecimal where
-//! the C program also read hexadecimal, error messages describe `errno` values with `nix`'s
-//! text, and `nvx-ingress` reads the kernel's socket tables and sysctl, and its test snapshots,
-//! only in the form in which the kernel writes them, rejecting the signed, prefixed, and other
-//! lenient forms that C's `strtoul` and `scanf` also read. `nvx-time`'s test hooks keep the C
-//! program's `strtoll` and `strtoull` reading of their decimal arguments, which its
-//! compatibility tests compare.
+//! the C program also read hexadecimal, floating-point arguments plain decimal with an optional
+//! exponent, error messages describe `errno` values with `nix`'s text, and `nvx-ingress` and
+//! `nvx-time-probe` read the kernel's numbers, such as its socket tables, sysctls, and rates,
+//! and `nvx-ingress`'s test snapshots, only in the form in which the kernel writes them,
+//! rejecting the signed, prefixed, and other lenient forms that C's `strtoul`, `strtod`, and
+//! `scanf` also read. `nvx-time`'s test hooks keep the C program's `strtoll` and `strtoull`
+//! reading of their decimal arguments, which its compatibility tests compare.
 //!
 //! # Conventions
 //!
@@ -61,3 +62,5 @@ pub mod mmio_write;
 pub mod reseed;
 #[cfg(target_arch = "x86_64")]
 pub mod time;
+#[cfg(target_arch = "x86_64")]
+pub mod time_probe;

@@ -59,6 +59,33 @@ pub(crate) fn parse_hexadecimal(text: &[u8]) -> Option<u64> {
     u64::from_str_radix(std::str::from_utf8(text).ok()?, 16).ok()
 }
 
+/// Parses a whole, finite decimal floating-point number: digits with an optional fraction, at
+/// least one digit in all, and an optional exponent, such as `2.5`, `.5`, `1e9`, or `2.4e+9`.
+///
+/// Returns `None` for any other form, including the leading whitespace, sign, hexadecimal
+/// significand, infinity, and NaN that C's `strtod` also read, or for a value too large for a
+/// finite `f64`, which `strtod` reported as a range error.
+pub(crate) fn parse_f64(text: &[u8]) -> Option<f64> {
+    let text = std::str::from_utf8(text).ok()?;
+    let digits = |part: &str| part.bytes().all(|byte| byte.is_ascii_digit());
+    let (significand, exponent) = match text.split_once(['e', 'E']) {
+        Some((significand, exponent)) => (significand, Some(exponent)),
+        None => (text, None),
+    };
+    let (whole, fraction) = significand.split_once('.').unwrap_or((significand, ""));
+    if whole.len() + fraction.len() == 0 || !digits(whole) || !digits(fraction) {
+        return None;
+    }
+    if let Some(exponent) = exponent {
+        let magnitude = exponent.strip_prefix(['+', '-']).unwrap_or(exponent);
+        if magnitude.is_empty() || !digits(magnitude) {
+            return None;
+        }
+    }
+    // `from_str` alone would also accept a sign, an infinity, and a NaN.
+    text.parse().ok().filter(|value: &f64| value.is_finite())
+}
+
 #[cfg(test)]
 mod tests {
     use std::ffi::CString;
@@ -182,6 +209,43 @@ mod tests {
             "\u{ff21}".as_bytes(),
         ] {
             assert_eq!(parse_hexadecimal(text), None, "{}", text.escape_ascii());
+        }
+    }
+
+    #[test]
+    fn parses_finite_decimal_floating_point_numbers() {
+        let cases: &[(&[u8], f64)] = &[
+            (b"0", 0.0),
+            (b"2.5", 2.5),
+            (b".5", 0.5),
+            (b"7.", 7.0),
+            (b"1e9", 1e9),
+            (b"2994.374E6", 2_994_374_000.0),
+            (b"2.4e+9", 2.4e9),
+            (b"5e-1", 0.5),
+            (b"1e200", 1e200),
+        ];
+        for &(text, expected) in cases {
+            assert_eq!(parse_f64(text), Some(expected), "{}", text.escape_ascii());
+        }
+        for text in [
+            &b""[..],
+            b".",
+            b"e5",
+            b"1e",
+            b"1e+",
+            b"+1",
+            b"-1",
+            b" 1",
+            b"1 ",
+            b"1.5x",
+            b"0x1p3",
+            b"inf",
+            b"NaN",
+            b"1e400",
+            b"1.2.3",
+        ] {
+            assert_eq!(parse_f64(text), None, "{}", text.escape_ascii());
         }
     }
 }

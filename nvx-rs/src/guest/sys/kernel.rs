@@ -1,7 +1,8 @@
-//! The kernel's log and the procfs and sysfs files that the time tools read and write.
+//! The kernel's log, its auxiliary vector, and the procfs and sysfs files that the time tools
+//! read and write.
 //!
-//! `nix` does not wrap `syslog(2)`, which the C library calls `klogctl`, so this module calls it
-//! through libc.
+//! `nix` wraps neither `syslog(2)`, which the C library calls `klogctl`, nor `getauxval`, so this
+//! module calls them through libc.
 
 use std::ffi::{CStr, c_int};
 
@@ -19,6 +20,8 @@ pub(crate) const TIMER_LIST: &CStr = c"/proc/timer_list";
 pub(crate) const ONLINE_CPUS: &CStr = c"/sys/devices/system/cpu/online";
 /// The CPUs that could ever be online, as a CPU list.
 pub(crate) const POSSIBLE_CPUS: &CStr = c"/sys/devices/system/cpu/possible";
+/// The TSC frequency in kHz that the kernel determined, when it exposes it.
+pub(crate) const TSC_FREQUENCY_KHZ: &CStr = c"/sys/devices/system/cpu/cpu0/tsc_freq_khz";
 /// The first frequency-scaling policy, present when the kernel scales CPU frequency.
 pub(crate) const CPU_FREQUENCY_POLICY: &CStr = c"/sys/devices/system/cpu/cpufreq/policy0";
 /// The clocksource that timekeeping uses.
@@ -39,8 +42,14 @@ pub(crate) const RCU_STALL_TIMEOUT: &CStr =
 pub(crate) const RCU_NORMAL: &CStr = c"/sys/kernel/rcu_normal";
 /// How many RCU CPU stalls the kernel has reported.
 pub(crate) const RCU_STALL_COUNT: &CStr = c"/sys/kernel/rcu_stall_count";
+/// Whether the soft-lockup and hard-lockup detectors run.
+pub(crate) const WATCHDOG: &CStr = c"/proc/sys/kernel/watchdog";
 /// Whether the soft-lockup detector runs.
 pub(crate) const SOFT_WATCHDOG: &CStr = c"/proc/sys/kernel/soft_watchdog";
+/// Whether the hard-lockup detector runs.
+pub(crate) const NMI_WATCHDOG: &CStr = c"/proc/sys/kernel/nmi_watchdog";
+/// Seconds after which the lockup detectors report a lockup.
+pub(crate) const WATCHDOG_THRESHOLD: &CStr = c"/proc/sys/kernel/watchdog_thresh";
 /// Seconds after which the kernel reports a task that has not run as hung.
 pub(crate) const HUNG_TASK_TIMEOUT: &CStr = c"/proc/sys/kernel/hung_task_timeout_secs";
 /// The calling process's adjustment of its out-of-memory score.
@@ -75,11 +84,23 @@ pub(crate) fn read_kernel_log(buffer: &mut [u8]) -> Result<usize, Errno> {
     Ok(usize::try_from(count).map_or(0, |count| count.min(buffer.len())))
 }
 
+/// Returns whether the kernel mapped a vDSO into this process, which its auxiliary vector
+/// reports.
+pub(crate) fn has_vdso() -> bool {
+    // SAFETY: `getauxval` reads the process's immutable auxiliary vector.
+    unsafe { nix::libc::getauxval(nix::libc::AT_SYSINFO_EHDR) != 0 }
+}
+
 #[cfg(test)]
 mod tests {
     //! Checks of the kernel queries on the build host.
 
     use super::*;
+
+    #[test]
+    fn the_process_has_a_vdso() {
+        assert!(has_vdso());
+    }
 
     #[test]
     fn the_kernel_log_reads_into_any_buffer() {

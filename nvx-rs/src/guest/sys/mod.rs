@@ -24,8 +24,9 @@
 //! `nix`'s `Signal` cannot represent; and its execution helper duplicates the descriptor that it
 //! inherits by number, which it cannot borrow before it knows that the descriptor is open. So do
 //! the time tools, for the calls that `nix` does not wrap: `ioperm`, `adjtimex`, `klogctl`,
-//! `sigqueue`, and `_exit`; and `sched_setscheduler`, which musl does not implement for one
-//! thread. Each such call says why.
+//! `getauxval`, `sigqueue`, and `_exit`; `sched_setscheduler`, which musl does not implement for
+//! one thread; and the `clock_gettime` and `getpid` system calls, which the latency probe
+//! measures without the vDSO's or libc's shortcuts. Each such call says why.
 //!
 //! The x86 instructions of the time tools are `core::arch` intrinsics, except the port
 //! instructions, which only `port` executes, as inline assembly. The constants of the kernel's
@@ -61,9 +62,11 @@ use std::os::unix::ffi::OsStringExt;
 pub(crate) use nix::errno::Errno;
 pub(crate) use nix::sys::signal::Signal;
 
+pub(crate) use clock::{
+    Clock, ClockTime, clock_time, monotonic_ms, sleep_once, sleep_until_monotonic,
+};
 #[cfg(target_arch = "x86_64")]
-pub(crate) use clock::monotonic_ns;
-pub(crate) use clock::{Clock, clock_time, monotonic_ms, sleep_until_monotonic};
+pub(crate) use clock::{monotonic_ns, syscall_monotonic_nanoseconds};
 pub(crate) use discipline::{ClockAdjustment, ClockDiscipline, adjust_clock};
 pub(crate) use fd::{
     CreatedFile, FileDescriptor, FileLock, Mode, OpenFlags, create_directory, create_fifo,
@@ -83,6 +86,8 @@ pub(crate) use port::{PORT_DEVICE, Port};
 pub(crate) use port::{PortAccess, power_off};
 #[cfg(test)]
 pub(crate) use process::sigpipe_disposition;
+#[cfg(target_arch = "x86_64")]
+pub(crate) use process::syscall_process_id;
 pub(crate) use process::{
     ChildStatus, DirectStdout, ForkResult, ProcessId, Stdout, current_process, detach, exec,
     exit_immediately, fork, has_exited, ignore_interrupt_and_hangup, kill_process_group,
@@ -90,8 +95,9 @@ pub(crate) use process::{
     try_wait, wait, with_sigpipe_ignored, write_port_diagnostic, write_standard_error,
 };
 pub(crate) use scheduler::{
-    AffinityGuard, IdlePriority, SchedulingPolicy, current_thread, pin_current_thread,
-    promote_all_threads, scheduling_policy, set_scheduling_policy, thread_count,
+    AffinityGuard, IdlePriority, SchedulingPolicy, current_affinity, current_cpu, current_thread,
+    pin_current_thread, promote_all_threads, scheduling_policy, set_scheduling_policy,
+    thread_count, yield_now,
 };
 pub(crate) use signal::{
     ChildSignalWait, SignalDescriptor, ignore_signals, queue_user_signal, reset_child_signal,
