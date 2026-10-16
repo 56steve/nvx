@@ -8507,6 +8507,41 @@ class BuildTests(unittest.TestCase):
         self.assertEqual(action.count("build/vmlinux.provenance.json"), 2)
         self.assertEqual(action.count("build/initramfs.provenance.json"), 2)
 
+    def test_kernel_patch_identity_follows_patch_paths_and_order(self):
+        # A content-only hash ignores names, so a rename reused a kernel whose
+        # provenance named the old patch. The identity must see paths and order.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "0001-a.patch").write_bytes(b"same bytes\n")
+            (root / "0002-b.patch").write_bytes(b"other bytes\n")
+            original = ci.kernel_patch_identity(root)
+            self.assertEqual(original, ci.kernel_patch_identity(root))
+
+            (root / "0001-a.patch").rename(root / "0001-renamed.patch")
+            self.assertNotEqual(original, ci.kernel_patch_identity(root))
+
+            renamed = ci.kernel_patch_identity(root)
+            (root / "0001-renamed.patch").rename(root / "0003-renamed.patch")
+            self.assertNotEqual(renamed, ci.kernel_patch_identity(root))
+
+    def test_ci_guest_kernel_keys_include_the_patch_identity(self):
+        action = (
+            BuildConstants.REPO_ROOT
+            / ".github"
+            / "actions"
+            / "build-guest-artifacts"
+            / "action.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn("kernel-patch-identity", action)
+        self.assertIn(
+            "linux-kernel-v1-${KERNEL_VERSION}-${KERNEL_INPUT_HASH}-${patch_identity}",
+            action,
+        )
+        self.assertIn(
+            "linux-kernel-debug-v1-${KERNEL_VERSION}-${DEBUG_KERNEL_INPUT_HASH}-${patch_identity}",
+            action,
+        )
+
     def test_ci_guest_cache_keys_include_build_configuration(self):
         action = (
             BuildConstants.REPO_ROOT

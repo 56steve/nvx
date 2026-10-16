@@ -36,6 +36,7 @@ python3 scripts/nvx.py performance gate --help
 | `materialize-kernel-provenance-inputs` | Write kernel provenance inputs from raw run-head blobs. |
 | `setup-cross-os-cache` | Install GNU tar and zstd for GitHub Actions cross-OS caches. |
 | `classify-ci-changes` | Select the CI suites that a list of changed files runs. |
+| `kernel-patch-identity` | Print the digest of the kernel patch paths and contents that keys the kernel cache. |
 | `check-required-ci` | Validate required GitHub Actions job results. |
 | `check-static-elf` | Check that executables are static ELF files without an interpreter. |
 | `test-openvmm-unit` | Run the OpenVMM workspace unit and documentation tests. |
@@ -84,6 +85,17 @@ python3 scripts/nvx.py setup-cross-os-cache
 ```
 
 Installs the GNU tar and zstd tools used by GitHub Actions cross-OS caches.
+
+### `kernel-patch-identity`
+
+```text
+python3 scripts/nvx.py kernel-patch-identity [--root PATH]
+```
+
+Prints a digest of each file under `kernel/patches/` by relative path, in path
+order, together with its content. The guest build appends it to both kernel
+cache keys, because `hashFiles` hashes contents only: a renamed patch changes
+the key even when its bytes do not.
 
 ### `classify-ci-changes`
 
