@@ -450,10 +450,12 @@ to host loopback, without a port list:
 
 The guest reaches host loopback services through its gateway, subject to the
 egress policy: a host service on `127.0.0.1:8080` at `10.0.0.1:8080`, and one
-on `[::1]:8080` at `[fd00::a00:1]:8080`. The guest sees host peers at
-addresses that OpenVMM assigns inside its own network, and the egress policy
-applies to its traffic to them as it applies at the gateway, so a rule that
-denies a gateway port denies it at those addresses too. In the other
+on `[::1]:8080` at `[fd00::a00:1]:8080`. Their replies come from the gateway
+address and port that the guest addressed, so connected UDP sockets receive
+them too. The guest sees other host peers, such as clients of its published
+ports, at addresses that OpenVMM assigns inside its own network, and the egress
+policy applies to its traffic to them as it applies at the gateway, so a rule
+that denies a gateway port denies it at those addresses too. In the other
 direction, OpenVMM appends `virtnet_ingress=host-loopback` to the kernel
 command line unless ingress is `allow`, and the guest's `nvx-ingress` reports
 its listeners as it does for

@@ -2641,6 +2641,32 @@ class _PortExclusionSockets:
         return endpoint
 
 
+class _EphemeralPortSockets:
+    """Create sockets to which the host assigns ``ports`` in turn on bind."""
+
+    def __init__(self, ports: Collection[int]) -> None:
+        self._socket_type = socket.socket
+        self._ports = iter(ports)
+        self.created: list[MagicMock] = []
+        self.events: list[tuple[str, int]] = []
+
+    def __call__(self, _family: int, _kind: int) -> MagicMock:
+        endpoint = MagicMock(spec=self._socket_type)
+        port = next(self._ports)
+
+        def bind(_address: tuple[str, int]) -> None:
+            self.events.append(("bind", port))
+
+        def close() -> None:
+            self.events.append(("close", port))
+
+        endpoint.bind.side_effect = bind
+        endpoint.close.side_effect = close
+        endpoint.getsockname.return_value = ("127.0.0.1", port)
+        self.created.append(endpoint)
+        return endpoint
+
+
 class MicrovmTests(unittest.TestCase):
     def test_managed_lifecycle_spawns_openvmm_with_a_prepared_capability_pipe(self):
         # OpenVMM reads its capability as soon as it starts, so the scenario hands
@@ -3235,11 +3261,14 @@ class MicrovmTests(unittest.TestCase):
                         "host-loopback-policy.sh.in",
                         MODE=mode,
                         GATEWAY_IPV4="10.0.0.1",
+                        GATEWAY_IPV6="fd00::a00:1",
                         GENERAL_PORT="8444",
                         PROXY_PORT="8443",
                         GUEST_PORT="0",
                         PRIVATE_GUEST_PORT="0",
                         UDP_IPV6_GUEST_PORT="0",
+                        UDP_ECHO_PORT="0",
+                        UDP_ECHO_IPV6_PORT="0",
                     )
                     .replace("nvx-exit", "nvx_exit")
                     .replace("/proc/cmdline", cmdline.as_posix())
@@ -3283,11 +3312,14 @@ class MicrovmTests(unittest.TestCase):
                         "host-loopback-policy.sh.in",
                         MODE="deny",
                         GATEWAY_IPV4="10.0.0.1",
+                        GATEWAY_IPV6="fd00::a00:1",
                         GENERAL_PORT="8444",
                         PROXY_PORT="8443",
                         GUEST_PORT="0",
                         PRIVATE_GUEST_PORT="0",
                         UDP_IPV6_GUEST_PORT="0",
+                        UDP_ECHO_PORT="0",
+                        UDP_ECHO_IPV6_PORT="0",
                     )
                     .replace("nvx-exit", "nvx_exit")
                     .replace("/proc/cmdline", path.as_posix())
@@ -3316,12 +3348,16 @@ class MicrovmTests(unittest.TestCase):
             "host-loopback-policy.sh.in",
             MODE="deny",
             GATEWAY_IPV4="10.0.0.1",
+            GATEWAY_IPV6="fd00::a00:1",
             GENERAL_PORT="8444",
             PROXY_PORT="8443",
             GUEST_PORT="0",
             PRIVATE_GUEST_PORT="0",
             UDP_IPV6_GUEST_PORT="0",
+            UDP_ECHO_PORT="0",
+            UDP_ECHO_IPV6_PORT="0",
         )
+        self.assertNotRegex(script, "@[A-Z0-9_]+@")
         self.assertIn("nc -u -w 1 10.0.0.1 8443", script)
         self.assertIn("nc -u -w 1 10.0.0.1 8444", script)
         self.assertIn("http://10.0.0.1:8443/proxy", script)
@@ -3338,6 +3374,8 @@ class MicrovmTests(unittest.TestCase):
         listeners: bool = True,
         udp_ipv6_listener: bool = True,
         private_listeners: bool = True,
+        udp_echo: bool = True,
+        udp_echo_ipv6: bool = True,
     ) -> subprocess.CompletedProcess[str]:
         shell = _posix_shell()
         if shell is None:
@@ -3371,11 +3409,14 @@ class MicrovmTests(unittest.TestCase):
                     "host-loopback-policy.sh.in",
                     MODE="allow",
                     GATEWAY_IPV4="10.0.0.1",
+                    GATEWAY_IPV6="fd00::a00:1",
                     GENERAL_PORT="8444",
                     PROXY_PORT="0",
                     GUEST_PORT="8080",
                     PRIVATE_GUEST_PORT="8081",
                     UDP_IPV6_GUEST_PORT="8082",
+                    UDP_ECHO_PORT="8083",
+                    UDP_ECHO_IPV6_PORT="8084",
                 )
                 .replace("nvx-exit", "nvx_exit")
                 .replace("/proc/", f"{root.as_posix()}/proc/")
@@ -3392,6 +3433,9 @@ class MicrovmTests(unittest.TestCase):
             private_server = (
                 "echo NVX-HOST-LOOPBACK-INBOUND" if private_request else ":"
             )
+            echo_reply = "echo NVX-HOST-LOOPBACK-UDP-ECHO-REPLY"
+            udp_echo_server = echo_reply if udp_echo else ":"
+            udp_echo_ipv6_server = echo_reply if udp_echo_ipv6 else ":"
             path = root / "host-loopback-policy.sh"
             path.write_text(
                 "sleep() { :; }\n"
@@ -3402,6 +3446,8 @@ class MicrovmTests(unittest.TestCase):
                 f"'-u -l -p 8082 '*) {udp_ipv6_server} ;;\n"
                 f"'-u -l -p '*) {udp_server} ;;\n"
                 f"'-l -s '*) {private_server} ;;\n"
+                f"'-u -w 2 10.0.0.1 8083') {udp_echo_server} ;;\n"
+                f"'-u -w 2 fd00::a00:1 8084') {udp_echo_ipv6_server} ;;\n"
                 "*) return 1 ;;\n"
                 "esac; }\n"
                 'nvx_exit() { exit "$1"; }\n' + script,
@@ -3552,6 +3598,176 @@ class MicrovmTests(unittest.TestCase):
             with self.assertRaisesRegex(TimeoutError, "did not answer"):
                 microvm_tests._host_loopback_udp_exchange("127.0.0.1", port, 0)
 
+    def test_udp_echo_server_answers_each_request(self):
+        for address, family in (
+            ("127.0.0.1", socket.AF_INET),
+            ("::1", socket.AF_INET6),
+        ):
+            with self.subTest(address):
+                server = socket.socket(family, socket.SOCK_DGRAM)
+                try:
+                    server.bind((address, 0))
+                except OSError:
+                    server.close()
+                    continue
+                stop = threading.Event()
+                errors: list[Exception] = []
+                thread = threading.Thread(
+                    target=microvm_tests._udp_echo_server,
+                    args=(server, stop, errors),
+                    daemon=True,
+                )
+                thread.start()
+                try:
+                    with socket.socket(family, socket.SOCK_DGRAM) as client:
+                        client.settimeout(5)
+                        client.connect(server.getsockname()[:2])
+                        for _ in range(2):
+                            client.send(microvm_tests.HOST_LOOPBACK_UDP_ECHO_REQUEST)
+                            self.assertEqual(
+                                client.recv(64),
+                                microvm_tests.HOST_LOOPBACK_UDP_ECHO_REPLY,
+                            )
+                finally:
+                    stop.set()
+                    thread.join(10)
+                    server.close()
+                self.assertFalse(thread.is_alive())
+                self.assertEqual(errors, [])
+
+    def test_udp_echo_server_rejects_an_unexpected_request(self):
+        with (
+            socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as server,
+            socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client,
+        ):
+            server.bind(("127.0.0.1", 0))
+            errors: list[Exception] = []
+            thread = threading.Thread(
+                target=microvm_tests._udp_echo_server,
+                args=(server, threading.Event(), errors),
+                daemon=True,
+            )
+            thread.start()
+            client.sendto(b"UNEXPECTED\n", server.getsockname())
+            thread.join(10)
+            self.assertFalse(thread.is_alive())
+        self.assertEqual(len(errors), 1)
+        self.assertRegex(str(errors[0]), "unexpected host-loopback UDP echo request")
+
+    def test_host_loopback_udp_echo_avoids_the_published_guest_ports(self):
+        # The probes that drew the guest ports released them, so ephemeral binds
+        # can draw them. Each rejected socket holds its port until one is free.
+        sockets = _EphemeralPortSockets((8080, 8082, 50000))
+
+        with patch.object(microvm_tests.socket, "socket", side_effect=sockets):
+            udp_echo = microvm_tests._bind_host_loopback_udp_echo(
+                socket.AF_INET6, "::1", (8080, 8082)
+            )
+
+        self.assertIs(udp_echo, sockets.created[-1])
+        self.assertEqual(
+            sockets.events,
+            [
+                ("bind", 8080),
+                ("bind", 8082),
+                ("bind", 50000),
+                ("close", 8080),
+                ("close", 8082),
+            ],
+        )
+        for endpoint in sockets.created:
+            endpoint.setsockopt.assert_called_once_with(
+                socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1
+            )
+            endpoint.bind.assert_called_once_with(("::1", 0))
+
+    def test_host_loopback_udp_echo_gives_up_after_the_attempt_budget(self):
+        attempts = microvm_tests.HOST_LOOPBACK_PORT_BIND_ATTEMPTS
+        published = range(50000, 50000 + attempts)
+        sockets = _EphemeralPortSockets(published)
+
+        with (
+            patch.object(microvm_tests.socket, "socket", side_effect=sockets),
+            self.assertRaises(RuntimeError) as raised,
+        ):
+            microvm_tests._bind_host_loopback_udp_echo(
+                socket.AF_INET, "127.0.0.1", published
+            )
+
+        self.assertEqual(
+            str(raised.exception),
+            "failed to bind a UDP port on 127.0.0.1 outside guest ports "
+            f"{list(published)} after {attempts} attempts",
+        )
+        self.assertEqual(len(sockets.created), attempts)
+        for endpoint in sockets.created:
+            endpoint.setsockopt.assert_not_called()
+            endpoint.close.assert_called_once_with()
+
+    def test_host_loopback_udp_echoes_avoid_both_published_guest_ports(self):
+        # The guest's UDP servers are dual-stack, so OpenVMM publishes both of
+        # their ports on both loopback addresses.
+        def answer_udp_control(
+            command: list[str], script: str, *_args: object, **_kwargs: object
+        ) -> None:
+            if "--host-loopback" in command:
+                return
+            ports = {
+                int(line.split()[5])
+                for line in script.splitlines()
+                if line.strip().startswith("nc -u -w 1")
+            }
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sender:
+                for port in ports:
+                    sender.sendto(b"NVX-HOST-LOOPBACK-UDP-CONTROL", ("127.0.0.1", port))
+
+        with tempfile.TemporaryDirectory() as temporary:
+            with (
+                patch.object(microvm_tests, "_http_server"),
+                patch.object(microvm_tests, "_udp_echo_server"),
+                patch.object(
+                    microvm_tests, "run_guest_script", side_effect=answer_udp_control
+                ),
+                patch.object(
+                    microvm_tests,
+                    "_host_loopback_publication_port",
+                    side_effect=range(50001, 50101),
+                ),
+                patch.object(
+                    microvm_tests, "_bind_host_loopback_udp_echo"
+                ) as bind_udp_echo,
+                patch.object(microvm_tests, "OpenvmmProcess") as process,
+                patch.object(
+                    microvm_tests, "_verify_host_loopback_publication"
+                ) as verify,
+                patch.object(microvm_tests, "run_host_loopback_rejections"),
+            ):
+                bind_udp_echo.return_value.getsockname.return_value = (
+                    "127.0.0.1",
+                    40000,
+                )
+                process.return_value.__enter__.return_value.wait.return_value = (
+                    openvmm_process.OpenvmmProcessResult(0, b"")
+                )
+                microvm_tests.run_host_loopback_policy(
+                    Path("openvmm"),
+                    Path("kernel"),
+                    Path("initrd"),
+                    "whp",
+                    memory_mib=128,
+                    timeout=5,
+                    output_dir=Path(temporary),
+                )
+
+        published = tuple(verify.call_args.args[:2])
+        self.assertEqual(
+            [bound.args for bound in bind_udp_echo.call_args_list],
+            [
+                (socket.AF_INET, "127.0.0.1", published),
+                (socket.AF_INET6, "::1", published),
+            ],
+        )
+
     def test_host_loopback_allow_script_checks_publication_and_traffic(self):
         run = self._run_host_loopback_allow_script
         for label, check, expected in (
@@ -3588,6 +3804,12 @@ class MicrovmTests(unittest.TestCase):
                 97,
             ),
             ("private-reached", functools.partial(run, private_request=True), 96),
+            ("udp-echo-unanswered", functools.partial(run, udp_echo=False), 84),
+            (
+                "udp-echo-ipv6-unanswered",
+                functools.partial(run, udp_echo_ipv6=False),
+                85,
+            ),
         ):
             with self.subTest(label):
                 result = check()
