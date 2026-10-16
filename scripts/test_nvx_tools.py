@@ -3298,6 +3298,7 @@ class CiConfigurationTests(unittest.TestCase):
             ((".github/actions/setup-curl/curl-shim.rs",), (True, True, True, True)),
             (("scripts/nvx.py",), (True, True, True, True)),
             (("scripts/nvx_tools/ci.py",), (True, True, True, True)),
+            ((".dockerignore",), (True, True, False, True)),
             (("scripts/nvx_tools/common.py",), (True, True, True, True)),
             (("scripts/nvx_tools/build.py",), (True, True, False, True)),
             (("scripts/nvx_tools/guests.py",), (True, True, False, True)),
@@ -3456,6 +3457,29 @@ class CiConfigurationTests(unittest.TestCase):
             for path in sorted(inputs):
                 with self.subTest(pattern=pattern.pattern, path=path):
                     self.assertIsNotNone(pattern.match(path))
+
+    def test_guest_cache_keys_hash_the_docker_build_context_filter(self):
+        # Docker excludes files by .dockerignore before COPY, so a change to that
+        # file changes the guest build even when no other input changes.
+        action = (
+            BuildConstants.REPO_ROOT
+            / ".github"
+            / "actions"
+            / "build-guest-artifacts"
+            / "action.yml"
+        )
+        expressions = re.findall(
+            r"hashFiles\(([^)]*)\)", action.read_text(encoding="utf-8")
+        )
+        hashed = [
+            expression
+            for expression in expressions
+            if "docker/Dockerfile" in expression
+        ]
+        self.assertTrue(hashed)
+        for expression in hashed:
+            with self.subTest(expression=expression[:60]):
+                self.assertIn("'.dockerignore'", expression)
 
     def test_ci_change_summary_explains_each_decision(self):
         changed_files = [

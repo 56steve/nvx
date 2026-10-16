@@ -233,7 +233,8 @@ Shared guest artifacts are built with Docker on a GitHub-hosted Ubuntu runner.
 The kernel, Alpine initramfs, Ubuntu initramfs, and Ubuntu EROFS layer use
 separate cache keys. Ubuntu keys include the Canonical archive pin,
 supplemental package lock, common guest sources, shared download and guest
-descriptor modules, converter implementation, and Dockerfile. Artifact upload
+descriptor modules, converter implementation, Dockerfile, and `.dockerignore`.
+Artifact upload
 retains the Alpine filenames and adds the distinct Ubuntu filenames. Each
 backend also boots the Ubuntu initramfs and runs
 `/sbin/nvx-sandbox-smoke` from the Ubuntu EROFS layer as UID/GID 65534 over a
@@ -345,7 +346,9 @@ musl build for MSHV without maintaining a separate shell build path.
 
 The kernel, debug kernel, and initramfs cache keys include
 [`docker/Dockerfile`](../docker/Dockerfile), which pins the build image and its
-toolchain and in which every guest artifact builds, and
+toolchain and in which every guest artifact builds,
+[`.dockerignore`](../.dockerignore), which Docker applies to the build context
+before `COPY`, and
 [`build_config.py`](../scripts/nvx_tools/build_config.py) and
 [`build_constants.py`](../scripts/nvx_tools/build_constants.py), so a toolchain,
 shared build configuration, or constant change invalidates cached guest
