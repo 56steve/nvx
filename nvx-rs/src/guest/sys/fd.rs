@@ -1,6 +1,7 @@
 //! Owned file descriptors and safe file-oriented system operations.
 
 use std::ffi::{CStr, CString};
+use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 
 pub(crate) use nix::fcntl::OFlag as OpenFlags;
@@ -157,6 +158,19 @@ impl FileDescriptor {
     /// tree.
     pub(super) fn raw(&self) -> RawFd {
         self.0.as_raw_fd()
+    }
+}
+
+/// Reads through the standard library's I/O traits, so that its buffering and bounding adapters,
+/// such as `BufReader` and `Read::take`, read a descriptor that this module opened while the
+/// descriptor keeps its one owner.
+///
+/// Each call is one `read` system call, as it is for `std::fs::File`, which buffers nothing
+/// either. An interrupted call is `ErrorKind::Interrupted`, which the standard library's
+/// buffered and whole-input reads retry.
+impl io::Read for FileDescriptor {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        FileDescriptor::read(self, bytes).map_err(io::Error::from)
     }
 }
 

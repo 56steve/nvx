@@ -361,8 +361,13 @@ class GuestBinaryBuildTests(unittest.TestCase):
             for binary in GuestRustBuildConstants.BINARIES
             if binary not in GuestRustBuildConstants.ADDED_BINARIES
         )
+        latest = GuestRustBuildConstants.ADDED_BINARIES[-1]
+        predecessor = tuple(
+            binary for binary in GuestRustBuildConstants.BINARIES if binary != latest
+        )
         for case, previous in (
             ("build without the added executables", earlier),
+            ("build without the latest added executable", predecessor),
             ("build from before nvx-port-io retired", (*earlier, "nvx-port-io")),
         ):
             with (

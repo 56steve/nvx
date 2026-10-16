@@ -161,15 +161,15 @@ python3 scripts/nvx.py build-guest-binaries --output DIRECTORY
 ```
 
 The Linux-only build command checks the exact `rust-toolchain.toml` pin and
-builds the six Rust guest executables for `x86_64-unknown-linux-musl` with one
+builds the seven Rust guest executables for `x86_64-unknown-linux-musl` with one
 `cargo build` of the `guest` profile, a fresh target directory, Cargo's locked
 mode, incremental compilation disabled, inherited Cargo profile overrides
 removed, remapped source paths, and no linker build IDs. It runs the static-ELF
 check and writes `manifest.json` with the source and executable SHA-256 digests.
 It updates the output of an earlier build in place, adding `nvx-managed-agent`
-when that build's manifest does not record it and removing the retired
-`nvx-port-io` executable when that build's manifest records it, and refuses any
-other existing `DIRECTORY`.
+and `nvx-ingress` when that build's manifest does not record them and removing
+the retired `nvx-port-io` executable when that build's manifest records it, and
+refuses any other existing `DIRECTORY`.
 
 ### `test-guest-binaries`
 
@@ -177,7 +177,7 @@ other existing `DIRECTORY`.
 python3 scripts/nvx.py test-guest-binaries --binaries DIRECTORY
 ```
 
-The Linux-only test command validates the six binaries and build manifest,
+The Linux-only test command validates the seven binaries and build manifest,
 sets `NVX_GUEST_BINARIES`, and runs the musl `guest_tools` integration test
 against that exact directory.
 

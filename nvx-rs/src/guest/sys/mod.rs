@@ -4,7 +4,19 @@
 //! system, through `nix`: it owns descriptors and mappings, and its submodules confine the few
 //! unsafe `nix` operations, such as ioctls, memory mappings, signal dispositions, and `fork`,
 //! behind wrappers that establish their pointer, lifetime, and ownership invariants. Errors are
-//! `nix`'s [`Errno`], whose descriptions the programs print.
+//! `nix`'s [`Errno`], whose descriptions the programs print. It also builds and decodes the
+//! kernel's binary interfaces that `nix` does not model, such as the netlink messages of socket
+//! diagnostics, as explicit byte layouts, so that the programs handle only typed values.
+//!
+//! A descriptor that this module opens keeps one owner, its wrapper here, such as
+//! `FileDescriptor`, and the programs read and write it only through that wrapper, never through
+//! a second owner, such as a `std::fs::File` made from its number. `FileDescriptor` implements
+//! `std::io::Read` with one `read` system call per call, as `std::fs::File` does, so that a
+//! standard-library adapter such as `BufReader` can hold it and add the only buffer in front of
+//! it. Standard output and standard error belong to the process: `Stdout`, `DirectStdout`, and
+//! `write_standard_error` borrow them from the standard library's handles only to write them
+//! directly, so the standard library's line buffer for standard output must stay empty, which
+//! the guest module ensures by denying the standard library's print macros.
 //!
 //! The managed agent needs a few operations that `nix` cannot provide, which reach libc through
 //! `nix`'s re-export: its forked child, which may neither allocate nor drop an owner, closes,
@@ -13,7 +25,6 @@
 //! inherits by number, which it cannot borrow before it knows that the descriptor is open. Each
 //! such call says why.
 
-#[cfg(target_arch = "x86_64")]
 mod clock;
 mod fd;
 mod filesystem;
@@ -21,6 +32,7 @@ mod ioctl;
 mod mapping;
 mod poll;
 mod process;
+mod sock_diag;
 mod socket;
 mod spawn;
 mod terminal;
@@ -32,6 +44,7 @@ use std::os::unix::ffi::OsStringExt;
 pub(crate) use nix::errno::Errno;
 pub(crate) use nix::sys::signal::Signal;
 
+pub(crate) use clock::monotonic_ms;
 #[cfg(target_arch = "x86_64")]
 pub(crate) use clock::monotonic_ns;
 pub(crate) use fd::{
@@ -47,11 +60,16 @@ pub(crate) use poll::readable_or_hung_up;
 #[cfg(test)]
 pub(crate) use process::sigpipe_disposition;
 pub(crate) use process::{
-    ChildStatus, DirectStdout, ProcessId, Stdout, exec, has_exited, kill_process_group,
-    reap_any_nonblocking, restore_sigpipe, take_inherited_descriptor, wait, with_sigpipe_ignored,
-    write_port_diagnostic, write_standard_error,
+    ChildStatus, DirectStdout, ProcessId, Stdout, exec, has_exited, ignore_interrupt_and_hangup,
+    kill_process_group, reap_any_nonblocking, restore_sigpipe, take_inherited_descriptor, wait,
+    with_sigpipe_ignored, write_port_diagnostic, write_standard_error,
 };
-pub(crate) use socket::connect_datagram;
+pub(crate) use sock_diag::{
+    INET_DIAG_BUFFER_LENGTH, InetDiagMessage, decode_inet_diag_dump, dump_ipv6_tcp_sockets,
+};
+#[cfg(test)]
+pub(crate) use sock_diag::{encode_inet_diag_done, encode_inet_diag_socket};
+pub(crate) use socket::{UdpSocket, connect_datagram};
 pub(crate) use spawn::{CHILD_STAGE_CWD, PhysicalPwd, SpawnDescriptors, SpawnPlan, spawn};
 pub(crate) use terminal::{configure_raw, drain};
 
@@ -143,6 +161,27 @@ pub(crate) mod tests {
     fn explicit_close_reports_errno() {
         let descriptor = open(c"/dev/null", OpenFlags::O_RDONLY, Mode::empty()).unwrap();
         assert_eq!(descriptor.close(), Ok(()));
+    }
+
+    #[test]
+    fn descriptors_read_through_the_standard_io_traits() {
+        use std::io::{BufRead, BufReader, Read};
+
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), b"ab\ncd").unwrap();
+        let path = path_c_string(file.path()).unwrap();
+        let flags = OpenFlags::O_RDONLY | OpenFlags::O_CLOEXEC;
+        let mut reader = BufReader::new(open(&path, flags, Mode::empty()).unwrap());
+        let mut line = Vec::new();
+        assert_eq!(reader.read_until(b'\n', &mut line).unwrap(), 3);
+        assert_eq!(line, b"ab\n");
+        let mut rest = Vec::new();
+        assert_eq!(reader.read_to_end(&mut rest).unwrap(), 2);
+        assert_eq!(rest, b"cd");
+
+        let mut directory = open(c"/", flags, Mode::empty()).unwrap();
+        let error = directory.read_to_end(&mut Vec::new()).unwrap_err();
+        assert_eq!(errno_of(&error), Errno::EISDIR);
     }
 
     #[test]
