@@ -210,6 +210,8 @@ HOST_LOOPBACK_TCP_ACK = b"NVX-HOST-LOOPBACK-TCP-ACK\n"
 HOST_LOOPBACK_TCP_REQUEST = b"NVX-HOST-LOOPBACK-INBOUND\n"
 HOST_LOOPBACK_UDP_REQUEST = b"NVX-HOST-LOOPBACK-UDP\n"
 HOST_LOOPBACK_UDP_REPLY = b"NVX-HOST-LOOPBACK-UDP-REPLY\n"
+HOST_LOOPBACK_UDP_ECHO_REQUEST = b"NVX-HOST-LOOPBACK-UDP-ECHO\n"
+HOST_LOOPBACK_UDP_ECHO_REPLY = b"NVX-HOST-LOOPBACK-UDP-ECHO-REPLY\n"
 HOST_LOOPBACK_PORT_BIND_ATTEMPTS = 16
 # IANA's dynamic port range, which is also Windows' default. The host-loopback
 # scenario draws the port of each TCP and UDP listener pair from it.
@@ -3171,6 +3173,57 @@ def _http_server(
         errors.append(error)
 
 
+def _udp_echo_server(
+    server: socket.socket, stop: threading.Event, errors: list[Exception]
+) -> None:
+    """Answer each echo request that ``server`` receives until ``stop`` is set."""
+    try:
+        server.settimeout(0.05)
+        while not stop.is_set():
+            try:
+                request, peer = server.recvfrom(4096)
+            except (TimeoutError, ConnectionResetError):
+                # Windows reports a datagram that a closed port refused as a
+                # reset on the next receive.
+                continue
+            if request != HOST_LOOPBACK_UDP_ECHO_REQUEST:
+                raise RuntimeError(
+                    f"unexpected host-loopback UDP echo request: {request!r}"
+                )
+            server.sendto(HOST_LOOPBACK_UDP_ECHO_REPLY, peer)
+    except Exception as error:
+        errors.append(error)
+
+
+def _bind_host_loopback_udp_echo(
+    family: int, address: str, published: Sequence[int]
+) -> socket.socket:
+    """Bind a UDP socket to an ephemeral port of ``address`` outside ``published``.
+
+    The probes that drew the guest ports that OpenVMM publishes released them,
+    so an ephemeral bind can take one, keep OpenVMM from publishing it, and
+    receive the host's datagrams for the guest. Each rejected socket holds its
+    port until the search ends, so no later attempt draws that port again.
+    """
+    attempts: list[socket.socket] = []
+    try:
+        for _ in range(HOST_LOOPBACK_PORT_BIND_ATTEMPTS):
+            udp_echo = socket.socket(family, socket.SOCK_DGRAM)
+            attempts.append(udp_echo)
+            if family == socket.AF_INET6:
+                udp_echo.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+            udp_echo.bind((address, 0))
+            if int(udp_echo.getsockname()[1]) not in published:
+                return attempts.pop()
+    finally:
+        for rejected in attempts:
+            rejected.close()
+    raise RuntimeError(
+        f"failed to bind a UDP port on {address} outside guest ports "
+        f"{sorted(published)} after {HOST_LOOPBACK_PORT_BIND_ATTEMPTS} attempts"
+    )
+
+
 def _host_loopback_port_candidates() -> list[int]:
     """Draw distinct ports uniformly from ``HOST_LOOPBACK_PORT_RANGE``.
 
@@ -3278,11 +3331,14 @@ def run_host_loopback_policy(
                 "host-loopback-policy.sh.in",
                 MODE="udp-control",
                 GATEWAY_IPV4=DIRECTIONAL_NETWORK_GATEWAY_IPV4,
+                GATEWAY_IPV6=DIRECTIONAL_NETWORK_GATEWAY_IPV6,
                 GENERAL_PORT=str(denied_general_port),
                 PROXY_PORT=str(proxy_port),
                 GUEST_PORT="0",
                 PRIVATE_GUEST_PORT="0",
                 UDP_IPV6_GUEST_PORT="0",
+                UDP_ECHO_PORT="0",
+                UDP_ECHO_IPV6_PORT="0",
             ),
             HOST_LOOPBACK_UDP_CONTROL_MARKER,
             timeout=timeout,
@@ -3313,11 +3369,14 @@ def run_host_loopback_policy(
                 "host-loopback-policy.sh.in",
                 MODE="deny",
                 GATEWAY_IPV4=DIRECTIONAL_NETWORK_GATEWAY_IPV4,
+                GATEWAY_IPV6=DIRECTIONAL_NETWORK_GATEWAY_IPV6,
                 GENERAL_PORT=str(denied_general_port),
                 PROXY_PORT=str(proxy_port),
                 GUEST_PORT="0",
                 PRIVATE_GUEST_PORT="0",
                 UDP_IPV6_GUEST_PORT="0",
+                UDP_ECHO_PORT="0",
+                UDP_ECHO_IPV6_PORT="0",
             ),
             HOST_LOOPBACK_DENY_MARKER,
             timeout=timeout,
@@ -3382,7 +3441,34 @@ def run_host_loopback_policy(
         daemon=True,
     )
     allow_server.start()
+    udp_echoes: list[socket.socket] = []
+    udp_echo_servers: list[threading.Thread] = []
+    udp_echo_errors: list[Exception] = []
+    udp_echo_stop = threading.Event()
     try:
+        # Host UDP services on IPv4 and IPv6 loopback, which the guest reaches
+        # at its gateway. The guest's UDP servers are dual-stack, so OpenVMM
+        # publishes both of their ports on both loopback addresses, and
+        # neither service may hold either port.
+        for family, address in (
+            (socket.AF_INET, "127.0.0.1"),
+            (socket.AF_INET6, "::1"),
+        ):
+            udp_echo = _bind_host_loopback_udp_echo(
+                family, address, (guest_port, udp_ipv6_guest_port)
+            )
+            udp_echoes.append(udp_echo)
+            udp_echo_server = threading.Thread(
+                target=_udp_echo_server,
+                args=(udp_echo, udp_echo_stop, udp_echo_errors),
+                name="nvx-host-loopback-udp-echo",
+                daemon=True,
+            )
+            udp_echo_server.start()
+            udp_echo_servers.append(udp_echo_server)
+        udp_echo_port, udp_echo_ipv6_port = (
+            int(udp_echo.getsockname()[1]) for udp_echo in udp_echoes
+        )
         allow_command = workload_boot_command(
             executable,
             backend,
@@ -3393,8 +3479,9 @@ def run_host_loopback_policy(
             network=DIRECTIONAL_NETWORK_CIDR,
         )
         # Egress admits only the guest's own connection to the general host
-        # service, so the guest's replies to the host pass because host
-        # loopback admits them, not because egress does.
+        # service and its datagrams to the UDP services, so the guest's
+        # replies to the host pass because host loopback admits them, not
+        # because egress does.
         allow_command.extend(
             (
                 "--host-loopback",
@@ -3405,6 +3492,10 @@ def run_host_loopback_policy(
                 "deny",
                 "--network-egress-allow",
                 f"{DIRECTIONAL_NETWORK_GATEWAY_IPV4}/32:tcp:{allowed_general_port}",
+                "--network-egress-allow",
+                f"{DIRECTIONAL_NETWORK_GATEWAY_IPV4}/32:udp:{udp_echo_port}",
+                "--network-egress-allow",
+                f"{DIRECTIONAL_NETWORK_GATEWAY_IPV6}/128:udp:{udp_echo_ipv6_port}",
                 "--host-loopback-forward",
                 f"tcp:{host_forward_port}:{guest_port}",
             )
@@ -3422,11 +3513,14 @@ def run_host_loopback_policy(
                     "host-loopback-policy.sh.in",
                     MODE="allow",
                     GATEWAY_IPV4=DIRECTIONAL_NETWORK_GATEWAY_IPV4,
+                    GATEWAY_IPV6=DIRECTIONAL_NETWORK_GATEWAY_IPV6,
                     GENERAL_PORT=str(allowed_general_port),
                     PROXY_PORT="0",
                     GUEST_PORT=str(guest_port),
                     PRIVATE_GUEST_PORT=str(private_guest_port),
                     UDP_IPV6_GUEST_PORT=str(udp_ipv6_guest_port),
+                    UDP_ECHO_PORT=str(udp_echo_port),
+                    UDP_ECHO_IPV6_PORT=str(udp_echo_ipv6_port),
                 ),
             )
             process.wait_for_line(HOST_LOOPBACK_INGRESS_READY_MARKER, timeout)
@@ -3451,9 +3545,18 @@ def run_host_loopback_policy(
             raise RuntimeError("general host-loopback server failed") from allow_errors[
                 0
             ]
+        if udp_echo_errors:
+            raise RuntimeError(
+                "host-loopback UDP echo service failed"
+            ) from udp_echo_errors[0]
     finally:
         allowed_general.close()
         allow_server.join(timeout=NETWORK_SERVER_JOIN_TIMEOUT_SECONDS)
+        udp_echo_stop.set()
+        for udp_echo_server in udp_echo_servers:
+            udp_echo_server.join(timeout=NETWORK_SERVER_JOIN_TIMEOUT_SECONDS)
+        for udp_echo in udp_echoes:
+            udp_echo.close()
 
     run_host_loopback_rejections(
         executable,
