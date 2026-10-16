@@ -34,5 +34,4 @@ pub mod device_io;
 pub mod exit;
 #[cfg(target_arch = "x86_64")]
 pub mod mmio_write;
-pub mod port_io;
 pub mod reseed;

@@ -15,9 +15,6 @@ use std::sync::RwLock;
 
 use nix::errno::Errno;
 
-const PORT_IO_USAGE: &[u8] = b"usage: nvx-port-io read-generation-id DATA_PORT SELECT_PORT \
-[OUTPUT] | read-u8 PORT | write-u8 PORT VALUE\n";
-
 /// Returns the path of the guest binary `name`.
 fn binary(name: &str) -> PathBuf {
     if let Some(directory) = std::env::var_os("NVX_GUEST_BINARIES") {
@@ -26,7 +23,6 @@ fn binary(name: &str) -> PathBuf {
     PathBuf::from(match name {
         "nvx-console-pending" => env!("CARGO_BIN_EXE_nvx-console-pending"),
         "nvx-mmio-write" => env!("CARGO_BIN_EXE_nvx-mmio-write"),
-        "nvx-port-io" => env!("CARGO_BIN_EXE_nvx-port-io"),
         "nvx-reseed" => env!("CARGO_BIN_EXE_nvx-reseed"),
         "nvx-exit" => env!("CARGO_BIN_EXE_nvx-exit"),
         "nvx-device-io" => env!("CARGO_BIN_EXE_nvx-device-io"),
@@ -244,44 +240,6 @@ fn mmio_write_reports_an_inaccessible_dev_mem() {
             format!("open /dev/mem: {}\n", errno.desc()).into_bytes()
         )
     );
-}
-
-#[test]
-fn port_io_usage() {
-    for arguments in [
-        &[][..],
-        &["read-u8"],
-        &["read-u8", "0x10000"],
-        &["write-u8", "1", "256"],
-        &["read-generation-id", "1"],
-        &["read-generation-id", "1", "2", "out", "extra"],
-    ] {
-        assert_eq!(
-            run("nvx-port-io", arguments),
-            (Some(2), Vec::new(), PORT_IO_USAGE.to_vec()),
-            "{arguments:?}"
-        );
-    }
-}
-
-#[test]
-fn port_io_reports_an_inaccessible_dev_port() {
-    for (arguments, read, write) in [
-        (&["read-u8", "0x70"][..], true, false),
-        (&["write-u8", "0x70", "0"], false, true),
-    ] {
-        let Some(errno) = device_error("/dev/port", read, write) else {
-            return;
-        };
-        assert_eq!(
-            run("nvx-port-io", arguments),
-            (
-                Some(1),
-                Vec::new(),
-                format!("nvx-port-io: open /dev/port: {}\n", errno.desc()).into_bytes()
-            )
-        );
-    }
 }
 
 #[test]

@@ -101,13 +101,6 @@ doc = false
 test = false
 
 [[bin]]
-name = "nvx-port-io"
-path = "src/bin/nvx-port-io.rs"
-required-features = ["guest"]
-doc = false
-test = false
-
-[[bin]]
 name = "nvx-reseed"
 path = "src/bin/nvx-reseed.rs"
 required-features = ["guest"]

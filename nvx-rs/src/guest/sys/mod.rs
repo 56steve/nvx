@@ -24,7 +24,7 @@ pub(crate) use nix::errno::Errno;
 pub(crate) use clock::monotonic_ns;
 #[cfg(test)]
 pub(crate) use fd::create_fifo;
-pub(crate) use fd::{FileDescriptor, FileLock, Mode, OpenFlags, create_directory, open, page_size};
+pub(crate) use fd::{FileDescriptor, Mode, OpenFlags, open, page_size};
 pub(crate) use ioctl::{console_pending, reseed_random};
 pub(crate) use mapping::MemoryMapping;
 pub(crate) use process::{DirectStdout, Stdout, restore_sigpipe};
@@ -63,20 +63,6 @@ pub(crate) fn print(stream: &mut dyn Write, bytes: &[u8]) -> Result<(), Errno> {
 /// generic I/O-failure treatment.
 fn errno_of(error: &io::Error) -> Errno {
     error.raw_os_error().map_or(Errno::EIO, Errno::from_raw)
-}
-
-/// Repeats a safe system operation while it fails with `EINTR`.
-///
-/// The first success or non-interruption error is returned. Callers use this only where the C
-/// implementation had an explicit retry loop; operations such as seed-file reads deliberately
-/// call their wrapper directly.
-pub(crate) fn retry<T>(mut operation: impl FnMut() -> Result<T, Errno>) -> Result<T, Errno> {
-    loop {
-        match operation() {
-            Err(Errno::EINTR) => {}
-            result => return result,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -124,49 +110,9 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn retry_repeats_only_after_eintr() {
-        let mut results = vec![Err(Errno::EINTR), Err(Errno::EINTR), Ok(3)].into_iter();
-        let mut calls = 0;
-        let result = retry(|| {
-            calls += 1;
-            results.next().expect("one result per call")
-        });
-        assert_eq!((result, calls), (Ok(3), 3));
-
-        let mut calls = 0;
-        let result: Result<usize, Errno> = retry(|| {
-            calls += 1;
-            Err(Errno::EIO)
-        });
-        assert_eq!((result, calls), (Err(Errno::EIO), 1));
-    }
-
-    #[test]
     fn explicit_close_reports_errno() {
         let descriptor = open(c"/dev/null", OpenFlags::O_RDONLY, Mode::empty()).unwrap();
         assert_eq!(descriptor.close(), Ok(()));
-    }
-
-    #[test]
-    fn file_locks_are_exclusive_until_their_scope_ends() {
-        use nix::fcntl::{Flock, FlockArg};
-
-        let file = tempfile::NamedTempFile::new().unwrap();
-        let path = CString::new(file.path().to_str().unwrap()).unwrap();
-        let try_lock = || {
-            Flock::lock(
-                std::fs::File::open(file.path()).unwrap(),
-                FlockArg::LockExclusiveNonblock,
-            )
-        };
-        {
-            let _lock = open(&path, OpenFlags::O_RDWR, Mode::empty())
-                .unwrap()
-                .lock_exclusive()
-                .unwrap();
-            assert_eq!(try_lock().map(|_| ()).unwrap_err().1, Errno::EWOULDBLOCK);
-        }
-        assert!(try_lock().is_ok());
     }
 
     #[test]
