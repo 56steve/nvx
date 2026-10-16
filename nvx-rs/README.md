@@ -165,6 +165,7 @@ executables as `/sbin/nvx-*`.
 | `nvx-reseed [--generation-only] SEED_FILE [PREVIOUS]`, `nvx-reseed --sample` | Reseeds the kernel's random number generator from a seed file and checks its VM generation ID, or prints a random sample |
 | `nvx-exit [CODE]` | Stops the VM with an 8-bit exit code through OpenVMM's control port 0x604 (x86_64) |
 | `nvx-device-io file ...`, `nvx-device-io network ...` | The benchmark helper that measures file and UDP round-trip I/O and prints one JSON line (x86_64) |
+| `nvx-managed-agent CONTROL_TTY ROOTFS HOSTNAME UID GID USER HOME` | Serves the managed control session and supervises sequential workloads; `--exec-config-fd FD -- WORKLOAD ...` is its internal launch helper |
 
 Each binary's command line, exit statuses, and byte output are compatibility
 contracts; the [`nvx::guest`](src/guest/mod.rs) documentation describes each
@@ -187,8 +188,10 @@ NVX_BUNDLE=skip cargo test --all-features   # unit, golden-fixture, and fake-Ope
 The tests need no hypervisor. The fake-OpenVMM test drives `Instance` end to end
 against `nvx-fake-openvmm`, and the protocol tests compare the wire constants
 with the guest agent's source in `guest/common/nvx-managed-agent.c`. On Linux,
-`nvx.py` also lints and tests the guest binaries, and runs their integration
-tests against a build of them:
+a loopback test drives the host `ControlSession` through a broker shim into the
+real managed agent's session, dispatch, and execution engine, and `nvx.py` also
+lints and tests the guest binaries, and runs their integration tests against a
+build of them:
 
 ```bash
 python3 ../scripts/nvx.py check-guest-binaries
