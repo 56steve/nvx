@@ -13,6 +13,7 @@
 
 mod checks;
 mod commands;
+mod cpu_mask;
 mod daemon;
 mod decoders;
 mod events;

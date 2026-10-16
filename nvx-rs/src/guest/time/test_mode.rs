@@ -2,32 +2,36 @@
 //! decoders, formats, and process structure without the hypervisor.
 //!
 //! A hook prints a decoded failure as its output and succeeds; it fails with the usage status
-//! only when its own command line is malformed. Its numeric arguments keep the C program's
-//! `strtoll` and `strtoull` reading, except the CPUID values of `exhaustive-leaf`, which are
-//! plain decimal or `0x`-prefixed hexadecimal, as other guest programs read their arguments.
+//! only when its own command line is malformed: a wrong number of arguments, a fixture that it
+//! cannot read, a check name, code, or source that is not UTF-8, or a number that is not plain
+//! decimal, with a `-` sign when it is negative. The CPUID values of `exhaustive-leaf` may also
+//! be `0x`-prefixed hexadecimal, as other guest programs read their arguments. The packet and
+//! sample hooks read their fixtures as port B delivers a record, zero-filled past its end.
+//! `console` writes its whole line, as the program writes every event, which is shorter than
+//! the 638 bytes after which the C program's buffer cut an asynchronous line.
 
-use std::ffi::{CString, OsStr};
+use std::ffi::OsStr;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
-use std::sync::{Arc, Condvar, Mutex, mpsc};
+use std::str::FromStr;
+use std::sync::mpsc;
 
+use super::cpu_mask::CpuMask;
 use super::daemon::{self, Promoter};
 use super::decoders::{
-    self, GENERATION_ID_SIZE, PACKET_HEADER_SIZE, PACKET_MAX_SIZE, RestorePacket, SAMPLE_SIZE,
+    self, GENERATION_ID_SIZE, PACKET_HEADER_SIZE, PacketHeader, RestorePacket, SAMPLE_SIZE,
     TimeSample,
 };
-use super::events::{DETAIL_MAX, escape_text, format_event};
+use super::events::{CheckId, DETAIL_MAX, EventSource, ViolationCode, escape_text, format_event};
 use super::state::TimeState;
 use super::system::{clock_ns, cpu_time_ns};
-use super::{DEFERRED_START_NS, IDLE_BOUND_NS, MAX_CPUS, NSEC_PER_MSEC, NSEC_PER_SEC, Phase};
+use super::{DEFERRED_START_NS, IDLE_BOUND_NS, NSEC_PER_MSEC, NSEC_PER_SEC, Phase};
+use crate::guest::parse::{parse_integer, parse_u64};
 use crate::guest::status::CommandError;
+use crate::guest::sys::x86::CpuidResult;
 use crate::guest::sys::{self, ChildStatus, ClockAdjustment, Errno, ForkResult};
 
-/// Maximum compatibility-test input file size.
-const TEXT_MAX: usize = 65_536;
-/// Maximum size of a state, status, or restore-record fixture, as the C program's buffer.
-const RECORD_MAX: usize = 4096;
 /// How long after its start the `promote` hook's first promoter promotes the threads.
 const PROMOTION_DELAY_NS: i64 = 50 * NSEC_PER_MSEC;
 /// How long after its start the `promote` hook's second promoter would promote the threads,
@@ -78,78 +82,90 @@ pub(super) fn run(arguments: &[&[u8]], out: &mut dyn Write) -> Result<(), Comman
     }
 }
 
-/// Checks that a hook received exactly `count` arguments.
-fn expect(arguments: &[&[u8]], count: usize) -> Result<(), CommandError> {
-    if arguments.len() == count {
-        Ok(())
-    } else {
-        Err(CommandError::Usage)
-    }
+/// Returns a hook's arguments when it received exactly `N` of them.
+fn exactly<'a, const N: usize>(arguments: &[&'a [u8]]) -> Result<[&'a [u8]; N], CommandError> {
+    arguments.try_into().map_err(|_| CommandError::Usage)
 }
 
-/// Reads at most `size` bytes of a test fixture, and either extends them with zero bytes to
-/// `size`, or drops the last byte of a fixture that fills `size`, as C's NUL did.
-fn read_file(path: &[u8], size: usize, zero_fill: bool) -> Result<Vec<u8>, CommandError> {
-    let file = fs::File::open(OsStr::from_bytes(path)).map_err(|_| CommandError::Usage)?;
-    let mut bytes = Vec::with_capacity(size);
-    file.take(size as u64)
-        .read_to_end(&mut bytes)
-        .map_err(|_| CommandError::Usage)?;
-    if zero_fill {
-        bytes.resize(size, 0);
-    } else if bytes.len() == size {
-        bytes.truncate(size.saturating_sub(1));
-    }
-    Ok(bytes)
+/// Reads a hook's text argument, which must be UTF-8.
+fn utf8(argument: &[u8]) -> Result<&str, CommandError> {
+    std::str::from_utf8(argument).map_err(|_| CommandError::Usage)
+}
+
+/// Reads a hook's numeric argument.
+fn number<T: FromStr>(argument: &[u8]) -> Result<T, CommandError> {
+    parse_integer(argument).ok_or(CommandError::Usage)
+}
+
+/// Reads a test fixture.
+fn read_fixture(path: &[u8]) -> Result<Vec<u8>, CommandError> {
+    fs::read(OsStr::from_bytes(path)).map_err(|_| CommandError::Usage)
+}
+
+/// Returns the `size` bytes of a binary fixture at `offset`, zero-filled past the fixture's end,
+/// as port B delivers a record.
+fn record(fixture: &[u8], offset: usize, size: usize) -> Vec<u8> {
+    let mut record = fixture.get(offset..).unwrap_or_default().to_vec();
+    record.resize(size, 0);
+    record
 }
 
 /// Decodes and prints one synthetic restore packet.
 fn test_packet(arguments: &[&[u8]], out: &mut dyn Write) -> Result<(), CommandError> {
-    expect(arguments, 3)?;
-    let bytes = read_file(arguments[0], PACKET_MAX_SIZE, true)?;
+    let [path, recorded, previous] = exactly(arguments)?;
+    let bytes = read_fixture(path)?;
     let previous =
-        decoders::parse_hex(arguments[2], GENERATION_ID_SIZE).ok_or(CommandError::Usage)?;
-    let recorded = decoders::parse_u64_lossy(arguments[1]);
-    let mut packet = match RestorePacket::parse_header(&bytes) {
-        Ok(packet) => packet,
-        Err(detail) => {
-            let _ = writeln!(out, "error G_REPAIR_PACKET {detail}");
+        decoders::parse_hex::<GENERATION_ID_SIZE>(previous).ok_or(CommandError::Usage)?;
+    let recorded: u64 = number(recorded)?;
+    let header = match PacketHeader::parse(&record(&bytes, 0, PACKET_HEADER_SIZE)) {
+        Ok(header) => header,
+        Err(error) => {
+            let _ = writeln!(out, "error {} {error}", ViolationCode::RepairPacket);
             return Ok(());
         }
     };
-    if u64::from(packet.generation) == recorded {
+    if u64::from(header.generation) == recorded {
         let _ = writeln!(out, "stale");
         return Ok(());
     }
-    if u64::from(packet.generation) != recorded.wrapping_add(1) {
+    if recorded.checked_add(1) != Some(u64::from(header.generation)) {
         let _ = writeln!(
             out,
-            "error G_REPAIR_GENERATION generation {}",
-            packet.generation
+            "error {} generation {}",
+            ViolationCode::RepairGeneration,
+            header.generation
         );
         return Ok(());
     }
-    if let Err(detail) = packet.parse_body(&bytes[PACKET_HEADER_SIZE..]) {
-        let _ = writeln!(out, "error G_REPAIR_PACKET {detail}");
-        return Ok(());
-    }
-    if packet.entropy[..GENERATION_ID_SIZE] == previous {
-        let _ = writeln!(out, "error G_REPAIR_GENERATION generation ID unchanged");
+    let body = record(&bytes, PACKET_HEADER_SIZE, header.body_size());
+    let packet = match RestorePacket::parse(header, &body) {
+        Ok(packet) => packet,
+        Err(error) => {
+            let _ = writeln!(out, "error {} {error}", ViolationCode::RepairPacket);
+            return Ok(());
+        }
+    };
+    if packet.generation_id() == previous {
+        let _ = writeln!(
+            out,
+            "error {} generation ID unchanged",
+            ViolationCode::RepairGeneration
+        );
         return Ok(());
     }
     let _ = write!(
         out,
         "ok flags={} online={} ranges={} generation={} rate_deviation={} \
          frequency={} downtime_ns={} utc_ns={} generation_id={}",
-        packet.flags,
-        packet.online_vp_count,
-        packet.range_count,
-        packet.generation,
-        packet.rate_deviation,
-        decoders::restore_frequency(packet.rate_deviation),
-        packet.downtime_ns,
-        packet.utc_ns,
-        decoders::format_hex(&packet.entropy[..GENERATION_ID_SIZE])
+        header.flags,
+        header.online_vp_count,
+        header.range_count,
+        header.generation,
+        header.rate_deviation,
+        decoders::restore_frequency(header.rate_deviation),
+        header.downtime_ns,
+        header.utc_ns,
+        decoders::format_hex(packet.generation_id())
     );
     for (start, length) in packet.ranges {
         let _ = write!(out, " range={start}:{length}");
@@ -160,13 +176,14 @@ fn test_packet(arguments: &[&[u8]], out: &mut dyn Write) -> Result<(), CommandEr
 
 /// Decodes and prints one synthetic time sample.
 fn test_sample(arguments: &[&[u8]], out: &mut dyn Write) -> Result<(), CommandError> {
-    expect(arguments, 2)?;
-    let bytes = read_file(arguments[0], SAMPLE_SIZE, true)?;
+    let [path, generation] = exactly(arguments)?;
+    let bytes = record(&read_fixture(path)?, 0, SAMPLE_SIZE);
+    let generation: u64 = number(generation)?;
     match TimeSample::parse(&bytes) {
-        Err(detail) => {
-            let _ = writeln!(out, "error {detail}");
+        Err(error) => {
+            let _ = writeln!(out, "error {error}");
         }
-        Ok(sample) if u64::from(sample.generation) != decoders::parse_u64_lossy(arguments[1]) => {
+        Ok(sample) if u64::from(sample.generation) != generation => {
             let _ = writeln!(out, "error generation {}", sample.generation);
         }
         Ok(sample) => {
@@ -182,12 +199,8 @@ fn test_sample(arguments: &[&[u8]], out: &mut dyn Write) -> Result<(), CommandEr
 
 /// Computes and prints a synthetic clock pairing.
 fn test_pair(arguments: &[&[u8]], out: &mut dyn Write) -> Result<(), CommandError> {
-    expect(arguments, 3)?;
-    let (theta, epsilon) = decoders::pair_clocks(
-        decoders::parse_i64_lossy(arguments[0]),
-        decoders::parse_i64_lossy(arguments[1]),
-        decoders::parse_u64_lossy(arguments[2]),
-    );
+    let [t0, t1, utc_ns] = exactly(arguments)?;
+    let (theta, epsilon) = decoders::pair_clocks(number(t0)?, number(t1)?, number(utc_ns)?);
     let _ = writeln!(out, "theta_ns={theta} epsilon_ns={epsilon}");
     Ok(())
 }
@@ -209,16 +222,18 @@ fn test_lines(
     mode: LineMode,
     out: &mut dyn Write,
 ) -> Result<(), CommandError> {
-    expect(arguments, 1)?;
-    let text = read_file(arguments[0], TEXT_MAX, false)?;
+    let [path] = exactly(arguments)?;
+    let text = read_fixture(path)?;
     if matches!(mode, LineMode::Kmsg) {
-        let text = text.split(|byte| *byte == 0).next().unwrap_or_default();
         for line in text
-            .split(|byte| *byte == b'\n')
+            .split(|&byte| byte == b'\n')
             .filter(|line| !line.is_empty())
         {
-            let code = decoders::match_watch_rule(line).unwrap_or("none");
-            let _ = writeln!(out, "{code}");
+            match decoders::match_watch_rule(line) {
+                Some(code) => writeln!(out, "{code}"),
+                None => writeln!(out, "none"),
+            }
+            .ok();
         }
         return Ok(());
     }
@@ -231,42 +246,54 @@ fn test_lines(
             let _ = out.write_all(&[b"fail ".as_slice(), &detail, b"\n"].concat());
         }
     }
-    if !log.wx.is_empty() {
-        let _ = out.write_all(&[b"wx ".as_slice(), &log.wx, b"\n"].concat());
+    if let Some(wx) = &log.wx {
+        let _ = out.write_all(&[b"wx ".as_slice(), wx, b"\n"].concat());
     }
     Ok(())
 }
 
 /// Reproduces synchronous or asynchronous console byte output.
 fn test_console(arguments: &[&[u8]], out: &mut dyn Write) -> Result<(), CommandError> {
-    expect(arguments, 2)?;
-    if arguments[1] == b"async" {
+    let [line, mode] = exactly(arguments)?;
+    if mode == b"async" {
         let _ = out.write_all(b"\n");
     }
-    let _ = out.write_all(arguments[0]);
+    let _ = out.write_all(line);
     Ok(())
 }
 
-/// Parses a CPUID value as plain decimal or `0x`-prefixed hexadecimal, as `parse_u64` reads
-/// the guest programs' arguments, and narrows it with C's `uint32_t` cast. Any other text is
-/// zero, as `strtoul` returned for text without digits.
-fn cpuid_value(text: &[u8]) -> u32 {
-    CString::new(text)
-        .ok()
-        .and_then(|text| super::super::parse::parse_u64(&text))
-        .unwrap_or(0) as u32
+/// Parses a 32-bit CPUID value as plain decimal or `0x`-prefixed hexadecimal, as `parse_u64`
+/// reads the guest programs' arguments.
+fn cpuid_value(text: &[u8]) -> Result<u32, CommandError> {
+    parse_u64(text)
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or(CommandError::Usage)
 }
 
 /// Validates one synthetic exhaustive CPUID leaf.
 fn test_exhaustive_leaf(arguments: &[&[u8]], out: &mut dyn Write) -> Result<(), CommandError> {
-    expect(arguments, 9)?;
-    let mut value = [0; 4];
-    let mut out_of_range = [0; 4];
-    for index in 0..4 {
-        value[index] = cpuid_value(arguments[index + 1]);
-        out_of_range[index] = cpuid_value(arguments[index + 5]);
-    }
-    match decoders::exhaustive_leaf_ok(cpuid_value(arguments[0]), value, out_of_range) {
+    let [
+        leaf,
+        eax,
+        ebx,
+        ecx,
+        edx,
+        high_eax,
+        high_ebx,
+        high_ecx,
+        high_edx,
+    ] = exactly(arguments)?;
+    let result = |eax, ebx, ecx, edx| -> Result<CpuidResult, CommandError> {
+        Ok(CpuidResult {
+            eax: cpuid_value(eax)?,
+            ebx: cpuid_value(ebx)?,
+            ecx: cpuid_value(ecx)?,
+            edx: cpuid_value(edx)?,
+        })
+    };
+    let value = result(eax, ebx, ecx, edx)?;
+    let out_of_range = result(high_eax, high_ebx, high_ecx, high_edx)?;
+    match decoders::exhaustive_leaf_ok(cpuid_value(leaf)?, value, out_of_range) {
         Ok(()) => {
             let _ = writeln!(out, "pass");
         }
@@ -279,27 +306,25 @@ fn test_exhaustive_leaf(arguments: &[&[u8]], out: &mut dyn Write) -> Result<(), 
 
 /// Formats one exhaustive subcheck report.
 fn test_exhaustive_report(arguments: &[&[u8]], out: &mut dyn Write) -> Result<(), CommandError> {
-    expect(arguments, 4)?;
-    let passed = arguments[2] == b"pass";
-    let escaped = escape_text(arguments[3], DETAIL_MAX - 1);
-    let _ = write!(
+    let [check, cpu, status, detail] = exactly(arguments)?;
+    let passed = status == b"pass";
+    let _ = writeln!(
         out,
-        "NVX-TIME-ABI-EXHAUSTIVE: v=1 check={} cpu={} status={} detail=\"",
-        String::from_utf8_lossy(arguments[0]),
-        decoders::parse_i64_lossy(arguments[1]),
-        if passed { "pass" } else { "fail" }
+        "NVX-TIME-ABI-EXHAUSTIVE: v=1 check={} cpu={} status={} detail=\"{}\"",
+        utf8(check)?,
+        number::<usize>(cpu)?,
+        if passed { "pass" } else { "fail" },
+        escape_text(detail, DETAIL_MAX - 1),
     );
-    let _ = out.write_all(&escaped);
-    let _ = writeln!(out, "\"");
     let _ = writeln!(out, "failures={}", usize::from(!passed));
     Ok(())
 }
 
 /// Formats one exhaustive final summary.
 fn test_exhaustive_summary(arguments: &[&[u8]], out: &mut dyn Write) -> Result<(), CommandError> {
-    expect(arguments, 2)?;
-    let online = decoders::parse_i64_lossy(arguments[0]);
-    let failures = decoders::parse_i64_lossy(arguments[1]);
+    let [online, failures] = exactly(arguments)?;
+    let online: usize = number(online)?;
+    let failures: usize = number(failures)?;
     let status = if failures == 0 { "ok" } else { "fail" };
     let _ = writeln!(
         out,
@@ -310,38 +335,29 @@ fn test_exhaustive_summary(arguments: &[&[u8]], out: &mut dyn Write) -> Result<(
 }
 
 /// Parses a CPU list that must name at least one CPU.
-fn selected_cpus(text: &[u8]) -> Result<[bool; MAX_CPUS], CommandError> {
-    decoders::parse_cpu_list(text)
-        .filter(|(_, count)| *count > 0)
-        .map(|(cpus, _)| cpus)
+fn selected_cpus(text: &[u8]) -> Result<CpuMask, CommandError> {
+    CpuMask::parse(text)
+        .filter(|cpus| !cpus.is_empty())
         .ok_or(CommandError::Usage)
 }
 
 /// Validates a synthetic `/proc/timer_list` fixture.
 fn test_timer_list(arguments: &[&[u8]], out: &mut dyn Write) -> Result<(), CommandError> {
-    expect(arguments, 2)?;
-    let text = read_file(arguments[0], TEXT_MAX, false)?;
-    let cpus = selected_cpus(arguments[1])?;
-    match decoders::timer_list_verdict(&text, &cpus) {
-        Ok(()) => {
-            let _ = writeln!(out, "ok");
-        }
-        Err(detail) => {
-            let _ = out.write_all(&[b"fail ".as_slice(), &detail, b"\n"].concat());
-        }
+    let [path, cpus] = exactly(arguments)?;
+    let text = read_fixture(path)?;
+    match decoders::timer_list_verdict(&text, selected_cpus(cpus)?) {
+        Ok(()) => writeln!(out, "ok"),
+        Err(detail) => writeln!(out, "fail {detail}"),
     }
+    .ok();
     Ok(())
 }
 
 /// Plans and prints one step or slew correction, with the `adjtimex` modes and status that the
 /// system layer would apply.
 fn test_correction(arguments: &[&[u8]], out: &mut dyn Write) -> Result<(), CommandError> {
-    expect(arguments, 3)?;
-    let correction = decoders::plan_correction(
-        decoders::parse_i64_lossy(arguments[0]),
-        decoders::parse_i64_lossy(arguments[1]),
-        arguments[2] == b"fast",
-    );
+    let [theta, epsilon, speed] = exactly(arguments)?;
+    let correction = decoders::plan_correction(number(theta)?, number(epsilon)?, speed == b"fast");
     let modes = correction.modes();
     match correction {
         ClockAdjustment::Step {
@@ -372,10 +388,10 @@ fn test_correction(arguments: &[&[u8]], out: &mut dyn Write) -> Result<(), Comma
     Ok(())
 }
 
-/// Converts one frequency value to parts per billion.
+/// Converts one restore rate deviation to the frequency correction and its parts per billion.
 fn test_frequency(arguments: &[&[u8]], out: &mut dyn Write) -> Result<(), CommandError> {
-    expect(arguments, 1)?;
-    let frequency = decoders::restore_frequency(decoders::parse_i64_lossy(arguments[0]) as i32);
+    let [rate_deviation] = exactly(arguments)?;
+    let frequency = decoders::restore_frequency(number(rate_deviation)?);
     let _ = writeln!(
         out,
         "frequency={frequency} ppb={}",
@@ -386,8 +402,8 @@ fn test_frequency(arguments: &[&[u8]], out: &mut dyn Write) -> Result<(), Comman
 
 /// Formats one synthetic time-ABI violation event.
 fn test_event(arguments: &[&[u8]], out: &mut dyn Write) -> Result<(), CommandError> {
-    expect(arguments, 6)?;
-    let phase = match arguments[2] {
+    let [code, source, phase, generation, boottime_ns, detail] = exactly(arguments)?;
+    let phase = match phase {
         b"boot" => Phase::Boot,
         b"capture" => Phase::Capture,
         b"restore" => Phase::Restore,
@@ -395,73 +411,66 @@ fn test_event(arguments: &[&[u8]], out: &mut dyn Write) -> Result<(), CommandErr
     };
     let line = format_event(
         false,
-        arguments[0],
-        arguments[1],
+        utf8(code)?,
+        utf8(source)?,
         phase,
-        decoders::parse_u64_lossy(arguments[3]) as u32,
-        decoders::parse_i64_lossy(arguments[4]),
-        arguments[5],
+        number(generation)?,
+        number(boottime_ns)?,
+        detail,
     );
-    let _ = out.write_all(&line);
+    let _ = out.write_all(line.as_bytes());
     Ok(())
 }
 
 /// Parses and re-formats one state fixture.
 fn test_state(arguments: &[&[u8]], out: &mut dyn Write) -> Result<(), CommandError> {
-    expect(arguments, 1)?;
-    let text = read_file(arguments[0], RECORD_MAX, false)?;
-    match TimeState::parse(&text) {
-        Some(state) => {
-            let _ = out.write_all(&state.format());
-        }
-        None => {
-            let _ = writeln!(out, "error");
-        }
+    let [path] = exactly(arguments)?;
+    match TimeState::parse(&read_fixture(path)?) {
+        Some(state) => write!(out, "{state}"),
+        None => writeln!(out, "error"),
     }
+    .ok();
     Ok(())
 }
 
 /// Formats status from one state fixture.
 fn test_status(arguments: &[&[u8]], out: &mut dyn Write) -> Result<(), CommandError> {
-    expect(arguments, 2)?;
-    let text = read_file(arguments[0], RECORD_MAX, false)?;
-    let state = TimeState::parse(&text).ok_or(CommandError::Usage)?;
-    let (text, ok) = state.format_status(arguments[1] == b"report-only");
-    let _ = out.write_all(&text);
-    let _ = writeln!(out, "ok={}", u8::from(ok));
+    let [path, mode] = exactly(arguments)?;
+    let state = TimeState::parse(&read_fixture(path)?).ok_or(CommandError::Usage)?;
+    let _ = out.write_all(state.status_markers(mode == b"report-only").as_bytes());
+    let _ = writeln!(out, "ok={}", u8::from(state.checks_ok()));
     Ok(())
 }
 
-/// Parses and prints one private restore record.
+/// Parses and prints one private restore record, with its CPUs one by one.
 fn test_restore_record(arguments: &[&[u8]], out: &mut dyn Write) -> Result<(), CommandError> {
-    expect(arguments, 1)?;
-    let text = read_file(arguments[0], RECORD_MAX, false)?;
-    let Some((generation, cpus, count)) = decoders::parse_restore_record(&text) else {
+    let [path] = exactly(arguments)?;
+    let Some((generation, cpus)) = decoders::parse_restore_record(&read_fixture(path)?) else {
         let _ = writeln!(out, "error");
         return Ok(());
     };
-    let _ = write!(out, "generation={generation} new_cpus=");
-    let mut separator = "";
-    for (cpu, selected) in cpus.iter().copied().enumerate() {
-        if selected {
-            let _ = write!(out, "{separator}{cpu}");
-            separator = ",";
-        }
-    }
-    if count == 0 {
-        let _ = write!(out, "none");
-    }
-    let _ = writeln!(out, " count={count}");
+    let listed = if cpus.is_empty() {
+        "none".to_owned()
+    } else {
+        cpus.iter()
+            .map(|cpu| cpu.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let _ = writeln!(
+        out,
+        "generation={generation} new_cpus={listed} count={}",
+        cpus.len()
+    );
     Ok(())
 }
 
 /// Formats a report-only conformance failure event.
-fn failure_event(id: &str, detail: &[u8]) -> Vec<u8> {
-    let code = format!("G_CONFORMANCE_{id}");
+fn failure_event(id: CheckId, detail: &[u8]) -> String {
     format_event(
         true,
-        code.as_bytes(),
-        b"conformance",
+        ViolationCode::Conformance(id),
+        EventSource::Conformance,
         Phase::Boot,
         0,
         clock_ns(sys::Clock::Boottime),
@@ -471,20 +480,21 @@ fn failure_event(id: &str, detail: &[u8]) -> Vec<u8> {
 
 /// Validates and summarizes a synthetic cpuinfo fixture.
 fn test_cpuinfo(arguments: &[&[u8]], out: &mut dyn Write) -> Result<(), CommandError> {
-    expect(arguments, 2)?;
-    let text = read_file(arguments[0], TEXT_MAX, false)?;
-    let selected = selected_cpus(arguments[1])?;
-    let (cpuinfo, verdict) = decoders::check_cpuinfo(&text, &selected, true);
+    let [path, cpus] = exactly(arguments)?;
+    let text = read_fixture(path)?;
+    let (cpuinfo, verdict) = decoders::check_cpuinfo(&text, selected_cpus(cpus)?, true);
     match verdict {
         Ok(()) => {
             let _ = write!(out, "ok");
-            for cpu in (0..MAX_CPUS).filter(|&cpu| cpuinfo.known[cpu]) {
-                let _ = write!(out, " cpu{cpu}_khz={}", cpuinfo.khz[cpu]);
+            for (cpu, khz) in cpuinfo.khz.iter().enumerate() {
+                if let Some(khz) = khz {
+                    let _ = write!(out, " cpu{cpu}_khz={khz}");
+                }
             }
             let _ = writeln!(out);
         }
         Err(detail) => {
-            let _ = out.write_all(&failure_event("C5", detail.as_bytes()));
+            let _ = out.write_all(failure_event(CheckId::C5, detail.as_bytes()).as_bytes());
         }
     }
     Ok(())
@@ -492,13 +502,13 @@ fn test_cpuinfo(arguments: &[&[u8]], out: &mut dyn Write) -> Result<(), CommandE
 
 /// Validates a synthetic kernel command line.
 fn test_cmdline(arguments: &[&[u8]], out: &mut dyn Write) -> Result<(), CommandError> {
-    expect(arguments, 1)?;
-    match decoders::check_cmdline(arguments[0]) {
+    let [command_line] = exactly(arguments)?;
+    match decoders::check_cmdline(command_line) {
         Ok(()) => {
             let _ = writeln!(out, "ok");
         }
         Err(detail) => {
-            let _ = out.write_all(&failure_event("C9", &detail));
+            let _ = out.write_all(failure_event(CheckId::C9, &detail).as_bytes());
         }
     }
     Ok(())
@@ -506,46 +516,45 @@ fn test_cmdline(arguments: &[&[u8]], out: &mut dyn Write) -> Result<(), CommandE
 
 /// Validates synthetic current and available clocksources.
 fn test_clocksource(arguments: &[&[u8]], out: &mut dyn Write) -> Result<(), CommandError> {
-    expect(arguments, 2)?;
-    match decoders::check_clocksource(arguments[0], arguments[1]) {
+    let [current, available] = exactly(arguments)?;
+    match decoders::check_clocksource(current, available) {
         Ok(()) => {
             let _ = writeln!(out, "ok");
         }
         Err(detail) => {
-            let _ = out.write_all(&failure_event("C6", &detail));
+            let _ = out.write_all(failure_event(CheckId::C6, &detail).as_bytes());
         }
     }
     Ok(())
 }
 
-/// Exercises deterministic ordering of parallel check reports.
+/// Exercises the merge of parallel check reports as the C program's `check_cpus_parallel` ran
+/// them: the foreground fails once, then three side jobs fail once, twice, and three times, and
+/// then each selected CPU's job fails C1 when it cannot run on its CPU.
 fn test_parallel(arguments: &[&[u8]], out: &mut dyn Write) -> Result<(), CommandError> {
-    expect(arguments, 1)?;
-    let selected = selected_cpus(arguments[0])?;
+    let [cpus] = exactly(arguments)?;
+    let selected = selected_cpus(cpus)?;
     let mut failures = 0;
+    let mut fail = |id: CheckId, detail: &str| {
+        let _ = out.write_all(failure_event(id, detail.as_bytes()).as_bytes());
+        failures += 1;
+    };
+    fail(CheckId::C9, "foreground failure");
     for side in 1..=3 {
         for index in 1..=side {
-            let detail = format!("side job failure {index}");
-            let _ = out.write_all(&failure_event("C4", detail.as_bytes()));
-            failures += 1;
+            fail(CheckId::C4, &format!("side job failure {index}"));
         }
     }
-    let _ = out.write_all(&failure_event("C9", b"foreground failure"));
-    failures += 1;
-    for (cpu, selected) in selected.iter().copied().enumerate() {
-        if !selected {
-            continue;
-        }
+    for cpu in selected.iter() {
         let pinned = std::thread::spawn(move || sys::pin_current_thread(cpu))
             .join()
             .unwrap_or(Err(Errno::EINVAL));
-        let Err(error) = pinned else {
-            continue;
-        };
-        let detail = format!("cannot run on cpu {cpu}: {}", error.desc());
-        let _ = out.write_all(&failure_event("C1", detail.as_bytes()));
-        failures += 1;
-        break;
+        if let Err(error) = pinned {
+            fail(
+                CheckId::C1,
+                &format!("cannot run on cpu {cpu}: {}", error.desc()),
+            );
+        }
     }
     let _ = writeln!(out, "failures={failures}");
     Ok(())
@@ -553,8 +562,8 @@ fn test_parallel(arguments: &[&[u8]], out: &mut dyn Write) -> Result<(), Command
 
 /// A test thread that reports its thread ID and waits until it is told to end.
 struct WaitingThread {
-    /// Whether the thread may end, and the condition that announces it.
-    done: Arc<(Mutex<bool>, Condvar)>,
+    /// The channel whose disconnection ends the thread; it carries nothing.
+    end: mpsc::Sender<()>,
     /// The running thread.
     thread: std::thread::JoinHandle<()>,
 }
@@ -562,30 +571,21 @@ struct WaitingThread {
 impl WaitingThread {
     /// Starts the thread and returns it with its thread ID.
     fn start() -> Result<(Self, sys::ProcessId), CommandError> {
-        let done = Arc::new((Mutex::new(false), Condvar::new()));
-        let wait = Arc::clone(&done);
+        let (end, ended) = mpsc::channel();
         let (sender, receiver) = mpsc::channel();
         let thread = std::thread::spawn(move || {
             let _ = sender.send(sys::current_thread());
-            let (lock, changed) = &*wait;
-            if let Ok(done) = lock.lock() {
-                let _done = changed.wait_while(done, |done| !*done);
-            }
+            let _ = ended.recv();
         });
         let id = receiver.recv().map_err(|_| CommandError::Operation)?;
-        Ok((Self { done, thread }, id))
+        Ok((Self { end, thread }, id))
     }
 
     /// Tells the thread to end, and joins it.
     fn end(self) -> Result<(), CommandError> {
-        {
-            let (lock, changed) = &*self.done;
-            if let Ok(mut done) = lock.lock() {
-                *done = true;
-                changed.notify_all();
-            }
-        }
-        self.thread.join().map_err(|_| CommandError::Operation)
+        let Self { end, thread } = self;
+        drop(end);
+        thread.join().map_err(|_| CommandError::Operation)
     }
 }
 
@@ -593,6 +593,12 @@ impl WaitingThread {
 fn start_promoter(now: i64, delay_ns: i64) -> Result<Promoter, CommandError> {
     Promoter::start(now.wrapping_sub(IDLE_BOUND_NS).wrapping_add(delay_ns))
         .ok_or(CommandError::Operation)
+}
+
+/// Returns the scheduling policy of `thread`, or of the calling thread for `None`, as the C
+/// program printed `sched_getscheduler`'s result: the policy's number, or -1 for a failure.
+fn printed_policy(thread: Option<sys::ProcessId>) -> i64 {
+    sys::scheduling_policy(thread).map_or(-1, i64::from)
 }
 
 /// Exercises the promoter: one that promotes an idle caller and the thread that it started,
@@ -603,10 +609,7 @@ fn test_promote(out: &mut dyn Write) -> Result<(), CommandError> {
         let _idle = sys::IdlePriority::enter();
         let (waiting, id) = WaitingThread::start()?;
         promoter.finish();
-        let policies = (
-            sys::scheduling_policy(None),
-            sys::scheduling_policy(Some(id)),
-        );
+        let policies = (printed_policy(None), printed_policy(Some(id)));
         waiting.end()?;
         policies
     };
@@ -619,7 +622,7 @@ fn test_promote(out: &mut dyn Write) -> Result<(), CommandError> {
     let _ = writeln!(
         out,
         "stopped caller={} stop_ms={}",
-        sys::scheduling_policy(None),
+        printed_policy(None),
         clock_ns(sys::Clock::Monotonic).wrapping_sub(start) / NSEC_PER_MSEC
     );
     Ok(())
@@ -629,9 +632,9 @@ fn test_promote(out: &mut dyn Write) -> Result<(), CommandError> {
 fn test_idle_priority(out: &mut dyn Write) -> Result<(), CommandError> {
     let idle = {
         let _idle = sys::IdlePriority::enter();
-        sys::scheduling_policy(None)
+        printed_policy(None)
     };
-    let _ = writeln!(out, "idle={idle} normal={}", sys::scheduling_policy(None));
+    let _ = writeln!(out, "idle={idle} normal={}", printed_policy(None));
     Ok(())
 }
 
@@ -647,9 +650,12 @@ fn burn_cpu(milliseconds: i64) {
 /// that costs the parent `FORK_MS`; the worker spends `CHILD_MS` and prints its preparation
 /// share and step 7's CPU time.
 fn test_deferred_restore_cpu(arguments: &[&[u8]], out: &mut dyn Write) -> Result<(), CommandError> {
-    expect(arguments, 3)?;
-    let [preparation_ms, fork_ms, child_ms] =
-        [arguments[0], arguments[1], arguments[2]].map(decoders::parse_i64_lossy);
+    let [preparation_ms, fork_ms, child_ms] = exactly(arguments)?;
+    let [preparation_ms, fork_ms, child_ms] = [
+        number::<i64>(preparation_ms)?,
+        number(fork_ms)?,
+        number(child_ms)?,
+    ];
     let mut timing = daemon::empty_restore_timing();
     let start = cpu_time_ns();
     burn_cpu(preparation_ms);
@@ -679,12 +685,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cpuid_values_are_decimal_or_hexadecimal_and_narrow_like_c() {
-        assert_eq!(cpuid_value(b"0x40000006"), 0x4000_0006);
-        assert_eq!(cpuid_value(b"7"), 7);
-        assert_eq!(cpuid_value(b"4294967297"), 1);
-        assert_eq!(cpuid_value(b"-1"), 0);
-        assert_eq!(cpuid_value(b"x"), 0);
+    fn cpuid_values_are_32_bit_decimal_or_hexadecimal() {
+        assert_eq!(cpuid_value(b"0x40000006"), Ok(0x4000_0006));
+        assert_eq!(cpuid_value(b"7"), Ok(7));
+        assert_eq!(cpuid_value(b"4294967295"), Ok(u32::MAX));
+        for text in [&b"4294967296"[..], b"-1", b"x", b""] {
+            assert_eq!(cpuid_value(text), Err(CommandError::Usage), "{text:?}");
+        }
     }
 
     #[test]
@@ -694,12 +701,44 @@ mod tests {
         assert_eq!(run(&[b"unknown"], &mut out), Err(CommandError::Usage));
         assert_eq!(run(&[b"pair", b"1"], &mut out), Err(CommandError::Usage));
         assert_eq!(
+            run(&[b"pair", b"1000", b"+3000", b"5000"], &mut out),
+            Err(CommandError::Usage)
+        );
+        assert_eq!(
+            run(&[b"frequency", b"2147483648"], &mut out),
+            Err(CommandError::Usage)
+        );
+        assert_eq!(
             run(&[b"deferral", b"x"], &mut out),
+            Err(CommandError::Usage)
+        );
+        assert_eq!(
+            run(
+                &[b"exhaustive-report", b"X\xff", b"0", b"pass", b"ok"],
+                &mut out
+            ),
+            Err(CommandError::Usage)
+        );
+        assert_eq!(
+            run(
+                &[
+                    b"event", b"G_\xff", b"watcher", b"runtime", b"0", b"1", b"x"
+                ],
+                &mut out
+            ),
             Err(CommandError::Usage)
         );
         assert!(out.is_empty());
         assert_eq!(run(&[b"pair", b"1000", b"3000", b"5000"], &mut out), Ok(()));
         assert_eq!(out, b"theta_ns=3000 epsilon_ns=1000\n");
+    }
+
+    #[test]
+    fn asynchronous_console_lines_are_written_whole() {
+        let line = [b'a'; 700];
+        let mut out = Vec::new();
+        run(&[b"console", &line, b"async"], &mut out).unwrap();
+        assert_eq!(out, [b"\n".as_slice(), &line].concat());
     }
 
     #[test]

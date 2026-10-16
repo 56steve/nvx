@@ -2,21 +2,24 @@
 //!
 //! Each module holds one program, and the crate's binary of the same name runs its `main`. The
 //! programs keep the command lines, exit statuses, and output of the C programs that they
-//! replace, except that numeric arguments are plain decimal, or `0x`-prefixed hexadecimal where
-//! the C program also read hexadecimal, floating-point arguments plain decimal with an optional
-//! exponent, error messages describe `errno` values with `nix`'s text, and `nvx-ingress` and
-//! `nvx-time-probe` read the kernel's numbers, such as its socket tables, sysctls, and rates,
-//! and `nvx-ingress`'s test snapshots, only in the form in which the kernel writes them,
-//! rejecting the signed, prefixed, and other lenient forms that C's `strtoul`, `strtod`, and
-//! `scanf` also read. `nvx-time`'s test hooks keep the C program's `strtoll` and `strtoull`
-//! reading of their decimal arguments, which its compatibility tests compare.
+//! replace, except that numeric arguments are plain decimal, with a `-` sign where `nvx-time`'s
+//! test hooks take negative numbers, or `0x`-prefixed hexadecimal where the C program also read
+//! hexadecimal, floating-point arguments plain decimal with an optional exponent, error messages
+//! describe `errno` values with `nix`'s text, and the programs read the kernel's text, such as
+//! its socket tables, sysctls, rates, CPU lists, and timer list, their own records, and their
+//! test fixtures only in the form in which they are written, rejecting the signed, prefixed, and
+//! other lenient forms that C's `strtoul`, `strtod`, and `scanf` also read. Nor do they keep
+//! what only the C programs' fixed buffers and string handling did to oversized or malformed
+//! input, such as a length limit on a valid CPU list, an unknown option that a later valid one
+//! masked, or a NUL byte that ended a diagnostic.
 //!
 //! # Conventions
 //!
 //! - Program modules deny unsafe code. Only the private `sys` module may use it, behind
 //!   documented safe operations. It makes every system call through `nix`, with the enabled,
-//!   default-free feature set, except the few managed-agent and time-tool operations that `nix`
-//!   cannot provide, which `sys` documents, and the programs take random bytes from the
+//!   default-free feature set, or through the standard library, which reads and writes whole
+//!   files and the MSR devices, except the few managed-agent and time-tool operations that
+//!   neither provides, which `sys` documents, and the programs take random bytes from the
 //!   `getrandom` crate. `sys` also names the kernel's and the processor's interfaces once: the
 //!   procfs, sysfs, and device paths, OpenVMM's I/O ports, CPUID leaves and MSRs, and the
 //!   kernel's flags, so that the programs refer to them by name.
@@ -49,6 +52,9 @@ mod parse;
 mod status;
 #[allow(unsafe_code)]
 mod sys;
+
+#[cfg(target_arch = "x86_64")]
+mod kernel_text;
 
 pub mod console_pending;
 #[cfg(target_arch = "x86_64")]

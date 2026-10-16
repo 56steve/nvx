@@ -3,15 +3,65 @@
 //! The intrinsics compile to the single instructions that their names give: `CPUID`, `RDTSC`,
 //! `RDTSCP`, and `LFENCE`. `LFENCE` also orders the compiler's memory accesses, so a fenced read
 //! of the time-stamp counter stays where the caller put it. Each intrinsic is safe to execute in
-//! user mode on every x86-64 processor, except `RDTSCP`, whose CPUID bit the callers check
-//! first. Some of the intrinsics became safe functions after the crate's minimum Rust version,
-//! so their calls allow an unused `unsafe` block.
+//! user mode on every x86-64 processor, except `RDTSCP`, which callers use only when
+//! [`has_rdtscp`] reports it. Some of the intrinsics became safe functions after the crate's
+//! minimum Rust version, so their calls allow an unused `unsafe` block.
 
-use core::arch::x86_64::{__cpuid_count, __rdtscp, _mm_lfence, _rdtsc, CpuidResult};
+use core::arch::x86_64::{__cpuid_count, __rdtscp, _mm_lfence, _rdtsc};
+
+pub(crate) use core::arch::x86_64::CpuidResult;
 
 /// CPUID leaves of the architecture and of Hyper-V, and the bits of their registers, that the
 /// time tools read.
 pub(crate) mod cpuid {
+    use super::CpuidResult;
+
+    /// A CPUID result whose four registers are zero.
+    pub(crate) const ZERO: CpuidResult = CpuidResult {
+        eax: 0,
+        ebx: 0,
+        ecx: 0,
+        edx: 0,
+    };
+
+    /// One of the four registers of a CPUID result.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Register {
+        /// EAX.
+        Eax,
+        /// EBX.
+        Ebx,
+        /// ECX.
+        Ecx,
+        /// EDX.
+        Edx,
+    }
+
+    impl Register {
+        /// The four registers, in the order in which CPUID results print them.
+        pub(crate) const ALL: [Self; 4] = [Self::Eax, Self::Ebx, Self::Ecx, Self::Edx];
+
+        /// Returns the register's value in `result`.
+        pub(crate) const fn of(self, result: CpuidResult) -> u32 {
+            match self {
+                Self::Eax => result.eax,
+                Self::Ebx => result.ebx,
+                Self::Ecx => result.ecx,
+                Self::Edx => result.edx,
+            }
+        }
+
+        /// Returns the register's name, such as `EAX`.
+        pub(crate) const fn name(self) -> &'static str {
+            match self {
+                Self::Eax => "EAX",
+                Self::Ebx => "EBX",
+                Self::Ecx => "ECX",
+                Self::Edx => "EDX",
+            }
+        }
+    }
+
     /// Basic leaf whose EAX is the highest basic leaf.
     pub(crate) const LEAF_MAXIMUM: u32 = 0;
     /// Basic leaf of the processor's signature and feature flags.
@@ -77,6 +127,31 @@ pub(crate) mod cpuid {
     /// Returns whether bit `bit` of `register` is set.
     pub(crate) const fn bit(register: u32, bit: u32) -> bool {
         (register >> bit) & 1 != 0
+    }
+
+    /// Formats the registers of `result` as eight hexadecimal digits each, EAX first, between
+    /// `separator`s.
+    pub(crate) fn hex_registers(result: CpuidResult, separator: &str) -> String {
+        Register::ALL
+            .map(|register| format!("{:08x}", register.of(result)))
+            .join(separator)
+    }
+
+    /// Returns the twelve-character signature that EBX, ECX, and EDX of `result` spell, as the
+    /// hypervisor leaves hold a vendor's, with each byte that is not printable ASCII shown as a
+    /// period.
+    pub(crate) fn signature(result: CpuidResult) -> String {
+        [result.ebx, result.ecx, result.edx]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .map(|byte| {
+                if byte == b' ' || byte.is_ascii_graphic() {
+                    char::from(byte)
+                } else {
+                    '.'
+                }
+            })
+            .collect()
     }
 
     /// The processor's display family, display model, and stepping, which leaf 1's EAX encodes.
@@ -147,12 +222,20 @@ pub(crate) mod msr {
     pub(crate) const KVM_SYSTEM_TIME_NEW: u32 = 0x4b56_4d01;
 }
 
-/// Runs `CPUID` with `leaf` and `subleaf` and returns EAX, EBX, ECX, and EDX.
+/// Runs `CPUID` with `leaf` and `subleaf`.
 #[allow(unused_unsafe)]
-pub(crate) fn cpuid(leaf: u32, subleaf: u32) -> [u32; 4] {
+pub(crate) fn cpuid(leaf: u32, subleaf: u32) -> CpuidResult {
     // SAFETY: CPUID executes in user mode on every x86-64 processor and accesses no memory.
-    let CpuidResult { eax, ebx, ecx, edx } = unsafe { __cpuid_count(leaf, subleaf) };
-    [eax, ebx, ecx, edx]
+    unsafe { __cpuid_count(leaf, subleaf) }
+}
+
+/// Returns whether the processor has `RDTSCP`, which CPUID leaf 0x80000001 EDX bit 27 reports.
+pub(crate) fn has_rdtscp() -> bool {
+    cpuid(cpuid::LEAF_EXTENDED_MAXIMUM, 0).eax >= cpuid::LEAF_EXTENDED_FEATURES
+        && cpuid::bit(
+            cpuid(cpuid::LEAF_EXTENDED_FEATURES, 0).edx,
+            cpuid::EXTENDED_FEATURES_EDX_RDTSCP,
+        )
 }
 
 /// Reads the time-stamp counter without a fence.
@@ -165,13 +248,13 @@ pub(crate) fn rdtsc() -> u64 {
 
 /// Reads the time-stamp counter with `RDTSCP`, which waits for the preceding instructions.
 ///
-/// On a processor without the instruction, which CPUID leaf 0x80000001 EDX bit 27 reports, it
-/// raises the same invalid-opcode fault as the C probe did, so callers check the bit first.
+/// On a processor without the instruction, it raises the same invalid-opcode fault as the C
+/// probe did, so callers check [`has_rdtscp`] first.
 #[inline]
 #[allow(unused_unsafe)]
 pub(crate) fn rdtscp() -> u64 {
     let mut processor = 0;
-    // SAFETY: the callers checked the CPUID bit, and `processor` is writable for the call.
+    // SAFETY: the callers checked `has_rdtscp`, and `processor` is writable for the call.
     unsafe { __rdtscp(&mut processor) }
 }
 
@@ -220,13 +303,7 @@ mod tests {
             first <= second && second <= third,
             "{first} {second} {third}"
         );
-        let maximum = cpuid(cpuid::LEAF_EXTENDED_MAXIMUM, 0)[0];
-        if maximum >= cpuid::LEAF_EXTENDED_FEATURES
-            && cpuid::bit(
-                cpuid(cpuid::LEAF_EXTENDED_FEATURES, 0)[3],
-                cpuid::EXTENDED_FEATURES_EDX_RDTSCP,
-            )
-        {
+        if has_rdtscp() {
             assert!(rdtscp() >= third);
         }
     }
@@ -234,8 +311,10 @@ mod tests {
     #[test]
     fn cpuid_reports_the_time_stamp_counter() {
         let features = cpuid(cpuid::LEAF_FEATURES, 0);
-        assert!(cpuid::bit(features[3], cpuid::FEATURES_EDX_TSC));
+        assert!(cpuid::bit(features.edx, cpuid::FEATURES_EDX_TSC));
         assert!(!cpuid::bit(0, 0) && cpuid::bit(1 << 31, 31));
+        assert_eq!(cpuid::Register::Edx.of(features), features.edx);
+        assert_eq!(cpuid::Register::Ebx.name(), "EBX");
     }
 
     #[test]

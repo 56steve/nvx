@@ -1,9 +1,10 @@
 //! Owned access to Linux's per-CPU model-specific-register devices, on x86-64.
 
-use std::ffi::CString;
+use std::fs::{File, OpenOptions};
 use std::mem::size_of;
+use std::os::unix::fs::FileExt;
 
-use super::{Errno, FileDescriptor, Mode, OpenFlags, open};
+use super::{Errno, errno_of};
 
 /// Whether an MSR device opens for reading only or for reading and writing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -14,12 +15,13 @@ pub(crate) enum MsrAccess {
     ReadWrite,
 }
 
-/// An owned `/dev/cpu/N/msr` descriptor, whose file offsets are register numbers.
+/// An owned `/dev/cpu/N/msr` file, whose offsets are register numbers.
 ///
-/// The `msr` driver turns a register access that faults with `#GP` into `EIO`, which the time
-/// tools check for the registers that must fault.
+/// The standard library opens the file, close-on-exec, and reads and writes it with `pread` and
+/// `pwrite`. The `msr` driver turns a register access that faults with `#GP` into `EIO`, which the
+/// time tools check for the registers that must fault.
 #[derive(Debug)]
-pub(crate) struct MsrFile(FileDescriptor);
+pub(crate) struct MsrFile(File);
 
 impl MsrFile {
     /// Returns the path of the MSR device of `cpu`.
@@ -29,28 +31,41 @@ impl MsrFile {
 
     /// Opens the MSR device of `cpu`, which needs `CAP_SYS_RAWIO`.
     pub(crate) fn open(cpu: usize, access: MsrAccess) -> Result<Self, Errno> {
-        let path = CString::new(Self::path(cpu)).map_err(|_| Errno::EINVAL)?;
-        let access = match access {
-            MsrAccess::Read => OpenFlags::O_RDONLY,
-            MsrAccess::ReadWrite => OpenFlags::O_RDWR,
-        };
-        open(&path, access | OpenFlags::O_CLOEXEC, Mode::empty()).map(Self)
+        OpenOptions::new()
+            .read(true)
+            .write(access == MsrAccess::ReadWrite)
+            .open(Self::path(cpu))
+            .map(Self)
+            .map_err(|error| errno_of(&error))
     }
 
     /// Reads the 64-bit register `register`. A short read is `EIO`.
     pub(crate) fn read(&self, register: u32) -> Result<u64, Errno> {
         let mut bytes = [0; size_of::<u64>()];
-        match self.0.pread(&mut bytes, u64::from(register))? {
-            count if count == bytes.len() => Ok(u64::from_ne_bytes(bytes)),
-            _ => Err(Errno::EIO),
-        }
+        self.0
+            .read_exact_at(&mut bytes, u64::from(register))
+            .map_err(|error| errno_of(&error))?;
+        Ok(u64::from_ne_bytes(bytes))
     }
 
     /// Writes `value` to the 64-bit register `register`. A short write is `EIO`.
     pub(crate) fn write(&self, register: u32, value: u64) -> Result<(), Errno> {
-        match self.0.pwrite(&value.to_ne_bytes(), u64::from(register))? {
-            count if count == size_of::<u64>() => Ok(()),
-            _ => Err(Errno::EIO),
-        }
+        self.0
+            .write_all_at(&value.to_ne_bytes(), u64::from(register))
+            .map_err(|error| errno_of(&error))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Checks of the MSR device's path and the errors of a missing device.
+
+    use super::*;
+
+    #[test]
+    fn a_cpu_that_does_not_exist_has_no_msr_device() {
+        assert_eq!(MsrFile::path(3), "/dev/cpu/3/msr");
+        let error = MsrFile::open(usize::MAX, MsrAccess::Read).unwrap_err();
+        assert!(matches!(error, Errno::ENOENT | Errno::ENXIO), "{error:?}");
     }
 }

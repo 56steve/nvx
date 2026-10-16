@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use nix::sys::time::TimeSpec;
+use nix::sys::time::{TimeSpec, TimeValLike};
 use nix::time::{ClockId, ClockNanosleepFlags, clock_gettime, clock_nanosleep};
 
 use super::Errno;
@@ -45,30 +45,9 @@ impl Clock {
     }
 }
 
-/// One reading of a clock: whole seconds, and nanoseconds within the second.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct ClockTime {
-    /// Whole seconds.
-    pub(crate) seconds: i64,
-    /// Nanoseconds within the second.
-    pub(crate) nanoseconds: i64,
-}
-
-impl ClockTime {
-    /// Returns the reading in nanoseconds, wrapping as the C programs' `int64_t` arithmetic did.
-    pub(crate) fn wrapping_nanoseconds(self) -> i64 {
-        self.seconds
-            .wrapping_mul(NANOSECONDS_PER_SECOND as i64)
-            .wrapping_add(self.nanoseconds)
-    }
-}
-
 /// Reads `clock`, through the vDSO where the kernel provides one.
-pub(crate) fn clock_time(clock: Clock) -> Result<ClockTime, Errno> {
-    clock_gettime(clock.id()).map(|time| ClockTime {
-        seconds: time.tv_sec(),
-        nanoseconds: time.tv_nsec(),
-    })
+pub(crate) fn clock_time(clock: Clock) -> Result<TimeSpec, Errno> {
+    clock_gettime(clock.id())
 }
 
 /// Returns the monotonic clock in nanoseconds, wrapping as the C programs' `u64` arithmetic did.
@@ -96,8 +75,7 @@ pub(crate) fn monotonic_ms() -> Result<u64, Errno> {
 ///
 /// A deadline that has passed returns at once.
 pub(crate) fn sleep_until_monotonic(deadline_ns: i64) {
-    let per_second = NANOSECONDS_PER_SECOND as i64;
-    let deadline = TimeSpec::new(deadline_ns / per_second, deadline_ns % per_second);
+    let deadline = TimeSpec::nanoseconds(deadline_ns);
     while clock_nanosleep(
         ClockId::CLOCK_MONOTONIC,
         ClockNanosleepFlags::TIMER_ABSTIME,
@@ -171,7 +149,7 @@ mod tests {
     }
 
     #[test]
-    fn every_clock_reads_and_converts_to_nanoseconds() {
+    fn every_clock_reads_within_its_second() {
         for clock in [
             Clock::Realtime,
             Clock::Monotonic,
@@ -182,23 +160,18 @@ mod tests {
         ] {
             let time = clock_time(clock).unwrap();
             assert!(
-                (0..NANOSECONDS_PER_SECOND as i64).contains(&time.nanoseconds),
+                (0..NANOSECONDS_PER_SECOND as i64).contains(&time.tv_nsec()),
                 "{clock:?} {time:?}"
             );
         }
-        let time = ClockTime {
-            seconds: 2,
-            nanoseconds: 5,
-        };
-        assert_eq!(time.wrapping_nanoseconds(), 2_000_000_005);
     }
 
     #[test]
     fn sleeps_reach_their_deadlines() {
-        let start = clock_time(Clock::Monotonic).unwrap().wrapping_nanoseconds();
+        let start = clock_time(Clock::Monotonic).unwrap().num_nanoseconds();
         let deadline = start + 2 * NANOSECONDS_PER_MILLISECOND as i64;
         sleep_until_monotonic(deadline);
-        assert!(clock_time(Clock::Monotonic).unwrap().wrapping_nanoseconds() >= deadline);
+        assert!(clock_time(Clock::Monotonic).unwrap().num_nanoseconds() >= deadline);
         sleep_until_monotonic(start);
         let instant = Instant::now();
         sleep_once(Duration::from_millis(1));

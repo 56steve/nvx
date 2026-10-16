@@ -1,26 +1,21 @@
-//! Parsing, affinity, kernel-log access, and TSC-rate discovery.
+//! Option parsing, affinity, kernel-log access, and TSC-rate discovery.
 
-use std::ffi::CStr;
+use std::fmt;
 use std::io::Write;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use crate::guest::kernel_text::{self, KmsgRecord, SyslogLine};
 use crate::guest::parse::{parse_decimal, parse_f64};
 use crate::guest::status::CommandError;
-use crate::guest::sys::{self, Errno, Mode, OpenFlags, kernel};
+use crate::guest::sys::{self, Errno, Mode, OpenFlags, TimeValLike, kernel};
 
 use super::MAX_CPUS;
 
-/// Maximum structured `/dev/kmsg` record read by the probe.
+/// The largest structured `/dev/kmsg` record, the kernel's `CONSOLE_EXT_LOG_MAX`.
 const KMSG_RECORD_MAX: usize = 8192;
 /// Size of the buffer for the kernel's log when the kernel does not report the log's size.
 const FALLBACK_LOG_SIZE: usize = 1 << 20;
-/// Longest CPU list that the probe prints, as its C buffer held.
-const CPU_LIST_PRINT_MAX: usize = 255;
-/// Bytes of the probe's buffers for a one-line sysfs or procfs value, its NUL included.
-pub(super) const VALUE_LIMIT: usize = 64;
-/// Microseconds in a second, which scale a syslog timestamp's seconds.
-const MICROSECONDS_PER_SECOND: f64 = 1e6;
 /// Nanoseconds in a second, which scale a TSC rate's cycles.
 pub(super) const NANOSECONDS_PER_SECOND: f64 = 1e9;
 /// kHz in a MHz, and Hz in a kHz.
@@ -28,20 +23,47 @@ const THOUSAND: f64 = 1000.0;
 /// The interval over which the probe measures the TSC rate when nothing reports it.
 const MEASURE_INTERVAL: Duration = Duration::from_millis(200);
 
-#[derive(Clone, Copy)]
-/// Detected TSC frequency and the source that supplied it.
-pub(super) struct TscRate {
-    /// Cycles per second.
-    pub(super) hz: f64,
-    /// Stable source token printed in output.
-    pub(super) source: &'static str,
+/// Where the probe found the TSC rate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum TscRateSource {
+    /// The `--tsc-hz` option.
+    Option,
+    /// The kernel's `tsc_freq_khz` sysfs attribute.
+    SysfsTscFreqKhz,
+    /// The kernel log's refined TSC calibration.
+    KmsgRefined,
+    /// The kernel log's detected TSC rate.
+    KmsgDetectedTsc,
+    /// The kernel log's detected processor rate.
+    KmsgDetectedProcessor,
+    /// The first `cpu MHz` of `/proc/cpuinfo`.
+    CpuinfoCpuMhz,
+    /// A measurement against `CLOCK_MONOTONIC_RAW`.
+    MeasuredMonotonicRaw,
 }
 
-/// Parses an integer option: plain decimal, or hexadecimal after `0x` or `0X`.
-pub(super) fn parse_u64(text: &[u8]) -> Option<u64> {
-    std::ffi::CString::new(text)
-        .ok()
-        .and_then(|text| crate::guest::parse::parse_u64(&text))
+impl fmt::Display for TscRateSource {
+    /// Writes the source's stable output token.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Option => "option",
+            Self::SysfsTscFreqKhz => "sysfs-tsc_freq_khz",
+            Self::KmsgRefined => "kmsg-refined",
+            Self::KmsgDetectedTsc => "kmsg-detected-tsc",
+            Self::KmsgDetectedProcessor => "kmsg-detected-processor",
+            Self::CpuinfoCpuMhz => "cpuinfo-cpu-mhz",
+            Self::MeasuredMonotonicRaw => "measured-monotonic-raw",
+        })
+    }
+}
+
+/// Detected TSC frequency and the source that supplied it.
+#[derive(Clone, Copy)]
+pub(super) struct TscRate {
+    /// Cycles per second, zero for a measurement that could not read its clock.
+    pub(super) hz: f64,
+    /// Where the rate came from.
+    pub(super) source: TscRateSource,
 }
 
 /// Parses a positive, finite rate option, such as `--tsc-hz`, in decimal floating point.
@@ -49,24 +71,47 @@ pub(super) fn parse_rate(text: &[u8]) -> Option<f64> {
     parse_f64(text).filter(|value| *value > 0.0)
 }
 
-/// Extracts `--name=value` or `--name value` and advances `index`.
-pub(super) fn option_value<'a>(
-    arguments: &'a [&'a [u8]],
-    index: &mut usize,
-    name: &[u8],
-) -> Option<&'a [u8]> {
-    let argument = arguments[*index];
-    if !argument.starts_with(name) {
-        return None;
+/// A probe command's arguments, which it reads one option at a time.
+pub(super) struct Arguments<'a> {
+    /// The arguments not read yet.
+    rest: std::slice::Iter<'a, &'a [u8]>,
+    /// The last argument read, which the diagnostic of an invalid option or value quotes.
+    last: &'a [u8],
+}
+
+impl<'a> Arguments<'a> {
+    /// Starts reading `arguments`.
+    pub(super) fn new(arguments: &'a [&'a [u8]]) -> Self {
+        Self {
+            rest: arguments.iter(),
+            last: &[],
+        }
     }
-    if argument.get(name.len()) == Some(&b'=') {
-        return Some(&argument[name.len() + 1..]);
+
+    /// Returns the value of the option `name` when `argument` is that option: the text after
+    /// `name=`, or for exactly `name`, the next argument, which it reads.
+    pub(super) fn value(&mut self, argument: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
+        match argument.strip_prefix(name)? {
+            [] => self.next(),
+            [b'=', value @ ..] => Some(value),
+            _ => None,
+        }
     }
-    if argument.len() == name.len() && *index + 1 < arguments.len() {
-        *index += 1;
-        return Some(arguments[*index]);
+
+    /// Returns the last argument read.
+    pub(super) fn last_read(&self) -> &'a [u8] {
+        self.last
     }
-    None
+}
+
+impl<'a> Iterator for Arguments<'a> {
+    type Item = &'a [u8];
+
+    /// Reads the next argument.
+    fn next(&mut self) -> Option<Self::Item> {
+        self.last = self.rest.next()?;
+        Some(self.last)
+    }
 }
 
 /// Prints the byte-exact invalid-option diagnostic and fails with the usage status.
@@ -84,263 +129,153 @@ pub(super) fn bad_option(command: &[u8], argument: &[u8], err: &mut dyn Write) -
     CommandError::Usage
 }
 
-/// Returns CPUs in the calling thread's affinity mask.
+/// Returns the CPUs in the calling thread's affinity mask.
 pub(super) fn affinity_cpus() -> Result<Vec<usize>, Errno> {
-    sys::current_affinity().map(|set| {
-        let mut cpus = set.cpus();
-        cpus.truncate(MAX_CPUS);
-        cpus
-    })
+    sys::current_affinity().map(|set| set.cpus())
 }
 
-/// Verifies every requested CPU belongs to the affinity mask.
-pub(super) fn check_cpus_allowed(command: &[u8], cpus: &[usize], err: &mut dyn Write) -> bool {
-    let allowed = match sys::current_affinity() {
-        Ok(allowed) => allowed,
-        Err(error) => {
-            sys::report(
-                err,
-                &[
-                    b"nvx-time-probe ",
-                    command,
-                    b": sched_getaffinity: ",
-                    error.desc().as_bytes(),
-                    b"\n",
-                ],
-            );
-            return false;
-        }
-    };
-    for &cpu in cpus {
-        if !allowed.contains(cpu) {
-            sys::report(
-                err,
-                &[
-                    b"nvx-time-probe ",
-                    command,
-                    format!(": cpu {cpu} is not in the affinity mask (offline or excluded)\n")
-                        .as_bytes(),
-                ],
-            );
-            return false;
+/// Checks that each of `cpus` is in the calling thread's affinity mask, and reports the first
+/// that is not, or the mask's error, as a usage error.
+pub(super) fn check_cpus_allowed(
+    command: &[u8],
+    cpus: &[usize],
+    err: &mut dyn Write,
+) -> Result<(), CommandError> {
+    let allowed = sys::current_affinity().map_err(|error| {
+        sys::report(
+            err,
+            &[
+                b"nvx-time-probe ",
+                command,
+                b": sched_getaffinity: ",
+                error.desc().as_bytes(),
+                b"\n",
+            ],
+        );
+        CommandError::Usage
+    })?;
+    match cpus.iter().find(|&&cpu| !allowed.contains(cpu)) {
+        None => Ok(()),
+        Some(cpu) => {
+            let detail = format!(": cpu {cpu} is not in the affinity mask (offline or excluded)\n");
+            sys::report(err, &[b"nvx-time-probe ", command, detail.as_bytes()]);
+            Err(CommandError::Usage)
         }
     }
-    true
 }
 
-/// Parses one CPU number of a CPU list, below `MAX_CPUS`.
-fn parse_cpu(text: &[u8]) -> Option<usize> {
-    parse_decimal(text)
-        .and_then(|cpu| usize::try_from(cpu).ok())
-        .filter(|cpu| *cpu < MAX_CPUS)
-}
-
-/// Parses a comma-separated list of CPUs and CPU ranges, such as `0-3,6`, in plain decimal,
-/// that names each CPU at most once.
+/// Parses a CPU list, such as `0-3,6`, that names each CPU below `MAX_CPUS` at most once, into
+/// its CPUs in the list's order.
 pub(super) fn parse_cpu_list(text: &[u8]) -> Option<Vec<usize>> {
-    let mut cpus = Vec::new();
-    if text.is_empty() {
-        return Some(cpus);
+    let ranges = kernel_text::parse_cpu_list(text)?;
+    if ranges.iter().any(|range| *range.end() >= MAX_CPUS) {
+        return None;
     }
-    for item in text.split(|byte| *byte == b',') {
-        let (first, last) = match item.iter().position(|byte| *byte == b'-') {
-            Some(dash) => (parse_cpu(&item[..dash])?, parse_cpu(&item[dash + 1..])?),
-            None => {
-                let cpu = parse_cpu(item)?;
-                (cpu, cpu)
-            }
-        };
-        if last < first {
+    let mut cpus = Vec::new();
+    for cpu in ranges.into_iter().flatten() {
+        if cpus.contains(&cpu) {
             return None;
         }
-        for cpu in first..=last {
-            if cpus.contains(&cpu) {
-                return None;
-            }
-            cpus.push(cpu);
-        }
+        cpus.push(cpu);
     }
     Some(cpus)
 }
 
-/// Compresses sorted CPU numbers into comma/range syntax.
+/// Formats CPU numbers in the CPU-list syntax, with each run of consecutive CPUs as a range.
 pub(super) fn format_cpu_list(cpus: &[usize]) -> String {
-    let mut output = String::new();
-    let mut index = 0;
-    while index < cpus.len() {
-        let first = cpus[index];
-        let mut last = first;
-        while index + 1 < cpus.len() && cpus[index + 1] == last + 1 {
-            index += 1;
-            last = cpus[index];
-        }
-        if !output.is_empty() {
-            output.push(',');
-        }
-        output.push_str(&first.to_string());
-        if last != first {
-            output.push('-');
-            output.push_str(&last.to_string());
-        }
-        index += 1;
-    }
-    output.truncate(CPU_LIST_PRINT_MAX);
-    output
+    cpus.chunk_by(|first, second| first + 1 == *second)
+        .map(|run| match (run.first(), run.last()) {
+            (Some(first), Some(last)) if first != last => format!("{first}-{last}"),
+            (Some(cpu), _) => cpu.to_string(),
+            (None, _) => String::new(),
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
-/// Reads the whole of a procfs or sysfs file.
-pub(super) fn read_file(path: &CStr) -> Result<Vec<u8>, Errno> {
-    let mut file = sys::open(
-        path,
-        OpenFlags::O_RDONLY | OpenFlags::O_CLOEXEC,
-        Mode::empty(),
-    )?;
-    let mut text = Vec::new();
-    std::io::Read::read_to_end(&mut file, &mut text).map_err(|error| sys::errno_of(&error))?;
-    Ok(text)
-}
-
-/// Reads the first line of a file, at most `limit - 1` bytes of it, as the C probe read into a
-/// `limit`-byte buffer with room for its NUL.
-pub(super) fn read_first_line(path: &CStr, limit: usize) -> Result<Vec<u8>, Errno> {
-    let text = read_file(path)?;
-    let line = text.split(|byte| *byte == b'\n').next().unwrap_or_default();
-    Ok(line[..line.len().min(limit.saturating_sub(1))].to_vec())
-}
-
-/// Reads the whole of a procfs or sysfs file, or nothing when it cannot be read.
-pub(super) fn read_or_empty(path: &CStr) -> Vec<u8> {
-    read_file(path).unwrap_or_default()
-}
-
-/// Parses a decimal number in the form in which the kernel prints rates and times, such as
-/// `2194.843` or a syslog timestamp's `    3.000000`: digits with an optional fraction, after
-/// optional spaces and tabs.
+/// Parses a decimal number in the form in which the kernel prints rates, such as `2194.843`:
+/// digits with an optional fraction, after optional spaces and tabs.
 fn parse_kernel_decimal(text: &[u8]) -> Option<f64> {
-    let start = text
-        .iter()
-        .position(|byte| !matches!(byte, b' ' | b'\t'))
-        .unwrap_or(text.len());
-    let number = &text[start..];
-    let (whole, fraction) = match number.iter().position(|byte| *byte == b'.') {
-        Some(dot) => (&number[..dot], &number[dot + 1..]),
-        None => (number, &[][..]),
-    };
-    if whole.is_empty() || !whole.iter().chain(fraction).all(u8::is_ascii_digit) {
+    let number = std::str::from_utf8(text)
+        .ok()?
+        .trim_start_matches([' ', '\t']);
+    let (whole, fraction) = number.split_once('.').unwrap_or((number, ""));
+    let digits = |part: &str| part.bytes().all(|byte| byte.is_ascii_digit());
+    if whole.is_empty() || !digits(whole) || !digits(fraction) {
         return None;
     }
-    parse_f64(number)
+    parse_f64(number.as_bytes())
 }
 
-/// Iterates structured nonblocking `/dev/kmsg` records.
-fn kmsg_from_dev(mut consume: impl FnMut(u64, &[u8])) -> Result<(), Errno> {
+/// Iterates the records of the nonblocking `/dev/kmsg`, skipping those that the kernel overwrote
+/// before the probe read them. Fails with the error that ended the reading when it read no
+/// record, such as `EAGAIN` for a log without records.
+fn kmsg_from_dev(mut consume: impl FnMut(KmsgRecord<'_>)) -> Result<(), Errno> {
     let log = sys::open(
         kernel::KERNEL_LOG_DEVICE,
         OpenFlags::O_RDONLY | OpenFlags::O_NONBLOCK | OpenFlags::O_CLOEXEC,
         Mode::empty(),
     )?;
     let mut count = 0;
-    let mut record = [0_u8; KMSG_RECORD_MAX];
+    let mut buffer = [0_u8; KMSG_RECORD_MAX];
     let error = loop {
-        let read = match log.read(&mut record[..KMSG_RECORD_MAX - 1]) {
+        let read = match log.read(&mut buffer) {
             Ok(0) => break Errno::ENODATA,
             Ok(read) => read,
             // A record that the kernel overwrote is skipped, as the C probe skipped it.
             Err(Errno::EINTR | Errno::EPIPE) => continue,
             Err(error) => break error,
         };
-        let record = &record[..read];
-        let Some(semicolon) = record.iter().position(|byte| *byte == b';') else {
-            continue;
-        };
-        // A record's fields are its priority, sequence number, and microseconds since boot.
-        let timestamp = record[..semicolon]
-            .split(|byte| *byte == b',')
-            .nth(2)
-            .map_or(0, parse_decimal_prefix);
-        let message = &record[semicolon + 1..];
-        let end = message
-            .iter()
-            .position(|byte| *byte == b'\n')
-            .unwrap_or(message.len());
-        consume(timestamp, &message[..end]);
-        count += 1;
+        if let Some(record) = KmsgRecord::parse(&buffer[..read]) {
+            consume(record);
+            count += 1;
+        }
     };
     if count > 0 { Ok(()) } else { Err(error) }
 }
 
-/// Parses the leading decimal portion of a kernel-log metadata field.
-fn parse_decimal_prefix(text: &[u8]) -> u64 {
-    let digits = text
-        .iter()
-        .position(|byte| !byte.is_ascii_digit())
-        .unwrap_or(text.len());
-    text[..digits].iter().fold(0_u64, |value, &byte| {
-        value
-            .saturating_mul(10)
-            .saturating_add(u64::from(byte - b'0'))
-    })
-}
-
-/// Iterates the complete syslog buffer when `/dev/kmsg` yields no records.
-fn kmsg_from_syslog(mut consume: impl FnMut(u64, &[u8])) -> Result<(), Errno> {
-    let size = sys::kernel::kernel_log_size()
+/// Iterates the lines of the whole `syslog(2)` buffer, which the probe reads when `/dev/kmsg`
+/// yields no records.
+fn kmsg_from_syslog(mut consume: impl FnMut(KmsgRecord<'_>)) -> Result<(), Errno> {
+    let size = kernel::kernel_log_size()
         .ok()
         .filter(|size| *size > 0)
         .unwrap_or(FALLBACK_LOG_SIZE);
     let mut buffer = Vec::new();
     buffer.try_reserve_exact(size).map_err(|_| Errno::ENOMEM)?;
     buffer.resize(size, 0);
-    let count = sys::kernel::read_kernel_log(&mut buffer)?;
-    for line in buffer[..count].split(|byte| *byte == b'\n') {
-        if line.is_empty() {
-            continue;
-        }
-        let mut message = line;
-        if message.first() == Some(&b'<')
-            && let Some(close) = message.iter().position(|byte| *byte == b'>')
-        {
-            message = &message[close + 1..];
-        }
-        let mut usec = 0;
-        if message.first() == Some(&b'[')
-            && let Some(close) = message.iter().position(|byte| *byte == b']')
-        {
-            if let Some(seconds) = parse_kernel_decimal(&message[1..close]) {
-                usec = (seconds * MICROSECONDS_PER_SECOND + 0.5) as u64;
-            }
-            message = &message[close + 1..];
-            if message.first() == Some(&b' ') {
-                message = &message[1..];
-            }
-        }
-        consume(usec, message);
+    let count = kernel::read_kernel_log(&mut buffer)?;
+    for line in buffer[..count]
+        .split(|&byte| byte == b'\n')
+        .filter(|line| !line.is_empty())
+    {
+        let line = SyslogLine::parse(line);
+        consume(KmsgRecord {
+            timestamp_us: line.timestamp_us,
+            message: line.message,
+        });
     }
     Ok(())
 }
 
 /// Iterates kernel messages, preferring structured `/dev/kmsg`.
-pub(super) fn kmsg_foreach(mut consume: impl FnMut(u64, &[u8])) -> Result<(), Errno> {
-    if kmsg_from_dev(&mut consume).is_ok() {
-        Ok(())
-    } else {
-        kmsg_from_syslog(consume)
-    }
+pub(super) fn kmsg_foreach(mut consume: impl FnMut(KmsgRecord<'_>)) -> Result<(), Errno> {
+    kmsg_from_dev(&mut consume).or_else(|_| kmsg_from_syslog(consume))
 }
 
 /// Reads `/proc/cpuinfo` once, as raw bytes, which are empty when it cannot be read.
 fn cpuinfo() -> &'static [u8] {
     static TEXT: OnceLock<Vec<u8>> = OnceLock::new();
-    TEXT.get_or_init(|| read_or_empty(kernel::CPU_INFORMATION))
+    TEXT.get_or_init(|| sys::read_file(kernel::CPU_INFORMATION).unwrap_or_default())
 }
 
 /// Returns the value of the first `/proc/cpuinfo` line whose key starts with `key`.
 fn cpuinfo_value(key: &[u8]) -> Option<&'static [u8]> {
     cpuinfo()
-        .split(|byte| *byte == b'\n')
+        .split(|&byte| byte == b'\n')
         .filter(|line| line.starts_with(key))
         .find_map(|line| {
-            let colon = line.iter().position(|byte| *byte == b':')?;
+            let colon = line.iter().position(|&byte| byte == b':')?;
             Some(&line[colon + 1..])
         })
 }
@@ -364,45 +299,38 @@ pub(super) fn cpuinfo_has_flag(flag: &[u8]) -> bool {
     cpu_flags().iter().any(|word| word == flag)
 }
 
-/// Returns the first cpuinfo MHz value, or zero.
-fn cpuinfo_mhz() -> f64 {
+/// Returns the first positive cpuinfo MHz value.
+fn cpuinfo_mhz() -> Option<f64> {
     cpuinfo_value(b"cpu MHz")
         .and_then(parse_kernel_decimal)
-        .unwrap_or(0.0)
+        .filter(|&mhz| mhz > 0.0)
 }
 
-/// Parses an MHz value between a kernel-message prefix and suffix, or returns zero.
-fn mhz_after(text: &[u8], prefix: &[u8], suffix: &[u8]) -> f64 {
-    let Some(start) = find(text, prefix).map(|start| start + prefix.len()) else {
-        return 0.0;
-    };
+/// Returns the positive MHz value between a kernel message's `prefix` and `suffix`.
+fn mhz_after(text: &[u8], prefix: &[u8], suffix: &[u8]) -> Option<f64> {
+    let start = kernel_text::find(text, prefix)? + prefix.len();
     let value = &text[start..];
-    find(value, suffix)
-        .and_then(|end| parse_kernel_decimal(&value[..end]))
-        .unwrap_or(0.0)
+    let end = kernel_text::find(value, suffix)?;
+    parse_kernel_decimal(&value[..end]).filter(|&mhz| mhz > 0.0)
 }
 
-/// Finds the first byte-exact occurrence of `needle`.
-fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
-}
-
-/// Converts MHz to rounded kHz and then to hertz like the C probe.
+/// Converts MHz to whole kHz, rounded, and then to hertz, as the C probe did.
 fn mhz_to_hz(mhz: f64) -> f64 {
-    (mhz * THOUSAND + 0.5) as u64 as f64 * THOUSAND
+    (mhz * THOUSAND).round() * THOUSAND
 }
 
-/// Measures the TSC rate against the raw monotonic clock over `interval`.
+/// Measures the TSC rate against the raw monotonic clock over `interval`, or returns zero when
+/// the clock cannot be read.
 pub(super) fn measure_tsc_hz(interval: Duration) -> f64 {
-    let first = sys::clock_time(sys::Clock::MonotonicRaw).unwrap_or_default();
+    let first = sys::clock_time(sys::Clock::MonotonicRaw);
     let t0 = sys::x86::rdtsc_fenced();
     sys::sleep_once(interval);
-    let second = sys::clock_time(sys::Clock::MonotonicRaw).unwrap_or_default();
+    let second = sys::clock_time(sys::Clock::MonotonicRaw);
     let t1 = sys::x86::rdtsc_fenced();
-    let ns = (second.seconds - first.seconds) as f64 * NANOSECONDS_PER_SECOND
-        + (second.nanoseconds - first.nanoseconds) as f64;
+    let (Ok(first), Ok(second)) = (first, second) else {
+        return 0.0;
+    };
+    let ns = (second - first).num_nanoseconds() as f64;
     if ns > 0.0 {
         t1.wrapping_sub(t0) as f64 * NANOSECONDS_PER_SECOND / ns
     } else {
@@ -410,70 +338,73 @@ pub(super) fn measure_tsc_hz(interval: Duration) -> f64 {
     }
 }
 
-/// Detects TSC rate in option, sysfs, kernel-log, cpuinfo, then measured order.
-pub(super) fn detect_tsc_rate(override_hz: f64) -> TscRate {
-    if override_hz > 0.0 {
-        return TscRate {
-            hz: override_hz,
-            source: "option",
-        };
-    }
-    if let Ok(line) = read_first_line(kernel::TSC_FREQUENCY_KHZ, VALUE_LIMIT)
-        && let Some(khz) = parse_decimal(&line).filter(|value| *value > 0)
-    {
-        return TscRate {
-            hz: khz as f64 * THOUSAND,
-            source: "sysfs-tsc_freq_khz",
-        };
-    }
-    let mut refined = 0.0;
-    let mut detected_tsc = 0.0;
-    let mut detected_cpu = 0.0;
-    let _ = kmsg_foreach(|_, text| {
-        let value = mhz_after(text, b"Refined TSC clocksource calibration: ", b" MHz");
-        if value > 0.0 {
-            refined = value;
-            return;
-        }
-        let value = mhz_after(text, b"tsc: Detected ", b" MHz TSC");
-        if value > 0.0 {
-            detected_tsc = value;
-            return;
-        }
-        let value = mhz_after(text, b"tsc: Detected ", b" MHz processor");
-        if value > 0.0 {
-            detected_cpu = value;
-        }
-    });
-    for (mhz, source) in [
-        (refined, "kmsg-refined"),
-        (detected_tsc, "kmsg-detected-tsc"),
-        (detected_cpu, "kmsg-detected-processor"),
-    ] {
-        if mhz > 0.0 {
-            return TscRate {
-                hz: mhz_to_hz(mhz),
-                source,
-            };
-        }
-    }
-    let mhz = cpuinfo_mhz();
-    if !cpuinfo_has_flag(b"aperfmperf") && mhz > 0.0 {
-        return TscRate {
-            hz: mhz_to_hz(mhz),
-            source: "cpuinfo-cpu-mhz",
-        };
-    }
-    TscRate {
-        hz: measure_tsc_hz(MEASURE_INTERVAL),
-        source: "measured-monotonic-raw",
-    }
+/// Returns the TSC rate that the kernel exposes in sysfs, when it does.
+fn sysfs_tsc_rate() -> Option<TscRate> {
+    let khz = parse_decimal(&sys::read_line(kernel::TSC_FREQUENCY_KHZ).ok()?)?;
+    (khz > 0).then_some(TscRate {
+        hz: khz as f64 * THOUSAND,
+        source: TscRateSource::SysfsTscFreqKhz,
+    })
 }
 
-/// Reads the active clocksource token.
+/// Returns the TSC rate that the kernel logged: its last refined calibration, or else its last
+/// detected TSC rate, or else its last detected processor rate.
+fn kmsg_tsc_rate() -> Option<TscRate> {
+    let (mut refined, mut tsc, mut processor) = (None, None, None);
+    let _ = kmsg_foreach(|record| {
+        let text = record.message;
+        if let Some(mhz) = mhz_after(text, b"Refined TSC clocksource calibration: ", b" MHz") {
+            refined = Some(mhz);
+        } else if let Some(mhz) = mhz_after(text, b"tsc: Detected ", b" MHz TSC") {
+            tsc = Some(mhz);
+        } else if let Some(mhz) = mhz_after(text, b"tsc: Detected ", b" MHz processor") {
+            processor = Some(mhz);
+        }
+    });
+    [
+        (refined, TscRateSource::KmsgRefined),
+        (tsc, TscRateSource::KmsgDetectedTsc),
+        (processor, TscRateSource::KmsgDetectedProcessor),
+    ]
+    .into_iter()
+    .find_map(|(mhz, source)| {
+        mhz.map(|mhz| TscRate {
+            hz: mhz_to_hz(mhz),
+            source,
+        })
+    })
+}
+
+/// Returns the rate of `/proc/cpuinfo`'s first `cpu MHz`, unless the `aperfmperf` flag shows that
+/// the processor's frequency varies.
+fn cpuinfo_tsc_rate() -> Option<TscRate> {
+    let mhz = cpuinfo_mhz()?;
+    (!cpuinfo_has_flag(b"aperfmperf")).then(|| TscRate {
+        hz: mhz_to_hz(mhz),
+        source: TscRateSource::CpuinfoCpuMhz,
+    })
+}
+
+/// Detects the TSC rate from the `--tsc-hz` option, then sysfs, then the kernel log, then
+/// cpuinfo, and measures it as a last resort.
+pub(super) fn detect_tsc_rate(override_hz: Option<f64>) -> TscRate {
+    override_hz
+        .map(|hz| TscRate {
+            hz,
+            source: TscRateSource::Option,
+        })
+        .or_else(sysfs_tsc_rate)
+        .or_else(kmsg_tsc_rate)
+        .or_else(cpuinfo_tsc_rate)
+        .unwrap_or_else(|| TscRate {
+            hz: measure_tsc_hz(MEASURE_INTERVAL),
+            source: TscRateSource::MeasuredMonotonicRaw,
+        })
+}
+
+/// Reads the active clocksource, or `unknown`.
 pub(super) fn current_clocksource() -> Vec<u8> {
-    read_first_line(kernel::CURRENT_CLOCKSOURCE, VALUE_LIMIT)
-        .unwrap_or_else(|_| b"unknown".to_vec())
+    sys::read_line(kernel::CURRENT_CLOCKSOURCE).unwrap_or_else(|_| b"unknown".to_vec())
 }
 
 /// Converts TSC cycles to nanoseconds using `rate`.
@@ -493,12 +424,15 @@ pub(super) fn round_ll(value: f64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::guest::parse::parse_u64;
 
     #[test]
     fn cpu_lists_reject_duplicates_and_format_ranges() {
         assert_eq!(parse_cpu_list(b"0-3,6"), Some(vec![0, 1, 2, 3, 6]));
         assert_eq!(parse_cpu_list(b""), Some(Vec::new()));
         assert_eq!(format_cpu_list(&[0, 1, 2, 3, 6]), "0-3,6");
+        assert_eq!(format_cpu_list(&[6, 0, 1]), "6,0-1");
+        assert_eq!(format_cpu_list(&[]), "");
         for list in [
             &b"0,0"[..],
             b"3-1",
@@ -528,6 +462,22 @@ mod tests {
     }
 
     #[test]
+    fn options_take_inline_or_following_values() {
+        let arguments: [&[u8]; 4] = [b"--batch=5", b"--cpu", b"3", b"--cpu"];
+        let mut arguments = Arguments::new(&arguments);
+        let first = arguments.next().unwrap();
+        assert_eq!(arguments.value(first, b"--cpu"), None);
+        assert_eq!(arguments.value(first, b"--batch"), Some(&b"5"[..]));
+        let second = arguments.next().unwrap();
+        assert_eq!(arguments.value(second, b"--cpu"), Some(&b"3"[..]));
+        assert_eq!(arguments.last_read(), b"3");
+        let third = arguments.next().unwrap();
+        assert_eq!(arguments.value(third, b"--cpu"), None);
+        assert_eq!(arguments.last_read(), b"--cpu");
+        assert_eq!(arguments.next(), None);
+    }
+
+    #[test]
     fn kernel_numbers_are_read_in_the_kernels_form() {
         assert_eq!(parse_kernel_decimal(b" 2194.843"), Some(2194.843));
         assert_eq!(parse_kernel_decimal(b"    3.000000"), Some(3.0));
@@ -541,7 +491,7 @@ mod tests {
                 b"tsc: Detected ",
                 b" MHz processor"
             ),
-            2194.843
+            Some(2194.843)
         );
         assert_eq!(
             mhz_after(
@@ -549,10 +499,23 @@ mod tests {
                 b"tsc: Detected ",
                 b" MHz processor"
             ),
-            0.0
+            None
+        );
+        assert_eq!(
+            mhz_after(b"tsc: Detected 0 MHz TSC", b"tsc: Detected ", b" MHz TSC"),
+            None
         );
         assert_eq!(mhz_to_hz(2194.843), 2_194_843_000.0);
-        assert_eq!(parse_decimal_prefix(b"1234,-"), 1234);
+    }
+
+    #[test]
+    fn rate_sources_print_their_tokens() {
+        assert_eq!(
+            TscRateSource::SysfsTscFreqKhz.to_string(),
+            "sysfs-tsc_freq_khz"
+        );
+        let rate = detect_tsc_rate(Some(2.5e9));
+        assert_eq!((rate.hz, rate.source), (2.5e9, TscRateSource::Option));
     }
 
     #[test]

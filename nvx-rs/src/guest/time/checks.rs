@@ -2,29 +2,30 @@
 
 use std::io::Write;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use super::Phase;
+use super::cpu_mask::CpuMask;
 use super::decoders::{self, CpuInfo, ZERO_HYPERV_LEAVES};
-use super::events::{DETAIL_MAX, escape_text};
-use super::state::TimeState;
+use super::events::{CheckId, DETAIL_MAX, ViolationCode, escape_text};
+use super::state::{CheckState, CheckStatus, TimeState};
 use super::system::{
-    COMMAND_LINE_LIMIT, CPU_LIST_LIMIT, DAEMON_PID_PATH, DEFAULT_STALL_TIMEOUT_S, MsrDescriptor,
-    Runtime, clock_ns, msr_error, rates_load, read_file, read_i64, read_text, state_apply,
-    state_load,
+    DAEMON_PID_PATH, DEFAULT_STALL_TIMEOUT_S, MsrDescriptor, Runtime, msr_error, rates_load,
+    state_apply, state_load,
 };
-use super::{MAX_CPUS, NSEC_PER_MSEC, NSEC_PER_SEC, Phase};
 use crate::guest::status::CommandError;
-use crate::guest::sys::x86::{cpuid, msr};
+use crate::guest::sys::x86::cpuid::{self, Register};
+use crate::guest::sys::x86::{CpuidResult, msr};
 use crate::guest::sys::{self, Errno, MsrAccess, MsrFile, ProcessId, kernel};
 
-/// Maximum timer-list convergence wait during boot.
-const TIMER_LIST_WAIT_NS: i64 = 200 * NSEC_PER_MSEC;
+/// Maximum timer-list convergence wait during boot and restore.
+pub(crate) const TIMER_LIST_WAIT: Duration = Duration::from_millis(200);
 /// Poll interval while the timer list converges.
 const TIMER_LIST_POLL: Duration = Duration::from_millis(10);
 /// Maximum wait for persisted phase checks to complete.
-const STATUS_WAIT_NS: i64 = 30 * NSEC_PER_SEC;
+const STATUS_WAIT: Duration = Duration::from_secs(30);
 /// Poll interval while waiting for persisted checks.
-const STATUS_POLL_NS: i64 = 10 * NSEC_PER_MSEC;
+const STATUS_POLL: Duration = Duration::from_millis(10);
 /// Hz in a kHz, which `/proc/cpuinfo`'s rates use.
 const HZ_PER_KHZ: u64 = 1000;
 /// The process ID of init, which never runs the daemon.
@@ -88,23 +89,14 @@ const EXHAUSTIVE_CHECKS: [&str; 6] = ["X1", "X2", "X3", "X4", "X5", "X6"];
 /// The IDs of the exhaustive subchecks that read MSRs.
 const EXHAUSTIVE_MSR_CHECKS: [&str; 4] = ["X3", "X4", "X5", "X6"];
 
-/// The names of CPUID's four result registers, in the order that `cpuid` returns them.
-const REGISTERS: [&str; 4] = ["EAX", "EBX", "ECX", "EDX"];
-/// Position of EBX in a CPUID result.
-const EBX: usize = 1;
-/// Position of ECX in a CPUID result.
-const ECX: usize = 2;
-/// Position of EDX in a CPUID result.
-const EDX: usize = 3;
-
 /// One CPUID feature bit that the time ABI requires set or clear.
 struct FeatureBit {
     /// The leaf that holds the bit.
     leaf: u32,
     /// The subleaf, for a leaf that has subleaves.
     subleaf: Option<u32>,
-    /// The position of the register in the CPUID result.
-    register: usize,
+    /// The register of the CPUID result that holds the bit.
+    register: Register,
     /// The bit's number.
     bit: u32,
     /// The feature's name, which the diagnostic gives.
@@ -121,7 +113,10 @@ impl FeatureBit {
             .map_or_else(String::new, |subleaf| format!(".{subleaf}"));
         format!(
             "CPUID.{:X}{subleaf}:{}[{}] ({})",
-            self.leaf, REGISTERS[self.register], self.bit, self.name
+            self.leaf,
+            self.register.name(),
+            self.bit,
+            self.name
         )
     }
 }
@@ -131,7 +126,7 @@ const LEAF1_TIME_BITS: [FeatureBit; 4] = [
     FeatureBit {
         leaf: cpuid::LEAF_FEATURES,
         subleaf: None,
-        register: ECX,
+        register: Register::Ecx,
         bit: cpuid::FEATURES_ECX_HYPERVISOR,
         name: "hypervisor",
         set: true,
@@ -139,7 +134,7 @@ const LEAF1_TIME_BITS: [FeatureBit; 4] = [
     FeatureBit {
         leaf: cpuid::LEAF_FEATURES,
         subleaf: None,
-        register: ECX,
+        register: Register::Ecx,
         bit: cpuid::FEATURES_ECX_TSC_DEADLINE,
         name: "TSC-deadline",
         set: false,
@@ -147,7 +142,7 @@ const LEAF1_TIME_BITS: [FeatureBit; 4] = [
     FeatureBit {
         leaf: cpuid::LEAF_FEATURES,
         subleaf: None,
-        register: ECX,
+        register: Register::Ecx,
         bit: cpuid::FEATURES_ECX_PDCM,
         name: "PDCM",
         set: false,
@@ -155,7 +150,7 @@ const LEAF1_TIME_BITS: [FeatureBit; 4] = [
     FeatureBit {
         leaf: cpuid::LEAF_FEATURES,
         subleaf: None,
-        register: EDX,
+        register: Register::Edx,
         bit: cpuid::FEATURES_EDX_TSC,
         name: "TSC",
         set: true,
@@ -165,7 +160,7 @@ const LEAF1_TIME_BITS: [FeatureBit; 4] = [
 const TSC_ADJUST_BIT: FeatureBit = FeatureBit {
     leaf: cpuid::LEAF_STRUCTURED_FEATURES,
     subleaf: Some(0),
-    register: EBX,
+    register: Register::Ebx,
     bit: cpuid::STRUCTURED_FEATURES_EBX_TSC_ADJUST,
     name: "TSC_ADJUST",
     set: false,
@@ -174,7 +169,7 @@ const TSC_ADJUST_BIT: FeatureBit = FeatureBit {
 const RDTSCP_BIT: FeatureBit = FeatureBit {
     leaf: cpuid::LEAF_EXTENDED_FEATURES,
     subleaf: None,
-    register: EDX,
+    register: Register::Edx,
     bit: cpuid::EXTENDED_FEATURES_EDX_RDTSCP,
     name: "RDTSCP",
     set: true,
@@ -188,12 +183,37 @@ const ZERO_BASIC_LEAVES: [u32; 3] = [
 ];
 
 /// Formats a CPUID result as the checks print it.
-fn registers(value: [u32; 4]) -> String {
-    format!(
-        "{:08x}:{:08x}:{:08x}:{:08x}",
-        value[0], value[1], value[2], value[3]
-    )
+fn registers(value: CpuidResult) -> String {
+    cpuid::hex_registers(value, ":")
 }
+
+/// Returns an MSR access's value, or zero, and its negative `errno`, or zero, as the
+/// diagnostics print them.
+fn value_and_error(result: &Result<u64, Errno>) -> (u64, i32) {
+    (*result.as_ref().unwrap_or(&0), msr_error(result))
+}
+
+/// One conformance failure: the check that failed, and its diagnostic.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Failure {
+    /// The check that failed.
+    id: CheckId,
+    /// The diagnostic, which the violation event escapes byte for byte.
+    detail: Vec<u8>,
+}
+
+impl Failure {
+    /// Returns the failure of check `id`, with `detail`.
+    fn new(id: CheckId, detail: impl Into<Vec<u8>>) -> Self {
+        Self {
+            id,
+            detail: detail.into(),
+        }
+    }
+}
+
+/// The outcome of one conformance check, which reports its first failure.
+pub(crate) type Verdict = Result<(), Failure>;
 
 #[derive(Clone)]
 /// Mutable evidence and failure count for one conformance-check phase.
@@ -201,13 +221,11 @@ pub(crate) struct Checks {
     /// Phase whose failures are being reported.
     pub(crate) phase: Phase,
     /// Number of failed checks.
-    pub(crate) failures: i32,
+    pub(crate) failures: usize,
     /// Number of possible CPUs.
     pub(crate) possible: usize,
-    /// Number of currently online CPUs.
-    pub(crate) online_count: usize,
-    /// Fixed online-CPU mask.
-    pub(crate) online: [bool; MAX_CPUS],
+    /// The online CPUs.
+    pub(crate) online: CpuMask,
     /// Parsed per-CPU frequency evidence.
     pub(crate) cpuinfo: CpuInfo,
     /// Validated TSC frequency.
@@ -223,27 +241,24 @@ impl Checks {
             phase,
             failures: 0,
             possible: 0,
-            online_count: 0,
-            online: [false; MAX_CPUS],
+            online: CpuMask::EMPTY,
             cpuinfo: CpuInfo::default(),
             tsc_hz: 0,
             lapic_hz: 0,
         }
     }
 
-    /// Loads and validates the possible and online CPU masks.
+    /// Loads the possible and online CPUs, which must each be a nonempty CPU list.
     pub(crate) fn load(phase: Phase) -> Result<Self, Errno> {
-        let possible = read_text(kernel::POSSIBLE_CPUS, CPU_LIST_LIMIT)?;
-        let online = read_text(kernel::ONLINE_CPUS, CPU_LIST_LIMIT)?;
-        let (_, possible_count) = decoders::parse_cpu_list(&possible).ok_or(Errno::EINVAL)?;
-        let (online, online_count) = decoders::parse_cpu_list(&online).ok_or(Errno::EINVAL)?;
-        if possible_count == 0 || online_count == 0 {
-            return Err(Errno::EINVAL);
-        }
+        let cpus = |path| {
+            let list = sys::read_line(path)?;
+            CpuMask::parse(&list)
+                .filter(|cpus| !cpus.is_empty())
+                .ok_or(Errno::EINVAL)
+        };
         Ok(Self {
-            possible: possible_count,
-            online_count,
-            online,
+            possible: cpus(kernel::POSSIBLE_CPUS)?.len(),
+            online: cpus(kernel::ONLINE_CPUS)?,
             ..Self::empty(phase)
         })
     }
@@ -252,10 +267,10 @@ impl Checks {
     pub(crate) fn fail_code(
         &mut self,
         runtime: &Runtime<'_>,
-        code: &[u8],
+        code: ViolationCode,
         detail: impl AsRef<[u8]>,
     ) -> bool {
-        self.failures = self.failures.saturating_add(1);
+        self.failures += 1;
         runtime.conformance_failure(code, self.phase, detail.as_ref());
         false
     }
@@ -264,43 +279,56 @@ impl Checks {
     pub(crate) fn fail(
         &mut self,
         runtime: &Runtime<'_>,
-        id: &str,
+        id: CheckId,
         detail: impl AsRef<[u8]>,
     ) -> bool {
-        self.fail_code(runtime, format!("G_CONFORMANCE_{id}").as_bytes(), detail)
+        self.fail_code(runtime, ViolationCode::Conformance(id), detail)
+    }
+
+    /// Records the failure of a check that failed, and returns whether it passed.
+    pub(crate) fn record(&mut self, runtime: &Runtime<'_>, verdict: Verdict) -> bool {
+        match verdict {
+            Ok(()) => true,
+            Err(Failure { id, detail }) => self.fail(runtime, id, detail),
+        }
     }
 }
 
-/// Publishes one completed phase's status, timing, failures, and rates.
+/// Publishes one completed phase's outcome, timing, failures, and rates. Report-only mode records
+/// the failures, and fails a phase that has any.
 pub(crate) fn record_check(
     runtime: &Runtime<'_>,
     checks: &Checks,
-    status: &[u8],
     elapsed_us: i64,
     cpu_us: i64,
     tsc_hz: u64,
     lapic_hz: u64,
 ) -> Result<(), Errno> {
-    let Some(index) = checks.phase.check_index() else {
+    let phase = checks.phase;
+    if phase.check_index().is_none() {
         return Err(Errno::EINVAL);
+    }
+    let failures = runtime.report_only().then_some(checks.failures as u64);
+    let status = if failures.is_some_and(|failures| failures > 0) {
+        CheckStatus::Fail
+    } else {
+        CheckStatus::Ok
     };
     state_apply(|state| {
-        let check = &mut state.checks[index];
-        check.status = status.to_vec();
-        check.cpus = checks.online_count as u64;
-        check.elapsed_us = elapsed_us;
-        check.cpu_us = cpu_us;
-        check.generation = if checks.phase == Phase::Boot {
+        let generation = if phase == Phase::Boot {
             0
         } else {
             state.generation
         };
-        check.failures = -1;
-        if runtime.report_only() {
-            check.failures = i64::from(checks.failures);
-            if checks.failures > 0 && check.status == b"ok" {
-                check.status = b"fail".to_vec();
-            }
+        if let Some(check) = state.check_mut(phase) {
+            *check = CheckState {
+                status: Some(status),
+                cpus: checks.online.len() as u64,
+                elapsed_us,
+                cpu_us,
+                generation,
+                failures,
+            };
         }
         if tsc_hz != 0 {
             state.tsc_hz = tsc_hz;
@@ -311,342 +339,268 @@ pub(crate) fn record_check(
     })
 }
 
-/// Validates the Hyper-V CPUID identity leaves on one CPU.
-fn check_identity(runtime: &Runtime<'_>, checks: &mut Checks, cpu: usize) -> bool {
-    let capacity = checks.possible as u32;
+/// Validates the Hyper-V CPUID identity leaves on one CPU, of `possible` possible CPUs.
+fn check_identity(possible: usize, cpu: usize) -> Verdict {
+    let capacity = possible as u32;
     let expected = [
-        [
-            HYPERV_MAXIMUM_LEAF,
-            HYPERV_VENDOR[0],
-            HYPERV_VENDOR[1],
-            HYPERV_VENDOR[2],
-        ],
-        [HYPERV_INTERFACE, 0, 0, 0],
-        [HYPERV_BUILD[0], HYPERV_BUILD[1], 0, 0],
-        [HYPERV_PRIVILEGES, 0, 0, HYPERV_FEATURES],
-        [0, HYPERV_NEVER_NOTIFY, 0, 0],
-        [capacity, capacity, 0, 0],
+        CpuidResult {
+            eax: HYPERV_MAXIMUM_LEAF,
+            ebx: HYPERV_VENDOR[0],
+            ecx: HYPERV_VENDOR[1],
+            edx: HYPERV_VENDOR[2],
+        },
+        CpuidResult {
+            eax: HYPERV_INTERFACE,
+            ..cpuid::ZERO
+        },
+        CpuidResult {
+            eax: HYPERV_BUILD[0],
+            ebx: HYPERV_BUILD[1],
+            ..cpuid::ZERO
+        },
+        CpuidResult {
+            eax: HYPERV_PRIVILEGES,
+            edx: HYPERV_FEATURES,
+            ..cpuid::ZERO
+        },
+        CpuidResult {
+            ebx: HYPERV_NEVER_NOTIFY,
+            ..cpuid::ZERO
+        },
+        CpuidResult {
+            eax: capacity,
+            ebx: capacity,
+            ..cpuid::ZERO
+        },
     ];
     for (leaf, expected) in (cpuid::LEAF_HYPERVISOR..).zip(expected) {
         let value = sys::x86::cpuid(leaf, 0);
         if value != expected {
-            return checks.fail(
-                runtime,
-                "C1",
+            return Err(Failure::new(
+                CheckId::C1,
                 format!(
                     "cpu {cpu} leaf 0x{leaf:08x} is {}, expected {}",
                     registers(value),
                     registers(expected)
                 ),
-            );
+            ));
         }
     }
-    for leaves in ZERO_HYPERV_LEAVES {
-        for leaf in leaves {
-            let value = sys::x86::cpuid(leaf, 0);
-            if value != [0; 4] {
-                return checks.fail(
-                    runtime,
-                    "C1",
-                    format!(
-                        "cpu {cpu} leaf 0x{leaf:08x} is {}, expected zero",
-                        registers(value)
-                    ),
-                );
-            }
+    for leaf in ZERO_HYPERV_LEAVES.into_iter().flatten() {
+        let value = sys::x86::cpuid(leaf, 0);
+        if value != cpuid::ZERO {
+            return Err(Failure::new(
+                CheckId::C1,
+                format!(
+                    "cpu {cpu} leaf 0x{leaf:08x} is {}, expected zero",
+                    registers(value)
+                ),
+            ));
         }
     }
-    true
+    Ok(())
 }
 
 /// Validates one CPUID feature bit in `value`, the result of its leaf.
-fn check_bit(
-    runtime: &Runtime<'_>,
-    checks: &mut Checks,
-    cpu: usize,
-    bit: &FeatureBit,
-    value: [u32; 4],
-) -> bool {
-    if cpuid::bit(value[bit.register], bit.bit) == bit.set {
-        true
-    } else {
-        checks.fail(
-            runtime,
-            "C2",
-            format!(
-                "cpu {cpu} {} is {}",
-                bit.label(),
-                if bit.set { "clear" } else { "set" }
-            ),
-        )
+fn check_bit(cpu: usize, bit: &FeatureBit, value: CpuidResult) -> Verdict {
+    if cpuid::bit(bit.register.of(value), bit.bit) == bit.set {
+        return Ok(());
     }
+    Err(Failure::new(
+        CheckId::C2,
+        format!(
+            "cpu {cpu} {} is {}",
+            bit.label(),
+            if bit.set { "clear" } else { "set" }
+        ),
+    ))
 }
 
 /// Validates one complete CPUID leaf value.
-fn check_leaf(
-    runtime: &Runtime<'_>,
-    checks: &mut Checks,
-    cpu: usize,
-    leaf: u32,
-    expected: [u32; 4],
-) -> bool {
+fn check_leaf(cpu: usize, leaf: u32, expected: CpuidResult) -> Verdict {
     let value = sys::x86::cpuid(leaf, 0);
     if value == expected {
-        true
-    } else {
-        checks.fail(
-            runtime,
-            "C2",
-            format!(
-                "cpu {cpu} leaf 0x{leaf:08x} is {}, expected {}",
-                registers(value),
-                registers(expected)
-            ),
-        )
+        return Ok(());
     }
+    Err(Failure::new(
+        CheckId::C2,
+        format!(
+            "cpu {cpu} leaf 0x{leaf:08x} is {}, expected {}",
+            registers(value),
+            registers(expected)
+        ),
+    ))
 }
 
 /// Validates time-related architectural and Hyper-V feature bits.
-fn check_time_bits(runtime: &Runtime<'_>, checks: &mut Checks, cpu: usize) -> bool {
-    let maximum = sys::x86::cpuid(cpuid::LEAF_MAXIMUM, 0)[0];
+fn check_time_bits(cpu: usize) -> Verdict {
+    let maximum = sys::x86::cpuid(cpuid::LEAF_MAXIMUM, 0).eax;
     let features = sys::x86::cpuid(cpuid::LEAF_FEATURES, 0);
-    if !LEAF1_TIME_BITS
-        .iter()
-        .all(|bit| check_bit(runtime, checks, cpu, bit, features))
-    {
-        return false;
+    for bit in &LEAF1_TIME_BITS {
+        check_bit(cpu, bit, features)?;
     }
     if maximum < cpuid::LEAF_POWER_MANAGEMENT {
-        return checks.fail(
-            runtime,
-            "C2",
+        return Err(Failure::new(
+            CheckId::C2,
             format!(
                 "cpu {cpu} lacks leaf {:#x} (ARAT)",
                 cpuid::LEAF_POWER_MANAGEMENT
             ),
-        );
+        ));
     }
-    let arat = [1 << cpuid::POWER_MANAGEMENT_EAX_ARAT, 0, 0, 0];
-    if !check_leaf(runtime, checks, cpu, cpuid::LEAF_POWER_MANAGEMENT, arat) {
-        return false;
-    }
+    let arat = CpuidResult {
+        eax: 1 << cpuid::POWER_MANAGEMENT_EAX_ARAT,
+        ..cpuid::ZERO
+    };
+    check_leaf(cpu, cpuid::LEAF_POWER_MANAGEMENT, arat)?;
     if maximum >= cpuid::LEAF_STRUCTURED_FEATURES {
         let structured = sys::x86::cpuid(cpuid::LEAF_STRUCTURED_FEATURES, 0);
-        if !check_bit(runtime, checks, cpu, &TSC_ADJUST_BIT, structured) {
-            return false;
-        }
+        check_bit(cpu, &TSC_ADJUST_BIT, structured)?;
     }
     for leaf in ZERO_BASIC_LEAVES {
-        if maximum >= leaf && !check_leaf(runtime, checks, cpu, leaf, [0; 4]) {
-            return false;
+        if maximum >= leaf {
+            check_leaf(cpu, leaf, cpuid::ZERO)?;
         }
     }
-    if sys::x86::cpuid(cpuid::LEAF_EXTENDED_MAXIMUM, 0)[0] < cpuid::LEAF_ADVANCED_POWER {
-        return checks.fail(
-            runtime,
-            "C2",
+    if sys::x86::cpuid(cpuid::LEAF_EXTENDED_MAXIMUM, 0).eax < cpuid::LEAF_ADVANCED_POWER {
+        return Err(Failure::new(
+            CheckId::C2,
             format!("cpu {cpu} lacks leaf {:#x}", cpuid::LEAF_ADVANCED_POWER),
-        );
+        ));
     }
     let extended = sys::x86::cpuid(cpuid::LEAF_EXTENDED_FEATURES, 0);
-    if !check_bit(runtime, checks, cpu, &RDTSCP_BIT, extended) {
-        return false;
-    }
-    let invariant_tsc = [0, 0, 0, 1 << cpuid::ADVANCED_POWER_EDX_INVARIANT_TSC];
-    check_leaf(
-        runtime,
-        checks,
-        cpu,
-        cpuid::LEAF_ADVANCED_POWER,
-        invariant_tsc,
-    )
+    check_bit(cpu, &RDTSCP_BIT, extended)?;
+    let invariant_tsc = CpuidResult {
+        edx: 1 << cpuid::ADVANCED_POWER_EDX_INVARIANT_TSC,
+        ..cpuid::ZERO
+    };
+    check_leaf(cpu, cpuid::LEAF_ADVANCED_POWER, invariant_tsc)
 }
 
-/// Validates required, rate, invariant-control, and faulting MSRs.
-fn check_msrs(runtime: &Runtime<'_>, checks: &mut Checks, cpu: usize, full: bool) -> bool {
-    let descriptor = match runtime.ops.open_msr(cpu, MsrAccess::Read) {
-        Ok(descriptor) => descriptor,
-        Err(error) => {
-            return checks.fail(
-                runtime,
-                "C3",
-                format!("cpu {cpu}: open {}: {}", MsrFile::path(cpu), error.desc()),
-            );
-        }
-    };
-    let mut ok = true;
+/// Validates one CPU's VP index MSR, CPU zero's TSC rate MSR, and, with `full`, CPU zero's
+/// LAPIC rate, invariant-control, and faulting MSRs. Records the validated rates in `checks`.
+fn check_msrs(runtime: &Runtime<'_>, checks: &mut Checks, cpu: usize, full: bool) -> Verdict {
+    let failure = |detail: String| Failure::new(CheckId::C3, format!("cpu {cpu}: {detail}"));
+    let descriptor = runtime
+        .ops
+        .open_msr(cpu, MsrAccess::Read)
+        .map_err(|error| failure(format!("open {}: {}", MsrFile::path(cpu), error.desc())))?;
+    let read = |register| runtime.ops.read_msr(&descriptor, register);
     if full {
-        let result = runtime.ops.read_msr(&descriptor, msr::HV_VP_INDEX);
-        let value = *result.as_ref().unwrap_or(&0);
-        if result.is_err() || value != cpu as u64 {
-            ok = checks.fail(
-                runtime,
-                "C3",
-                format!(
-                    "cpu {cpu}: MSR {:#010x} (VP index) is {value} (error {})",
-                    msr::HV_VP_INDEX,
-                    msr_error(&result)
-                ),
-            );
+        let index = read(msr::HV_VP_INDEX);
+        if index != Ok(cpu as u64) {
+            let (value, error) = value_and_error(&index);
+            return Err(failure(format!(
+                "MSR {:#010x} (VP index) is {value} (error {error})",
+                msr::HV_VP_INDEX
+            )));
         }
     }
     if cpu != 0 {
-        return ok;
+        return Ok(());
     }
-    if ok {
-        match runtime.ops.read_msr(&descriptor, msr::HV_TSC_FREQUENCY) {
-            Err(error) => {
-                ok = checks.fail(
-                    runtime,
-                    "C3",
-                    format!(
-                        "cpu {cpu}: MSR {:#010x} read: {}",
-                        msr::HV_TSC_FREQUENCY,
-                        error.desc()
-                    ),
-                );
-            }
-            Ok(value) if checks.tsc_hz != 0 && value != checks.tsc_hz => {
-                ok = checks.fail(
-                    runtime,
-                    "C3",
-                    format!(
-                        "cpu {cpu}: MSR {:#010x} is {value} Hz, expected {} Hz",
-                        msr::HV_TSC_FREQUENCY,
-                        checks.tsc_hz
-                    ),
-                );
-            }
-            Ok(value) => checks.tsc_hz = value,
-        }
+    let tsc = read(msr::HV_TSC_FREQUENCY).map_err(|error| {
+        failure(format!(
+            "MSR {:#010x} read: {}",
+            msr::HV_TSC_FREQUENCY,
+            error.desc()
+        ))
+    })?;
+    if checks.tsc_hz != 0 && tsc != checks.tsc_hz {
+        return Err(failure(format!(
+            "MSR {:#010x} is {tsc} Hz, expected {} Hz",
+            msr::HV_TSC_FREQUENCY,
+            checks.tsc_hz
+        )));
     }
-    if ok && full {
-        let result = runtime.ops.read_msr(&descriptor, msr::HV_APIC_FREQUENCY);
-        let value = *result.as_ref().unwrap_or(&0);
-        if result.is_err()
-            || !LAPIC_RATES_HZ.contains(&value)
-            || (checks.lapic_hz != 0 && value != checks.lapic_hz)
+    checks.tsc_hz = tsc;
+    if !full {
+        return Ok(());
+    }
+    let lapic = read(msr::HV_APIC_FREQUENCY);
+    match lapic {
+        Ok(rate)
+            if LAPIC_RATES_HZ.contains(&rate)
+                && (checks.lapic_hz == 0 || rate == checks.lapic_hz) =>
         {
-            ok = checks.fail(
-                runtime,
-                "C3",
-                format!(
-                    "cpu {cpu}: MSR {:#010x} (LAPIC rate) is {value} (error {})",
-                    msr::HV_APIC_FREQUENCY,
-                    msr_error(&result)
-                ),
-            );
-        } else {
-            checks.lapic_hz = value;
+            checks.lapic_hz = rate;
+        }
+        _ => {
+            let (value, error) = value_and_error(&lapic);
+            return Err(failure(format!(
+                "MSR {:#010x} (LAPIC rate) is {value} (error {error})",
+                msr::HV_APIC_FREQUENCY
+            )));
         }
     }
-    if ok && full {
-        let result = runtime
-            .ops
-            .read_msr(&descriptor, msr::HV_TSC_INVARIANT_CONTROL);
-        let value = *result.as_ref().unwrap_or(&0);
-        if result.is_err() || value != TSC_INVARIANT_ENABLED {
-            ok = checks.fail(
-                runtime,
-                "C3",
-                format!(
-                    "cpu {cpu}: MSR {:#010x} is {value} (error {})",
-                    msr::HV_TSC_INVARIANT_CONTROL,
-                    msr_error(&result)
-                ),
-            );
-        }
+    let control = read(msr::HV_TSC_INVARIANT_CONTROL);
+    if control != Ok(TSC_INVARIANT_ENABLED) {
+        let (value, error) = value_and_error(&control);
+        return Err(failure(format!(
+            "MSR {:#010x} is {value} (error {error})",
+            msr::HV_TSC_INVARIANT_CONTROL
+        )));
     }
     for register in FAULTING_READS {
-        if ok && full {
-            let result = runtime.ops.read_msr(&descriptor, register);
-            if result != Err(Errno::EIO) {
-                ok = checks.fail(
-                    runtime,
-                    "C3",
-                    format!(
-                        "cpu {cpu}: MSR {register:#010x} read did not fail with EIO (error {})",
-                        msr_error(&result)
-                    ),
-                );
-            }
+        let result = read(register);
+        if result != Err(Errno::EIO) {
+            return Err(failure(format!(
+                "MSR {register:#010x} read did not fail with EIO (error {})",
+                msr_error(&result)
+            )));
         }
     }
-    ok
+    Ok(())
 }
 
-/// Validates `/proc/cpuinfo` for selected CPUs.
-fn check_cpuinfo(
-    runtime: &Runtime<'_>,
-    checks: &mut Checks,
-    selected: &[bool; MAX_CPUS],
-    flags: bool,
-) -> bool {
-    let text = match read_file(kernel::CPU_INFORMATION) {
-        Ok(text) => text,
-        Err(error) => {
-            return checks.fail(
-                runtime,
-                "C5",
-                format!(
-                    "read {}: {}",
-                    kernel::CPU_INFORMATION.to_string_lossy(),
-                    error.desc()
-                ),
-            );
-        }
-    };
-    let (info, result) = decoders::check_cpuinfo(&text, selected, flags);
+/// Validates `/proc/cpuinfo` for the selected CPUs, and records the CPUs' rates in `checks`.
+fn check_cpuinfo(checks: &mut Checks, selected: CpuMask, flags: bool) -> Verdict {
+    let text = sys::read_file(kernel::CPU_INFORMATION).map_err(|error| {
+        Failure::new(
+            CheckId::C5,
+            format!(
+                "read {}: {}",
+                kernel::CPU_INFORMATION.to_string_lossy(),
+                error.desc()
+            ),
+        )
+    })?;
+    let (info, verdict) = decoders::check_cpuinfo(&text, selected, flags);
     checks.cpuinfo = info;
-    match result {
-        Ok(()) => true,
-        Err(detail) => checks.fail(runtime, "C5", detail),
-    }
+    verdict.map_err(|detail| Failure::new(CheckId::C5, detail))
 }
 
 /// Validates current and available clocksources from sysfs.
-fn check_clocksource(runtime: &Runtime<'_>, checks: &mut Checks) -> bool {
-    let sources = read_file(kernel::CURRENT_CLOCKSOURCE).and_then(|current| {
-        read_file(kernel::AVAILABLE_CLOCKSOURCES).map(|available| (current, available))
-    });
-    let (current, available) = match sources {
-        Ok(sources) => sources,
-        Err(error) => {
-            return checks.fail(
-                runtime,
-                "C6",
-                format!("clocksource sysfs: {}", error.desc()),
-            );
-        }
+fn check_clocksource() -> Verdict {
+    let read = |path| {
+        sys::read_file(path).map_err(|error| {
+            Failure::new(CheckId::C6, format!("clocksource sysfs: {}", error.desc()))
+        })
     };
-    match decoders::check_clocksource(&current, &available) {
-        Ok(()) => true,
-        Err(detail) => checks.fail(runtime, "C6", detail),
-    }
+    let current = read(kernel::CURRENT_CLOCKSOURCE)?;
+    let available = read(kernel::AVAILABLE_CLOCKSOURCES)?;
+    decoders::check_clocksource(&current, &available)
+        .map_err(|detail| Failure::new(CheckId::C6, detail))
 }
 
-/// Waits for and validates `/proc/timer_list`.
-pub(crate) fn check_timer_list(runtime: &Runtime<'_>, checks: &mut Checks, wait_ns: i64) -> bool {
-    let deadline = clock_ns(sys::Clock::Monotonic).wrapping_add(wait_ns);
+/// Validates `/proc/timer_list` for the online CPUs, waiting up to `wait` for it to converge.
+pub(crate) fn check_timer_list(online: CpuMask, wait: Duration) -> Verdict {
+    let deadline = Instant::now() + wait;
     loop {
-        let text = match read_file(kernel::TIMER_LIST) {
-            Ok(text) => text,
-            Err(error) => {
-                return checks.fail(
-                    runtime,
-                    "C7",
-                    format!(
-                        "read {}: {}",
-                        kernel::TIMER_LIST.to_string_lossy(),
-                        error.desc()
-                    ),
-                );
-            }
-        };
-        match decoders::timer_list_verdict(&text, &checks.online) {
-            Ok(()) => return true,
-            Err(detail) if clock_ns(sys::Clock::Monotonic) >= deadline => {
-                return checks.fail(runtime, "C7", detail);
+        let text = sys::read_file(kernel::TIMER_LIST).map_err(|error| {
+            Failure::new(
+                CheckId::C7,
+                format!(
+                    "read {}: {}",
+                    kernel::TIMER_LIST.to_string_lossy(),
+                    error.desc()
+                ),
+            )
+        })?;
+        match decoders::timer_list_verdict(&text, online) {
+            Ok(()) => return Ok(()),
+            Err(detail) if Instant::now() >= deadline => {
+                return Err(Failure::new(CheckId::C7, detail));
             }
             Err(_) => thread::sleep(TIMER_LIST_POLL),
         }
@@ -654,57 +608,52 @@ pub(crate) fn check_timer_list(runtime: &Runtime<'_>, checks: &mut Checks, wait_
 }
 
 /// Validates absence of unsupported platform devices and RCU settings.
-fn check_platform(runtime: &Runtime<'_>, checks: &mut Checks) -> bool {
+fn check_platform() -> Verdict {
     if sys::path_exists(kernel::VMBUS) {
-        return checks.fail(
-            runtime,
-            "C8",
+        return Err(Failure::new(
+            CheckId::C8,
             format!("{} exists", kernel::VMBUS.to_string_lossy()),
-        );
+        ));
     }
     if sys::path_exists(kernel::CPU_FREQUENCY_POLICY) {
-        return checks.fail(runtime, "C8", "cpufreq policy0 exists");
+        return Err(Failure::new(CheckId::C8, "cpufreq policy0 exists"));
     }
-    let suppress = read_i64(kernel::RCU_STALL_SUPPRESS).unwrap_or(-1);
+    // An unreadable setting prints as -1, as in the C program.
+    let suppress = sys::read_number::<i64>(kernel::RCU_STALL_SUPPRESS).unwrap_or(-1);
     if suppress != 0 {
-        return checks.fail(
-            runtime,
-            "C8",
+        return Err(Failure::new(
+            CheckId::C8,
             format!("rcu_cpu_stall_suppress is {suppress}"),
-        );
+        ));
     }
-    let timeout = read_i64(kernel::RCU_STALL_TIMEOUT).unwrap_or(-1);
+    let timeout = sys::read_number::<i64>(kernel::RCU_STALL_TIMEOUT).unwrap_or(-1);
     if timeout != DEFAULT_STALL_TIMEOUT_S {
-        return checks.fail(runtime, "C8", format!("rcu_cpu_stall_timeout is {timeout}"));
+        return Err(Failure::new(
+            CheckId::C8,
+            format!("rcu_cpu_stall_timeout is {timeout}"),
+        ));
     }
-    true
+    Ok(())
 }
 
 /// Validates the guest kernel command line.
-fn check_cmdline(runtime: &Runtime<'_>, checks: &mut Checks) -> bool {
-    let text = match read_text(kernel::COMMAND_LINE, COMMAND_LINE_LIMIT) {
-        Ok(text) => text,
-        Err(error) => {
-            return checks.fail(
-                runtime,
-                "C9",
-                format!(
-                    "read {}: {}",
-                    kernel::COMMAND_LINE.to_string_lossy(),
-                    error.desc()
-                ),
-            );
-        }
-    };
-    match decoders::check_cmdline(&text) {
-        Ok(()) => true,
-        Err(detail) => checks.fail(runtime, "C9", detail),
-    }
+fn check_cmdline() -> Verdict {
+    let text = sys::read_file(kernel::COMMAND_LINE).map_err(|error| {
+        Failure::new(
+            CheckId::C9,
+            format!(
+                "read {}: {}",
+                kernel::COMMAND_LINE.to_string_lossy(),
+                error.desc()
+            ),
+        )
+    })?;
+    decoders::check_cmdline(&text).map_err(|detail| Failure::new(CheckId::C9, detail))
 }
 
 /// Finds and validates the published `nvx-time` daemon process.
 pub(crate) fn daemon_pid() -> Option<ProcessId> {
-    let pid = read_i64(DAEMON_PID_PATH).ok()?;
+    let pid = sys::read_number::<i64>(DAEMON_PID_PATH).ok()?;
     let process = ProcessId::from_positive(pid).filter(|_| pid > INIT_PROCESS_ID)?;
     if !sys::process_exists(process) {
         return None;
@@ -713,52 +662,54 @@ pub(crate) fn daemon_pid() -> Option<ProcessId> {
 }
 
 /// Validates daemon liveness, state, violations, and RCU stalls.
-fn check_daemon(runtime: &Runtime<'_>, checks: &mut Checks) -> bool {
+fn check_daemon() -> Verdict {
     if daemon_pid().is_none() {
-        return checks.fail(runtime, "C10", "the time daemon is not running");
+        return Err(Failure::new(CheckId::C10, "the time daemon is not running"));
     }
-    let state = match state_load() {
-        Ok(state) => state,
-        Err(_) => return checks.fail(runtime, "C10", "time state is unreadable"),
+    let Ok(state) = state_load() else {
+        return Err(Failure::new(CheckId::C10, "time state is unreadable"));
     };
     if state.violations != 0 {
-        return checks.fail(
-            runtime,
-            "C10",
+        return Err(Failure::new(
+            CheckId::C10,
             format!("the time daemon recorded {} violations", state.violations),
-        );
+        ));
     }
-    let stalls = read_i64(kernel::RCU_STALL_COUNT).unwrap_or(-1);
+    let stalls = sys::read_number::<i64>(kernel::RCU_STALL_COUNT).unwrap_or(-1);
     if stalls != 0 {
-        return checks.fail(runtime, "C10", format!("rcu_stall_count is {stalls}"));
+        return Err(Failure::new(
+            CheckId::C10,
+            format!("rcu_stall_count is {stalls}"),
+        ));
     }
-    true
+    Ok(())
 }
 
-/// Validates soft and hung-task watchdog configuration when present.
-fn check_debug_watchdogs(runtime: &Runtime<'_>, checks: &mut Checks) -> bool {
-    let soft = sys::path_exists(kernel::SOFT_WATCHDOG);
-    let hung = sys::path_exists(kernel::HUNG_TASK_TIMEOUT);
-    if !soft && !hung {
-        return true;
+/// Validates the soft-lockup and hung-task detectors when the kernel has either.
+fn check_debug_watchdogs() -> Verdict {
+    // A missing or unreadable setting prints as -1, as in the C program.
+    let setting =
+        |path| sys::path_exists(path).then(|| sys::read_number::<i64>(path).unwrap_or(-1));
+    let (soft, hung) = (
+        setting(kernel::SOFT_WATCHDOG),
+        setting(kernel::HUNG_TASK_TIMEOUT),
+    );
+    if soft.is_none() && hung.is_none() {
+        return Ok(());
     }
-    let value = if soft {
-        read_i64(kernel::SOFT_WATCHDOG).unwrap_or(-1)
-    } else {
-        -1
-    };
-    if !soft || value != 1 {
-        return checks.fail(runtime, "C11", format!("soft_watchdog is {value}"));
+    if soft != Some(1) {
+        return Err(Failure::new(
+            CheckId::C11,
+            format!("soft_watchdog is {}", soft.unwrap_or(-1)),
+        ));
     }
-    let value = if hung {
-        read_i64(kernel::HUNG_TASK_TIMEOUT).unwrap_or(-1)
-    } else {
-        -1
-    };
-    if !hung || value == 0 {
-        return checks.fail(runtime, "C11", format!("hung_task_timeout_secs is {value}"));
+    match hung {
+        Some(timeout) if timeout != 0 => Ok(()),
+        _ => Err(Failure::new(
+            CheckId::C11,
+            format!("hung_task_timeout_secs is {}", hung.unwrap_or(-1)),
+        )),
     }
-    true
 }
 
 /// Runs selected identity and MSR checks on one pinned CPU.
@@ -774,53 +725,53 @@ fn check_one_cpu(
     if let Err(error) = sys::pin_current_thread(cpu) {
         checks.fail(
             runtime,
-            "C1",
+            CheckId::C1,
             format!("cannot run on cpu {cpu}: {}", error.desc()),
         );
         return checks;
     }
     if identity {
-        check_identity(runtime, &mut checks, cpu);
-        check_time_bits(runtime, &mut checks, cpu);
+        checks.record(runtime, check_identity(checks.possible, cpu));
+        checks.record(runtime, check_time_bits(cpu));
     }
     if msrs {
-        check_msrs(runtime, &mut checks, cpu, true);
+        let verdict = check_msrs(runtime, &mut checks, cpu, true);
+        checks.record(runtime, verdict);
     }
     checks
 }
 
-/// Runs selected per-CPU checks on this thread, which returns to its original affinity.
+/// Runs selected per-CPU checks on this thread, which returns to its original affinity, until a
+/// CPU fails.
 fn check_cpus(
     runtime: &Runtime<'_>,
     checks: &mut Checks,
-    selected: &[bool; MAX_CPUS],
+    selected: CpuMask,
     identity: bool,
     msrs: bool,
-) -> bool {
+) {
     let _affinity = match sys::AffinityGuard::save() {
         Ok(affinity) => affinity,
         Err(error) => {
-            return checks.fail(
+            checks.fail(
                 runtime,
-                "C1",
+                CheckId::C1,
                 format!("sched_getaffinity: {}", error.desc()),
             );
+            return;
         }
     };
-    let mut ok = true;
-    for (cpu, selected) in selected.iter().copied().enumerate() {
-        if !selected || !ok {
-            continue;
-        }
+    for cpu in selected.iter() {
         let child = check_one_cpu(runtime, checks, cpu, identity, msrs);
         checks.failures += child.failures;
         if cpu == 0 && msrs {
             checks.tsc_hz = child.tsc_hz;
             checks.lapic_hz = child.lapic_hz;
         }
-        ok = child.failures == 0;
+        if child.failures != 0 {
+            return;
+        }
     }
-    ok
 }
 
 /// The kernel log that the boot checks read from a buffer allocated before they start.
@@ -839,7 +790,7 @@ fn boot_log(runtime: &Runtime<'_>, checks: &mut Checks, log: Option<BootLog<'_>>
     let Some(buffer) = buffer else {
         checks.fail(
             runtime,
-            "C4",
+            CheckId::C4,
             format!("no buffer for the {size}-byte kernel log"),
         );
         return;
@@ -849,7 +800,7 @@ fn boot_log(runtime: &Runtime<'_>, checks: &mut Checks, log: Option<BootLog<'_>>
         Err(error) => {
             checks.fail(
                 runtime,
-                "C4",
+                CheckId::C4,
                 format!("read the kernel log: {}", error.desc()),
             );
             return;
@@ -857,10 +808,10 @@ fn boot_log(runtime: &Runtime<'_>, checks: &mut Checks, log: Option<BootLog<'_>>
     };
     let log = decoders::scan_boot_log(&buffer[..count], true);
     if let Err(detail) = log.verdict() {
-        checks.fail(runtime, "C4", detail);
+        checks.fail(runtime, CheckId::C4, detail);
     }
-    if !log.wx.is_empty() {
-        checks.fail_code(runtime, b"G_KERNEL_WX", &log.wx);
+    if let Some(wx) = &log.wx {
+        checks.fail_code(runtime, ViolationCode::KernelWx, wx);
     }
 }
 
@@ -881,42 +832,31 @@ pub(crate) fn run_boot_checks(
 ) {
     let base = checks.clone();
     let selected = checks.online;
-    if checks.online_count <= 1 {
-        check_cmdline(runtime, checks);
-        check_platform(runtime, checks);
-        check_clocksource(runtime, checks);
-        check_debug_watchdogs(runtime, checks);
+    let timer_list = |side: &mut Checks| {
+        side.record(runtime, check_timer_list(selected, TIMER_LIST_WAIT));
+    };
+    let cpuinfo = |side: &mut Checks| {
+        let verdict = check_cpuinfo(side, selected, true);
+        side.record(runtime, verdict);
+    };
+    if selected.len() <= 1 {
+        run_boot_foreground(runtime, checks);
         checks.failures += side_check(&base, |side| boot_log(runtime, side, log)).failures;
-        checks.failures += side_check(&base, |side| {
-            check_timer_list(runtime, side, TIMER_LIST_WAIT_NS);
-        })
-        .failures;
-        let cpuinfo = side_check(&base, |side| {
-            check_cpuinfo(runtime, side, &selected, true);
-        });
+        checks.failures += side_check(&base, timer_list).failures;
+        let cpuinfo = side_check(&base, cpuinfo);
         checks.failures += cpuinfo.failures;
         checks.cpuinfo = cpuinfo.cpuinfo;
-        check_cpus(runtime, checks, &selected, true, true);
+        check_cpus(runtime, checks, selected, true, true);
         compare_cpu_rate(runtime, checks);
         return;
     }
     thread::scope(|scope| {
         let log = scope.spawn(|| side_check(&base, |side| boot_log(runtime, side, log)));
-        let timer = scope.spawn(|| {
-            side_check(&base, |side| {
-                check_timer_list(runtime, side, TIMER_LIST_WAIT_NS);
-            })
-        });
-        let cpuinfo = scope.spawn(|| {
-            side_check(&base, |side| {
-                check_cpuinfo(runtime, side, &selected, true);
-            })
-        });
+        let timer = scope.spawn(|| side_check(&base, timer_list));
+        let cpuinfo = scope.spawn(|| side_check(&base, cpuinfo));
         let cpus = selected
             .iter()
-            .enumerate()
-            .filter(|(_, selected)| **selected)
-            .map(|(cpu, _)| {
+            .map(|cpu| {
                 let base = &base;
                 (
                     cpu,
@@ -925,16 +865,13 @@ pub(crate) fn run_boot_checks(
             })
             .collect::<Vec<_>>();
 
-        check_cmdline(runtime, checks);
-        check_platform(runtime, checks);
-        check_clocksource(runtime, checks);
-        check_debug_watchdogs(runtime, checks);
+        run_boot_foreground(runtime, checks);
 
         for side in [log.join(), timer.join()] {
             match side {
                 Ok(side) => checks.failures += side.failures,
                 Err(_) => {
-                    checks.fail(runtime, "C10", "a boot side job crashed");
+                    checks.fail(runtime, CheckId::C10, "a boot side job crashed");
                 }
             }
         }
@@ -944,7 +881,7 @@ pub(crate) fn run_boot_checks(
                 checks.cpuinfo = side.cpuinfo;
             }
             Err(_) => {
-                checks.fail(runtime, "C10", "the cpuinfo side job crashed");
+                checks.fail(runtime, CheckId::C10, "the cpuinfo side job crashed");
             }
         }
         for (cpu, handle) in cpus {
@@ -957,7 +894,7 @@ pub(crate) fn run_boot_checks(
                     }
                 }
                 Err(_) => {
-                    checks.fail(runtime, "C1", format!("the cpu {cpu} job crashed"));
+                    checks.fail(runtime, CheckId::C1, format!("the cpu {cpu} job crashed"));
                 }
             }
         }
@@ -965,19 +902,31 @@ pub(crate) fn run_boot_checks(
     compare_cpu_rate(runtime, checks);
 }
 
+/// Runs the boot checks that run on the caller's thread: C9, C8, C6, and C11.
+fn run_boot_foreground(runtime: &Runtime<'_>, checks: &mut Checks) {
+    let foreground: [fn() -> Verdict; 4] = [
+        check_cmdline,
+        check_platform,
+        check_clocksource,
+        check_debug_watchdogs,
+    ];
+    for check in foreground {
+        checks.record(runtime, check());
+    }
+}
+
 /// Cross-checks the validated TSC rate against CPU zero's cpuinfo rate.
 fn compare_cpu_rate(runtime: &Runtime<'_>, checks: &mut Checks) {
     if checks.tsc_hz != 0
-        && checks.cpuinfo.known[0]
-        && checks.tsc_hz / HZ_PER_KHZ != checks.cpuinfo.khz[0]
+        && let Some(khz) = checks.cpuinfo.khz[0]
+        && checks.tsc_hz / HZ_PER_KHZ != khz
     {
         checks.fail(
             runtime,
-            "C3",
+            CheckId::C3,
             format!(
-                "cpu 0: floor(F / 1000) is {} kHz but cpu MHz is {} kHz",
+                "cpu 0: floor(F / 1000) is {} kHz but cpu MHz is {khz} kHz",
                 checks.tsc_hz / HZ_PER_KHZ,
-                checks.cpuinfo.khz[0]
             ),
         );
     }
@@ -989,59 +938,53 @@ pub(crate) fn run_capture_checks(runtime: &Runtime<'_>, checks: &mut Checks) {
         checks.tsc_hz = tsc;
         checks.lapic_hz = lapic;
     }
-    check_clocksource(runtime, checks);
-    check_timer_list(runtime, checks, 0);
-    check_daemon(runtime, checks);
+    // Each failure counts a violation in the state before C10 reads the count.
+    checks.record(runtime, check_clocksource());
+    checks.record(runtime, check_timer_list(checks.online, Duration::ZERO));
+    checks.record(runtime, check_daemon());
 }
 
 /// Runs restore checks, including checks on newly online CPUs.
-pub(crate) fn run_restore_checks(
-    runtime: &Runtime<'_>,
-    checks: &mut Checks,
-    new_cpus: &[bool; MAX_CPUS],
-    new_count: usize,
-) {
+pub(crate) fn run_restore_checks(runtime: &Runtime<'_>, checks: &mut Checks, new_cpus: CpuMask) {
     match rates_load() {
         Ok((tsc, lapic)) => {
             checks.tsc_hz = tsc;
             checks.lapic_hz = lapic;
         }
         Err(_) => {
-            checks.fail(runtime, "C3", "the boot rates are unavailable");
+            checks.fail(runtime, CheckId::C3, "the boot rates are unavailable");
         }
     }
-    if new_count > 0 {
+    if !new_cpus.is_empty() {
         check_cpus(runtime, checks, new_cpus, true, false);
-        check_cpuinfo(runtime, checks, new_cpus, true);
+        let verdict = check_cpuinfo(checks, new_cpus, true);
+        checks.record(runtime, verdict);
     }
-    check_msrs(runtime, checks, 0, false);
-    check_clocksource(runtime, checks);
-    check_daemon(runtime, checks);
+    let verdict = check_msrs(runtime, checks, 0, false);
+    checks.record(runtime, verdict);
+    checks.record(runtime, check_clocksource());
+    checks.record(runtime, check_daemon());
 }
 
 /// Waits for boot-only or all persisted checks and returns completion state.
 pub(crate) fn wait_for_checks(boot_only: bool) -> (TimeState, bool) {
-    let deadline = clock_ns(sys::Clock::Monotonic).wrapping_add(STATUS_WAIT_NS);
+    let deadline = Instant::now() + STATUS_WAIT;
     loop {
         let state = state_load().unwrap_or_default();
-        let count = if boot_only { 1 } else { Phase::CHECKS.len() };
-        let pending = state.checks[..count]
-            .iter()
-            .any(|check| check.status == b"pending");
-        if !pending {
+        if !state.pending(boot_only) {
             return (state, true);
         }
-        if clock_ns(sys::Clock::Monotonic) >= deadline {
+        if Instant::now() >= deadline {
             return (state, false);
         }
-        thread::sleep(Duration::from_nanos(STATUS_POLL_NS as u64));
+        thread::sleep(STATUS_POLL);
     }
 }
 
 /// Aggregate counters and rates for the exhaustive CI-only report.
 struct Exhaustive {
     /// Number of failed exhaustive subchecks.
-    failures: i32,
+    failures: usize,
     /// First validated TSC rate.
     tsc_hz: u64,
     /// First validated LAPIC rate.
@@ -1050,242 +993,189 @@ struct Exhaustive {
     cpuinfo: CpuInfo,
 }
 
-/// Emits one stable exhaustive-check report line and updates failures.
+/// The outcome of one exhaustive subcheck: the diagnostic of its pass, or of its failure.
+type Outcome = Result<String, String>;
+
+/// Emits one stable exhaustive-check report line and counts a failure.
 fn exhaustive_report(
     output: &mut dyn Write,
     state: &mut Exhaustive,
     id: &str,
     cpu: usize,
-    passed: bool,
-    detail: &[u8],
+    outcome: &Outcome,
 ) {
-    let escaped = escape_text(detail, DETAIL_MAX - 1);
-    let _ = write!(
+    let (status, detail) = match outcome {
+        Ok(detail) => ("pass", detail),
+        Err(detail) => ("fail", detail),
+    };
+    let _ = writeln!(
         output,
-        "NVX-TIME-ABI-EXHAUSTIVE: v=1 check={id} cpu={cpu} status={} detail=\"",
-        if passed { "pass" } else { "fail" }
+        "NVX-TIME-ABI-EXHAUSTIVE: v=1 check={id} cpu={cpu} status={status} detail=\"{}\"",
+        escape_text(detail.as_bytes(), DETAIL_MAX - 1),
     );
-    let _ = output.write_all(&escaped);
-    let _ = output.write_all(b"\"\n");
-    if !passed {
+    if outcome.is_err() {
         state.failures += 1;
     }
 }
 
-/// Scans a sparse CPUID leaf range, `(first, last, step)`, and emits one aggregate result.
-fn exhaustive_leaves(
-    output: &mut dyn Write,
-    state: &mut Exhaustive,
-    id: &str,
-    cpu: usize,
-    (first, last, step): (u32, u32, usize),
-    out_of_range: [u32; 4],
-) {
-    let mut first_detail = String::new();
-    let mut failing = 0;
+/// Scans a sparse CPUID leaf range, `(first, last, step)`, for X1 or X2, and summarizes it.
+fn exhaustive_leaves((first, last, step): (u32, u32, usize), out_of_range: CpuidResult) -> Outcome {
     let mut count = 0;
+    let mut failing = 0;
+    let mut first_failure = None;
     for leaf in (first..=last).step_by(step) {
         count += 1;
         if let Err(detail) =
             decoders::exhaustive_leaf_ok(leaf, sys::x86::cpuid(leaf, 0), out_of_range)
         {
-            if failing == 0 {
-                first_detail = detail;
-            }
             failing += 1;
+            first_failure.get_or_insert(detail);
         }
     }
-    let detail = if failing == 0 {
-        format!(
+    match first_failure {
+        None => Ok(format!(
             "{count} {} read zero or the highest basic leaf",
             if step == 1 { "leaves" } else { "bases" }
-        )
-    } else if failing > 1 {
-        format!("{first_detail}; {failing} of {count} fail")
-    } else {
-        first_detail
-    };
-    exhaustive_report(output, state, id, cpu, failing == 0, detail.as_bytes());
+        )),
+        Some(detail) if failing == 1 => Err(detail),
+        Some(detail) => Err(format!("{detail}; {failing} of {count} fail")),
+    }
 }
 
-/// Reads one MSR and pairs its value, or zero, with its negative `errno`, or zero.
-fn read_msr(runtime: &Runtime<'_>, descriptor: &MsrDescriptor, register: u32) -> (u64, i32) {
-    let result = runtime.ops.read_msr(descriptor, register);
-    (*result.as_ref().unwrap_or(&0), msr_error(&result))
-}
-
-/// Runs exhaustive Hyper-V identity and rate MSR checks.
-fn exhaustive_x3(
+/// Validates one CPU's VP index, rate, invariant-control, and faulting MSRs for X3, against
+/// the first CPU's rates and cpuinfo, and returns the CPU's TSC and LAPIC rates.
+fn exhaustive_rates(
     runtime: &Runtime<'_>,
-    output: &mut dyn Write,
-    state: &mut Exhaustive,
+    state: &Exhaustive,
     descriptor: &MsrDescriptor,
     cpu: usize,
-) {
-    let (index, mut error) = read_msr(runtime, descriptor, msr::HV_VP_INDEX);
-    let mut detail;
-    let mut ok = false;
-    let mut tsc = 0;
-    let mut lapic = 0;
-    if error != 0 || index != cpu as u64 {
-        detail = format!(
+) -> Result<(u64, u64), String> {
+    let read = |register| runtime.ops.read_msr(descriptor, register);
+    let index = read(msr::HV_VP_INDEX);
+    if index != Ok(cpu as u64) {
+        let (index, error) = value_and_error(&index);
+        return Err(format!(
             "MSR {:#010x} (VP index) is {index} (error {error})",
             msr::HV_VP_INDEX
-        );
-    } else {
-        (tsc, error) = read_msr(runtime, descriptor, msr::HV_TSC_FREQUENCY);
-        if error != 0 || tsc == 0 || (state.tsc_hz != 0 && tsc != state.tsc_hz) {
-            detail = format!(
-                "MSR {:#010x} (TSC rate) is {tsc} (error {error}; first CPU {})",
-                msr::HV_TSC_FREQUENCY,
-                state.tsc_hz
-            );
-        } else if state.cpuinfo.known[cpu] && tsc / HZ_PER_KHZ != state.cpuinfo.khz[cpu] {
-            detail = format!(
-                "floor(F / 1000) is {} kHz but cpu MHz is {} kHz",
-                tsc / HZ_PER_KHZ,
-                state.cpuinfo.khz[cpu]
-            );
-        } else {
-            (lapic, error) = read_msr(runtime, descriptor, msr::HV_APIC_FREQUENCY);
-            if error != 0
-                || !LAPIC_RATES_HZ.contains(&lapic)
-                || (state.lapic_hz != 0 && lapic != state.lapic_hz)
-            {
-                detail = format!(
-                    "MSR {:#010x} (LAPIC rate) is {lapic} (error {error}; first CPU {})",
-                    msr::HV_APIC_FREQUENCY,
-                    state.lapic_hz
-                );
-            } else {
-                let (control, control_error) =
-                    read_msr(runtime, descriptor, msr::HV_TSC_INVARIANT_CONTROL);
-                error = control_error;
-                if error != 0 || control != TSC_INVARIANT_ENABLED {
-                    detail = format!(
-                        "MSR {:#010x} is {control} (error {error})",
-                        msr::HV_TSC_INVARIANT_CONTROL
-                    );
-                } else {
-                    detail = String::new();
-                    ok = true;
-                }
-            }
-        }
+        ));
+    }
+    let (tsc, error) = value_and_error(&read(msr::HV_TSC_FREQUENCY));
+    if error != 0 || tsc == 0 || (state.tsc_hz != 0 && tsc != state.tsc_hz) {
+        return Err(format!(
+            "MSR {:#010x} (TSC rate) is {tsc} (error {error}; first CPU {})",
+            msr::HV_TSC_FREQUENCY,
+            state.tsc_hz
+        ));
+    }
+    if let Some(khz) = state.cpuinfo.khz[cpu]
+        && tsc / HZ_PER_KHZ != khz
+    {
+        return Err(format!(
+            "floor(F / 1000) is {} kHz but cpu MHz is {khz} kHz",
+            tsc / HZ_PER_KHZ
+        ));
+    }
+    let (lapic, error) = value_and_error(&read(msr::HV_APIC_FREQUENCY));
+    if error != 0
+        || !LAPIC_RATES_HZ.contains(&lapic)
+        || (state.lapic_hz != 0 && lapic != state.lapic_hz)
+    {
+        return Err(format!(
+            "MSR {:#010x} (LAPIC rate) is {lapic} (error {error}; first CPU {})",
+            msr::HV_APIC_FREQUENCY,
+            state.lapic_hz
+        ));
+    }
+    let control = read(msr::HV_TSC_INVARIANT_CONTROL);
+    if control != Ok(TSC_INVARIANT_ENABLED) {
+        let (control, error) = value_and_error(&control);
+        return Err(format!(
+            "MSR {:#010x} is {control} (error {error})",
+            msr::HV_TSC_INVARIANT_CONTROL
+        ));
     }
     for register in FAULTING_READS {
-        if ok {
-            let result = runtime.ops.read_msr(descriptor, register);
-            if result != Err(Errno::EIO) {
-                ok = false;
-                detail = format!(
-                    "MSR {register:#010x} read did not fail with EIO (error {})",
-                    msr_error(&result)
-                );
-            }
+        let result = read(register);
+        if result != Err(Errno::EIO) {
+            return Err(format!(
+                "MSR {register:#010x} read did not fail with EIO (error {})",
+                msr_error(&result)
+            ));
         }
     }
-    if ok {
-        detail = format!("vp_index={cpu} tsc_hz={tsc} lapic_hz={lapic} invariant_control=1");
-        if state.tsc_hz == 0 {
-            state.tsc_hz = tsc;
-            state.lapic_hz = lapic;
-        }
-    }
-    exhaustive_report(output, state, "X3", cpu, ok, detail.as_bytes());
+    Ok((tsc, lapic))
 }
 
-/// Runs exhaustive invariant-control MSR write/read checks.
-fn exhaustive_x4(
+/// Writes 0 and 1 to the invariant-control MSR, reading each back, then the rejected 2.
+fn probe_invariant_control(
     runtime: &Runtime<'_>,
-    output: &mut dyn Write,
-    state: &mut Exhaustive,
     descriptor: &MsrDescriptor,
-    cpu: usize,
-) {
+) -> Result<(), String> {
     let control = msr::HV_TSC_INVARIANT_CONTROL;
-    let mut detail = "0 and 1 accepted, 2 rejected, left at 1".to_owned();
-    let mut ok = true;
     for written in 0..=TSC_INVARIANT_ENABLED {
-        let error = msr_error(&runtime.ops.write_msr(descriptor, control, written));
-        let (value, read_error) = read_msr(runtime, descriptor, control);
-        let error = if error != 0 { error } else { read_error };
+        let write_error = msr_error(&runtime.ops.write_msr(descriptor, control, written));
+        let (value, read_error) = value_and_error(&runtime.ops.read_msr(descriptor, control));
+        let error = if write_error != 0 {
+            write_error
+        } else {
+            read_error
+        };
         if error != 0 || value != written {
-            ok = false;
-            detail =
-                format!("after writing {written}, MSR {control:#010x} is {value} (error {error})");
-            break;
+            return Err(format!(
+                "after writing {written}, MSR {control:#010x} is {value} (error {error})"
+            ));
         }
     }
-    if ok {
-        let result = runtime
-            .ops
-            .write_msr(descriptor, control, TSC_INVARIANT_REJECTED);
-        if result != Err(Errno::EIO) {
-            ok = false;
-            detail = format!(
-                "write of {TSC_INVARIANT_REJECTED} to MSR {control:#010x} did not fail with EIO \
-                 (error {})",
-                msr_error(&result)
-            );
-        }
+    let rejected = runtime
+        .ops
+        .write_msr(descriptor, control, TSC_INVARIANT_REJECTED);
+    if rejected != Err(Errno::EIO) {
+        return Err(format!(
+            "write of {TSC_INVARIANT_REJECTED} to MSR {control:#010x} did not fail with EIO \
+             (error {})",
+            msr_error(&rejected)
+        ));
     }
+    Ok(())
+}
+
+/// Validates for X4 that the invariant-control MSR takes 0 and 1 and rejects 2, and leaves it
+/// at 1, which exposes the invariant TSC, whatever it found.
+fn exhaustive_invariant_control(runtime: &Runtime<'_>, descriptor: &MsrDescriptor) -> Outcome {
+    let control = msr::HV_TSC_INVARIANT_CONTROL;
+    let probed = probe_invariant_control(runtime, descriptor);
     let _ = runtime
         .ops
         .write_msr(descriptor, control, TSC_INVARIANT_ENABLED);
-    if ok {
-        let (value, error) = read_msr(runtime, descriptor, control);
-        if error != 0 || value != TSC_INVARIANT_ENABLED {
-            ok = false;
-            detail = format!("MSR {control:#010x} is {value} after the check");
-        }
+    probed?;
+    let (value, error) = value_and_error(&runtime.ops.read_msr(descriptor, control));
+    if error != 0 || value != TSC_INVARIANT_ENABLED {
+        return Err(format!("MSR {control:#010x} is {value} after the check"));
     }
-    exhaustive_report(output, state, "X4", cpu, ok, detail.as_bytes());
+    Ok("0 and 1 accepted, 2 rejected, left at 1".to_owned())
 }
 
-/// Verifies that forbidden MSR reads or writes fault with `EIO`.
-fn exhaustive_faults(
-    runtime: &Runtime<'_>,
-    output: &mut dyn Write,
-    state: &mut Exhaustive,
-    descriptor: &MsrDescriptor,
-    cpu: usize,
-    writes: bool,
-) {
-    let list: &[u32] = if writes {
-        &FAULTING_WRITES
+/// Validates that writes of zero to the Hyper-V MSRs fault with `EIO`, for X5, or that reads of
+/// the architectural MSRs do, for X6.
+fn exhaustive_faults(runtime: &Runtime<'_>, descriptor: &MsrDescriptor, writes: bool) -> Outcome {
+    let (registers, access, accesses): (&[u32], _, _) = if writes {
+        (&FAULTING_WRITES, "write of 0 to", "writes")
     } else {
-        &FAULTING_ARCHITECTURAL_READS
+        (&FAULTING_ARCHITECTURAL_READS, "read of", "reads")
     };
-    let mut detail = format!(
-        "{} {} fail with EIO",
-        list.len(),
-        if writes { "writes" } else { "reads" }
-    );
-    let mut ok = true;
-    for &register in list {
+    for &register in registers {
         let error = if writes {
             msr_error(&runtime.ops.write_msr(descriptor, register, 0))
         } else {
             msr_error(&runtime.ops.read_msr(descriptor, register))
         };
         if error != -(Errno::EIO as i32) {
-            ok = false;
-            detail = format!(
-                "{} MSR {register:#x} did not fail with EIO (error {error})",
-                if writes { "write of 0 to" } else { "read of" }
-            );
-            break;
+            return Err(format!(
+                "{access} MSR {register:#x} did not fail with EIO (error {error})"
+            ));
         }
     }
-    exhaustive_report(
-        output,
-        state,
-        if writes { "X5" } else { "X6" },
-        cpu,
-        ok,
-        detail.as_bytes(),
-    );
+    Ok(format!("{} {accesses} fail with EIO", registers.len()))
 }
 
 /// Runs every CI-only exhaustive check on every online CPU, from this thread, which returns to
@@ -1300,74 +1190,64 @@ pub(crate) fn exhaustive(
         lapic_hz: 0,
         cpuinfo: CpuInfo::default(),
     };
-    let online = read_text(kernel::ONLINE_CPUS, CPU_LIST_LIMIT)
+    let online = sys::read_line(kernel::ONLINE_CPUS)
         .ok()
-        .and_then(|text| decoders::parse_cpu_list(&text));
-    let Some((cpus, online_count)) = online.filter(|(_, count)| *count > 0) else {
+        .and_then(|list| CpuMask::parse(&list));
+    let Some(cpus) = online.filter(|cpus| !cpus.is_empty()) else {
         let _ = writeln!(
             output,
             "NVX-TIME-ABI-EXHAUSTIVE: v=1 status=fail cpus=0 failures=1"
         );
         return Err(CommandError::Operation);
     };
-    if let Ok(text) = read_file(kernel::CPU_INFORMATION) {
-        state.cpuinfo = decoders::check_cpuinfo(&text, &cpus, false).0;
+    if let Ok(text) = sys::read_file(kernel::CPU_INFORMATION) {
+        state.cpuinfo = decoders::check_cpuinfo(&text, cpus, false).0;
     }
     let _affinity = sys::AffinityGuard::save().ok();
-    for (cpu, online) in cpus.iter().copied().enumerate() {
-        if !online {
-            continue;
-        }
+    for cpu in cpus.iter() {
         if sys::pin_current_thread(cpu).is_err() {
+            let outcome = Err("cannot run on this CPU".to_owned());
             for id in EXHAUSTIVE_CHECKS {
-                exhaustive_report(
-                    output,
-                    &mut state,
-                    id,
-                    cpu,
-                    false,
-                    b"cannot run on this CPU",
-                );
+                exhaustive_report(output, &mut state, id, cpu, &outcome);
             }
             continue;
         }
         let basic = sys::x86::cpuid(cpuid::LEAF_MAXIMUM, 0);
-        let out_of_range = sys::x86::cpuid(basic[0], 0);
-        exhaustive_leaves(
-            output,
-            &mut state,
-            "X1",
-            cpu,
-            EXHAUSTIVE_LEAVES,
-            out_of_range,
-        );
-        exhaustive_leaves(
-            output,
-            &mut state,
-            "X2",
-            cpu,
-            EXHAUSTIVE_BASES,
-            out_of_range,
-        );
-        match runtime.ops.open_msr(cpu, MsrAccess::ReadWrite) {
-            Ok(descriptor) => {
-                exhaustive_x3(runtime, output, &mut state, &descriptor, cpu);
-                exhaustive_x4(runtime, output, &mut state, &descriptor, cpu);
-                exhaustive_faults(runtime, output, &mut state, &descriptor, cpu, true);
-                exhaustive_faults(runtime, output, &mut state, &descriptor, cpu, false);
-            }
+        let out_of_range = sys::x86::cpuid(basic.eax, 0);
+        for (id, leaves) in [("X1", EXHAUSTIVE_LEAVES), ("X2", EXHAUSTIVE_BASES)] {
+            let outcome = exhaustive_leaves(leaves, out_of_range);
+            exhaustive_report(output, &mut state, id, cpu, &outcome);
+        }
+        let descriptor = match runtime.ops.open_msr(cpu, MsrAccess::ReadWrite) {
+            Ok(descriptor) => descriptor,
             Err(error) => {
-                let detail = format!("open {}: {}", MsrFile::path(cpu), error.desc());
+                let outcome = Err(format!("open {}: {}", MsrFile::path(cpu), error.desc()));
                 for id in EXHAUSTIVE_MSR_CHECKS {
-                    exhaustive_report(output, &mut state, id, cpu, false, detail.as_bytes());
+                    exhaustive_report(output, &mut state, id, cpu, &outcome);
                 }
+                continue;
             }
+        };
+        let rates = exhaustive_rates(runtime, &state, &descriptor, cpu).map(|(tsc, lapic)| {
+            if state.tsc_hz == 0 {
+                state.tsc_hz = tsc;
+                state.lapic_hz = lapic;
+            }
+            format!("vp_index={cpu} tsc_hz={tsc} lapic_hz={lapic} invariant_control=1")
+        });
+        exhaustive_report(output, &mut state, "X3", cpu, &rates);
+        let control = exhaustive_invariant_control(runtime, &descriptor);
+        exhaustive_report(output, &mut state, "X4", cpu, &control);
+        for (id, writes) in [("X5", true), ("X6", false)] {
+            let faults = exhaustive_faults(runtime, &descriptor, writes);
+            exhaustive_report(output, &mut state, id, cpu, &faults);
         }
     }
     let status = if state.failures == 0 { "ok" } else { "fail" };
     let _ = writeln!(
         output,
-        "NVX-TIME-ABI-EXHAUSTIVE: v=1 status={status} cpus={online_count} failures={}",
+        "NVX-TIME-ABI-EXHAUSTIVE: v=1 status={status} cpus={} failures={}",
+        cpus.len(),
         state.failures
     );
     if state.failures == 0 {
@@ -1383,9 +1263,9 @@ mod tests {
 
     #[test]
     fn wait_timeout_math_uses_the_abi_constants() {
-        assert_eq!(STATUS_WAIT_NS, 30_000_000_000);
-        assert_eq!(STATUS_POLL_NS, 10_000_000);
-        assert_eq!(TIMER_LIST_WAIT_NS, 200_000_000);
+        assert_eq!(STATUS_WAIT, Duration::from_nanos(30_000_000_000));
+        assert_eq!(STATUS_POLL, Duration::from_nanos(10_000_000));
+        assert_eq!(TIMER_LIST_WAIT, Duration::from_nanos(200_000_000));
     }
 
     #[test]

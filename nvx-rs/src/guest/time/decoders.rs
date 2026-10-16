@@ -1,11 +1,17 @@
 //! Pure decoders, parsers, and arithmetic of the guest time ABI.
 
-use std::fmt::Write as _;
-use std::io::Write as _;
+use std::fmt::{self, Display, Write as _};
 use std::ops::RangeInclusive;
 
+use super::cpu_mask::CpuMask;
+use super::events::ViolationCode;
 use super::{MAX_CPUS, NSEC_PER_SEC, NSEC_PER_USEC};
+use crate::guest::kernel_text::{
+    self, ClockEventState, SyslogLine, TickDevice, TickMode, TimerList,
+};
+use crate::guest::parse::parse_decimal;
 use crate::guest::sys::ClockAdjustment;
+use crate::guest::sys::x86::{CpuidResult, cpuid};
 
 /// Fixed restore-packet header length.
 pub(crate) const PACKET_HEADER_SIZE: usize = 32;
@@ -13,20 +19,27 @@ pub(crate) const PACKET_HEADER_SIZE: usize = 32;
 pub(crate) const PACKET_RANGE_SIZE: usize = 16;
 /// Entropy payload length appended to every restore packet.
 pub(crate) const PACKET_ENTROPY_SIZE: usize = 64;
-/// Largest range count representable by the packet's byte field.
-pub(crate) const PACKET_MAX_RANGES: usize = 255;
-/// Largest complete restore packet accepted by the test interface.
-pub(crate) const PACKET_MAX_SIZE: usize =
-    PACKET_HEADER_SIZE + PACKET_MAX_RANGES * PACKET_RANGE_SIZE + PACKET_ENTROPY_SIZE;
 /// Fixed host time-sample record length.
 pub(crate) const SAMPLE_SIZE: usize = 16;
 /// VM generation identifier length.
 pub(crate) const GENERATION_ID_SIZE: usize = 16;
 
+/// The magic number that starts every restore packet.
+const PACKET_MAGIC: [u8; 3] = *b"OVR";
+/// The restore-packet version of time ABI version one.
+const PACKET_VERSION: u8 = 4;
+/// Restore flag indicating that the downtime came from the host's UTC clock.
+const PACKET_DOWNTIME_UTC: u8 = 0x01;
 /// Restore flag indicating that memory ranges follow.
 const PACKET_MEMORY_TARGET: u8 = 0x02;
+/// Restore flag requiring a snapshot acknowledgement.
+const PACKET_ACK_REQUIRED: u8 = 0x04;
 /// Mask of restore flags defined by ABI version one.
 const PACKET_KNOWN_FLAGS: u8 = 0x0f;
+/// The online VP counts that a restore packet may give.
+const PACKET_ONLINE_VP_COUNTS: [u8; 5] = [0, 1, 2, 4, 8];
+/// The time-sample version of time ABI version one.
+const SAMPLE_VERSION: u8 = 1;
 /// Time-sample flag reserved for host test hooks.
 const SAMPLE_TEST_HOOKS: u8 = 0x08;
 /// Maximum signed restore rate deviation, equivalent to 250 ppm.
@@ -43,16 +56,139 @@ const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
 const DOWNTIME_LIMIT_NS: u64 = 30 * SECONDS_PER_DAY * NSEC_PER_SEC as u64;
 /// kHz in a MHz, which scale the whole MHz of `/proc/cpuinfo`.
 const KHZ_PER_MHZ: u64 = 1000;
-/// Offset magnitude above which correction steps the clock.
-const STEP_THRESHOLD_NS: i64 = 128_000_000;
+/// Offset magnitude at or above which correction steps the clock.
+const STEP_THRESHOLD_NS: u64 = 128_000_000;
 /// Time constant of the phase-locked loop while the discipline converges.
 const FAST_TIME_CONSTANT: i64 = 4;
 /// Time constant of the phase-locked loop once the discipline has converged.
 const SLOW_TIME_CONSTANT: i64 = 6;
+/// Bytes of a kernel message that a boot-log diagnostic quotes.
+const QUOTED_MESSAGE_MAX: usize = 300;
+/// Bytes of a kernel command-line token that a diagnostic quotes.
+const QUOTED_TOKEN_MAX: usize = 120;
+/// The prefix of the time tools' own kernel-log records, which the watcher ignores.
+const OWN_RECORD_PREFIX: &[u8] = b"NVX-TIME-";
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-/// Decoded version-one restore packet.
-pub(crate) struct RestorePacket {
+/// Reads the little-endian fields of a binary record in order, and fails with `incomplete` when
+/// the record ends before a field.
+struct Fields<'a, E> {
+    /// The bytes after the fields read so far.
+    rest: &'a [u8],
+    /// The error of a record that ends early.
+    incomplete: E,
+}
+
+impl<'a, E: Copy> Fields<'a, E> {
+    /// Starts reading `record`.
+    const fn new(record: &'a [u8], incomplete: E) -> Self {
+        Self {
+            rest: record,
+            incomplete,
+        }
+    }
+
+    /// Reads the next `N` bytes.
+    fn bytes<const N: usize>(&mut self) -> Result<[u8; N], E> {
+        let (field, rest) = self.rest.split_first_chunk().ok_or(self.incomplete)?;
+        self.rest = rest;
+        Ok(*field)
+    }
+
+    /// Reads the next 16-bit field.
+    fn u16(&mut self) -> Result<u16, E> {
+        self.bytes().map(u16::from_le_bytes)
+    }
+
+    /// Reads the next 32-bit field.
+    fn u32(&mut self) -> Result<u32, E> {
+        self.bytes().map(u32::from_le_bytes)
+    }
+
+    /// Reads the next signed 32-bit field.
+    fn i32(&mut self) -> Result<i32, E> {
+        self.bytes().map(i32::from_le_bytes)
+    }
+
+    /// Reads the next 64-bit field.
+    fn u64(&mut self) -> Result<u64, E> {
+        self.bytes().map(u64::from_le_bytes)
+    }
+}
+
+/// Why a restore packet is invalid. Its `Display` is the diagnostic that repair reports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PacketError {
+    /// The packet ends within its header.
+    IncompleteHeader,
+    /// The magic number is not `OVR`.
+    Magic([u8; 3]),
+    /// The version is not version one's.
+    Version(u8),
+    /// The flags set reserved bits.
+    ReservedFlags(u8),
+    /// The online VP count is not 0, 1, 2, 4, or 8.
+    OnlineVpCount(u8),
+    /// Memory ranges follow, but the flags select no memory target.
+    RangesWithoutTarget(u8),
+    /// The reserved byte is not zero.
+    ReservedByte(u8),
+    /// The generation is zero.
+    ZeroGeneration,
+    /// The rate deviation exceeds 250 ppm.
+    RateDeviation(i32),
+    /// The downtime exceeds 30 days.
+    Downtime(u64),
+    /// The UTC time is zero or does not fit the clocks' signed nanoseconds.
+    Utc(u64),
+    /// The packet ends before the memory ranges and the entropy that its header gives.
+    IncompleteBody,
+    /// The memory range at this index is empty, or ends past the address space.
+    Range(usize),
+}
+
+impl Display for PacketError {
+    /// Writes the diagnostic, such as `restore packet version is 3`.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Self::IncompleteHeader => formatter.write_str("restore packet header is incomplete"),
+            Self::Magic([first, second, third]) => write!(
+                formatter,
+                "restore packet magic is {first:02x}{second:02x}{third:02x}"
+            ),
+            Self::Version(version) => write!(formatter, "restore packet version is {version}"),
+            Self::ReservedFlags(flags) => write!(
+                formatter,
+                "restore packet flags 0x{flags:02x} set reserved bits"
+            ),
+            Self::OnlineVpCount(count) => {
+                write!(formatter, "restore packet online VP count is {count}")
+            }
+            Self::RangesWithoutTarget(count) => write!(
+                formatter,
+                "restore packet has {count} memory ranges without a memory target"
+            ),
+            Self::ReservedByte(byte) => write!(formatter, "restore packet reserved byte is {byte}"),
+            Self::ZeroGeneration => formatter.write_str("restore packet generation is 0"),
+            Self::RateDeviation(deviation) => write!(
+                formatter,
+                "restore packet rate deviation {deviation} exceeds the 250 ppm tolerance"
+            ),
+            Self::Downtime(downtime) => write!(
+                formatter,
+                "restore packet downtime {downtime} ns exceeds 30 days"
+            ),
+            Self::Utc(utc) => write!(formatter, "restore packet UTC {utc} is invalid"),
+            Self::IncompleteBody => formatter.write_str("restore packet body is incomplete"),
+            Self::Range(index) => write!(formatter, "restore memory range {index} is invalid"),
+        }
+    }
+}
+
+impl std::error::Error for PacketError {}
+
+/// The validated header of a version-one restore packet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PacketHeader {
     /// Packet behavior flags.
     pub(crate) flags: u8,
     /// Number of online virtual processors reported by the VMM.
@@ -67,107 +203,149 @@ pub(crate) struct RestorePacket {
     pub(crate) downtime_ns: u64,
     /// Host UTC at packet creation in nanoseconds.
     pub(crate) utc_ns: u64,
-    /// Decoded memory ranges as `(start, length)` pairs.
-    pub(crate) ranges: Vec<(u64, u64)>,
-    /// Fresh entropy and leading generation identifier.
-    pub(crate) entropy: [u8; PACKET_ENTROPY_SIZE],
 }
 
-impl RestorePacket {
-    /// Decodes and validates the fixed packet header.
-    pub(crate) fn parse_header(bytes: &[u8]) -> Result<Self, String> {
-        let bytes = bytes
-            .get(..PACKET_HEADER_SIZE)
-            .ok_or_else(|| "restore packet magic is 000000".to_owned())?;
-        if &bytes[..3] != b"OVR" {
-            return Err(format!(
-                "restore packet magic is {:02x}{:02x}{:02x}",
-                bytes[0], bytes[1], bytes[2]
-            ));
-        }
-        if bytes[3] != 4 {
-            return Err(format!("restore packet version is {}", bytes[3]));
-        }
-        let flags = bytes[4];
-        let online_vp_count = bytes[5];
-        let range_count = bytes[6];
-        let generation = read_le32(&bytes[8..]);
-        let rate_deviation = read_le32(&bytes[12..]) as i32;
-        let downtime_ns = read_le64(&bytes[16..]);
-        let utc_ns = read_le64(&bytes[24..]);
-        if flags & !PACKET_KNOWN_FLAGS != 0 {
-            return Err(format!(
-                "restore packet flags 0x{flags:02x} set reserved bits"
-            ));
-        }
-        if !matches!(online_vp_count, 0 | 1 | 2 | 4 | 8) {
-            return Err(format!(
-                "restore packet online VP count is {online_vp_count}"
-            ));
-        }
-        if flags & PACKET_MEMORY_TARGET == 0 && range_count != 0 {
-            return Err(format!(
-                "restore packet has {range_count} memory ranges without a memory target"
-            ));
-        }
-        if bytes[7] != 0 {
-            return Err(format!("restore packet reserved byte is {}", bytes[7]));
-        }
-        if generation == 0 {
-            return Err("restore packet generation is 0".to_owned());
-        }
-        if !(-RATE_DEVIATION_LIMIT..=RATE_DEVIATION_LIMIT).contains(&rate_deviation) {
-            return Err(format!(
-                "restore packet rate deviation {rate_deviation} exceeds the 250 ppm tolerance"
-            ));
-        }
-        if downtime_ns > DOWNTIME_LIMIT_NS {
-            return Err(format!(
-                "restore packet downtime {downtime_ns} ns exceeds 30 days"
-            ));
-        }
-        if utc_ns == 0 || utc_ns > i64::MAX as u64 {
-            return Err(format!("restore packet UTC {utc_ns} is invalid"));
-        }
-        Ok(Self {
+impl PacketHeader {
+    /// Decodes and validates the header at the start of `bytes`.
+    pub(crate) fn parse(bytes: &[u8]) -> Result<Self, PacketError> {
+        let mut fields = Fields::new(bytes, PacketError::IncompleteHeader);
+        let magic: [u8; 3] = fields.bytes()?;
+        let [version, flags, online_vp_count, range_count, reserved] = fields.bytes()?;
+        let header = Self {
             flags,
             online_vp_count,
             range_count,
-            generation,
-            rate_deviation,
-            downtime_ns,
-            utc_ns,
-            ranges: Vec::with_capacity(usize::from(range_count)),
-            entropy: [0; PACKET_ENTROPY_SIZE],
-        })
+            generation: fields.u32()?,
+            rate_deviation: fields.i32()?,
+            downtime_ns: fields.u64()?,
+            utc_ns: fields.u64()?,
+        };
+        if magic != PACKET_MAGIC {
+            return Err(PacketError::Magic(magic));
+        }
+        if version != PACKET_VERSION {
+            return Err(PacketError::Version(version));
+        }
+        if flags & !PACKET_KNOWN_FLAGS != 0 {
+            return Err(PacketError::ReservedFlags(flags));
+        }
+        if !PACKET_ONLINE_VP_COUNTS.contains(&online_vp_count) {
+            return Err(PacketError::OnlineVpCount(online_vp_count));
+        }
+        if !header.memory_target() && range_count != 0 {
+            return Err(PacketError::RangesWithoutTarget(range_count));
+        }
+        if reserved != 0 {
+            return Err(PacketError::ReservedByte(reserved));
+        }
+        if header.generation == 0 {
+            return Err(PacketError::ZeroGeneration);
+        }
+        if !(-RATE_DEVIATION_LIMIT..=RATE_DEVIATION_LIMIT).contains(&header.rate_deviation) {
+            return Err(PacketError::RateDeviation(header.rate_deviation));
+        }
+        if header.downtime_ns > DOWNTIME_LIMIT_NS {
+            return Err(PacketError::Downtime(header.downtime_ns));
+        }
+        if header.utc_ns == 0 || i64::try_from(header.utc_ns).is_err() {
+            return Err(PacketError::Utc(header.utc_ns));
+        }
+        Ok(header)
     }
 
-    /// Returns the exact variable body length implied by the header.
+    /// Returns the length of the body that follows the header.
     pub(crate) fn body_size(&self) -> usize {
         usize::from(self.range_count) * PACKET_RANGE_SIZE + PACKET_ENTROPY_SIZE
     }
 
-    /// Decodes and validates memory ranges and entropy from the packet body.
-    pub(crate) fn parse_body(&mut self, bytes: &[u8]) -> Result<(), String> {
-        let Some(bytes) = bytes.get(..self.body_size()) else {
-            return Err("restore packet body is incomplete".to_owned());
-        };
-        self.ranges.clear();
-        for index in 0..usize::from(self.range_count) {
-            let offset = index * PACKET_RANGE_SIZE;
-            let start = read_le64(&bytes[offset..]);
-            let length = read_le64(&bytes[offset + 8..]);
-            if length == 0 || start.checked_add(length).is_none() {
-                return Err(format!("restore memory range {index} is invalid"));
-            }
-            self.ranges.push((start, length));
-        }
-        let entropy = usize::from(self.range_count) * PACKET_RANGE_SIZE;
-        self.entropy
-            .copy_from_slice(&bytes[entropy..entropy + PACKET_ENTROPY_SIZE]);
-        Ok(())
+    /// Returns whether the host measured the downtime with its UTC clock, rather than with its
+    /// monotonic clock.
+    pub(crate) const fn downtime_from_utc(&self) -> bool {
+        self.flags & PACKET_DOWNTIME_UTC != 0
+    }
+
+    /// Returns whether the packet selects a memory target, whose memory ranges follow.
+    pub(crate) const fn memory_target(&self) -> bool {
+        self.flags & PACKET_MEMORY_TARGET != 0
+    }
+
+    /// Returns whether the host waits for the guest to acknowledge the restore.
+    pub(crate) const fn acknowledgement_required(&self) -> bool {
+        self.flags & PACKET_ACK_REQUIRED != 0
     }
 }
+
+/// A validated version-one restore packet.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RestorePacket {
+    /// The packet's header.
+    pub(crate) header: PacketHeader,
+    /// Memory ranges as `(start, length)` pairs.
+    pub(crate) ranges: Vec<(u64, u64)>,
+    /// Fresh entropy, which starts with the new VM generation ID.
+    pub(crate) entropy: [u8; PACKET_ENTROPY_SIZE],
+}
+
+impl RestorePacket {
+    /// Decodes and validates the memory ranges and entropy that follow `header` in `body`.
+    pub(crate) fn parse(header: PacketHeader, body: &[u8]) -> Result<Self, PacketError> {
+        let mut fields = Fields::new(body, PacketError::IncompleteBody);
+        let ranges = (0..usize::from(header.range_count))
+            .map(|index| {
+                let (start, length) = (fields.u64()?, fields.u64()?);
+                if length == 0 || start.checked_add(length).is_none() {
+                    return Err(PacketError::Range(index));
+                }
+                Ok((start, length))
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(Self {
+            header,
+            ranges,
+            entropy: fields.bytes()?,
+        })
+    }
+
+    /// Returns the new VM generation ID, which leads the entropy.
+    pub(crate) fn generation_id(&self) -> &[u8] {
+        &self.entropy[..GENERATION_ID_SIZE]
+    }
+}
+
+/// Why a host time sample is invalid. Its `Display` is the sample's diagnostic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TimeSampleError {
+    /// The sample is shorter than its record.
+    Incomplete,
+    /// The version is not version one's.
+    Version(u8),
+    /// The flags set bits other than the test-hook flag, or the reserved field is not zero.
+    Flags {
+        /// The sample's flags.
+        flags: u8,
+        /// The sample's reserved field.
+        reserved: u16,
+    },
+    /// The UTC time is zero or does not fit the clocks' signed nanoseconds.
+    Utc(u64),
+}
+
+impl Display for TimeSampleError {
+    /// Writes the diagnostic, such as `time sample version is 2`.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Self::Incomplete => formatter.write_str("time sample is incomplete"),
+            Self::Version(version) => write!(formatter, "time sample version is {version}"),
+            Self::Flags { flags, reserved } => write!(
+                formatter,
+                "time sample flags 0x{flags:02x} or reserved 0x{reserved:04x}"
+            ),
+            Self::Utc(utc) => write!(formatter, "time sample UTC {utc} is invalid"),
+        }
+    }
+}
+
+impl std::error::Error for TimeSampleError {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 /// One host clock sample paired with guest clock brackets.
@@ -185,25 +363,22 @@ pub(crate) struct TimeSample {
 }
 
 impl TimeSample {
-    /// Decodes and validates one fixed-size sample record.
-    pub(crate) fn parse(bytes: &[u8]) -> Result<Self, String> {
-        let Some(bytes) = bytes.get(..SAMPLE_SIZE) else {
-            return Err("time sample version is 0".to_owned());
-        };
-        let flags = bytes[1];
-        let reserved = u16::from_le_bytes([bytes[2], bytes[3]]);
-        let generation = read_le32(&bytes[4..]);
-        let utc_ns = read_le64(&bytes[8..]);
-        if bytes[0] != 1 {
-            return Err(format!("time sample version is {}", bytes[0]));
+    /// Decodes and validates the sample record at the start of `bytes`, without the guest's
+    /// brackets.
+    pub(crate) fn parse(bytes: &[u8]) -> Result<Self, TimeSampleError> {
+        let mut fields = Fields::new(bytes, TimeSampleError::Incomplete);
+        let [version, flags] = fields.bytes()?;
+        let reserved = fields.u16()?;
+        let generation = fields.u32()?;
+        let utc_ns = fields.u64()?;
+        if version != SAMPLE_VERSION {
+            return Err(TimeSampleError::Version(version));
         }
         if flags & !SAMPLE_TEST_HOOKS != 0 || reserved != 0 {
-            return Err(format!(
-                "time sample flags 0x{flags:02x} or reserved 0x{reserved:04x}"
-            ));
+            return Err(TimeSampleError::Flags { flags, reserved });
         }
-        if utc_ns == 0 || utc_ns > i64::MAX as u64 {
-            return Err(format!("time sample UTC {utc_ns} is invalid"));
+        if utc_ns == 0 || i64::try_from(utc_ns).is_err() {
+            return Err(TimeSampleError::Utc(utc_ns));
         }
         Ok(Self {
             flags,
@@ -215,22 +390,6 @@ impl TimeSample {
     }
 }
 
-/// Reads a possibly short little-endian 32-bit field with zero extension.
-pub(crate) fn read_le32(bytes: &[u8]) -> u32 {
-    let mut value = [0; 4];
-    let count = bytes.len().min(value.len());
-    value[..count].copy_from_slice(&bytes[..count]);
-    u32::from_le_bytes(value)
-}
-
-/// Reads a possibly short little-endian 64-bit field with zero extension.
-pub(crate) fn read_le64(bytes: &[u8]) -> u64 {
-    let mut value = [0; 8];
-    let count = bytes.len().min(value.len());
-    value[..count].copy_from_slice(&bytes[..count]);
-    u64::from_le_bytes(value)
-}
-
 /// Encodes bytes as lowercase hexadecimal without separators.
 pub(crate) fn format_hex(bytes: &[u8]) -> String {
     let mut text = String::with_capacity(bytes.len() * 2);
@@ -240,220 +399,17 @@ pub(crate) fn format_hex(bytes: &[u8]) -> String {
     text
 }
 
-/// Decodes exactly `size` bytes of hexadecimal text.
-pub(crate) fn parse_hex(text: &[u8], size: usize) -> Option<Vec<u8>> {
-    if text.len() != size * 2 {
+/// Decodes exactly `N` bytes from `2 * N` hexadecimal digits, in either case.
+pub(crate) fn parse_hex<const N: usize>(text: &[u8]) -> Option<[u8; N]> {
+    if text.len() != 2 * N {
         return None;
     }
-    let mut bytes = vec![0; size];
-    for (index, pair) in text.chunks_exact(2).enumerate() {
-        bytes[index] = hex_digit(pair[0])?.checked_mul(16)? + hex_digit(pair[1])?;
+    let digit = |byte: u8| char::from(byte).to_digit(16);
+    let mut bytes = [0; N];
+    for (byte, pair) in bytes.iter_mut().zip(text.chunks_exact(2)) {
+        *byte = u8::try_from(digit(pair[0])? << 4 | digit(pair[1])?).ok()?;
     }
     Some(bytes)
-}
-
-/// Converts one ASCII hexadecimal digit.
-fn hex_digit(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
-}
-
-/// Parses the C helper's CPU-list syntax. Repeated CPUs count once.
-/// Parses the kernel CPU-list grammar into a fixed ABI mask and count.
-pub(crate) fn parse_cpu_list(text: &[u8]) -> Option<([bool; MAX_CPUS], usize)> {
-    let mut selected = [false; MAX_CPUS];
-    let mut count = 0;
-    let mut cursor = 0;
-    while cursor < text.len() && !matches!(text[cursor], b'\n' | 0) {
-        let (first, end) = decimal_prefix(text, cursor)?;
-        if first < 0 {
-            return None;
-        }
-        cursor = end;
-        let mut last = first;
-        if text.get(cursor) == Some(&b'-') {
-            let parsed = decimal_prefix(text, cursor + 1)?;
-            last = parsed.0;
-            cursor = parsed.1;
-            if last < first {
-                return None;
-            }
-        }
-        if last >= MAX_CPUS as i64 {
-            return None;
-        }
-        for cpu in first..=last {
-            let cpu = cpu as usize;
-            if !selected[cpu] {
-                selected[cpu] = true;
-                count += 1;
-            }
-        }
-        match text.get(cursor).copied() {
-            Some(b',') => cursor += 1,
-            Some(b'\n' | 0) | None => {}
-            _ => return None,
-        }
-    }
-    Some((selected, count))
-}
-
-/// Parses one decimal prefix using C-compatible signed wrapping rules.
-fn decimal_prefix(text: &[u8], mut cursor: usize) -> Option<(i64, usize)> {
-    while text
-        .get(cursor)
-        .is_some_and(|byte| byte.is_ascii_whitespace())
-    {
-        cursor += 1;
-    }
-    let mut negative = false;
-    match text.get(cursor) {
-        Some(b'-') => {
-            negative = true;
-            cursor += 1;
-        }
-        Some(b'+') => cursor += 1,
-        _ => {}
-    }
-    let start = cursor;
-    let limit = if negative {
-        i64::MAX as u64 + 1
-    } else {
-        i64::MAX as u64
-    };
-    let mut value = 0_u64;
-    while let Some(digit @ b'0'..=b'9') = text.get(cursor).copied() {
-        value = value
-            .checked_mul(10)?
-            .checked_add(u64::from(digit - b'0'))?;
-        if value > limit {
-            return None;
-        }
-        cursor += 1;
-    }
-    if cursor == start {
-        return None;
-    }
-    let value = if negative {
-        if value == i64::MAX as u64 + 1 {
-            i64::MIN
-        } else {
-            -(value as i64)
-        }
-    } else {
-        value as i64
-    };
-    Some((value, cursor))
-}
-
-/// Applies C `strtoll`-like lossy parsing used by the compatibility tests.
-pub(crate) fn parse_i64_lossy(text: &[u8]) -> i64 {
-    let mut cursor = 0;
-    while text
-        .get(cursor)
-        .is_some_and(|byte| byte.is_ascii_whitespace())
-    {
-        cursor += 1;
-    }
-    let negative = match text.get(cursor) {
-        Some(b'-') => {
-            cursor += 1;
-            true
-        }
-        Some(b'+') => {
-            cursor += 1;
-            false
-        }
-        _ => false,
-    };
-    let start = cursor;
-    let limit = if negative {
-        i64::MAX as u64 + 1
-    } else {
-        i64::MAX as u64
-    };
-    let mut value = 0_u64;
-    while let Some(digit @ b'0'..=b'9') = text.get(cursor).copied() {
-        value = value
-            .saturating_mul(10)
-            .saturating_add(u64::from(digit - b'0'))
-            .min(limit);
-        cursor += 1;
-    }
-    if cursor == start {
-        0
-    } else if negative && value == i64::MAX as u64 + 1 {
-        i64::MIN
-    } else if negative {
-        -(value as i64)
-    } else {
-        value as i64
-    }
-}
-
-/// Parses a complete signed decimal integer and rejects overflow or suffixes.
-pub(crate) fn parse_i64_exact(text: &[u8]) -> Option<i64> {
-    let text = c_text(text);
-    let (value, mut cursor) = decimal_prefix(text, 0)?;
-    while matches!(text.get(cursor), Some(b'\n' | b' ')) {
-        cursor += 1;
-    }
-    (cursor == text.len()).then_some(value)
-}
-
-/// Applies C `strtoull`-like lossy parsing used by persisted compatibility data.
-pub(crate) fn parse_u64_lossy(text: &[u8]) -> u64 {
-    u64_prefix_lossy(text, 0).map_or(0, |value| value.0)
-}
-
-/// Parses one unsigned prefix while retaining C saturation and sign behavior.
-fn u64_prefix_lossy(text: &[u8], mut cursor: usize) -> Option<(u64, usize)> {
-    while text
-        .get(cursor)
-        .is_some_and(|byte| byte.is_ascii_whitespace())
-    {
-        cursor += 1;
-    }
-    let negative = match text.get(cursor) {
-        Some(b'-') => {
-            cursor += 1;
-            true
-        }
-        Some(b'+') => {
-            cursor += 1;
-            false
-        }
-        _ => false,
-    };
-    let mut value = 0_u64;
-    let mut overflow = false;
-    let mut converted = false;
-    while let Some(digit @ b'0'..=b'9') = text.get(cursor).copied() {
-        converted = true;
-        let next = value
-            .checked_mul(10)
-            .and_then(|value| value.checked_add(u64::from(digit - b'0')));
-        if let Some(next) = next {
-            value = next;
-        } else {
-            value = u64::MAX;
-            overflow = true;
-        }
-        cursor += 1;
-    }
-    if !converted {
-        None
-    } else if overflow {
-        Some((u64::MAX, cursor))
-    } else if negative {
-        Some((value.wrapping_neg(), cursor))
-    } else {
-        Some((value, cursor))
-    }
 }
 
 /// Computes clock offset and half-round-trip uncertainty with wrapping C arithmetic.
@@ -480,20 +436,17 @@ pub(crate) fn frequency_to_ppb(frequency: i64) -> i64 {
 /// Splits a signed nanosecond offset into whole seconds, rounded toward negative infinity, and
 /// the nonnegative nanoseconds that complete it, as a step of the wall clock takes it.
 pub(crate) fn split_offset(offset_ns: i64) -> (i64, i64) {
-    let mut seconds = offset_ns / NSEC_PER_SEC;
-    let mut nanoseconds = offset_ns % NSEC_PER_SEC;
-    if nanoseconds < 0 {
-        seconds -= 1;
-        nanoseconds += NSEC_PER_SEC;
-    }
-    (seconds, nanoseconds)
+    (
+        offset_ns.div_euclid(NSEC_PER_SEC),
+        offset_ns.rem_euclid(NSEC_PER_SEC),
+    )
 }
 
 /// Selects and parameterizes a step or slew of the wall clock for the offset `theta` and the
 /// uncertainty `epsilon`, both in nanoseconds: a step at or above the step threshold, and
 /// otherwise a slew with the fast or slow time constant.
 pub(crate) fn plan_correction(theta: i64, epsilon: i64, fast: bool) -> ClockAdjustment {
-    let magnitude = theta.wrapping_abs();
+    let magnitude = theta.unsigned_abs();
     if magnitude >= STEP_THRESHOLD_NS {
         let (seconds, nanoseconds) = split_offset(theta);
         return ClockAdjustment::Step {
@@ -501,7 +454,7 @@ pub(crate) fn plan_correction(theta: i64, epsilon: i64, fast: bool) -> ClockAdju
             nanoseconds,
         };
     }
-    let ceil_us = |nanoseconds: i64| nanoseconds.wrapping_add(NSEC_PER_USEC - 1) / NSEC_PER_USEC;
+    let ceil_us = |nanoseconds: i64| nanoseconds.saturating_add(NSEC_PER_USEC - 1) / NSEC_PER_USEC;
     ClockAdjustment::Slew {
         offset_ns: theta,
         time_constant: if fast {
@@ -509,7 +462,8 @@ pub(crate) fn plan_correction(theta: i64, epsilon: i64, fast: bool) -> ClockAdju
         } else {
             SLOW_TIME_CONSTANT
         },
-        maximum_error_us: ceil_us(magnitude.wrapping_add(epsilon)),
+        // Below the step threshold, the magnitude fits an `i64`.
+        maximum_error_us: ceil_us((magnitude as i64).saturating_add(epsilon)),
         estimated_error_us: ceil_us(epsilon),
     }
 }
@@ -517,7 +471,7 @@ pub(crate) fn plan_correction(theta: i64, epsilon: i64, fast: bool) -> ClockAdju
 /// Kernel-message signature associated with one violation code.
 struct WatchRule {
     /// Stable ABI violation code.
-    code: &'static str,
+    code: ViolationCode,
     /// Substrings that must all occur.
     all: &'static [&'static str],
     /// Alternative substrings of which at least one must occur.
@@ -527,12 +481,12 @@ struct WatchRule {
 /// Ordered kernel-message rules used by the runtime watcher.
 const WATCH_RULES: &[WatchRule] = &[
     WatchRule {
-        code: "G_TSC_UNSTABLE",
+        code: ViolationCode::TscUnstable,
         all: &["Marking TSC unstable due to "],
         any: &[],
     },
     WatchRule {
-        code: "G_CLOCKSOURCE_UNSTABLE",
+        code: ViolationCode::ClocksourceUnstable,
         all: &[
             "timekeeping watchdog on CPU",
             "as unstable because the skew is too large",
@@ -540,17 +494,17 @@ const WATCH_RULES: &[WatchRule] = &[
         any: &[],
     },
     WatchRule {
-        code: "G_CLOCKSOURCE_SWITCH",
+        code: ViolationCode::ClocksourceSwitch,
         all: &["clocksource: Switched to clocksource "],
         any: &[],
     },
     WatchRule {
-        code: "G_CLOCKSOURCE_SKEW",
+        code: ViolationCode::ClocksourceSkew,
         all: &["clocksource: "],
         any: &[" ahead of CPU ", " behind CPU "],
     },
     WatchRule {
-        code: "G_TSC_WARP",
+        code: ViolationCode::TscWarp,
         all: &[],
         any: &[
             "TSC synchronization [CPU#",
@@ -559,12 +513,12 @@ const WATCH_RULES: &[WatchRule] = &[
         ],
     },
     WatchRule {
-        code: "G_TSC_ADJUST",
+        code: ViolationCode::TscAdjust,
         all: &["TSC ADJUST"],
         any: &[],
     },
     WatchRule {
-        code: "G_RCU_STALL",
+        code: ViolationCode::RcuStall,
         all: &["rcu: INFO: "],
         any: &[
             " detected stalls on CPUs/tasks",
@@ -573,7 +527,7 @@ const WATCH_RULES: &[WatchRule] = &[
         ],
     },
     WatchRule {
-        code: "G_RCU_STARVED",
+        code: ViolationCode::RcuStarved,
         all: &["rcu: "],
         any: &[
             " kthread starved for ",
@@ -581,54 +535,48 @@ const WATCH_RULES: &[WatchRule] = &[
         ],
     },
     WatchRule {
-        code: "G_SOFT_LOCKUP",
+        code: ViolationCode::SoftLockup,
         all: &["watchdog: BUG: soft lockup - CPU#"],
         any: &[],
     },
     WatchRule {
-        code: "G_HARD_LOCKUP",
+        code: ViolationCode::HardLockup,
         all: &["Watchdog detected hard LOCKUP"],
         any: &[],
     },
     WatchRule {
-        code: "G_HUNG_TASK",
+        code: ViolationCode::HungTask,
         all: &["INFO: task ", " blocked for more than "],
         any: &[],
     },
     WatchRule {
-        code: "G_UNCHECKED_MSR",
+        code: ViolationCode::UncheckedMsr,
         all: &["unchecked MSR access error"],
         any: &[],
     },
     WatchRule {
-        code: "G_APIC_ID_MISMATCH",
+        code: ViolationCode::ApicIdMismatch,
         all: &["APIC ID mismatch"],
         any: &[],
     },
 ];
 
 /// Returns the first violation code matched by a kernel message.
-pub(crate) fn match_watch_rule(message: &[u8]) -> Option<&'static str> {
-    let message = c_text(message);
-    if message.starts_with(b"NVX-TIME-") {
+pub(crate) fn match_watch_rule(message: &[u8]) -> Option<ViolationCode> {
+    if message.starts_with(OWN_RECORD_PREFIX) {
         return None;
     }
-    WATCH_RULES.iter().find_map(|rule| {
-        let all = rule
-            .all
-            .iter()
-            .all(|part| contains_bytes(message, part.as_bytes()));
-        let any = rule.any.is_empty()
-            || rule
-                .any
-                .iter()
-                .any(|part| contains_bytes(message, part.as_bytes()));
-        (all && any).then_some(rule.code)
-    })
+    let contains = |part: &&str| kernel_text::contains(message, part.as_bytes());
+    WATCH_RULES
+        .iter()
+        .find(|rule| {
+            rule.all.iter().all(contains) && (rule.any.is_empty() || rule.any.iter().any(contains))
+        })
+        .map(|rule| rule.code)
 }
 
+/// Accumulated boot-log evidence for check C4, and the boot log's first W+X record.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-/// Accumulated boot-log evidence for checks C2 through C4.
 pub(crate) struct BootLog {
     /// Whether the Microsoft Hyper-V hypervisor line was observed.
     hypervisor: bool,
@@ -636,169 +584,97 @@ pub(crate) struct BootLog {
     privileges: bool,
     /// Whether the expected LAPIC frequency line was observed.
     lapic: bool,
-    /// Name from the latest clocksource switch.
-    last_switch: Vec<u8>,
-    /// First forbidden or violation-bearing message.
-    problem: Vec<u8>,
-    /// First insecure writable-executable mapping message.
-    pub(crate) wx: Vec<u8>,
+    /// The clocksource that the last clocksource switch selected.
+    last_switch: Option<Vec<u8>>,
+    /// The diagnostic of the first forbidden or violation-bearing message.
+    problem: Option<Vec<u8>>,
+    /// The first message that reports an insecure writable and executable mapping.
+    pub(crate) wx: Option<Vec<u8>>,
 }
 
 impl BootLog {
     /// Incorporates one kernel message into the accumulated verdict.
     pub(crate) fn add(&mut self, message: &[u8]) {
-        const FORBIDDEN: &[&[u8]] = &[
+        const FORBIDDEN: [&[u8]; 4] = [
             b"Fast TSC calibration",
             b"Refined TSC clocksource calibration",
             b"kvm-clock",
             b"APIC timer: using supplied frequency",
         ];
-        let message = c_text(message);
-        if self.wx.is_empty()
-            && !message.starts_with(b"NVX-TIME-")
-            && contains_bytes(message, b"Found insecure W+X mapping")
-        {
-            self.wx
-                .extend_from_slice(&message[..message.len().min(300)]);
-        }
-        self.hypervisor |= contains_bytes(message, b"Hypervisor detected: Microsoft Hyper-V");
-        self.privileges |= contains_bytes(message, b"Hyper-V: privilege flags low 0x8860,");
-        self.lapic |= message.ends_with(b"Hyper-V: LAPIC Timer Frequency: 0x989680")
-            || message.ends_with(b"Hyper-V: LAPIC Timer Frequency: 0x1e8480");
+        const LAPIC_RATES: [&[u8]; 2] = [
+            b"Hyper-V: LAPIC Timer Frequency: 0x989680",
+            b"Hyper-V: LAPIC Timer Frequency: 0x1e8480",
+        ];
         const SWITCHED: &[u8] = b"clocksource: Switched to clocksource ";
-        if let Some(name) = find_bytes(message, SWITCHED) {
-            let name = &message[name + SWITCHED.len()..];
-            let end = name
-                .iter()
-                .position(|byte| matches!(byte, b' ' | b'\n'))
-                .unwrap_or(name.len())
-                .min(47);
-            self.last_switch.clear();
-            self.last_switch.extend_from_slice(&name[..end]);
+        let own = message.starts_with(OWN_RECORD_PREFIX);
+        let quoted = &message[..message.len().min(QUOTED_MESSAGE_MAX)];
+        if self.wx.is_none()
+            && !own
+            && kernel_text::contains(message, b"Found insecure W+X mapping")
+        {
+            self.wx = Some(quoted.to_vec());
         }
-        if !self.problem.is_empty() {
+        self.hypervisor |=
+            kernel_text::contains(message, b"Hypervisor detected: Microsoft Hyper-V");
+        self.privileges |= kernel_text::contains(message, b"Hyper-V: privilege flags low 0x8860,");
+        self.lapic |= LAPIC_RATES.iter().any(|record| message.ends_with(record));
+        if let Some(start) = kernel_text::find(message, SWITCHED) {
+            let name = &message[start + SWITCHED.len()..];
+            let name = name.split(|&byte| matches!(byte, b' ' | b'\n')).next();
+            self.last_switch = name.map(<[u8]>::to_vec);
+        }
+        if self.problem.is_some() {
             return;
         }
         if let Some(code) = match_watch_rule(message)
-            && code != "G_CLOCKSOURCE_SWITCH"
+            && code != ViolationCode::ClocksourceSwitch
         {
-            let _ = write!(&mut self.problem, "{code}: ");
-            self.problem
-                .extend_from_slice(&message[..message.len().min(300)]);
-            return;
-        }
-        if !message.starts_with(b"NVX-TIME-")
+            self.problem = Some([format!("{code}: ").as_bytes(), quoted].concat());
+        } else if !own
             && FORBIDDEN
                 .iter()
-                .any(|record| contains_bytes(message, record))
+                .any(|record| kernel_text::contains(message, record))
         {
-            self.problem.extend_from_slice(b"forbidden record: ");
-            self.problem
-                .extend_from_slice(&message[..message.len().min(300)]);
+            self.problem = Some([b"forbidden record: ".as_slice(), quoted].concat());
         }
     }
 
     /// Validates all accumulated boot-log requirements.
     pub(crate) fn verdict(&self) -> Result<(), Vec<u8>> {
-        if !self.problem.is_empty() {
-            Err(self.problem.clone())
+        if let Some(problem) = &self.problem {
+            Err(problem.clone())
         } else if !self.hypervisor {
             Err(b"no 'Hypervisor detected: Microsoft Hyper-V'".to_vec())
         } else if !self.privileges {
             Err(b"no 'Hyper-V: privilege flags low 0x8860,'".to_vec())
         } else if !self.lapic {
             Err(b"no 'Hyper-V: LAPIC Timer Frequency' of 1 GHz or 200 MHz".to_vec())
-        } else if self.last_switch != b"tsc" {
-            let mut detail = b"last clocksource switch is to '".to_vec();
-            detail.extend_from_slice(&self.last_switch);
-            detail.extend_from_slice(b"', not tsc");
-            Err(detail)
+        } else if self.last_switch.as_deref() != Some(b"tsc") {
+            Err([
+                b"last clocksource switch is to '".as_slice(),
+                self.last_switch.as_deref().unwrap_or_default(),
+                b"', not tsc",
+            ]
+            .concat())
         } else {
             Ok(())
         }
     }
 }
 
-/// Removes syslog metadata and returns only a message's bytes.
-pub(crate) fn syslog_message(line: &[u8]) -> &[u8] {
-    let mut cursor = 0;
-    if line.first() == Some(&b'<')
-        && let Some(end) = line.iter().position(|byte| *byte == b'>')
-    {
-        cursor = end + 1;
-    }
-    if line.get(cursor) != Some(&b'[') {
-        return &line[cursor..];
-    }
-    let start = cursor;
-    cursor += 1;
-    while line.get(cursor) == Some(&b' ') {
-        cursor += 1;
-    }
-    while line.get(cursor).is_some_and(u8::is_ascii_digit) {
-        cursor += 1;
-    }
-    if line.get(cursor) != Some(&b'.') {
-        return &line[start..];
-    }
-    cursor += 1;
-    while line.get(cursor).is_some_and(u8::is_ascii_digit) {
-        cursor += 1;
-    }
-    if line.get(cursor) != Some(&b']') {
-        return &line[start..];
-    }
-    cursor += 1;
-    if line.get(cursor) == Some(&b' ') {
-        cursor += 1;
-    }
-    &line[cursor..]
-}
-
-/// Truncates a byte string at its first C NUL terminator.
-fn c_text(text: &[u8]) -> &[u8] {
-    text.split(|byte| *byte == 0).next().unwrap_or_default()
-}
-
-/// Finds the first byte-exact occurrence of `needle`.
-fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() {
-        Some(0)
-    } else {
-        haystack
-            .windows(needle.len())
-            .position(|window| window == needle)
-    }
-}
-
-/// Returns whether `needle` occurs byte-exactly in `haystack`.
-fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
-    find_bytes(haystack, needle).is_some()
-}
-
-/// Returns whether a whitespace-delimited byte list contains `word`.
-fn has_word(list: &[u8], word: &[u8]) -> bool {
-    let mut offset = 0;
-    while let Some(found) = find_bytes(&list[offset..], word) {
-        let start = offset + found;
-        let end = start + word.len();
-        let starts = start == 0 || matches!(list[start - 1], b' ' | b'\t');
-        let ends = end == list.len() || matches!(list[end], 0 | b' ' | b'\n');
-        if starts && ends {
-            return true;
-        }
-        offset = end;
-    }
-    false
-}
-
-/// Scans every line of a boot log into one accumulated verdict.
+/// Scans every line of a boot log into one accumulated verdict. A `syslog(2)` log's lines start
+/// with their priorities and timestamps.
 pub(crate) fn scan_boot_log(text: &[u8], syslog: bool) -> BootLog {
     let mut log = BootLog::default();
-    for line in c_text(text).split(|byte| *byte == b'\n') {
-        if !line.is_empty() {
-            log.add(if syslog { syslog_message(line) } else { line });
-        }
+    for line in text
+        .split(|&byte| byte == b'\n')
+        .filter(|line| !line.is_empty())
+    {
+        log.add(if syslog {
+            SyslogLine::parse(line).message
+        } else {
+            line
+        });
     }
     log
 }
@@ -818,30 +694,18 @@ pub(crate) fn explicit_zero_leaf(leaf: u32) -> bool {
 /// Validates one CPUID leaf in an exhaustive sparse-range scan.
 pub(crate) fn exhaustive_leaf_ok(
     leaf: u32,
-    value: [u32; 4],
-    out_of_range: [u32; 4],
+    value: CpuidResult,
+    out_of_range: CpuidResult,
 ) -> Result<(), String> {
-    if value == [0; 4] || (!explicit_zero_leaf(leaf) && value == out_of_range) {
+    let explicit = explicit_zero_leaf(leaf);
+    if value == cpuid::ZERO || (!explicit && value == out_of_range) {
         return Ok(());
     }
-    let mut signature = [0; 12];
-    signature[..4].copy_from_slice(&value[1].to_ne_bytes());
-    signature[4..8].copy_from_slice(&value[2].to_ne_bytes());
-    signature[8..].copy_from_slice(&value[3].to_ne_bytes());
-    for byte in &mut signature {
-        if !(0x20..=0x7e).contains(byte) {
-            *byte = b'.';
-        }
-    }
-    let signature = String::from_utf8_lossy(&signature);
     Err(format!(
-        "leaf 0x{leaf:08x} is {:08x} {:08x} {:08x} {:08x} \
-         (signature \"{signature}\"), expected zero{}",
-        value[0],
-        value[1],
-        value[2],
-        value[3],
-        if explicit_zero_leaf(leaf) {
+        "leaf 0x{leaf:08x} is {} (signature \"{}\"), expected zero{}",
+        cpuid::hex_registers(value, " "),
+        cpuid::signature(value),
+        if explicit {
             ""
         } else {
             " or the highest basic leaf"
@@ -849,183 +713,93 @@ pub(crate) fn exhaustive_leaf_ok(
     ))
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-/// One broadcast or per-CPU section from `/proc/timer_list`.
-struct TickSection {
-    /// Whether the section appeared.
-    seen: bool,
-    /// Tick-device mode inherited from the surrounding heading.
-    mode: i32,
-    /// Clock-event state.
-    state: i32,
-    /// Clock-event device name.
-    device: Vec<u8>,
-    /// Installed event-handler name.
-    handler: Vec<u8>,
-}
-
-/// Matches a scanf-like literal prefix with collapsed ASCII whitespace.
-fn scan_prefix(line: &[u8], pattern: &[u8]) -> Option<usize> {
-    let mut input = 0;
-    let mut format = 0;
-    while format < pattern.len() {
-        if pattern[format].is_ascii_whitespace() {
-            while pattern.get(format).is_some_and(u8::is_ascii_whitespace) {
-                format += 1;
-            }
-            while line.get(input).is_some_and(u8::is_ascii_whitespace) {
-                input += 1;
-            }
-        } else {
-            if line.get(input) != pattern.get(format) {
-                return None;
-            }
-            input += 1;
-            format += 1;
-        }
+/// Validates the broadcast device and the selected CPUs' tick devices of `/proc/timer_list`:
+/// the broadcast device, if any, has no clock-event device, and each selected CPU ticks with a
+/// one-shot LAPIC timer through the high-resolution timers.
+pub(crate) fn timer_list_verdict(text: &[u8], selected: CpuMask) -> Result<(), String> {
+    let list = TimerList::parse(text);
+    if let Some(broadcast) = &list.broadcast
+        && broadcast.device.as_deref() != Some("<NULL>")
+    {
+        return Err(format!(
+            "broadcast clock event device is {}",
+            broadcast.device.as_deref().unwrap_or_default()
+        ));
     }
-    Some(input)
-}
-
-/// Scans one signed integer after a prefix.
-fn scan_i32(line: &[u8], pattern: &[u8]) -> Option<i32> {
-    let start = scan_prefix(line, pattern)?;
-    let (value, _) = decimal_prefix(line, start)?;
-    Some(value as i32)
-}
-
-/// Scans one bounded non-whitespace word after a prefix.
-fn scan_word(line: &[u8], pattern: &[u8]) -> Option<Vec<u8>> {
-    let mut start = scan_prefix(line, pattern)?;
-    while line.get(start).is_some_and(u8::is_ascii_whitespace) {
-        start += 1;
-    }
-    let end = line[start..]
-        .iter()
-        .position(|byte| byte.is_ascii_whitespace() || *byte == 0)
-        .map_or(line.len(), |length| start + length);
-    (end > start).then(|| line[start..end.min(start + 47)].to_vec())
-}
-
-/// Validates selected CPUs' tick devices and the broadcast device.
-pub(crate) fn timer_list_verdict(text: &[u8], selected: &[bool; MAX_CPUS]) -> Result<(), Vec<u8>> {
-    let mut cpus: [TickSection; MAX_CPUS] = std::array::from_fn(|_| TickSection {
-        mode: -1,
-        state: -1,
-        ..TickSection::default()
-    });
-    let mut broadcast = TickSection {
-        mode: -1,
-        state: -1,
-        ..TickSection::default()
-    };
-    enum Current {
-        None,
-        Cpu(usize),
-        Broadcast,
-    }
-    let mut current = Current::None;
-    let mut tick_mode = -1;
-    for line in c_text(text).split(|byte| *byte == b'\n') {
-        if let Some(value) = scan_i32(line, b"Tick Device: mode: ") {
-            tick_mode = value;
-            current = Current::None;
-        } else if line.starts_with(b"Broadcast device") {
-            broadcast.seen = true;
-            broadcast.mode = tick_mode;
-            current = Current::Broadcast;
-        } else if let Some(value) = scan_i32(line, b"Per CPU device: ") {
-            current = usize::try_from(value)
-                .ok()
-                .filter(|cpu| *cpu < MAX_CPUS)
-                .map_or(Current::None, |cpu| {
-                    cpus[cpu].seen = true;
-                    cpus[cpu].mode = tick_mode;
-                    Current::Cpu(cpu)
-                });
-        } else {
-            let section = match current {
-                Current::None => None,
-                Current::Cpu(cpu) => Some(&mut cpus[cpu]),
-                Current::Broadcast => Some(&mut broadcast),
-            };
-            let Some(section) = section else {
-                continue;
-            };
-            if let Some(value) = scan_word(line, b"Clock Event Device: ") {
-                section.device = value;
-            } else if let Some(value) = scan_i32(line, b" mode: ") {
-                section.state = value;
-            } else if let Some(value) = scan_word(line, b" event_handler: ") {
-                section.handler = value;
-            }
-        }
-    }
-    if broadcast.seen && broadcast.device != b"<NULL>" {
-        let mut detail = b"broadcast clock event device is ".to_vec();
-        detail.extend_from_slice(&broadcast.device);
-        return Err(detail);
-    }
-    for cpu in 0..MAX_CPUS {
-        if !selected[cpu] {
+    for cpu in selected.iter() {
+        let tick = list.tick_devices.get(&cpu);
+        if tick.is_some_and(one_shot_lapic) {
             continue;
         }
-        let section = &cpus[cpu];
-        if !section.seen
-            || section.device != b"lapic"
-            || section.handler != b"hrtimer_interrupt"
-            || section.mode != 1
-            || !matches!(section.state, 3 | 4)
-        {
-            let mut detail = Vec::new();
-            let _ = write!(&mut detail, "cpu {cpu} tick device ");
-            if section.seen {
-                detail.extend_from_slice(&section.device);
-            } else {
-                detail.extend_from_slice(b"missing");
-            }
-            detail.extend_from_slice(b" handler ");
-            if section.handler.is_empty() {
-                detail.extend_from_slice(b"none");
-            } else {
-                detail.extend_from_slice(&section.handler);
-            }
-            let _ = write!(
-                &mut detail,
-                " tick mode {} state {}",
-                section.mode, section.state
-            );
-            return Err(detail);
-        }
+        let missing = TickDevice::default();
+        let details = tick.unwrap_or(&missing);
+        return Err(format!(
+            "cpu {cpu} tick device {} handler {} tick mode {} state {}",
+            match tick {
+                Some(tick) => tick.device.as_deref().unwrap_or_default(),
+                None => "missing",
+            },
+            details.handler.as_deref().unwrap_or("none"),
+            details.mode.unwrap_or(-1),
+            details.state.unwrap_or(-1),
+        ));
     }
     Ok(())
 }
 
+/// Returns whether a tick device is the LAPIC timer, in one-shot mode, with the
+/// high-resolution timers' event handler.
+fn one_shot_lapic(tick: &TickDevice) -> bool {
+    tick.device.as_deref() == Some("lapic")
+        && tick.handler.as_deref() == Some("hrtimer_interrupt")
+        && tick.tick_mode() == Some(TickMode::Oneshot)
+        && matches!(
+            tick.clock_event_state(),
+            Some(ClockEventState::Oneshot | ClockEventState::OneshotStopped)
+        )
+}
+
+/// The CPU rates of `/proc/cpuinfo`.
 #[derive(Clone, Debug, PartialEq, Eq)]
-/// CPU rates extracted from `/proc/cpuinfo`.
 pub(crate) struct CpuInfo {
-    /// Per-CPU frequency in kilohertz.
-    pub(crate) khz: [u64; MAX_CPUS],
-    /// Whether a frequency was parsed for each CPU.
-    pub(crate) known: [bool; MAX_CPUS],
+    /// Each CPU's `cpu MHz`, in kHz rounded down, when the file gives it.
+    pub(crate) khz: [Option<u64>; MAX_CPUS],
 }
 
 impl Default for CpuInfo {
     fn default() -> Self {
         Self {
-            khz: [0; MAX_CPUS],
-            known: [false; MAX_CPUS],
+            khz: [None; MAX_CPUS],
         }
     }
 }
 
-/// Validates CPU topology, rates, and optional feature flags.
+/// Parses a `cpu MHz` value, such as `2194.843`, into kHz, rounded down.
+fn parse_khz(value: &str) -> Option<u64> {
+    /// The decimals of a MHz value that make whole kHz.
+    const DECIMALS: usize = 3;
+    let (whole, fraction) = value.split_once('.').unwrap_or((value, ""));
+    if !fraction.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let fraction = fraction
+        .bytes()
+        .chain(std::iter::repeat(b'0'))
+        .take(DECIMALS)
+        .fold(0, |khz, digit| khz * 10 + u64::from(digit - b'0'));
+    parse_decimal(whole.as_bytes())?
+        .checked_mul(KHZ_PER_MHZ)?
+        .checked_add(fraction)
+}
+
+/// Records every CPU's rate from `/proc/cpuinfo`, and, with `flags`, validates the selected
+/// CPUs' feature flags and their presence. The first failure ends the scan.
 pub(crate) fn check_cpuinfo(
     text: &[u8],
-    selected: &[bool; MAX_CPUS],
+    selected: CpuMask,
     flags: bool,
 ) -> (CpuInfo, Result<(), String>) {
-    const REQUIRED: &[&str] = &[
+    const REQUIRED: [&str; 8] = [
         "tsc",
         "constant_tsc",
         "nonstop_tsc",
@@ -1035,194 +809,188 @@ pub(crate) fn check_cpuinfo(
         "hypervisor",
         "arat",
     ];
-    const FORBIDDEN: &[&str] = &["tsc_deadline_timer", "tsc_adjust"];
-    let mut result = CpuInfo::default();
+    const FORBIDDEN: [&str; 2] = ["tsc_deadline_timer", "tsc_adjust"];
+    let text = String::from_utf8_lossy(text);
+    let mut info = CpuInfo::default();
+    let mut seen = CpuMask::EMPTY;
     let mut cpu = None;
-    let mut failure = None;
-    let mut seen = [false; MAX_CPUS];
-    for raw in c_text(text).split(|byte| *byte == b'\n') {
-        if failure.is_some() {
-            break;
-        }
-        let Some(colon) = raw.iter().position(|byte| *byte == b':') else {
-            continue;
-        };
-        if raw.starts_with(b"processor") {
-            let number = parse_i64_lossy(&raw[colon + 1..]);
-            cpu = usize::try_from(number).ok().filter(|cpu| *cpu < MAX_CPUS);
-            if let Some(cpu) = cpu {
-                seen[cpu] = true;
+    for (key, value) in text.lines().filter_map(|line| line.split_once(':')) {
+        match key.trim_end() {
+            "processor" => {
+                cpu = value
+                    .trim()
+                    .parse()
+                    .ok()
+                    .filter(|&cpu: &usize| cpu < MAX_CPUS);
+                seen = cpu.map_or(seen, |cpu| seen.with(cpu));
             }
-        } else if raw.starts_with(b"cpu MHz") {
-            let Some(cpu) = cpu else {
-                continue;
-            };
-            let value = &raw[colon + 1..];
-            let whole = parse_u64_lossy(value);
-            let mut fraction = [b'0'; 3];
-            if let Some(dot) = value.iter().position(|byte| *byte == b'.') {
-                for (target, &digit) in fraction.iter_mut().zip(&value[dot + 1..]) {
-                    if digit.is_ascii_digit() {
-                        *target = digit;
-                    } else {
-                        break;
-                    }
+            "cpu MHz" => {
+                if let Some(cpu) = cpu {
+                    info.khz[cpu] = parse_khz(value.trim());
                 }
             }
-            let fraction = u64::from(fraction[0] - b'0') * 100
-                + u64::from(fraction[1] - b'0') * 10
-                + u64::from(fraction[2] - b'0');
-            result.khz[cpu] = whole.wrapping_mul(KHZ_PER_MHZ).wrapping_add(fraction);
-            result.known[cpu] = true;
-        } else if flags && raw.starts_with(b"flags") {
-            let Some(cpu) = cpu.filter(|cpu| selected[*cpu]) else {
-                continue;
-            };
-            let words = &raw[colon + 1..];
-            if let Some(required) = REQUIRED
-                .iter()
-                .find(|flag| !has_word(words, flag.as_bytes()))
-            {
-                failure = Some(format!("cpu {cpu} lacks the {required} flag"));
-            } else if let Some(forbidden) = FORBIDDEN
-                .iter()
-                .find(|flag| has_word(words, flag.as_bytes()))
-            {
-                failure = Some(format!("cpu {cpu} has the {forbidden} flag"));
+            "flags" if flags => {
+                let Some(cpu) = cpu.filter(|&cpu| selected.contains(cpu)) else {
+                    continue;
+                };
+                let has = |flag: &str| value.split_ascii_whitespace().any(|word| word == flag);
+                if let Some(flag) = REQUIRED.into_iter().find(|&flag| !has(flag)) {
+                    return (info, Err(format!("cpu {cpu} lacks the {flag} flag")));
+                }
+                if let Some(flag) = FORBIDDEN.into_iter().find(|&flag| has(flag)) {
+                    return (info, Err(format!("cpu {cpu} has the {flag} flag")));
+                }
             }
+            _ => {}
         }
     }
-    if failure.is_none()
-        && flags
-        && let Some(cpu) = (0..MAX_CPUS).find(|cpu| selected[*cpu] && !seen[*cpu])
-    {
-        failure = Some(format!("cpu {cpu} is not in /proc/cpuinfo"));
+    let missing = selected.iter().find(|&cpu| !seen.contains(cpu));
+    match missing.filter(|_| flags) {
+        Some(cpu) => (info, Err(format!("cpu {cpu} is not in /proc/cpuinfo"))),
+        None => (info, Ok(())),
     }
-    let verdict = failure.map_or(Ok(()), Err);
-    (result, verdict)
 }
 
 /// Validates the kernel command line required by time ABI version one.
 pub(crate) fn check_cmdline(text: &[u8]) -> Result<(), Vec<u8>> {
-    const PREFIXES: &[&[u8]] = &[b"tsc_early_khz=", b"lapic_timer_hz="];
-    const TOKENS: &[&[u8]] = &[
+    const PREFIXES: [&[u8]; 2] = [b"tsc_early_khz=", b"lapic_timer_hz="];
+    const TOKENS: [&[u8]; 5] = [
         b"notsc",
         b"nolapic",
         b"nolapic_timer",
         b"tsc=unstable",
         b"hpet=force",
     ];
-    for token in c_text(text)
-        .split(|byte| matches!(byte, b' ' | b'\t' | b'\n'))
-        .filter(|token| !token.is_empty())
-    {
-        let bad_clocksource = token
+    let forbidden = |token: &&[u8]| {
+        token
             .strip_prefix(b"clocksource=")
-            .is_some_and(|value| value != b"tsc");
-        if bad_clocksource
+            .is_some_and(|value| value != b"tsc")
             || PREFIXES.iter().any(|prefix| token.starts_with(prefix))
-            || TOKENS.contains(&token)
-        {
-            let mut detail = b"command line contains ".to_vec();
-            detail.extend_from_slice(&token[..token.len().min(120)]);
-            return Err(detail);
-        }
+            || TOKENS.contains(token)
+    };
+    match text.split(u8::is_ascii_whitespace).find(forbidden) {
+        Some(token) => Err([
+            b"command line contains ".as_slice(),
+            &token[..token.len().min(QUOTED_TOKEN_MAX)],
+        ]
+        .concat()),
+        None => Ok(()),
     }
-    Ok(())
 }
 
-/// Validates the selected and available kernel clocksources.
+/// Validates the current clocksource, the first line of `current`, and the available ones.
 pub(crate) fn check_clocksource(current: &[u8], available: &[u8]) -> Result<(), Vec<u8>> {
-    let current_name = c_text(current)
-        .split(|byte| *byte == b'\n')
+    let current = current
+        .split(|&byte| byte == b'\n')
         .next()
         .unwrap_or_default();
-    if current_name != b"tsc" {
-        let mut detail = b"current clocksource is ".to_vec();
-        detail.extend_from_slice(current_name);
-        return Err(detail);
+    if current != b"tsc" {
+        return Err([b"current clocksource is ".as_slice(), current].concat());
     }
     let mut tsc = false;
-    for token in c_text(available)
-        .split(|byte| matches!(byte, b' ' | b'\n'))
-        .filter(|token| !token.is_empty())
+    for name in available
+        .split(|&byte| matches!(byte, b' ' | b'\n'))
+        .filter(|name| !name.is_empty())
     {
-        match token {
+        match name {
             b"tsc" => tsc = true,
             b"refined-jiffies" | b"jiffies" => {}
-            _ => {
-                let mut detail = b"clocksource ".to_vec();
-                detail.extend_from_slice(&token[..token.len().min(64)]);
-                detail.extend_from_slice(b" is available");
-                return Err(detail);
-            }
+            _ => return Err([b"clocksource ".as_slice(), name, b" is available"].concat()),
         }
     }
-    if !tsc {
-        return Err(b"tsc is not an available clocksource".to_vec());
+    if tsc {
+        Ok(())
+    } else {
+        Err(b"tsc is not an available clocksource".to_vec())
     }
-    Ok(())
 }
 
-/// Parses the private generation/new-CPU restore record.
-pub(crate) fn parse_restore_record(text: &[u8]) -> Option<(u64, [bool; MAX_CPUS], usize)> {
-    let text = c_text(text);
-    let rest = text.strip_prefix(b"generation=")?;
-    let (generation, end) = u64_prefix_lossy(rest, 0)?;
-    let mut cursor = end;
-    while rest.get(cursor).is_some_and(u8::is_ascii_whitespace) {
-        cursor += 1;
-    }
-    let cpus = rest[cursor..]
-        .strip_prefix(b"new_cpus=")
-        .and_then(|value| {
-            let value = value
-                .iter()
-                .position(|byte| !byte.is_ascii_whitespace())
-                .map(|start| &value[start..])
-                .unwrap_or_default();
-            let value = value
-                .split(u8::is_ascii_whitespace)
-                .next()
-                .unwrap_or_default();
-            (!value.is_empty()).then_some(&value[..value.len().min(127)])
-        })
-        .unwrap_or(b"none");
-    let (selected, count) = if cpus.is_empty() || cpus == b"none" {
-        ([false; MAX_CPUS], 0)
-    } else {
-        parse_cpu_list(cpus)?
+/// Parses the private restore record that `restore-finish` writes: a `generation=N` line, and
+/// optionally a `new_cpus=` line with the CPUs that the restore brought online, as
+/// `--new-cpus` gives them.
+pub(crate) fn parse_restore_record(text: &[u8]) -> Option<(u64, CpuMask)> {
+    let mut lines = std::str::from_utf8(text).ok()?.lines();
+    let generation = parse_decimal(lines.next()?.strip_prefix("generation=")?.as_bytes())?;
+    let new_cpus = match lines.next() {
+        Some(line) => CpuMask::parse_new(line.strip_prefix("new_cpus=")?.as_bytes())?,
+        None => CpuMask::EMPTY,
     };
-    Some((generation, selected, count))
+    lines.next().is_none().then_some((generation, new_cpus))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn packet_and_sample_decoders_check_bounds() {
-        let mut bytes = [0_u8; PACKET_HEADER_SIZE + PACKET_ENTROPY_SIZE];
-        bytes[..3].copy_from_slice(b"OVR");
-        bytes[3] = 4;
+    /// A valid packet header without memory ranges, of generation 1.
+    fn valid_header() -> [u8; PACKET_HEADER_SIZE] {
+        let mut bytes = [0; PACKET_HEADER_SIZE];
+        bytes[..4].copy_from_slice(b"OVR\x04");
         bytes[8..12].copy_from_slice(&1_u32.to_le_bytes());
         bytes[24..32].copy_from_slice(&1_u64.to_le_bytes());
-        let mut packet = RestorePacket::parse_header(&bytes).unwrap();
-        packet.parse_body(&bytes[PACKET_HEADER_SIZE..]).unwrap();
-        assert_eq!(packet.entropy, [0; PACKET_ENTROPY_SIZE]);
+        bytes
+    }
 
+    #[test]
+    fn packets_decode_their_header_then_their_body() {
+        let header = PacketHeader::parse(&valid_header()).unwrap();
+        assert_eq!((header.generation, header.utc_ns), (1, 1));
+        assert_eq!(header.body_size(), PACKET_ENTROPY_SIZE);
+        let entropy: Vec<u8> = (0..64).collect();
+        let packet = RestorePacket::parse(header, &entropy).unwrap();
+        assert_eq!(packet.entropy.as_slice(), entropy);
+        assert_eq!(packet.generation_id(), &entropy[..GENERATION_ID_SIZE]);
+        assert_eq!(
+            RestorePacket::parse(header, &entropy[1..]),
+            Err(PacketError::IncompleteBody)
+        );
+        assert_eq!(
+            PacketHeader::parse(&valid_header()[..31]),
+            Err(PacketError::IncompleteHeader)
+        );
+    }
+
+    #[test]
+    fn packet_errors_name_the_invalid_field() {
+        let mut bytes = valid_header();
+        bytes[2] = b'X';
+        let error = PacketHeader::parse(&bytes).unwrap_err();
+        assert_eq!(error.to_string(), "restore packet magic is 4f5658");
+        let mut bytes = valid_header();
+        bytes[4] = 0x02;
+        bytes[6] = 1;
+        let header = PacketHeader::parse(&bytes).unwrap();
+        let mut body = [0; PACKET_RANGE_SIZE + PACKET_ENTROPY_SIZE];
+        body[..8].copy_from_slice(&u64::MAX.to_le_bytes());
+        body[8..16].copy_from_slice(&1_u64.to_le_bytes());
+        let error = RestorePacket::parse(header, &body).unwrap_err();
+        assert_eq!(error.to_string(), "restore memory range 0 is invalid");
+    }
+
+    #[test]
+    fn samples_check_their_version_flags_and_time() {
         let mut sample = [0_u8; SAMPLE_SIZE];
         sample[0] = 1;
         sample[8] = 1;
         assert_eq!(TimeSample::parse(&sample).unwrap().utc_ns, 1);
+        assert_eq!(
+            TimeSample::parse(&sample[..15]),
+            Err(TimeSampleError::Incomplete)
+        );
+        sample[2] = 1;
+        assert_eq!(
+            TimeSample::parse(&sample).unwrap_err().to_string(),
+            "time sample flags 0x00 or reserved 0x0001"
+        );
     }
 
     #[test]
-    fn cpu_lists_deduplicate_and_check_the_limit() {
-        let (cpus, count) = parse_cpu_list(b"0-3,2,5\n").unwrap();
-        assert_eq!(count, 5);
-        assert!(cpus[0] && cpus[5] && !cpus[4]);
-        assert!(parse_cpu_list(b"64").is_none());
+    fn generation_ids_are_exact_hexadecimal() {
+        assert_eq!(parse_hex::<2>(b"0aFf"), Some([0x0a, 0xff]));
+        assert_eq!(parse_hex::<2>(b"0aF"), None);
+        assert_eq!(parse_hex::<2>(b"+aff"), None);
+        assert_eq!(parse_hex::<2>(b"0agf"), None);
+        assert_eq!(format_hex(&[0x0a, 0xff]), "0aff");
     }
 
     #[test]
@@ -1245,10 +1013,40 @@ mod tests {
     }
 
     #[test]
+    fn offsets_split_toward_negative_infinity() {
+        assert_eq!(split_offset(-1), (-1, 999_999_999));
+        assert_eq!(split_offset(1_500_000_000), (1, 500_000_000));
+        assert_eq!(split_offset(i64::MIN), (-9_223_372_037, 145_224_192));
+    }
+
+    #[test]
+    fn extreme_clock_arithmetic_neither_wraps_nor_panics() {
+        assert_eq!(pair_clocks(i64::MIN, i64::MAX, 0), (i64::MIN, 0));
+        assert_eq!(
+            plan_correction(i64::MIN, 0, true),
+            ClockAdjustment::Step {
+                seconds: -9_223_372_037,
+                nanoseconds: 145_224_192,
+            }
+        );
+        let slew = plan_correction(-5, i64::MAX, true);
+        assert_eq!(
+            slew,
+            ClockAdjustment::Slew {
+                offset_ns: -5,
+                time_constant: 4,
+                maximum_error_us: i64::MAX / 1000,
+                estimated_error_us: i64::MAX / 1000,
+            }
+        );
+        assert_eq!((slew.modes(), slew.status()), (0x203d, 0x2001));
+    }
+
+    #[test]
     fn watcher_ignores_its_own_event() {
         assert_eq!(
             match_watch_rule(b"unchecked MSR access error"),
-            Some("G_UNCHECKED_MSR")
+            Some(ViolationCode::UncheckedMsr)
         );
         assert_eq!(
             match_watch_rule(b"NVX-TIME-ABI-VIOLATION: unchecked MSR access error"),
@@ -1257,46 +1055,83 @@ mod tests {
     }
 
     #[test]
-    fn decimal_parsers_match_the_c_extrema() {
-        assert_eq!(parse_i64_lossy(b"-9223372036854775808"), i64::MIN);
-        assert_eq!(parse_i64_lossy(b"9223372036854775808"), i64::MAX);
-        assert_eq!(parse_u64_lossy(b"-1"), u64::MAX);
-        assert_eq!(parse_u64_lossy(b"-18446744073709551616"), u64::MAX);
-        assert_eq!(parse_i64_exact(b"\t-9223372036854775808 "), Some(i64::MIN));
-        assert_eq!(parse_i64_exact(b"1\t"), None);
+    fn boot_log_reads_syslog_lines() {
+        let log = scan_boot_log(
+            b"<6>[    0.000000] Hypervisor detected: Microsoft Hyper-V\n\
+              <6>[    0.000000] Hyper-V: privilege flags low 0x8860, high 0x0\n\
+              <6>[    0.000000] Hyper-V: LAPIC Timer Frequency: 0x1e8480\n\
+              <6>[    1.000000] clocksource: Switched to clocksource tsc\n\
+              <4>[    1.500000] x86/mm: Found insecure W+X mapping at address 0x1\n",
+            true,
+        );
+        assert_eq!(log.verdict(), Ok(()));
+        assert_eq!(
+            log.wx.as_deref(),
+            Some(b"x86/mm: Found insecure W+X mapping at address 0x1".as_slice())
+        );
+        let log = scan_boot_log(b"clocksource: Switched to clocksource hpet\n", false);
+        assert_eq!(
+            log.verdict(),
+            Err(b"no 'Hypervisor detected: Microsoft Hyper-V'".to_vec())
+        );
     }
 
     #[test]
-    fn extreme_clock_arithmetic_wraps_without_panicking() {
-        assert_eq!(pair_clocks(i64::MIN, i64::MAX, 0), (i64::MIN, 0));
-        let slew = plan_correction(i64::MIN, 0, true);
+    fn timer_list_requires_one_shot_lapic_ticks() {
+        let list = b"Tick Device: mode:     1\n\
+                     Broadcast device\n\
+                     Clock Event Device: <NULL>\n\
+                     \n\
+                     Tick Device: mode:     1\n\
+                     Per CPU device: 0\n\
+                     Clock Event Device: lapic\n \
+                     mode:           3\n \
+                     event_handler:  hrtimer_interrupt\n";
+        assert_eq!(timer_list_verdict(list, CpuMask::EMPTY.with(0)), Ok(()));
         assert_eq!(
-            slew,
-            ClockAdjustment::Slew {
-                offset_ns: i64::MIN,
-                time_constant: 4,
-                maximum_error_us: -9_223_372_036_854_774,
-                estimated_error_us: 0,
-            }
+            timer_list_verdict(list, CpuMask::EMPTY.with(1)),
+            Err("cpu 1 tick device missing handler none tick mode -1 state -1".to_owned())
         );
-        assert_eq!((slew.modes(), slew.status()), (0x203d, 0x2001));
     }
 
     #[test]
-    fn restore_record_follows_scanf_field_adjacency() {
+    fn cpuinfo_rates_round_down_to_khz() {
+        assert_eq!(parse_khz("2194.8439"), Some(2_194_843));
+        assert_eq!(parse_khz("2194.8"), Some(2_194_800));
+        assert_eq!(parse_khz("2194"), Some(2_194_000));
+        assert_eq!(parse_khz("2194.8x"), None);
+        let (info, verdict) = check_cpuinfo(
+            b"processor\t: 1\ncpu MHz\t\t: 2194.843\n",
+            CpuMask::EMPTY.with(0),
+            true,
+        );
+        assert_eq!((info.khz[0], info.khz[1]), (None, Some(2_194_843)));
+        assert_eq!(verdict, Err("cpu 0 is not in /proc/cpuinfo".to_owned()));
+    }
+
+    #[test]
+    fn restore_record_has_a_generation_and_optional_new_cpus() {
+        let cpus = CpuMask::parse(b"4-6,9").unwrap();
         assert_eq!(
-            parse_restore_record(b"generation=18446744073709551615 new_cpus=1")
-                .map(|value| (value.0, value.2)),
-            Some((u64::MAX, 1))
+            parse_restore_record(b"generation=3\nnew_cpus=4-6,9\n"),
+            Some((3, cpus))
         );
         assert_eq!(
-            parse_restore_record(b"generation=3 ignored new_cpus=1").map(|value| value.2),
-            Some(0)
+            parse_restore_record(b"generation=18446744073709551615\nnew_cpus=none\n"),
+            Some((u64::MAX, CpuMask::EMPTY))
         );
         assert_eq!(
-            parse_restore_record(b"generation=3 new_cpus= 1-2").map(|value| value.2),
-            Some(2)
+            parse_restore_record(b"generation=3\n"),
+            Some((3, CpuMask::EMPTY))
         );
-        assert!(parse_restore_record(b"generation=3 new_cpus=\ntrailing=value").is_none());
+        for record in [
+            &b"new_cpus=4\ngeneration=3\n"[..],
+            b"generation=3 new_cpus=1",
+            b"generation=3\nnew_cpus= 1-2\n",
+            b"generation=3\nnew_cpus=64\n",
+            b"generation=3\nnew_cpus=\ntrailing=value\n",
+        ] {
+            assert_eq!(parse_restore_record(record), None, "{record:?}");
+        }
     }
 }

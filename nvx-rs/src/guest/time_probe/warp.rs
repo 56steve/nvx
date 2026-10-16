@@ -1,17 +1,17 @@
 //! Pairwise cross-CPU TSC warp and offset checks.
 
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::thread;
 
 use super::format::{f0, f1};
 use super::support::{
-    NANOSECONDS_PER_SECOND, TscRate, affinity_cpus, bad_option, check_cpus_allowed, cycles_to_ns,
-    detect_tsc_rate, format_cpu_list, option_value, parse_cpu_list, parse_rate, parse_u64,
-    round_ll,
+    Arguments, NANOSECONDS_PER_SECOND, TscRate, affinity_cpus, bad_option, check_cpus_allowed,
+    cycles_to_ns, detect_tsc_rate, format_cpu_list, parse_cpu_list, parse_rate, round_ll,
 };
+use crate::guest::parse::parse_u64;
 use crate::guest::status::CommandError;
-use crate::guest::sys::{self, Errno};
+use crate::guest::sys::{self, Errno, TimeValLike};
 
 /// Milliseconds that each test runs per CPU pair without `--duration-ms`.
 const DEFAULT_DURATION_MS: u64 = 100;
@@ -38,67 +38,103 @@ const STALL_SECONDS: f64 = 2.0;
 const SPIN_CHECK_MASK: u64 = 0x0f_ffff;
 
 #[repr(align(64))]
+#[derive(Default)]
 /// Cache-line-aligned owner preventing false sharing of hot atomics.
 struct Aligned<T>(T);
 
-/// Shared state for the spinlock lower-bound warp test.
+/// Shared state for the spinlock lower-bound warp test, cleared for each CPU pair.
+#[derive(Default)]
 struct WarpState {
     /// Test-and-set spinlock on its own cache line.
-    lock: Aligned<AtomicI32>,
+    lock: Aligned<AtomicBool>,
     /// TSC read by the previous lock owner.
     last_tsc: AtomicU64,
     /// Largest observed backward delta.
     max_warp: AtomicU64,
     /// Number of backward TSC observations.
     warps: AtomicU64,
-    /// Two-thread startup barrier on its own cache line.
-    ready: Aligned<AtomicI32>,
-    /// Startup failure flag.
-    abort: AtomicI32,
-    /// Leader-controlled completion flag.
-    stop: AtomicI32,
+    /// Two-thread startup barrier on its own cache line: the workers that reached it.
+    ready: Aligned<AtomicU32>,
+    /// Whether a worker could not start.
+    abort: AtomicBool,
+    /// Whether the leader ended the test.
+    stop: AtomicBool,
 }
 
-impl WarpState {
-    /// Creates cleared state for one CPU pair.
-    fn new() -> Self {
-        Self {
-            lock: Aligned(AtomicI32::new(0)),
-            last_tsc: AtomicU64::new(0),
-            max_warp: AtomicU64::new(0),
-            warps: AtomicU64::new(0),
-            ready: Aligned(AtomicI32::new(0)),
-            abort: AtomicI32::new(0),
-            stop: AtomicI32::new(0),
-        }
-    }
-}
-
-/// Shared state for the ping-pong offset estimate.
+/// Shared state for the ping-pong offset estimate, cleared for each CPU pair.
+#[derive(Default)]
 struct PingState {
     /// Release/acquire request and response sequence.
     sequence: Aligned<AtomicU64>,
     /// Follower timestamp paired with the current sequence.
     t2: AtomicU64,
-    /// Two-thread startup barrier on its own cache line.
-    ready: Aligned<AtomicI32>,
-    /// Startup failure flag.
-    abort: AtomicI32,
+    /// Two-thread startup barrier on its own cache line: the workers that reached it.
+    ready: Aligned<AtomicU32>,
+    /// Whether a worker could not start.
+    abort: AtomicBool,
 }
 
-impl PingState {
-    /// Creates cleared ping-pong state for one CPU pair.
-    fn new() -> Self {
+/// The ping-pong estimate of one CPU pair's TSC offset, in cycles.
+struct OffsetEstimate {
+    /// Completed ping-pong rounds.
+    rounds: u64,
+    /// Smallest round trip.
+    min_rtt_cycles: u64,
+    /// Greatest lower offset bound.
+    lo_cycles: i64,
+    /// Least upper offset bound.
+    hi_cycles: i64,
+    /// Nearest-median sampled offset.
+    median_offset_cycles: f64,
+    /// Selected offset estimate: the middle of the bounds, or the smallest round trip's offset
+    /// when the bounds do not intersect.
+    offset_cycles: f64,
+    /// Selected half-width uncertainty.
+    uncertainty_cycles: f64,
+    /// Whether all ping-pong interval bounds intersect.
+    consistent: bool,
+}
+
+impl OffsetEstimate {
+    /// Selects the estimate from the leader's bounds and the median of its sampled offsets, each
+    /// of them twice an offset.
+    fn new(leader: &LeaderResult, median_x2: i64) -> Self {
+        let consistent = leader.lo <= leader.hi;
+        let (offset_cycles, uncertainty_cycles) = if consistent {
+            (
+                (leader.lo as f64 + leader.hi as f64) / 2.0,
+                (leader.hi as f64 - leader.lo as f64) / 2.0,
+            )
+        } else {
+            (
+                leader.min_offset_x2 as f64 / 2.0,
+                leader.min_rtt as f64 / 2.0,
+            )
+        };
         Self {
-            sequence: Aligned(AtomicU64::new(0)),
-            t2: AtomicU64::new(0),
-            ready: Aligned(AtomicI32::new(0)),
-            abort: AtomicI32::new(0),
+            rounds: leader.rounds,
+            min_rtt_cycles: leader.min_rtt,
+            lo_cycles: leader.lo,
+            hi_cycles: leader.hi,
+            median_offset_cycles: median_x2 as f64 / 2.0,
+            offset_cycles,
+            uncertainty_cycles,
+            consistent,
+        }
+    }
+
+    /// Returns the largest skew that the estimate admits, in cycles.
+    fn skew_bound(&self) -> f64 {
+        if self.consistent {
+            (self.lo_cycles as f64)
+                .abs()
+                .max((self.hi_cycles as f64).abs())
+        } else {
+            self.offset_cycles.abs() + self.uncertainty_cycles
         }
     }
 }
 
-#[derive(Default)]
 /// Complete warp and offset result for one unordered CPU pair.
 struct PairResult {
     /// Leader CPU.
@@ -111,45 +147,89 @@ struct PairResult {
     warps: u64,
     /// Largest backward delta in cycles.
     max_warp_cycles: u64,
-    /// Completed ping-pong rounds.
-    rounds: u64,
-    /// Smallest round trip in cycles.
-    min_rtt_cycles: u64,
-    /// Twice the offset from the smallest round trip.
-    min_rtt_offset_x2: i64,
-    /// Greatest lower offset bound.
-    lo_cycles: i64,
-    /// Least upper offset bound.
-    hi_cycles: i64,
-    /// Nearest-median sampled offset in cycles.
-    median_offset_cycles: f64,
-    /// Selected offset estimate in cycles.
-    offset_cycles: f64,
-    /// Selected half-width uncertainty in cycles.
-    uncertainty_cycles: f64,
-    /// Whether all ping-pong interval bounds intersect.
-    consistent: bool,
-    /// Whether either worker exceeded its stall bound.
-    stalled: bool,
+    /// The ping-pong offset estimate, or `None` when a worker exceeded its stall bound.
+    offset: Option<OffsetEstimate>,
 }
 
-/// Synchronizes two pinned workers and propagates startup failure.
-fn barrier(ready: &AtomicI32, abort: &AtomicI32, failed: bool) -> bool {
+/// The verdict's inputs, accumulated over every CPU pair.
+#[derive(Default)]
+struct Summary {
+    /// Pairs measured.
+    pairs: usize,
+    /// Pairs whose ping-pong bounds did not intersect.
+    inconsistent: usize,
+    /// Pairs whose ping-pong test stalled.
+    stalled: usize,
+    /// Backward TSC observations of every pair.
+    total_warps: u64,
+    /// Largest backward TSC delta, in cycles.
+    max_backward: u64,
+    /// Largest absolute offset estimate, in cycles.
+    max_abs_offset: f64,
+    /// Largest offset uncertainty, in cycles.
+    max_uncertainty: f64,
+    /// Largest skew bound, in cycles.
+    max_skew_bound: f64,
+}
+
+impl Summary {
+    /// Accounts for one pair's result.
+    fn add(&mut self, result: &PairResult) {
+        self.pairs += 1;
+        self.total_warps += result.warps;
+        self.max_backward = self.max_backward.max(result.max_warp_cycles);
+        let Some(offset) = &result.offset else {
+            self.stalled += 1;
+            return;
+        };
+        if !offset.consistent {
+            self.inconsistent += 1;
+        }
+        self.max_abs_offset = self.max_abs_offset.max(offset.offset_cycles.abs());
+        self.max_uncertainty = self.max_uncertainty.max(offset.uncertainty_cycles);
+        self.max_skew_bound = self.max_skew_bound.max(offset.skew_bound());
+    }
+
+    /// Judges the pairs, whose TSCs run at `rate`, against the skew bound `bound_ns`.
+    fn verdict(&self, rate: TscRate, bound_ns: u64) -> Verdict {
+        let bound = bound_ns as f64;
+        Verdict {
+            pass: self.stalled == 0
+                && cycles_to_ns(self.max_backward as f64, rate) <= bound
+                && cycles_to_ns(self.max_abs_offset, rate) <= bound,
+            conclusive: self.pairs == 0
+                || (self.stalled == 0 && cycles_to_ns(self.max_uncertainty, rate) < bound),
+        }
+    }
+}
+
+/// The verdict on every pair against the skew bound.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Verdict {
+    /// Whether no pair stalled, and no backward step or offset exceeds the bound.
+    pass: bool,
+    /// Whether the verdict holds: there are no pairs, or none stalled and every offset is known
+    /// more precisely than the bound.
+    conclusive: bool,
+}
+
+/// Synchronizes two pinned workers, and returns whether both started: a worker whose pinning
+/// `failed` aborts both.
+fn barrier(ready: &AtomicU32, abort: &AtomicBool, failed: bool) -> bool {
     if failed {
-        abort.store(1, Ordering::SeqCst);
+        abort.store(true, Ordering::SeqCst);
     }
     ready.fetch_add(1, Ordering::SeqCst);
     while ready.load(Ordering::SeqCst) < 2 {
         sys::x86::pause();
     }
-    abort.load(Ordering::SeqCst) == 0
+    !abort.load(Ordering::SeqCst)
 }
 
-/// Reads coarse monotonic time for infrequent stall detection.
+/// Reads coarse monotonic time for infrequent stall detection, or zero when the clock cannot be
+/// read.
 fn coarse_ns() -> u64 {
-    sys::clock_time(sys::Clock::MonotonicCoarse)
-        .unwrap_or_default()
-        .wrapping_nanoseconds() as u64
+    sys::clock_time(sys::Clock::MonotonicCoarse).map_or(0, |time| time.num_nanoseconds() as u64)
 }
 
 /// Returns the `errno` of a thread that could not start, or `EAGAIN`, as `pthread_create`
@@ -176,8 +256,8 @@ fn warp_worker(
     );
     let mut iteration = 0_u64;
     loop {
-        while state.lock.0.swap(1, Ordering::Acquire) != 0 {
-            while state.lock.0.load(Ordering::Relaxed) != 0 {
+        while state.lock.0.swap(true, Ordering::Acquire) {
+            while state.lock.0.load(Ordering::Relaxed) {
                 sys::x86::pause();
             }
         }
@@ -188,21 +268,21 @@ fn warp_worker(
             state.max_warp.fetch_max(previous - now, Ordering::Relaxed);
             state.warps.fetch_add(1, Ordering::Relaxed);
         }
-        state.lock.0.store(0, Ordering::Release);
+        state.lock.0.store(false, Ordering::Release);
         if iteration & WARP_CHECK_MASK == 0 {
             if leader
                 && (sys::x86::rdtsc() > end
                     || (iteration & WARP_STALL_CHECK_MASK == 0 && coarse_ns() > deadline))
             {
-                state.stop.store(1, Ordering::Relaxed);
+                state.stop.store(true, Ordering::Relaxed);
             }
-            if state.stop.load(Ordering::Relaxed) != 0 {
+            if state.stop.load(Ordering::Relaxed) {
                 break;
             }
         }
-        iteration = iteration.wrapping_add(1);
+        iteration += 1;
     }
-    Ok(iteration.wrapping_add(1))
+    Ok(iteration + 1)
 }
 
 /// Leader-only aggregate from the ping-pong test.
@@ -217,19 +297,18 @@ struct LeaderResult {
     lo: i64,
     /// Least upper offset bound.
     hi: i64,
-    /// Number of offsets retained for median selection.
-    stored: usize,
     /// Whether the follower stalled.
     stalled: bool,
 }
 
-/// Runs the ping-pong leader and records offset intervals.
+/// Runs the ping-pong leader, records offset intervals, and adds twice each round's offset to
+/// `offsets`, up to `PP_MAX_SAMPLES` of them.
 fn ping_leader(
     state: &PingState,
     cpu: usize,
     budget_cycles: u64,
     stall_cycles: u64,
-    offsets: &mut [i64],
+    offsets: &mut Vec<i64>,
 ) -> Result<LeaderResult, Errno> {
     let pinned = sys::pin_current_thread(cpu);
     if !barrier(&state.ready.0, &state.abort, pinned.is_err()) {
@@ -242,19 +321,15 @@ fn ping_leader(
         min_offset_x2: 0,
         lo: i64::MIN,
         hi: i64::MAX,
-        stored: 0,
         stalled: false,
     };
     let mut round = 1_u64;
     loop {
         let mut spins = 0_u64;
         let t1 = sys::x86::rdtsc_fenced();
-        state
-            .sequence
-            .0
-            .store(round.wrapping_mul(2).wrapping_sub(1), Ordering::Release);
-        while state.sequence.0.load(Ordering::Acquire) != round.wrapping_mul(2) {
-            spins = spins.wrapping_add(1);
+        state.sequence.0.store(2 * round - 1, Ordering::Release);
+        while state.sequence.0.load(Ordering::Acquire) != 2 * round {
+            spins += 1;
             if spins & SPIN_CHECK_MASK == 0 && sys::x86::rdtsc().wrapping_sub(t1) > stall_cycles {
                 result.stalled = true;
                 state.sequence.0.store(PP_STOP, Ordering::Release);
@@ -273,16 +348,15 @@ fn ping_leader(
         }
         result.lo = result.lo.max(lo);
         result.hi = result.hi.min(hi);
-        if result.stored < offsets.len() {
-            offsets[result.stored] = lo.wrapping_add(hi);
-            result.stored += 1;
+        if offsets.len() < PP_MAX_SAMPLES {
+            offsets.push(lo.wrapping_add(hi));
         }
         result.rounds = round;
         if round & PING_CHECK_MASK == 0 && sys::x86::rdtsc() > end {
             state.sequence.0.store(PP_STOP, Ordering::Release);
             return Ok(result);
         }
-        round = round.wrapping_add(1);
+        round += 1;
     }
 }
 
@@ -294,7 +368,7 @@ fn ping_follower(state: &PingState, cpu: usize, stall_cycles: u64) -> Result<(),
     }
     let mut round = 1_u64;
     loop {
-        let expected = round.wrapping_mul(2).wrapping_sub(1);
+        let expected = 2 * round - 1;
         let mut spins = 0_u64;
         let mut wait_start = 0_u64;
         loop {
@@ -305,7 +379,7 @@ fn ping_follower(state: &PingState, cpu: usize, stall_cycles: u64) -> Result<(),
             if value == PP_STOP {
                 return Ok(());
             }
-            spins = spins.wrapping_add(1);
+            spins += 1;
             if spins & SPIN_CHECK_MASK == 0 {
                 let now = sys::x86::rdtsc();
                 if wait_start == 0 {
@@ -317,24 +391,22 @@ fn ping_follower(state: &PingState, cpu: usize, stall_cycles: u64) -> Result<(),
             sys::x86::pause();
         }
         state.t2.store(sys::x86::rdtsc_fenced(), Ordering::Relaxed);
-        state
-            .sequence
-            .0
-            .store(round.wrapping_mul(2), Ordering::Release);
-        round = round.wrapping_add(1);
+        state.sequence.0.store(2 * round, Ordering::Release);
+        round += 1;
     }
 }
 
-/// Runs both pairwise tests with scoped, joined worker threads.
+/// Runs both pairwise tests with scoped, joined worker threads, sampling the ping-pong offsets
+/// into `offsets`, whose capacity holds `PP_MAX_SAMPLES` of them.
 fn run_pair(
     cpu_a: usize,
     cpu_b: usize,
     budget_cycles: u64,
     stall_cycles: u64,
-    offsets: &mut [i64],
+    offsets: &mut Vec<i64>,
     rate: TscRate,
 ) -> Result<PairResult, Errno> {
-    let warp = WarpState::new();
+    let warp = WarpState::default();
     let (first, second) = thread::scope(|scope| {
         let first = thread::Builder::new()
             .spawn_scoped(scope, || {
@@ -346,7 +418,7 @@ fn run_pair(
         }) {
             Ok(thread) => thread,
             Err(error) => {
-                warp.abort.store(1, Ordering::SeqCst);
+                warp.abort.store(true, Ordering::SeqCst);
                 warp.ready.0.fetch_add(1, Ordering::SeqCst);
                 let _ = first.join();
                 return Err(spawn_errno(&error));
@@ -356,7 +428,8 @@ fn run_pair(
         let second = second.join().map_err(|_| Errno::EIO)??;
         Ok((first, second))
     })?;
-    let ping = PingState::new();
+    let ping = PingState::default();
+    offsets.clear();
     let leader = thread::scope(|scope| {
         let leader = thread::Builder::new()
             .spawn_scoped(scope, || {
@@ -368,7 +441,7 @@ fn run_pair(
         {
             Ok(thread) => thread,
             Err(error) => {
-                ping.abort.store(1, Ordering::SeqCst);
+                ping.abort.store(true, Ordering::SeqCst);
                 ping.ready.0.fetch_add(1, Ordering::SeqCst);
                 let _ = leader.join();
                 return Err(spawn_errno(&error));
@@ -378,36 +451,18 @@ fn run_pair(
         follower.join().map_err(|_| Errno::EIO)??;
         Ok(leader)
     })?;
-
-    let mut result = PairResult {
+    let offset = (!leader.stalled && !offsets.is_empty()).then(|| {
+        let middle = (offsets.len() - 1) / 2;
+        OffsetEstimate::new(&leader, *offsets.select_nth_unstable(middle).1)
+    });
+    Ok(PairResult {
         cpu_a,
         cpu_b,
-        warp_iterations: first.wrapping_add(second),
+        warp_iterations: first + second,
         warps: warp.warps.load(Ordering::Relaxed),
         max_warp_cycles: warp.max_warp.load(Ordering::Relaxed),
-        rounds: leader.rounds,
-        min_rtt_cycles: leader.min_rtt,
-        min_rtt_offset_x2: leader.min_offset_x2,
-        lo_cycles: leader.lo,
-        hi_cycles: leader.hi,
-        stalled: leader.stalled,
-        ..PairResult::default()
-    };
-    if leader.stored == 0 {
-        result.stalled = true;
-        return Ok(result);
-    }
-    offsets[..leader.stored].sort_unstable();
-    result.median_offset_cycles = offsets[(leader.stored - 1) / 2] as f64 / 2.0;
-    result.consistent = result.lo_cycles <= result.hi_cycles;
-    if result.consistent {
-        result.offset_cycles = (result.lo_cycles as f64 + result.hi_cycles as f64) / 2.0;
-        result.uncertainty_cycles = (result.hi_cycles as f64 - result.lo_cycles as f64) / 2.0;
-    } else {
-        result.offset_cycles = result.min_rtt_offset_x2 as f64 / 2.0;
-        result.uncertainty_cycles = result.min_rtt_cycles as f64 / 2.0;
-    }
-    Ok(result)
+        offset,
+    })
 }
 
 /// Parses options and runs every unordered CPU pair.
@@ -418,27 +473,27 @@ pub(super) fn run(
 ) -> Result<(), CommandError> {
     let mut duration_ms = DEFAULT_DURATION_MS;
     let mut bound_ns = DEFAULT_BOUND_NS;
-    let mut override_hz = 0.0;
+    let mut override_hz = None;
     let mut cpus = None;
-    let mut index = 0;
-    while index < arguments.len() {
-        if let Some(value) = option_value(arguments, &mut index, b"--duration-ms") {
+    let mut arguments = Arguments::new(arguments);
+    while let Some(argument) = arguments.next() {
+        if let Some(value) = arguments.value(argument, b"--duration-ms") {
             duration_ms = parse_u64(value)
                 .filter(|value| DURATIONS_MS.contains(value))
-                .ok_or_else(|| bad_option(b"warp", arguments[index], err))?;
-        } else if let Some(value) = option_value(arguments, &mut index, b"--cpus") {
+                .ok_or_else(|| bad_option(b"warp", arguments.last_read(), err))?;
+        } else if let Some(value) = arguments.value(argument, b"--cpus") {
             let parsed = parse_cpu_list(value).filter(|cpus| !cpus.is_empty());
-            cpus = Some(parsed.ok_or_else(|| bad_option(b"warp", arguments[index], err))?);
-        } else if let Some(value) = option_value(arguments, &mut index, b"--bound-ns") {
+            cpus = Some(parsed.ok_or_else(|| bad_option(b"warp", arguments.last_read(), err))?);
+        } else if let Some(value) = arguments.value(argument, b"--bound-ns") {
             bound_ns =
-                parse_u64(value).ok_or_else(|| bad_option(b"warp", arguments[index], err))?;
-        } else if let Some(value) = option_value(arguments, &mut index, b"--tsc-hz") {
+                parse_u64(value).ok_or_else(|| bad_option(b"warp", arguments.last_read(), err))?;
+        } else if let Some(value) = arguments.value(argument, b"--tsc-hz") {
+            let parsed = parse_rate(value);
             override_hz =
-                parse_rate(value).ok_or_else(|| bad_option(b"warp", arguments[index], err))?;
+                Some(parsed.ok_or_else(|| bad_option(b"warp", arguments.last_read(), err))?);
         } else {
-            return Err(bad_option(b"warp", arguments[index], err));
+            return Err(bad_option(b"warp", argument, err));
         }
-        index += 1;
     }
     // Linux never reports an empty affinity mask, which would be `EINVAL` to set.
     let cpus = cpus
@@ -461,9 +516,7 @@ pub(super) fn run(
             );
             CommandError::Setup
         })?;
-    if !check_cpus_allowed(b"warp", &cpus, err) {
-        return Err(CommandError::Usage);
-    }
+    check_cpus_allowed(b"warp", &cpus, err)?;
     let rate = detect_tsc_rate(override_hz);
     if rate.hz <= 0.0 {
         super::report(
@@ -479,7 +532,6 @@ pub(super) fn run(
         super::report(err, &[b"nvx-time-probe warp: out of memory\n"]);
         return Err(CommandError::Setup);
     }
-    offsets.resize(PP_MAX_SAMPLES, 0_i64);
     let cpu_text = format_cpu_list(&cpus);
     let expected_pairs = cpus.len() * cpus.len().saturating_sub(1) / 2;
     let _ = writeln!(
@@ -492,14 +544,7 @@ pub(super) fn run(
     );
     let _ = out.flush();
 
-    let mut pairs = 0;
-    let mut inconsistent = 0;
-    let mut stalled = 0;
-    let mut total_warps = 0_u64;
-    let mut max_backward = 0_u64;
-    let mut max_abs_offset = 0.0_f64;
-    let mut max_uncertainty = 0.0_f64;
-    let mut max_skew_bound = 0.0_f64;
+    let mut summary = Summary::default();
     for (first, &cpu_a) in cpus.iter().enumerate() {
         for &cpu_b in &cpus[first + 1..] {
             let result = match run_pair(
@@ -523,11 +568,8 @@ pub(super) fn run(
                     return Err(CommandError::Setup);
                 }
             };
-            pairs += 1;
-            total_warps = total_warps.wrapping_add(result.warps);
-            max_backward = max_backward.max(result.max_warp_cycles);
-            if result.stalled {
-                stalled += 1;
+            summary.add(&result);
+            let Some(offset) = &result.offset else {
                 let _ = writeln!(
                     out,
                     "pair {}-{}: warp_iterations={} warps={} max_backward_cycles={} \
@@ -539,20 +581,7 @@ pub(super) fn run(
                     result.max_warp_cycles
                 );
                 continue;
-            }
-            if !result.consistent {
-                inconsistent += 1;
-            }
-            let skew_bound = if result.consistent {
-                (result.lo_cycles as f64)
-                    .abs()
-                    .max((result.hi_cycles as f64).abs())
-            } else {
-                result.offset_cycles.abs() + result.uncertainty_cycles
             };
-            max_abs_offset = max_abs_offset.max(result.offset_cycles.abs());
-            max_uncertainty = max_uncertainty.max(result.uncertainty_cycles);
-            max_skew_bound = max_skew_bound.max(skew_bound);
             let _ = writeln!(
                 out,
                 "pair {}-{}: warp_iterations={} warps={} max_backward_cycles={} \
@@ -564,27 +593,33 @@ pub(super) fn run(
                 result.warps,
                 result.max_warp_cycles,
                 round_ll(cycles_to_ns(result.max_warp_cycles as f64, rate)),
-                result.rounds,
-                round_ll(cycles_to_ns(result.min_rtt_cycles as f64, rate)),
-                f1(result.offset_cycles),
-                round_ll(cycles_to_ns(result.offset_cycles, rate)),
-                round_ll(cycles_to_ns(result.uncertainty_cycles, rate)),
-                round_ll(cycles_to_ns(result.lo_cycles as f64, rate)),
-                round_ll(cycles_to_ns(result.hi_cycles as f64, rate)),
-                round_ll(cycles_to_ns(result.median_offset_cycles, rate)),
-                u8::from(result.consistent)
+                offset.rounds,
+                round_ll(cycles_to_ns(offset.min_rtt_cycles as f64, rate)),
+                f1(offset.offset_cycles),
+                round_ll(cycles_to_ns(offset.offset_cycles, rate)),
+                round_ll(cycles_to_ns(offset.uncertainty_cycles, rate)),
+                round_ll(cycles_to_ns(offset.lo_cycles as f64, rate)),
+                round_ll(cycles_to_ns(offset.hi_cycles as f64, rate)),
+                round_ll(cycles_to_ns(offset.median_offset_cycles, rate)),
+                u8::from(offset.consistent)
             );
             let _ = out.flush();
         }
     }
+    let Verdict { pass, conclusive } = summary.verdict(rate, bound_ns);
+    let Summary {
+        pairs,
+        inconsistent,
+        stalled,
+        total_warps,
+        max_backward,
+        max_abs_offset,
+        max_uncertainty,
+        max_skew_bound,
+    } = summary;
     if pairs == 0 {
         let _ = writeln!(out, "single CPU: no pairs to compare");
     }
-    let pass = stalled == 0
-        && cycles_to_ns(max_backward as f64, rate) <= bound_ns as f64
-        && cycles_to_ns(max_abs_offset, rate) <= bound_ns as f64;
-    let conclusive =
-        pairs == 0 || (stalled == 0 && cycles_to_ns(max_uncertainty, rate) < bound_ns as f64);
     if !conclusive {
         let _ = writeln!(
             out,
@@ -623,11 +658,126 @@ pub(super) fn run(
 
 #[cfg(test)]
 mod tests {
+    use super::super::support::TscRateSource;
     use super::*;
+
+    /// A TSC rate of 1 GHz, at which a cycle is a nanosecond.
+    const GIGAHERTZ: TscRate = TscRate {
+        hz: 1e9,
+        source: TscRateSource::Option,
+    };
+
+    /// Returns a ping-pong leader's result whose round trips bound the offset to `lo..=hi`
+    /// cycles, and whose quickest round trip took `min_rtt` cycles at twice the offset
+    /// `min_offset_x2`.
+    fn leader(lo: i64, hi: i64, min_rtt: u64, min_offset_x2: i64) -> LeaderResult {
+        LeaderResult {
+            rounds: 100,
+            min_rtt,
+            min_offset_x2,
+            lo,
+            hi,
+            stalled: false,
+        }
+    }
+
+    /// Returns a pair's result with `offset`, or `None` for a stalled ping-pong, and `warps`
+    /// backward steps of at most `max_warp_cycles`.
+    fn pair(offset: Option<OffsetEstimate>, warps: u64, max_warp_cycles: u64) -> PairResult {
+        PairResult {
+            cpu_a: 0,
+            cpu_b: 1,
+            warp_iterations: 1000,
+            warps,
+            max_warp_cycles,
+            offset,
+        }
+    }
+
+    /// Returns the summary of one measured pair, whose offset is bound to `lo..=hi` cycles and
+    /// whose largest backward step is `max_warp_cycles`.
+    fn measured(lo: i64, hi: i64, max_warp_cycles: u64) -> Summary {
+        let mut summary = Summary::default();
+        summary.add(&pair(
+            Some(OffsetEstimate::new(&leader(lo, hi, 50, 0), 0)),
+            0,
+            max_warp_cycles,
+        ));
+        summary
+    }
 
     #[test]
     fn cacheline_wrappers_are_really_aligned() {
         assert_eq!(std::mem::align_of::<Aligned<AtomicU64>>(), 64);
         assert!(std::mem::size_of::<Aligned<AtomicU64>>() >= 64);
+    }
+
+    #[test]
+    fn offsets_come_from_the_bounds_or_else_from_the_quickest_round_trip() {
+        let consistent = OffsetEstimate::new(&leader(-10, 30, 50, 4), 6);
+        assert!(consistent.consistent);
+        assert_eq!(consistent.offset_cycles, 10.0);
+        assert_eq!(consistent.uncertainty_cycles, 20.0);
+        assert_eq!(consistent.median_offset_cycles, 3.0);
+        assert_eq!(consistent.skew_bound(), 30.0);
+        let inconsistent = OffsetEstimate::new(&leader(50, 20, 40, 60), 0);
+        assert!(!inconsistent.consistent);
+        assert_eq!(inconsistent.offset_cycles, 30.0);
+        assert_eq!(inconsistent.uncertainty_cycles, 20.0);
+        assert_eq!(inconsistent.skew_bound(), 50.0);
+    }
+
+    #[test]
+    fn summaries_count_stalled_and_inconsistent_pairs() {
+        let mut summary = Summary::default();
+        summary.add(&pair(
+            Some(OffsetEstimate::new(&leader(-10, 30, 50, 4), 6)),
+            0,
+            0,
+        ));
+        summary.add(&pair(
+            Some(OffsetEstimate::new(&leader(50, 20, 40, 60), 0)),
+            1,
+            3,
+        ));
+        summary.add(&pair(None, 2, 7));
+        assert_eq!(summary.pairs, 3);
+        assert_eq!(summary.inconsistent, 1);
+        assert_eq!(summary.stalled, 1);
+        // A stalled pair's spinlock test still counts.
+        assert_eq!((summary.total_warps, summary.max_backward), (3, 7));
+        assert_eq!(summary.max_abs_offset, 30.0);
+        assert_eq!(summary.max_uncertainty, 20.0);
+        assert_eq!(summary.max_skew_bound, 50.0);
+        // A stalled pair fails the verdict, inconclusively, whatever the bound.
+        assert_eq!(
+            summary.verdict(GIGAHERTZ, u64::MAX),
+            Verdict {
+                pass: false,
+                conclusive: false
+            }
+        );
+    }
+
+    #[test]
+    fn verdicts_need_every_backward_step_and_offset_within_the_bound() {
+        let verdict = |pass, conclusive| Verdict { pass, conclusive };
+        // The offset is 10 cycles, known to +/-20, and the largest backward step 5 cycles.
+        let within = measured(-10, 30, 5);
+        assert_eq!(within.verdict(GIGAHERTZ, 100), verdict(true, true));
+        assert_eq!(within.verdict(GIGAHERTZ, 10), verdict(true, false));
+        assert_eq!(within.verdict(GIGAHERTZ, 9), verdict(false, false));
+        assert_eq!(
+            measured(-10, 30, 101).verdict(GIGAHERTZ, 100),
+            verdict(false, true)
+        );
+        assert_eq!(
+            measured(150, 250, 0).verdict(GIGAHERTZ, 100),
+            verdict(false, true)
+        );
+        assert_eq!(
+            Summary::default().verdict(GIGAHERTZ, 0),
+            verdict(true, true)
+        );
     }
 }

@@ -2,22 +2,23 @@
 //! step 7.
 
 use std::ffi::CStr;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::Duration;
 
 use super::checks::{self, Checks};
+use super::cpu_mask::CpuMask;
 use super::decoders;
-use super::state::TimeState;
+use super::events::{CheckId, EventSource, ViolationCode};
+use super::state::{Discontinuity, SampleRejection, TimeState};
 use super::system::{
     self, DAEMON_PID_PATH, DAEMON_PID_TEMP_PATH, DEFAULT_STALL_TIMEOUT_S, PowerOffStatus,
     RCU_SYNC_PATH, RESTORE_PATH, Runtime, SNAPSHOT_ACKNOWLEDGE, SampleError, SampleResult,
-    clock_ns, cpu_time_ns, current_frequency, read_i64, read_text, set_frequency, state_apply,
-    state_load, suppression_restore, write_i64, write_text,
+    clock_ns, cpu_time_ns, current_frequency, set_frequency, state_apply, state_load,
+    suppression_restore,
 };
-use super::{
-    DEFERRED_START_NS, IDLE_BOUND_NS, MAX_CPUS, NSEC_PER_MSEC, NSEC_PER_SEC, NSEC_PER_USEC, Phase,
-};
+use super::{DEFERRED_START_NS, IDLE_BOUND_NS, NSEC_PER_MSEC, NSEC_PER_SEC, NSEC_PER_USEC, Phase};
+use crate::guest::kernel_text::KmsgRecord;
 use crate::guest::sys::{
     self, ChildStatus, Errno, FileDescriptor, ForkResult, Mode, Pollable, Port, ProcessId, Signal,
     SignalDescriptor, Timer, kernel,
@@ -35,16 +36,12 @@ const FAST_PERIOD: Duration = Duration::from_secs(16);
 const SLOW_PERIOD: Duration = Duration::from_secs(64);
 /// Number of initial fast polls.
 const FAST_POLLS: i32 = 4;
-/// Maximum wait for stable clock-event state during restore.
-const TIMER_LIST_WAIT_NS: i64 = 200 * NSEC_PER_MSEC;
 /// Pause before the daemon polls again after `poll` failed for a reason other than a signal.
 const POLL_RETRY: Duration = Duration::from_secs(1);
-/// Bytes of the largest kernel log record that the daemon reads, as the C program's buffer.
+/// The largest structured kernel log record, the kernel's `CONSOLE_EXT_LOG_MAX`.
 const KERNEL_LOG_RECORD_LIMIT: usize = 8192;
 /// Longest prefix of a kernel message that a violation event quotes.
 const WATCHED_MESSAGE_LIMIT: usize = 400;
-/// Bytes of the C program's buffer for the restore record, its terminating NUL included.
-const RESTORE_LIMIT: usize = 256;
 /// The daemon's out-of-memory score adjustment, Linux's `OOM_SCORE_ADJ_MIN`, which exempts it
 /// from the out-of-memory killer.
 const OOM_SCORE_ADJUSTMENT: &[u8] = b"-1000";
@@ -65,8 +62,8 @@ const RCU_NORMAL_FORCED: i64 = 1;
 ///
 /// Dropping it before then cancels the promotion, and the caller keeps its policy.
 pub(crate) struct Promoter {
-    /// Shared stop flag and notification condition.
-    stop: Arc<(Mutex<bool>, Condvar)>,
+    /// The channel whose disconnection cancels the promotion; it carries nothing.
+    cancel: Option<mpsc::Sender<()>>,
     /// Running promoter thread, until it is joined.
     thread: Option<thread::JoinHandle<()>>,
 }
@@ -74,30 +71,20 @@ pub(crate) struct Promoter {
 impl Promoter {
     /// Starts a promoter whose deadline is `IDLE_BOUND_NS` after the monotonic `start_ns`.
     pub(crate) fn start(start_ns: i64) -> Option<Self> {
-        let stop = Arc::new((Mutex::new(false), Condvar::new()));
-        let child = Arc::clone(&stop);
+        let (cancel, cancelled) = mpsc::channel();
         let deadline = start_ns.wrapping_add(IDLE_BOUND_NS);
         let thread = thread::Builder::new()
             .name("nvx-time-promote".to_owned())
             .spawn(move || {
                 let remaining = deadline.wrapping_sub(clock_ns(sys::Clock::Monotonic));
                 let timeout = Duration::from_nanos(remaining.max(0) as u64);
-                let (lock, changed) = &*child;
-                let Ok(stopped) = lock.lock() else {
-                    return;
-                };
-                let Ok((stopped, result)) =
-                    changed.wait_timeout_while(stopped, timeout, |stopped| !*stopped)
-                else {
-                    return;
-                };
-                if !*stopped && result.timed_out() {
+                if cancelled.recv_timeout(timeout) == Err(RecvTimeoutError::Timeout) {
                     sys::promote_all_threads();
                 }
             })
             .ok()?;
         Some(Self {
-            stop,
+            cancel: Some(cancel),
             thread: Some(thread),
         })
     }
@@ -116,17 +103,10 @@ impl Promoter {
 impl Drop for Promoter {
     /// Cancels a promotion that is still pending and joins the thread.
     fn drop(&mut self) {
-        let Some(thread) = self.thread.take() else {
-            return;
-        };
-        {
-            let (lock, changed) = &*self.stop;
-            if let Ok(mut stopped) = lock.lock() {
-                *stopped = true;
-                changed.notify_one();
-            }
+        drop(self.cancel.take());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
         }
-        let _ = thread.join();
     }
 }
 
@@ -135,67 +115,84 @@ impl Drop for Promoter {
 /// It returns when no record is left, or with the error of a failed read, such as `EPIPE` for
 /// records that the kernel overwrote before the daemon read them.
 fn kmsg_drain(log: &FileDescriptor, mut consume: impl FnMut(&[u8])) -> Result<(), Errno> {
-    let mut record = [0_u8; KERNEL_LOG_RECORD_LIMIT];
+    let mut buffer = [0_u8; KERNEL_LOG_RECORD_LIMIT];
     loop {
-        let count = match log.read(&mut record[..KERNEL_LOG_RECORD_LIMIT - 1]) {
+        let count = match log.read(&mut buffer) {
+            Ok(0) | Err(Errno::EAGAIN) => return Ok(()),
             Ok(count) => count,
             Err(Errno::EINTR) => continue,
-            Err(Errno::EAGAIN) => return Ok(()),
             Err(error) => return Err(error),
         };
-        if count == 0 {
-            return Ok(());
+        if let Some(record) = KmsgRecord::parse(&buffer[..count]) {
+            consume(record.message);
         }
-        let record = &record[..count];
-        let Some(separator) = record.iter().position(|byte| *byte == b';') else {
-            continue;
-        };
-        let message = &record[separator + 1..];
-        let end = message
-            .iter()
-            .position(|byte| *byte == b'\n')
-            .unwrap_or(message.len());
-        consume(&message[..end]);
     }
 }
 
-/// State update produced by one discipline poll.
-struct PollOutcome {
-    /// Whether a sample was accepted.
-    accepted: bool,
-    /// Whether the accepted correction stepped realtime.
-    stepped: bool,
-    /// Whether the accepted sample is recent enough for synchronization.
-    synchronized: bool,
-    /// Accepted clock offset in nanoseconds.
-    theta: i64,
-    /// Accepted uncertainty in nanoseconds.
-    epsilon: i64,
-    /// Realtime immediately after a step.
-    step_realtime_ns: i64,
-    /// Programmed scaled-ppm frequency.
-    frequency: i64,
+/// What one discipline poll did with its time sample.
+enum PollOutcome {
+    /// It rejected the sample, or could not take or apply one.
+    Rejected,
+    /// It accepted the sample and corrected the wall clock.
+    Accepted {
+        /// Accepted clock offset in nanoseconds.
+        theta: i64,
+        /// Accepted uncertainty in nanoseconds.
+        epsilon: i64,
+        /// The frequency correction afterwards, in scaled parts per million.
+        frequency: i64,
+        /// The wall clock right after a step, or `None` for a slew.
+        step_realtime_ns: Option<i64>,
+    },
 }
 
-/// Applies one poll outcome to persistent time state.
-fn apply_poll(state: &mut TimeState, outcome: &PollOutcome) {
-    if outcome.accepted {
-        state.samples = state.samples.wrapping_add(1);
-        state.offset_ns = outcome.theta;
-        state.uncertainty_ns = outcome.epsilon;
-        state.frequency_ppb = decoders::frequency_to_ppb(outcome.frequency);
-        state.last_sample_error = b"none".to_vec();
-        if outcome.stepped {
-            state.discontinuities = state.discontinuities.wrapping_add(1);
-            state.last_discontinuity = b"step".to_vec();
-            state.last_step_ns = outcome.theta;
-            state.last_step_realtime_ns = outcome.step_realtime_ns;
+/// Applies one poll's outcome, and whether the discipline is synchronized, to the time state.
+fn apply_poll(state: &mut TimeState, outcome: &PollOutcome, synchronized: bool) {
+    match *outcome {
+        PollOutcome::Accepted {
+            theta,
+            epsilon,
+            frequency,
+            step_realtime_ns,
+        } => {
+            state.samples += 1;
+            state.offset_ns = theta;
+            state.uncertainty_ns = epsilon;
+            state.frequency_ppb = decoders::frequency_to_ppb(frequency);
+            state.last_sample_error = SampleRejection::None;
+            if let Some(realtime_ns) = step_realtime_ns {
+                state.discontinuities += 1;
+                state.last_discontinuity = Discontinuity::Step;
+                state.last_step_ns = theta;
+                state.last_step_realtime_ns = realtime_ns;
+            }
         }
-    } else {
-        state.rejected_samples = state.rejected_samples.wrapping_add(1);
-        state.last_sample_error = b"G_SAMPLE_UNCERTAIN".to_vec();
+        PollOutcome::Rejected => {
+            state.rejected_samples += 1;
+            state.last_sample_error = SampleRejection::Uncertain;
+        }
     }
-    state.synchronized = u64::from(outcome.synchronized);
+    state.synchronized = synchronized;
+}
+
+/// Repair step 7 work that a queued signal scheduled, which starts once it is due.
+#[derive(Clone, Copy, Debug)]
+struct PendingRestore {
+    /// Monotonic time at which the work may start.
+    due_ns: i64,
+    /// The readiness path's wall time, which the signal carried.
+    readiness_us: i64,
+}
+
+/// The child that runs repair step 7, and its outstanding deadlines on the monotonic clock.
+#[derive(Clone, Copy, Debug)]
+struct RestoreWorker {
+    /// The worker process.
+    process: ProcessId,
+    /// When the worker moves to normal scheduling, until it has.
+    promote_ns: Option<i64>,
+    /// When the daemon releases the stall suppression, until it has.
+    release_ns: Option<i64>,
 }
 
 /// Owned resources and mutable counters of the long-running time daemon.
@@ -208,22 +205,12 @@ pub(crate) struct Daemon {
     timer: Timer,
     /// Completed discipline polls.
     polls: i32,
-    /// Monotonic time of the latest accepted sample.
-    last_accepted_ns: i64,
-    /// Active restore worker, if any.
-    worker_pid: Option<ProcessId>,
-    /// Deadline for promoting the restore worker.
-    worker_promote_ns: i64,
-    /// Deadline for releasing stall suppression.
-    worker_deadline_ns: i64,
-    /// Whether suppression was already released for this worker.
-    suppression_released: bool,
-    /// Whether queued restore work awaits its defer interval.
-    restore_pending: bool,
-    /// Monotonic time at which queued restore work may start.
-    restore_due_ns: i64,
-    /// Restore readiness latency carried by the queued signal.
-    readiness_us: i64,
+    /// Monotonic time of the latest accepted sample, if any.
+    last_accepted_ns: Option<i64>,
+    /// Restore work that awaits its start.
+    restore: Option<PendingRestore>,
+    /// The running restore worker.
+    worker: Option<RestoreWorker>,
 }
 
 /// Arms the daemon timer with the current fast or slow interval.
@@ -241,8 +228,8 @@ fn watch_kernel_log(runtime: &Runtime<'_>, daemon: &Daemon) {
         if let Some(code) = decoders::match_watch_rule(message) {
             runtime.fail_fatal(
                 PowerOffStatus::Violation,
-                code.as_bytes(),
-                b"watcher",
+                code,
+                EventSource::Watcher,
                 Phase::Runtime,
                 &message[..message.len().min(WATCHED_MESSAGE_LIMIT)],
             );
@@ -251,8 +238,8 @@ fn watch_kernel_log(runtime: &Runtime<'_>, daemon: &Daemon) {
     if result == Err(Errno::EPIPE) {
         runtime.fail_fatal(
             PowerOffStatus::Violation,
-            b"G_KMSG_OVERRUN",
-            b"watcher",
+            ViolationCode::KmsgOverrun,
+            EventSource::Watcher,
             Phase::Runtime,
             b"kernel log records were lost (EPIPE)",
         );
@@ -261,61 +248,59 @@ fn watch_kernel_log(runtime: &Runtime<'_>, daemon: &Daemon) {
 
 /// Takes one host sample and updates Linux clock discipline and state.
 fn discipline_poll(runtime: &Runtime<'_>, daemon: &mut Daemon) {
-    let stalls = read_i64(kernel::RCU_STALL_COUNT).unwrap_or(0);
+    let stalls = sys::read_number::<i64>(kernel::RCU_STALL_COUNT).unwrap_or(0);
     if stalls != 0 {
         runtime.fail_fatal(
             PowerOffStatus::Violation,
-            b"G_RCU_STALL",
-            b"watcher",
+            ViolationCode::RcuStall,
+            EventSource::Watcher,
             Phase::Runtime,
             format!("rcu_stall_count is {stalls}").as_bytes(),
         );
     }
     let fast = daemon.polls < FAST_POLLS;
     daemon.polls += 1;
-    let mut outcome = PollOutcome {
-        accepted: false,
-        stepped: false,
-        synchronized: false,
-        theta: 0,
-        epsilon: 0,
-        step_realtime_ns: 0,
-        frequency: 0,
-    };
-    let _lock = match system::lock_portb() {
-        Ok(lock) => {
-            let sample = system::best_sample(
-                runtime,
-                SAMPLE_ATTEMPTS,
-                POLL_BOUND_NS,
-                runtime.generation(),
-            );
-            match sample {
-                Ok((SampleResult::Accepted, sample)) => {
-                    outcome.theta = sample.theta;
-                    outcome.epsilon = sample.epsilon;
-                    let frequency = current_frequency(runtime);
-                    let correction = decoders::plan_correction(sample.theta, sample.epsilon, fast);
-                    outcome.stepped = matches!(correction, sys::ClockAdjustment::Step { .. });
-                    outcome.accepted = runtime.ops.adjust_clock(correction).is_ok()
-                        && (!outcome.stepped || set_frequency(runtime, frequency).is_ok());
-                    outcome.step_realtime_ns = clock_ns(sys::Clock::Realtime);
-                    outcome.frequency = current_frequency(runtime);
-                    if outcome.accepted {
-                        daemon.last_accepted_ns = clock_ns(sys::Clock::Monotonic);
-                    }
+    // The port-B lock serializes the sample with the other port transactions, and the state
+    // update with the sample.
+    let lock = system::lock_portb().ok();
+    let mut outcome = PollOutcome::Rejected;
+    if lock.is_some() {
+        let sample = system::best_sample(
+            runtime,
+            SAMPLE_ATTEMPTS,
+            POLL_BOUND_NS,
+            runtime.generation(),
+        );
+        match sample {
+            Ok((SampleResult::Accepted, sample)) => {
+                let frequency = current_frequency(runtime);
+                let correction = decoders::plan_correction(sample.theta, sample.epsilon, fast);
+                let stepped = matches!(correction, sys::ClockAdjustment::Step { .. });
+                let applied = runtime.ops.adjust_clock(correction).is_ok()
+                    && (!stepped || set_frequency(runtime, frequency).is_ok());
+                let step_realtime_ns = clock_ns(sys::Clock::Realtime);
+                let frequency = current_frequency(runtime);
+                if applied {
+                    daemon.last_accepted_ns = Some(clock_ns(sys::Clock::Monotonic));
+                    outcome = PollOutcome::Accepted {
+                        theta: sample.theta,
+                        epsilon: sample.epsilon,
+                        frequency,
+                        step_realtime_ns: stepped.then_some(step_realtime_ns),
+                    };
                 }
-                Err(SampleError::Generation(_)) => return,
-                Ok((SampleResult::Wide, _)) | Err(SampleError::Unavailable(_)) => {}
             }
-            Some(lock)
+            Err(SampleError::Generation { .. }) => return,
+            Ok((SampleResult::Wide, _))
+            | Err(SampleError::Ports(_) | SampleError::NoTimeWindow(_) | SampleError::Invalid(_)) =>
+                {}
         }
-        Err(_) => None,
-    };
-    outcome.synchronized = daemon.last_accepted_ns != 0
-        && clock_ns(sys::Clock::Monotonic).wrapping_sub(daemon.last_accepted_ns)
-            <= SYNCHRONIZED_AGE_NS;
-    let _ = state_apply(|state| apply_poll(state, &outcome));
+    }
+    let synchronized = daemon.last_accepted_ns.is_some_and(|accepted_ns| {
+        clock_ns(sys::Clock::Monotonic).wrapping_sub(accepted_ns) <= SYNCHRONIZED_AGE_NS
+    });
+    let _ = state_apply(|state| apply_poll(state, &outcome, synchronized));
+    drop(lock);
 }
 
 /// A kernel setting forced to a value while the owner lives. Dropping the owner restores the
@@ -331,8 +316,8 @@ impl ForcedSetting {
     /// Saves the setting at `path` and forces it to `value`, or returns `None` when either
     /// fails, which leaves the setting unchanged.
     fn force(path: &'static CStr, value: i64) -> Option<Self> {
-        let saved = read_i64(path).ok()?;
-        write_i64(path, value).ok()?;
+        let saved = sys::read_number::<i64>(path).ok()?;
+        sys::write_number(path, value).ok()?;
         Some(Self {
             path,
             saved: Some(saved),
@@ -343,7 +328,7 @@ impl ForcedSetting {
     fn restore(mut self) -> Result<(), Errno> {
         self.saved
             .take()
-            .map_or(Ok(()), |saved| write_i64(self.path, saved))
+            .map_or(Ok(()), |saved| sys::write_number(self.path, saved))
     }
 }
 
@@ -351,7 +336,7 @@ impl Drop for ForcedSetting {
     /// Restores the saved value, best effort, unless `restore` did.
     fn drop(&mut self) {
         if let Some(saved) = self.saved.take() {
-            let _ = write_i64(self.path, saved);
+            let _ = sys::write_number(self.path, saved);
         }
     }
 }
@@ -487,8 +472,7 @@ pub(crate) fn fork_deferred_restore(
 /// C7. Returns whether the grace period was released.
 pub(crate) fn restore_work(
     runtime: &Runtime<'_>,
-    new_cpus: &[bool; MAX_CPUS],
-    new_count: usize,
+    new_cpus: CpuMask,
     with_deadline: bool,
     timing: &RestoreTiming,
 ) -> bool {
@@ -496,16 +480,17 @@ pub(crate) fn restore_work(
         Ok(checks) => checks,
         Err(_) => {
             let mut checks = Checks::empty(Phase::Restore);
-            checks.fail(runtime, "C6", "cannot read the CPU sets");
+            checks.fail(runtime, CheckId::C6, "cannot read the CPU sets");
             checks
         }
     };
-    if checks.online_count > 0 {
-        checks::run_restore_checks(runtime, &mut checks, new_cpus, new_count);
+    if !checks.online.is_empty() {
+        checks::run_restore_checks(runtime, &mut checks, new_cpus);
     }
     let elapsed = clock_ns(sys::Clock::Monotonic).wrapping_sub(timing.start_ns);
     let cpu = deferred_restore_cpu_ns(timing);
-    let timeout = read_i64(kernel::RCU_STALL_TIMEOUT).unwrap_or(DEFAULT_STALL_TIMEOUT_S);
+    let timeout =
+        sys::read_number::<i64>(kernel::RCU_STALL_TIMEOUT).unwrap_or(DEFAULT_STALL_TIMEOUT_S);
     let released = if with_deadline {
         release_with_deadline(timeout)
     } else {
@@ -514,8 +499,8 @@ pub(crate) fn restore_work(
     if !released {
         runtime.fail_fatal(
             PowerOffStatus::Repair,
-            b"G_REPAIR_SUPPRESSION",
-            b"repair",
+            ViolationCode::RepairSuppression,
+            EventSource::Repair,
             Phase::Restore,
             b"the RCU grace-period release failed",
         );
@@ -523,17 +508,17 @@ pub(crate) fn restore_work(
     if let Err(detail) = suppression_restore(true) {
         runtime.fail_fatal(
             PowerOffStatus::Repair,
-            b"G_REPAIR_SUPPRESSION",
-            b"repair",
+            ViolationCode::RepairSuppression,
+            EventSource::Repair,
             Phase::Restore,
             &detail,
         );
     }
-    checks::check_timer_list(runtime, &mut checks, TIMER_LIST_WAIT_NS);
+    let verdict = checks::check_timer_list(checks.online, checks::TIMER_LIST_WAIT);
+    checks.record(runtime, verdict);
     if let Err(error) = checks::record_check(
         runtime,
         &checks,
-        b"ok",
         timing.readiness_us.wrapping_add(elapsed / NSEC_PER_USEC),
         cpu / NSEC_PER_USEC,
         0,
@@ -541,44 +526,43 @@ pub(crate) fn restore_work(
     ) {
         checks.fail(
             runtime,
-            "C10",
+            CheckId::C10,
             format!("cannot record the restore check: {}", error.desc()),
         );
     }
     released
 }
 
-/// Parses and removes the private restore-work record.
-fn parse_restore_state() -> Result<([bool; MAX_CPUS], usize, u64), Vec<u8>> {
+/// Reads the private restore record, and returns the CPUs that the restore brought online, none
+/// for a missing record or one of another generation, and the recorded generation.
+fn parse_restore_state() -> Result<(CpuMask, u64), Vec<u8>> {
     let state = state_load().map_err(|_| b"the time state is unreadable".to_vec())?;
-    let text = match read_text(RESTORE_PATH, RESTORE_LIMIT) {
-        Ok(text) => text,
-        Err(_) => return Ok(([false; MAX_CPUS], 0, state.generation)),
+    let Ok(text) = sys::read_file(RESTORE_PATH) else {
+        return Ok((CpuMask::EMPTY, state.generation));
     };
-    let (generation, mut cpus, mut count) = decoders::parse_restore_record(&text)
+    let (generation, cpus) = decoders::parse_restore_record(&text)
         .ok_or_else(|| b"the restore record is malformed".to_vec())?;
-    if generation != state.generation {
-        cpus = [false; MAX_CPUS];
-        count = 0;
-    }
-    Ok((cpus, count, state.generation))
+    let cpus = if generation == state.generation {
+        cpus
+    } else {
+        CpuMask::EMPTY
+    };
+    Ok((cpus, state.generation))
 }
 
-/// Starts repair step 7 when it is due, `DEFERRED_START_NS` after the acknowledgement, in a
-/// child at `SCHED_IDLE`, so the watcher and the discipline keep normal priority; the fork
-/// itself also runs at `SCHED_IDLE`. The readiness path's wall time came with the signal.
-fn start_restore(runtime: &Runtime<'_>, daemon: &mut Daemon) {
-    if daemon.worker_pid.is_some() {
-        return;
-    }
+/// Starts `restore`, repair step 7, which is due `DEFERRED_START_NS` after the
+/// acknowledgement, in a child at `SCHED_IDLE`, so the watcher and the discipline keep normal
+/// priority; the fork itself also runs at `SCHED_IDLE`. The readiness path's wall time came
+/// with the signal.
+fn start_restore(runtime: &Runtime<'_>, daemon: &mut Daemon, restore: PendingRestore) {
     let cpu_start = cpu_time_ns();
-    let (new_cpus, new_count, generation) = match parse_restore_state() {
+    let (new_cpus, generation) = match parse_restore_state() {
         Ok(value) => value,
         Err(detail) => {
             runtime.fail_fatal(
                 PowerOffStatus::Repair,
-                b"G_REPAIR_SUPPRESSION",
-                b"repair",
+                ViolationCode::RepairSuppression,
+                EventSource::Repair,
                 Phase::Restore,
                 &detail,
             );
@@ -586,46 +570,46 @@ fn start_restore(runtime: &Runtime<'_>, daemon: &mut Daemon) {
         }
     };
     runtime.set_generation(generation as u32);
-    let timeout = read_i64(kernel::RCU_STALL_TIMEOUT).unwrap_or(DEFAULT_STALL_TIMEOUT_S);
+    let timeout =
+        sys::read_number::<i64>(kernel::RCU_STALL_TIMEOUT).unwrap_or(DEFAULT_STALL_TIMEOUT_S);
     let mut timing = RestoreTiming {
-        start_ns: daemon.restore_due_ns,
-        readiness_us: daemon.readiness_us,
+        start_ns: restore.due_ns,
+        readiness_us: restore.readiness_us,
         prior_cpu_ns: 0,
         cpu_base_ns: 0,
         fork_reader: None,
     };
     let process = match fork_deferred_restore(cpu_start, &mut timing, || {}) {
         Ok(ForkResult::Child) => {
-            let released = restore_work(runtime, &new_cpus, new_count, false, &timing);
+            let released = restore_work(runtime, new_cpus, false, &timing);
             sys::exit_immediately(u8::from(!released));
         }
         Ok(ForkResult::Parent(process)) => process,
         Err(error) => {
             runtime.fail_fatal(
                 PowerOffStatus::Repair,
-                b"G_REPAIR_SUPPRESSION",
-                b"repair",
+                ViolationCode::RepairSuppression,
+                EventSource::Repair,
                 Phase::Restore,
                 format!("cannot start the restore work: {}", error.desc()).as_bytes(),
             );
             return;
         }
     };
-    daemon.worker_pid = Some(process);
-    daemon.worker_promote_ns = daemon.restore_due_ns.wrapping_add(IDLE_BOUND_NS);
-    daemon.worker_deadline_ns =
-        clock_ns(sys::Clock::Monotonic).wrapping_add(timeout * NSEC_PER_SEC);
-    daemon.suppression_released = false;
+    daemon.worker = Some(RestoreWorker {
+        process,
+        promote_ns: Some(restore.due_ns.wrapping_add(IDLE_BOUND_NS)),
+        release_ns: Some(clock_ns(sys::Clock::Monotonic).wrapping_add(timeout * NSEC_PER_SEC)),
+    });
 }
 
 /// Restores saved stall settings after a worker deadline or completion.
-fn release_suppression(runtime: &Runtime<'_>, daemon: &mut Daemon) {
-    daemon.suppression_released = true;
+fn release_suppression(runtime: &Runtime<'_>) {
     if let Err(detail) = suppression_restore(true) {
         runtime.fail_fatal(
             PowerOffStatus::Repair,
-            b"G_REPAIR_SUPPRESSION",
-            b"repair",
+            ViolationCode::RepairSuppression,
+            EventSource::Repair,
             Phase::Restore,
             &detail,
         );
@@ -635,21 +619,20 @@ fn release_suppression(runtime: &Runtime<'_>, daemon: &mut Daemon) {
 /// Reaps every available child and handles the active restore worker.
 fn reap_children(runtime: &Runtime<'_>, daemon: &mut Daemon) {
     while let Some(child) = sys::reap_any_nonblocking() {
-        if Some(child.process) != daemon.worker_pid {
+        if daemon.worker.map(|worker| worker.process) != Some(child.process) {
             continue;
         }
-        daemon.worker_pid = None;
-        daemon.worker_promote_ns = 0;
+        daemon.worker = None;
         if !matches!(child.status, ChildStatus::Exited(_)) {
-            release_suppression(runtime, daemon);
+            release_suppression(runtime);
             let signal = match child.status {
                 ChildStatus::Signaled(signal) => signal,
                 _ => 0,
             };
             runtime.fail_fatal(
                 PowerOffStatus::Repair,
-                b"G_REPAIR_SUPPRESSION",
-                b"repair",
+                ViolationCode::RepairSuppression,
+                EventSource::Repair,
                 Phase::Restore,
                 format!("the restore work ended with signal {signal}").as_bytes(),
             );
@@ -668,14 +651,16 @@ fn handle_signals(runtime: &Runtime<'_>, daemon: &mut Daemon) {
             // `sigqueue` carries the readiness path's wall time. Step 7 is due
             // `DEFERRED_START_NS` later; the repair paired the clock with the packet's UTC now.
             Some(Signal::SIGUSR1) => {
-                daemon.restore_pending = true;
-                daemon.last_accepted_ns = clock_ns(sys::Clock::Monotonic);
-                daemon.restore_due_ns = daemon.last_accepted_ns.wrapping_add(DEFERRED_START_NS);
-                daemon.readiness_us = if event.queued {
-                    i64::from(event.value)
-                } else {
-                    0
-                };
+                let now = clock_ns(sys::Clock::Monotonic);
+                daemon.last_accepted_ns = Some(now);
+                daemon.restore = Some(PendingRestore {
+                    due_ns: now.wrapping_add(DEFERRED_START_NS),
+                    readiness_us: if event.queued {
+                        i64::from(event.value)
+                    } else {
+                        0
+                    },
+                });
             }
             _ => {}
         }
@@ -684,7 +669,7 @@ fn handle_signals(runtime: &Runtime<'_>, daemon: &mut Daemon) {
 }
 
 /// Creates all daemon-owned signal and timer resources.
-fn setup_daemon(kmsg: FileDescriptor, last_accepted_ns: i64) -> Result<Daemon, Errno> {
+fn setup_daemon(kmsg: FileDescriptor, last_accepted_ns: Option<i64>) -> Result<Daemon, Errno> {
     sys::ignore_signals(&IGNORED_SIGNALS);
     let signals = SignalDescriptor::new(&DAEMON_SIGNALS)?;
     let timer = Timer::new()?;
@@ -694,21 +679,20 @@ fn setup_daemon(kmsg: FileDescriptor, last_accepted_ns: i64) -> Result<Daemon, E
         timer,
         polls: 0,
         last_accepted_ns,
-        worker_pid: None,
-        worker_promote_ns: 0,
-        worker_deadline_ns: 0,
-        suppression_released: false,
-        restore_pending: false,
-        restore_due_ns: 0,
-        readiness_us: 0,
+        restore: None,
+        worker: None,
     };
-    write_text(kernel::OOM_SCORE_ADJUSTMENT, OOM_SCORE_ADJUSTMENT)?;
+    sys::write_file(kernel::OOM_SCORE_ADJUSTMENT, OOM_SCORE_ADJUSTMENT)?;
     arm_timer(&daemon)?;
     Ok(daemon)
 }
 
-/// Completes daemon setup and atomically publishes its process identifier.
-pub(crate) fn become_daemon(kmsg: FileDescriptor, last_accepted_ns: i64) -> Result<Daemon, Errno> {
+/// Completes daemon setup and atomically publishes its process identifier. The discipline
+/// starts from the sample accepted at the monotonic `last_accepted_ns`, if any.
+pub(crate) fn become_daemon(
+    kmsg: FileDescriptor,
+    last_accepted_ns: Option<i64>,
+) -> Result<Daemon, Errno> {
     let daemon = setup_daemon(kmsg, last_accepted_ns)?;
     system::replace_file(
         DAEMON_PID_PATH,
@@ -718,44 +702,34 @@ pub(crate) fn become_daemon(kmsg: FileDescriptor, last_accepted_ns: i64) -> Resu
     Ok(daemon)
 }
 
-/// Converts an absolute monotonic nanosecond deadline, or zero for none, to a poll timeout
-/// rounded up to whole milliseconds, or `None` to wait without one.
-fn timeout_until(deadline_ns: i64) -> Option<Duration> {
-    if deadline_ns == 0 {
-        return None;
-    }
+/// Converts an absolute monotonic nanosecond deadline to a poll timeout, rounded up to whole
+/// milliseconds, the unit of `poll`, so that the daemon does not wake before it.
+fn timeout_until(deadline_ns: i64) -> Duration {
+    /// The longest timeout that `poll` takes, in milliseconds.
+    const POLL_TIMEOUT_MAX_MS: u64 = i32::MAX as u64;
     let remaining = deadline_ns.wrapping_sub(clock_ns(sys::Clock::Monotonic));
-    let milliseconds = if remaining <= 0 {
-        0
-    } else {
-        ((remaining + NSEC_PER_MSEC - 1) / NSEC_PER_MSEC).min(i64::from(i32::MAX))
-    };
-    Some(Duration::from_millis(milliseconds as u64))
-}
-
-/// Returns the earlier of two poll timeouts, where `None` waits without one.
-fn earlier(first: Option<Duration>, second: Option<Duration>) -> Option<Duration> {
-    match (first, second) {
-        (Some(first), Some(second)) => Some(first.min(second)),
-        (first, second) => first.or(second),
-    }
+    let remaining = u64::try_from(remaining).unwrap_or(0);
+    Duration::from_millis(
+        remaining
+            .div_ceil(NSEC_PER_MSEC as u64)
+            .min(POLL_TIMEOUT_MAX_MS),
+    )
 }
 
 /// Runs the kernel watcher, discipline poller, and restore-worker coordinator.
 pub(crate) fn daemon_loop(runtime: &Runtime<'_>, mut daemon: Daemon) -> ! {
     loop {
-        let waiting = daemon.worker_pid.is_some() && !daemon.suppression_released;
-        let idle = daemon.worker_pid.is_some() && daemon.worker_promote_ns != 0;
-        let due = daemon.restore_pending && daemon.worker_pid.is_none();
-        let deadline =
-            |active: bool, deadline_ns: i64| timeout_until(if active { deadline_ns } else { 0 });
-        let timeout = earlier(
-            earlier(
-                deadline(idle, daemon.worker_promote_ns),
-                deadline(waiting, daemon.worker_deadline_ns),
-            ),
-            deadline(due, daemon.restore_due_ns),
-        );
+        let worker = daemon.worker;
+        let due = daemon.restore.filter(|_| worker.is_none());
+        let timeout = [
+            worker.and_then(|worker| worker.promote_ns),
+            worker.and_then(|worker| worker.release_ns),
+            due.map(|restore| restore.due_ns),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+        .map(timeout_until);
         let events = match sys::poll(
             [
                 Pollable::File(&daemon.kmsg),
@@ -786,23 +760,28 @@ pub(crate) fn daemon_loop(runtime: &Runtime<'_>, mut daemon: Daemon) -> ! {
         let mut now = clock_ns(sys::Clock::Monotonic);
         // Step 7 starts `DEFERRED_START_NS` after the acknowledgement, and continues at normal
         // priority `IDLE_BOUND_NS` after it starts.
-        if daemon.restore_pending && daemon.worker_pid.is_none() && now >= daemon.restore_due_ns {
-            daemon.restore_pending = false;
-            start_restore(runtime, &mut daemon);
+        if daemon.worker.is_none()
+            && let Some(restore) = daemon.restore.filter(|restore| now >= restore.due_ns)
+        {
+            daemon.restore = None;
+            start_restore(runtime, &mut daemon, restore);
             now = clock_ns(sys::Clock::Monotonic);
         }
-        if let Some(process) = daemon.worker_pid
-            && daemon.worker_promote_ns != 0
-            && now >= daemon.worker_promote_ns
-        {
-            daemon.worker_promote_ns = 0;
-            sys::set_scheduling_policy(Some(process), sys::SchedulingPolicy::Normal);
-        }
-        if daemon.worker_pid.is_some()
-            && !daemon.suppression_released
-            && now >= daemon.worker_deadline_ns
-        {
-            release_suppression(runtime, &mut daemon);
+        if let Some(worker) = &mut daemon.worker {
+            if worker
+                .promote_ns
+                .is_some_and(|promote_ns| now >= promote_ns)
+            {
+                worker.promote_ns = None;
+                sys::set_scheduling_policy(Some(worker.process), sys::SchedulingPolicy::Normal);
+            }
+            if worker
+                .release_ns
+                .is_some_and(|release_ns| now >= release_ns)
+            {
+                worker.release_ns = None;
+                release_suppression(runtime);
+            }
         }
     }
 }
@@ -883,24 +862,14 @@ mod tests {
 
     #[test]
     fn poll_deadlines_round_up_to_milliseconds() {
-        let millisecond = Some(Duration::from_millis(1));
-        assert_eq!(
-            earlier(None, Some(Duration::from_millis(4))),
-            Some(Duration::from_millis(4))
-        );
-        assert_eq!(
-            earlier(
-                Some(Duration::from_millis(7)),
-                Some(Duration::from_millis(4))
-            ),
-            Some(Duration::from_millis(4))
-        );
-        assert_eq!(earlier(None, None), None);
-        assert_eq!(timeout_until(0), None);
         let now = clock_ns(sys::Clock::Monotonic);
-        assert_eq!(timeout_until(now - 1), Some(Duration::ZERO));
+        assert_eq!(timeout_until(now - 1), Duration::ZERO);
         let soon = timeout_until(now + NSEC_PER_MSEC / 2);
-        assert!(soon <= millisecond, "{soon:?}");
+        assert!(soon <= Duration::from_millis(1), "{soon:?}");
+        assert_eq!(
+            timeout_until(i64::MAX),
+            Duration::from_millis(i32::MAX as u64)
+        );
     }
 
     #[test]

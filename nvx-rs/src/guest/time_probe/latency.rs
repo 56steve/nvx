@@ -1,15 +1,17 @@
 //! The single-CPU instruction and clock latency probe.
 
+use std::collections::TryReserveError;
+use std::hint::black_box;
 use std::io::Write;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::format::{f0, f1};
 use super::support::{
-    TscRate, bad_option, check_cpus_allowed, current_clocksource, cycles_to_ns, detect_tsc_rate,
-    option_value, parse_rate, parse_u64,
+    Arguments, TscRate, bad_option, check_cpus_allowed, current_clocksource, cycles_to_ns,
+    detect_tsc_rate, parse_rate,
 };
+use crate::guest::parse::parse_u64;
 use crate::guest::status::CommandError;
-use crate::guest::sys::{self, x86::cpuid};
+use crate::guest::sys::{self, x86};
 
 /// Timed batches that the probe measures without `--iterations`.
 const DEFAULT_ITERATIONS: u64 = 2000;
@@ -19,9 +21,6 @@ const DEFAULT_BATCH: u64 = 50;
 const ITERATIONS: std::ops::RangeInclusive<u64> = 1..=10_000_000;
 /// The operation counts that `--batch` accepts.
 const BATCH: std::ops::RangeInclusive<u64> = 1..=1_000_000;
-
-/// Optimizer-visible accumulation of every measured operation's result.
-static SINK: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 /// Operation measured by one latency row.
@@ -44,19 +43,35 @@ enum Method {
     SchedYield,
 }
 
-/// Stable measurement order and output names.
-const METHODS: &[(Method, &str)] = &[
-    (Method::Rdtsc, "rdtsc"),
-    (Method::Rdtscp, "rdtscp"),
-    (Method::LfenceRdtsc, "lfence_rdtsc"),
-    (Method::ClockMonotonic, "clock_gettime_monotonic"),
-    (Method::ClockRealtime, "clock_gettime_realtime"),
-    (Method::SyscallMonotonic, "syscall_clock_gettime_monotonic"),
-    (Method::SyscallGetpid, "syscall_getpid"),
-    (Method::SchedYield, "sched_yield"),
-];
+impl Method {
+    /// Every method, in the stable measurement and output order.
+    const ALL: [Self; 8] = [
+        Self::Rdtsc,
+        Self::Rdtscp,
+        Self::LfenceRdtsc,
+        Self::ClockMonotonic,
+        Self::ClockRealtime,
+        Self::SyscallMonotonic,
+        Self::SyscallGetpid,
+        Self::SchedYield,
+    ];
 
-#[derive(Clone, Copy, Default)]
+    /// Returns the method's stable output name.
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Rdtsc => "rdtsc",
+            Self::Rdtscp => "rdtscp",
+            Self::LfenceRdtsc => "lfence_rdtsc",
+            Self::ClockMonotonic => "clock_gettime_monotonic",
+            Self::ClockRealtime => "clock_gettime_realtime",
+            Self::SyscallMonotonic => "syscall_clock_gettime_monotonic",
+            Self::SyscallGetpid => "syscall_getpid",
+            Self::SchedYield => "sched_yield",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
 /// Summary statistics for one measured operation.
 struct ResultRow {
     /// Nearest-rank median latency in nanoseconds.
@@ -71,64 +86,58 @@ struct ResultRow {
     samples: usize,
 }
 
-/// Returns whether CPUID advertises RDTSCP.
-fn cpu_has_rdtscp() -> bool {
-    let maximum = sys::x86::cpuid(cpuid::LEAF_EXTENDED_MAXIMUM, 0)[0];
-    maximum >= cpuid::LEAF_EXTENDED_FEATURES
-        && cpuid::bit(
-            sys::x86::cpuid(cpuid::LEAF_EXTENDED_FEATURES, 0)[3],
-            cpuid::EXTENDED_FEATURES_EDX_RDTSCP,
-        )
+/// Executes `operation` `batch` times in one loop of its own, and returns the sum of its results,
+/// which the caller hands to `black_box` so that the optimizer keeps every operation.
+fn repeat(batch: u32, mut operation: impl FnMut() -> u64) -> u64 {
+    (0..batch).fold(0, |sum, _| sum.wrapping_add(operation()))
 }
 
-/// Executes `batch` copies of one operation and returns an optimizer sink.
+/// Executes `batch` copies of one operation and returns the sum of their results.
+///
+/// It selects the operation once, as the C probe's `switch` did, so that each operation runs in
+/// a loop specialized for it and the timed region dispatches nothing.
 fn run_batch(method: Method, batch: u32) -> u64 {
-    let mut sink = 0_u64;
-    for _ in 0..batch {
-        let value = match method {
-            Method::Rdtsc => sys::x86::rdtsc(),
-            Method::Rdtscp => sys::x86::rdtscp(),
-            Method::LfenceRdtsc => sys::x86::rdtsc_lfence(),
-            Method::ClockMonotonic => {
-                sys::clock_time(sys::Clock::Monotonic)
-                    .unwrap_or_default()
-                    .nanoseconds as u64
-            }
-            Method::ClockRealtime => {
-                sys::clock_time(sys::Clock::Realtime)
-                    .unwrap_or_default()
-                    .nanoseconds as u64
-            }
-            Method::SyscallMonotonic => sys::syscall_monotonic_nanoseconds(),
-            Method::SyscallGetpid => sys::syscall_process_id(),
-            Method::SchedYield => u64::from(sys::yield_now()),
-        };
-        sink = sink.wrapping_add(value);
+    /// Reads `clock` through the vDSO and returns its nanoseconds within the second.
+    fn nanoseconds(clock: sys::Clock) -> u64 {
+        sys::clock_time(clock).map_or(0, |time| time.tv_nsec() as u64)
     }
-    sink
+    match method {
+        Method::Rdtsc => repeat(batch, x86::rdtsc),
+        Method::Rdtscp => repeat(batch, x86::rdtscp),
+        Method::LfenceRdtsc => repeat(batch, x86::rdtsc_lfence),
+        Method::ClockMonotonic => repeat(batch, || nanoseconds(sys::Clock::Monotonic)),
+        Method::ClockRealtime => repeat(batch, || nanoseconds(sys::Clock::Realtime)),
+        Method::SyscallMonotonic => repeat(batch, sys::syscall_monotonic_nanoseconds),
+        Method::SyscallGetpid => repeat(batch, sys::syscall_process_id),
+        Method::SchedYield => repeat(batch, || {
+            std::thread::yield_now();
+            0
+        }),
+    }
 }
 
-/// Selects a nearest-rank percentile from sorted samples.
+/// Returns the zero-based position, in `count` sorted samples, of their nearest-rank
+/// `percentile`: the smallest sample that at least that fraction of the samples does not exceed.
+fn rank_index(count: usize, percentile: f64) -> usize {
+    ((percentile * count as f64).ceil() as usize).clamp(1, count) - 1
+}
+
+/// Selects a nearest-rank percentile from sorted, nonempty samples.
 fn nearest_rank(sorted: &[f64], percentile: f64) -> f64 {
-    let exact = percentile * sorted.len() as f64;
-    let mut rank = exact as usize;
-    if (rank as f64) < exact {
-        rank += 1;
-    }
-    sorted[rank.clamp(1, sorted.len()) - 1]
+    sorted[rank_index(sorted.len(), percentile)]
 }
 
-/// Measures the median fenced-TSC bracket overhead.
-fn bracket_overhead(iterations: usize) -> Result<f64, ()> {
+/// Measures the median fenced-TSC bracket overhead over `iterations` brackets.
+fn bracket_overhead(iterations: usize) -> Result<f64, TryReserveError> {
     let mut samples = Vec::new();
-    samples.try_reserve_exact(iterations).map_err(|_| ())?;
-    for _ in 0..iterations {
-        let t0 = sys::x86::rdtsc_fenced();
-        let t1 = sys::x86::rdtsc_fenced();
-        samples.push(t1.wrapping_sub(t0) as f64);
-    }
-    samples.sort_unstable_by(f64::total_cmp);
-    Ok(nearest_rank(&samples, 0.50))
+    samples.try_reserve_exact(iterations)?;
+    samples.extend((0..iterations).map(|_| {
+        let t0 = x86::rdtsc_fenced();
+        let t1 = x86::rdtsc_fenced();
+        t1.wrapping_sub(t0) as f64
+    }));
+    let median = rank_index(samples.len(), 0.50);
+    Ok(*samples.select_nth_unstable_by(median, f64::total_cmp).1)
 }
 
 /// Measures one method and computes its summary row.
@@ -138,27 +147,26 @@ fn measure(
     batch: u32,
     overhead: f64,
     rate: TscRate,
-) -> Result<ResultRow, ()> {
+) -> Result<ResultRow, TryReserveError> {
     let mut per_op = Vec::new();
-    per_op.try_reserve_exact(iterations).map_err(|_| ())?;
-    SINK.fetch_add(run_batch(method, batch), Ordering::Relaxed);
-    let mut sum = 0.0;
+    per_op.try_reserve_exact(iterations)?;
+    black_box(run_batch(method, batch));
     for _ in 0..iterations {
-        let t0 = sys::x86::rdtsc_fenced();
-        let sink = run_batch(method, batch);
-        let t1 = sys::x86::rdtsc_fenced();
+        let t0 = x86::rdtsc_fenced();
+        let sum = run_batch(method, batch);
+        let t1 = x86::rdtsc_fenced();
+        black_box(sum);
         let cycles = (t1.wrapping_sub(t0) as f64 - overhead).max(0.0);
-        SINK.fetch_add(sink, Ordering::Relaxed);
-        let value = cycles_to_ns(cycles, rate) / f64::from(batch);
-        per_op.push(value);
-        sum += value;
+        per_op.push(cycles_to_ns(cycles, rate) / f64::from(batch));
     }
+    // The mean adds the samples in measurement order, as the C probe did, before they are sorted.
+    let mean = per_op.iter().sum::<f64>() / iterations as f64;
     per_op.sort_unstable_by(f64::total_cmp);
     Ok(ResultRow {
         p50: nearest_rank(&per_op, 0.50),
         p99: nearest_rank(&per_op, 0.99),
         min: per_op[0],
-        mean: sum / iterations as f64,
+        mean,
         samples: iterations,
     })
 }
@@ -172,35 +180,34 @@ pub(super) fn run(
     let mut iterations = DEFAULT_ITERATIONS;
     let mut batch = DEFAULT_BATCH;
     let mut cpu = None;
-    let mut override_hz = 0.0;
-    let mut index = 0;
-    while index < arguments.len() {
-        if let Some(value) = option_value(arguments, &mut index, b"--iterations") {
+    let mut override_hz = None;
+    let mut arguments = Arguments::new(arguments);
+    while let Some(argument) = arguments.next() {
+        if let Some(value) = arguments.value(argument, b"--iterations") {
             iterations = parse_u64(value)
                 .filter(|value| ITERATIONS.contains(value))
-                .ok_or_else(|| bad_option(b"latency", arguments[index], err))?;
-        } else if let Some(value) = option_value(arguments, &mut index, b"--batch") {
+                .ok_or_else(|| bad_option(b"latency", arguments.last_read(), err))?;
+        } else if let Some(value) = arguments.value(argument, b"--batch") {
             batch = parse_u64(value)
                 .filter(|value| BATCH.contains(value))
-                .ok_or_else(|| bad_option(b"latency", arguments[index], err))?;
-        } else if let Some(value) = option_value(arguments, &mut index, b"--cpu") {
-            let parsed = parse_u64(value).filter(|value| *value < super::MAX_CPUS as u64);
-            cpu =
-                Some(parsed.ok_or_else(|| bad_option(b"latency", arguments[index], err))? as usize);
-        } else if let Some(value) = option_value(arguments, &mut index, b"--tsc-hz") {
+                .ok_or_else(|| bad_option(b"latency", arguments.last_read(), err))?;
+        } else if let Some(value) = arguments.value(argument, b"--cpu") {
+            let parsed = parse_u64(value)
+                .and_then(|cpu| usize::try_from(cpu).ok())
+                .filter(|cpu| *cpu < super::MAX_CPUS);
+            cpu = Some(parsed.ok_or_else(|| bad_option(b"latency", arguments.last_read(), err))?);
+        } else if let Some(value) = arguments.value(argument, b"--tsc-hz") {
+            let parsed = parse_rate(value);
             override_hz =
-                parse_rate(value).ok_or_else(|| bad_option(b"latency", arguments[index], err))?;
+                Some(parsed.ok_or_else(|| bad_option(b"latency", arguments.last_read(), err))?);
         } else {
-            return Err(bad_option(b"latency", arguments[index], err));
+            return Err(bad_option(b"latency", argument, err));
         }
-        index += 1;
     }
 
     let cpu = cpu.map_or_else(sys::current_cpu, Ok);
-    if let Ok(cpu) = cpu
-        && !check_cpus_allowed(b"latency", &[cpu], err)
-    {
-        return Err(CommandError::Usage);
+    if let Ok(cpu) = cpu {
+        check_cpus_allowed(b"latency", &[cpu], err)?;
     }
     // The C probe printed -1 for a CPU that `sched_getcpu` could not report.
     let cpu_label = cpu.map_or(-1, |cpu| cpu as i64);
@@ -224,10 +231,11 @@ pub(super) fn run(
         return Err(CommandError::Setup);
     }
     let clocksource = current_clocksource();
-    let overhead = bracket_overhead(iterations as usize).map_err(|()| {
+    let mut out_of_memory = |_: TryReserveError| {
         super::report(err, &[b"nvx-time-probe latency: out of memory\n"]);
         CommandError::Setup
-    })?;
+    };
+    let overhead = bracket_overhead(iterations as usize).map_err(&mut out_of_memory)?;
     let vdso = sys::kernel::has_vdso();
     let _ = writeln!(
         out,
@@ -245,9 +253,10 @@ pub(super) fn run(
         "{:<32} {:>10} {:>10} {:>10} {:>10}",
         "method", "p50_ns", "p99_ns", "min_ns", "mean_ns"
     );
-    let mut results = [ResultRow::default(); METHODS.len()];
-    let rdtscp = cpu_has_rdtscp();
-    for (index, &(method, name)) in METHODS.iter().enumerate() {
+    let mut results = [None; Method::ALL.len()];
+    let rdtscp = x86::has_rdtscp();
+    for (method, result) in Method::ALL.into_iter().zip(&mut results) {
+        let name = method.name();
         if method == Method::Rdtscp && !rdtscp {
             let _ = writeln!(
                 out,
@@ -255,12 +264,9 @@ pub(super) fn run(
             );
             continue;
         }
-        let row =
-            measure(method, iterations as usize, batch as u32, overhead, rate).map_err(|()| {
-                super::report(err, &[b"nvx-time-probe latency: out of memory\n"]);
-                CommandError::Setup
-            })?;
-        results[index] = row;
+        let row = measure(method, iterations as usize, batch as u32, overhead, rate)
+            .map_err(&mut out_of_memory)?;
+        *result = Some(row);
         let _ = writeln!(
             out,
             "{name:<32} {:>10} {:>10} {:>10} {:>10}",
@@ -271,12 +277,12 @@ pub(super) fn run(
         );
         let _ = out.flush();
     }
-    for (index, &(_, name)) in METHODS.iter().enumerate() {
-        let row = results[index];
-        if row.samples == 0 {
+    for (method, result) in Method::ALL.into_iter().zip(results) {
+        let name = method.name();
+        let Some(row) = result else {
             let _ = writeln!(out, "NVX-TIME-PROBE latency method={name} unsupported=1");
             continue;
-        }
+        };
         let _ = writeln!(
             out,
             "NVX-TIME-PROBE latency method={name} p50_ns={} p99_ns={} min_ns={} \

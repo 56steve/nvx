@@ -1,12 +1,13 @@
 //! Safe operating-system interface shared by the guest programs.
 //!
 //! Guest program modules deny unsafe code. This module is their only boundary to the operating
-//! system, through `nix`: it owns descriptors and mappings, and its submodules confine the few
-//! unsafe `nix` operations, such as ioctls, memory mappings, signal dispositions, and `fork`,
-//! behind wrappers that establish their pointer, lifetime, and ownership invariants. Errors are
-//! `nix`'s [`Errno`], whose descriptions the programs print. It also builds and decodes the
-//! kernel's binary interfaces that `nix` does not model, such as the netlink messages of socket
-//! diagnostics, as explicit byte layouts, so that the programs handle only typed values.
+//! system, through `nix` and, for whole files and the MSR devices, the standard library: it owns
+//! descriptors and mappings, and its submodules confine the few unsafe `nix` operations, such as
+//! ioctls, memory mappings, signal dispositions, and `fork`, behind wrappers that establish their
+//! pointer, lifetime, and ownership invariants. Errors are `nix`'s [`Errno`], whose descriptions
+//! the programs print. It also builds and decodes the kernel's binary interfaces that `nix` does
+//! not model, such as the netlink messages of socket diagnostics, as explicit byte layouts, so
+//! that the programs handle only typed values.
 //!
 //! A descriptor that this module opens keeps one owner, its wrapper here, such as
 //! `FileDescriptor`, and the programs read and write it only through that wrapper, never through
@@ -61,10 +62,9 @@ use std::os::unix::ffi::OsStringExt;
 
 pub(crate) use nix::errno::Errno;
 pub(crate) use nix::sys::signal::Signal;
+pub(crate) use nix::sys::time::{TimeSpec, TimeValLike};
 
-pub(crate) use clock::{
-    Clock, ClockTime, clock_time, monotonic_ms, sleep_once, sleep_until_monotonic,
-};
+pub(crate) use clock::{Clock, clock_time, monotonic_ms, sleep_once, sleep_until_monotonic};
 #[cfg(target_arch = "x86_64")]
 pub(crate) use clock::{monotonic_ns, syscall_monotonic_nanoseconds};
 pub(crate) use discipline::{ClockAdjustment, ClockDiscipline, adjust_clock};
@@ -74,7 +74,8 @@ pub(crate) use fd::{
 };
 pub(crate) use filesystem::{
     MountFlags, ScratchDirectory, TmpfsMount, change_directory, check_exists, chmod, chown,
-    current_directory, enter_private_mount_namespace, mount, path_c_string, path_exists,
+    current_directory, enter_private_mount_namespace, mount, path_c_string, path_exists, read_file,
+    read_line, read_number, write_file, write_number,
 };
 pub(crate) use ioctl::{console_pending, reseed_random};
 pub(crate) use mapping::MemoryMapping;
@@ -97,7 +98,7 @@ pub(crate) use process::{
 pub(crate) use scheduler::{
     AffinityGuard, IdlePriority, SchedulingPolicy, current_affinity, current_cpu, current_thread,
     pin_current_thread, promote_all_threads, scheduling_policy, set_scheduling_policy,
-    thread_count, yield_now,
+    thread_count,
 };
 pub(crate) use signal::{
     ChildSignalWait, SignalDescriptor, ignore_signals, queue_user_signal, reset_child_signal,

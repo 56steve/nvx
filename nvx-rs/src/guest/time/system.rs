@@ -2,17 +2,17 @@
 //! wall clock's discipline, over the system layer's owners.
 
 use std::ffi::{CStr, CString};
-use std::io::Read;
+use std::fmt::{self, Display};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-use super::decoders::{self, SAMPLE_SIZE, TimeSample};
-use super::events::format_event;
+use super::decoders::{self, SAMPLE_SIZE, TimeSample, TimeSampleError};
+use super::events::{EventSource, ViolationCode, format_event};
 use super::state::TimeState;
 use super::{NSEC_PER_MSEC, Phase};
 use crate::guest::sys::{
     self, ClockAdjustment, ClockDiscipline, CreatedFile, Errno, FileDescriptor, FileLock, Mode,
-    MsrAccess, MsrFile, OpenFlags, Port, PortAccess, kernel,
+    MsrAccess, MsrFile, OpenFlags, Port, PortAccess, TimeValLike, kernel,
 };
 
 /// Statuses with which a fatal time-ABI failure stops the VM through the control port.
@@ -90,12 +90,6 @@ const PUBLIC_FILE_MODE: Mode = Mode::S_IRUSR
 /// Mode of the lock files, the suppression record, and the restored entropy: `rw-------`.
 pub(crate) const PRIVATE_FILE_MODE: Mode = Mode::S_IRUSR.union(Mode::S_IWUSR);
 
-/// Bytes of the C program's buffer for the state file, its terminating NUL included.
-const STATE_LIMIT: usize = 2048;
-/// Bytes of the C program's buffer for the suppression record, its terminating NUL included.
-const SUPPRESSION_LIMIT: usize = 512;
-/// Bytes of the C program's buffer for a file that holds one number, its NUL included.
-const NUMBER_LIMIT: usize = 64;
 /// Longest prefix of a path that a restore diagnostic quotes, as C's `%.200s` did.
 const QUOTED_PATH_LIMIT: usize = 200;
 
@@ -116,12 +110,6 @@ const SAMPLE_ATTEMPTS: usize = 3;
 /// Seconds after which RCU reports a CPU stall in NVX's guest kernels, which the checks require
 /// and the daemon assumes when it cannot read the setting.
 pub(crate) const DEFAULT_STALL_TIMEOUT_S: i64 = 21;
-
-/// Bytes of the C program's buffer for the kernel command line, its NUL included.
-pub(crate) const COMMAND_LINE_LIMIT: usize = 4096;
-
-/// Bytes of the C program's buffer for a CPU list, its NUL included.
-pub(crate) const CPU_LIST_LIMIT: usize = 256;
 
 /// The time ABI's I/O ports, which a fake replaces in tests.
 pub(crate) trait PortIo: Sync {
@@ -286,13 +274,25 @@ impl<'a> Runtime<'a> {
     }
 
     /// Emits one serialized violation record to every ABI destination.
-    pub(crate) fn emit_event(&self, code: &[u8], source: &[u8], phase: Phase, detail: &[u8]) {
+    pub(crate) fn emit_event(
+        &self,
+        code: ViolationCode,
+        source: EventSource,
+        phase: Phase,
+        detail: &[u8],
+    ) {
         let _guard = self.report_lock.lock().ok();
         self.emit_event_unlocked(code, source, phase, detail);
     }
 
     /// Emits an event while the caller already owns `report_lock`.
-    fn emit_event_unlocked(&self, code: &[u8], source: &[u8], phase: Phase, detail: &[u8]) {
+    fn emit_event_unlocked(
+        &self,
+        code: ViolationCode,
+        source: EventSource,
+        phase: Phase,
+        detail: &[u8],
+    ) {
         let line = format_event(
             self.report_only(),
             code,
@@ -304,24 +304,24 @@ impl<'a> Runtime<'a> {
         );
         let flags = OpenFlags::O_WRONLY | OpenFlags::O_CLOEXEC;
         if let Ok(log) = sys::open(kernel::KERNEL_LOG_DEVICE, flags, Mode::empty()) {
-            let _ = log.write_all(&[KERNEL_LOG_PRIORITY, line.as_slice()].concat());
+            let _ = log.write_all(&[KERNEL_LOG_PRIORITY, line.as_bytes()].concat());
         }
         if let Ok(ports) = self.ports() {
             if self.async_output.load(Ordering::Relaxed) {
                 ports.outb(Port::PortbData, b'\n');
             }
-            for &byte in &line {
+            for byte in line.bytes() {
                 ports.outb(Port::PortbData, byte);
             }
         }
-        self.console_write(&line);
+        self.console_write(line.as_bytes());
         let _ = count_violation();
     }
 
     /// Reports a conformance failure and powers off unless report-only.
-    pub(crate) fn conformance_failure(&self, code: &[u8], phase: Phase, detail: &[u8]) {
+    pub(crate) fn conformance_failure(&self, code: ViolationCode, phase: Phase, detail: &[u8]) {
         let _guard = self.report_lock.lock().ok();
-        self.emit_event_unlocked(code, b"conformance", phase, detail);
+        self.emit_event_unlocked(code, EventSource::Conformance, phase, detail);
         if !self.report_only() {
             self.ops.power_off(PowerOffStatus::Conformance);
         }
@@ -331,8 +331,8 @@ impl<'a> Runtime<'a> {
     pub(crate) fn fail_fatal(
         &self,
         status: PowerOffStatus,
-        code: &[u8],
-        source: &[u8],
+        code: ViolationCode,
+        source: EventSource,
         phase: Phase,
         detail: &[u8],
     ) {
@@ -363,11 +363,9 @@ impl<'a> Runtime<'a> {
     }
 }
 
-/// Reads one Linux clock as wrapping nanoseconds, or zero when it cannot be read.
+/// Reads one Linux clock in nanoseconds, or zero when it cannot be read.
 pub(crate) fn clock_ns(clock: sys::Clock) -> i64 {
-    sys::clock_time(clock)
-        .unwrap_or_default()
-        .wrapping_nanoseconds()
+    sys::clock_time(clock).map_or(0, |time| time.num_nanoseconds())
 }
 
 /// Returns process-wide CPU time in wrapping nanoseconds.
@@ -379,56 +377,6 @@ pub(crate) fn cpu_time_ns() -> i64 {
 pub(crate) fn make_runtime_directories() {
     let _ = sys::create_directory(RUN_DIR, DIRECTORY_MODE);
     let _ = sys::create_directory(TIME_DIR, DIRECTORY_MODE);
-}
-
-/// Reads at most `limit - 1` bytes of `path`, as the C program read into a `limit`-byte buffer
-/// with room for its NUL, and reports a failure to close the file.
-pub(crate) fn read_text(path: &CStr, limit: usize) -> Result<Vec<u8>, Errno> {
-    let mut file = sys::open(
-        path,
-        OpenFlags::O_RDONLY | OpenFlags::O_CLOEXEC,
-        Mode::empty(),
-    )?;
-    let mut text = Vec::new();
-    Read::take(&mut file, limit.saturating_sub(1) as u64)
-        .read_to_end(&mut text)
-        .map_err(|error| sys::errno_of(&error))?;
-    file.close().map(|()| text)
-}
-
-/// Reads the whole of `path`.
-pub(crate) fn read_file(path: &CStr) -> Result<Vec<u8>, Errno> {
-    let mut file = sys::open(
-        path,
-        OpenFlags::O_RDONLY | OpenFlags::O_CLOEXEC,
-        Mode::empty(),
-    )?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
-        .map_err(|error| sys::errno_of(&error))?;
-    Ok(bytes)
-}
-
-/// Reads one exact signed decimal value from a bounded text file.
-pub(crate) fn read_i64(path: &CStr) -> Result<i64, Errno> {
-    let text = read_text(path, NUMBER_LIMIT)?;
-    decoders::parse_i64_exact(&text).ok_or(Errno::EINVAL)
-}
-
-/// Replaces an existing file's bytes and reports write or close failure.
-pub(crate) fn write_text(path: &CStr, text: &[u8]) -> Result<(), Errno> {
-    let file = sys::open(
-        path,
-        OpenFlags::O_WRONLY | OpenFlags::O_CLOEXEC,
-        Mode::empty(),
-    )?;
-    file.write_all(text)?;
-    file.close()
-}
-
-/// Writes one signed decimal value followed by a newline.
-pub(crate) fn write_i64(path: &CStr, value: i64) -> Result<(), Errno> {
-    write_text(path, format!("{value}\n").as_bytes())
 }
 
 /// Durably writes `text` to `temporary`, and atomically renames it to `path`. A failure after
@@ -448,13 +396,13 @@ pub(crate) fn lock_file(path: &CStr) -> Result<FileLock, Errno> {
 
 /// Loads and parses the published time state.
 pub(crate) fn state_load() -> Result<TimeState, Errno> {
-    let text = read_text(STATE_PATH, STATE_LIMIT)?;
+    let text = sys::read_file(STATE_PATH)?;
     TimeState::parse(&text).ok_or(Errno::EINVAL)
 }
 
 /// Atomically persists one complete time state.
 pub(crate) fn state_store(state: &TimeState) -> Result<(), Errno> {
-    replace_file(STATE_PATH, STATE_TEMP_PATH, &state.format())
+    replace_file(STATE_PATH, STATE_TEMP_PATH, state.to_string().as_bytes())
 }
 
 /// Applies one read-modify-write update to the time state under its lock.
@@ -486,7 +434,7 @@ pub(crate) fn rates_load() -> Result<(u64, u64), Errno> {
 /// Saves the stall detectors' settings in the suppression record, and suppresses them for a
 /// snapshot capture. A record that exists already, of a pending capture, is `EEXIST`.
 pub(crate) fn suppression_save() -> Result<(), Errno> {
-    let mut saved = Vec::with_capacity(SUPPRESSION_LIMIT);
+    let mut saved = Vec::new();
     for (index, (path, _)) in SUPPRESSED_DETECTORS.iter().enumerate() {
         if let Err(error) = sys::check_exists(path) {
             if index == 0 {
@@ -494,7 +442,7 @@ pub(crate) fn suppression_save() -> Result<(), Errno> {
             }
             continue;
         }
-        let value = read_i64(path)?;
+        let value = sys::read_number::<i64>(path)?;
         saved.extend_from_slice(path.to_bytes());
         saved.extend_from_slice(format!("={value}\n").as_bytes());
     }
@@ -504,7 +452,7 @@ pub(crate) fn suppression_save() -> Result<(), Errno> {
     let _ = record.keep();
     for (path, value) in SUPPRESSED_DETECTORS {
         if sys::path_exists(path) {
-            write_i64(path, value)?;
+            sys::write_number(path, value)?;
         }
     }
     Ok(())
@@ -520,7 +468,7 @@ fn describe(prefix: &[u8], error: Errno) -> Vec<u8> {
 pub(crate) fn suppression_restore(missing_ok: bool) -> Result<(), Vec<u8>> {
     let _lock = lock_file(SUPPRESSION_LOCK_PATH)
         .map_err(|error| describe(b"lock /run/nvx/time/suppression.lock: ", error))?;
-    let text = match read_text(SUPPRESSION_PATH, SUPPRESSION_LIMIT) {
+    let text = match sys::read_file(SUPPRESSION_PATH) {
         Ok(text) => text,
         Err(Errno::ENOENT) if missing_ok => return Ok(()),
         Err(error) => return Err(describe(b"read /run/nvx/time/suppression: ", error)),
@@ -535,7 +483,7 @@ pub(crate) fn suppression_restore(missing_ok: bool) -> Result<(), Vec<u8>> {
         let Ok(path) = CString::new(&line[..equal]) else {
             break;
         };
-        if let Err(error) = write_text(&path, &line[equal + 1..]) {
+        if let Err(error) = sys::write_file(&path, &line[equal + 1..]) {
             let quoted = &line[..equal.min(QUOTED_PATH_LIMIT)];
             return Err(describe(
                 &[b"restore ".as_slice(), quoted, b": "].concat(),
@@ -561,7 +509,7 @@ pub(crate) fn lock_portb() -> Result<FileLock, Vec<u8>> {
 }
 
 /// Requests and decodes one host time sample, bracketed by realtime reads.
-pub(crate) fn take_sample(ports: &dyn PortIo) -> Result<TimeSample, String> {
+pub(crate) fn take_sample(ports: &dyn PortIo) -> Result<TimeSample, TimeSampleError> {
     let mut bytes = [0_u8; SAMPLE_SIZE];
     let t0 = clock_ns(sys::Clock::Realtime);
     ports.outb(Port::PortbStatus, SELECT_TIME_SAMPLE);
@@ -592,23 +540,44 @@ pub(crate) enum SampleResult {
     Wide,
 }
 
-/// Why no sample could be selected.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Why no host time sample could be selected. Its `Display` is the diagnostic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SampleError {
+    /// The process may not access the ports.
+    Ports(Errno),
+    /// The port window, of this status, offers no time sample.
+    NoTimeWindow(u8),
     /// A sample came from another VM generation, which a restore must handle first.
-    Generation(Vec<u8>),
-    /// No sample was valid, or the ports are unavailable.
-    Unavailable(Vec<u8>),
+    Generation {
+        /// The sample's generation.
+        sample: u32,
+        /// The generation that the guest expected.
+        expected: u32,
+    },
+    /// No attempt took a valid sample: the last attempt's error, if any.
+    Invalid(Option<TimeSampleError>),
 }
 
-impl SampleError {
-    /// Returns the diagnostic of the failure.
-    pub(crate) fn detail(self) -> Vec<u8> {
-        match self {
-            Self::Generation(detail) | Self::Unavailable(detail) => detail,
+impl Display for SampleError {
+    /// Writes the diagnostic, such as `time sample generation 7, expected 6`.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Self::Ports(error) => write!(formatter, "ioperm: {}", error.desc()),
+            Self::NoTimeWindow(status) => write!(
+                formatter,
+                "portb status 0x{status:02x} has no time-sample window"
+            ),
+            Self::Generation { sample, expected } => write!(
+                formatter,
+                "time sample generation {sample}, expected {expected}"
+            ),
+            Self::Invalid(Some(error)) => error.fmt(formatter),
+            Self::Invalid(None) => formatter.write_str("no valid time sample"),
         }
     }
 }
+
+impl std::error::Error for SampleError {}
 
 /// Selects the lowest-uncertainty valid sample from a bounded attempt count.
 pub(crate) fn best_sample(
@@ -617,49 +586,38 @@ pub(crate) fn best_sample(
     bound_ns: i64,
     generation: u32,
 ) -> Result<(SampleResult, BestSample), SampleError> {
-    let ports = runtime
-        .ports()
-        .map_err(|error| SampleError::Unavailable(describe(b"ioperm: ", error)))?;
+    let ports = runtime.ports().map_err(SampleError::Ports)?;
     let status = ports.inb(Port::PortbStatus);
     if status & PORTB_TIME_WINDOW == 0 {
-        return Err(SampleError::Unavailable(
-            format!("portb status 0x{status:02x} has no time-sample window").into_bytes(),
-        ));
+        return Err(SampleError::NoTimeWindow(status));
     }
-    let mut best = None;
-    let mut detail = b"no valid time sample".to_vec();
+    let mut best: Option<BestSample> = None;
+    let mut invalid = None;
     for _ in 0..attempts {
         let sample = match take_sample(ports) {
             Ok(sample) => sample,
             Err(error) => {
-                detail = error.into_bytes();
+                invalid = Some(error);
                 continue;
             }
         };
         if sample.generation != generation {
-            return Err(SampleError::Generation(
-                format!(
-                    "time sample generation {}, expected {generation}",
-                    sample.generation
-                )
-                .into_bytes(),
-            ));
+            return Err(SampleError::Generation {
+                sample: sample.generation,
+                expected: generation,
+            });
         }
         let (theta, epsilon) = decoders::pair_clocks(sample.t0, sample.t1, sample.utc_ns);
         let candidate = BestSample { theta, epsilon };
-        if best
-            .as_ref()
-            .is_none_or(|current: &BestSample| epsilon < current.epsilon)
-        {
+        if best.is_none_or(|best| epsilon < best.epsilon) {
             best = Some(candidate);
         }
         if epsilon <= bound_ns {
             return Ok((SampleResult::Accepted, candidate));
         }
-        detail = format!("time sample uncertainty {epsilon} ns exceeds {bound_ns} ns").into_bytes();
     }
     best.map(|best| (SampleResult::Wide, best))
-        .ok_or(SampleError::Unavailable(detail))
+        .ok_or(SampleError::Invalid(invalid))
 }
 
 /// Steps realtime by a signed nanosecond offset.
@@ -700,7 +658,7 @@ pub(crate) fn initial_sample(runtime: &Runtime<'_>) -> Result<BestSample, Vec<u8
             NSEC_PER_MSEC,
             runtime.generation(),
         )
-        .map_err(SampleError::detail)?
+        .map_err(|error| error.to_string().into_bytes())?
     };
     step_clock(runtime, sample.theta).map_err(|error| describe(b"adjtimex step: ", error))?;
     Ok(sample)
@@ -848,8 +806,11 @@ pub(crate) mod tests {
         ops.ports = Err(Errno::EPERM);
         let runtime = Runtime::new(&ops, false);
         let error = best_sample(&runtime, 3, NSEC_PER_MSEC, 0).unwrap_err();
-        let expected = [b"ioperm: ".as_slice(), Errno::EPERM.desc().as_bytes()].concat();
-        assert_eq!(error, SampleError::Unavailable(expected));
+        assert_eq!(error, SampleError::Ports(Errno::EPERM));
+        assert_eq!(
+            error.to_string(),
+            format!("ioperm: {}", Errno::EPERM.desc())
+        );
     }
 
     #[test]
@@ -864,7 +825,14 @@ pub(crate) mod tests {
         let ops = FakeOps::new(std::iter::once(u32::from(PORTB_TIME_WINDOW)).chain(words));
         let runtime = Runtime::new(&ops, false);
         let error = best_sample(&runtime, 1, NSEC_PER_MSEC, 6).unwrap_err();
-        assert!(matches!(error, SampleError::Generation(_)), "{error:?}");
+        assert_eq!(
+            error,
+            SampleError::Generation {
+                sample: 7,
+                expected: 6
+            }
+        );
+        assert_eq!(error.to_string(), "time sample generation 7, expected 6");
         assert_eq!(
             ops.output.lock().unwrap().as_slice(),
             [(Port::PortbStatus, SELECT_TIME_SAMPLE)]

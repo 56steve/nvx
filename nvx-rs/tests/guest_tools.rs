@@ -13,6 +13,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::RwLock;
+use std::time::{Duration, Instant};
 
 use nix::errno::Errno;
 use nix::fcntl::{FcntlArg, FdFlag, fcntl};
@@ -69,6 +70,41 @@ where
             .args(arguments)
             .stdout(Stdio::piped()),
     );
+    (status.code(), stdout, stderr)
+}
+
+/// Runs the guest binary `name` with `arguments` as [`run`] does, but kills it and fails the
+/// test once `timeout` passes. Its output must fit in the pipes, which nothing reads until it
+/// exits.
+fn run_within<I, S>(name: &str, arguments: I, timeout: Duration) -> (Option<i32>, Vec<u8>, Vec<u8>)
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let mut child = {
+        let _spawning = SPAWNING.read().unwrap();
+        Command::new(binary(name))
+            .args(arguments)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|error| panic!("cannot run {name}: {error}"))
+    };
+    let deadline = Instant::now() + timeout;
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("{name} did not end within {timeout:?}");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let Output {
+        status,
+        stdout,
+        stderr,
+    } = child.wait_with_output().unwrap();
     (status.code(), stdout, stderr)
 }
 
@@ -967,6 +1003,15 @@ fn first_allowed_cpu() -> usize {
 }
 
 #[cfg(target_arch = "x86_64")]
+/// Returns the CPUs that this process may not run on, of the 64 that the time ABI covers.
+fn unusable_cpus() -> Vec<usize> {
+    let affinity = nix::sched::sched_getaffinity(nix::unistd::Pid::from_raw(0)).unwrap();
+    (0..64)
+        .filter(|&cpu| !affinity.is_set(cpu).unwrap())
+        .collect()
+}
+
+#[cfg(target_arch = "x86_64")]
 const TIME_UTC_NS: u64 = 1_790_841_600_123_456_789;
 
 #[cfg(target_arch = "x86_64")]
@@ -1618,6 +1663,52 @@ fn time_probe_cli_and_small_diagnostics_run() {
 
 #[test]
 #[cfg(target_arch = "x86_64")]
+fn time_probe_warp_runs_a_cpu_pair() {
+    let affinity = nix::sched::sched_getaffinity(nix::unistd::Pid::from_raw(0)).unwrap();
+    let cpus = (0..nix::sched::CpuSet::count())
+        .filter(|&cpu| affinity.is_set(cpu).unwrap())
+        .take(2)
+        .collect::<Vec<_>>();
+    let [first, second] = cpus[..] else {
+        // A single CPU has no pair to run.
+        return;
+    };
+    let (status, stdout, stderr) = run_within(
+        "nvx-time-probe",
+        [
+            "warp",
+            "--duration-ms",
+            "1",
+            "--cpus",
+            &format!("{first},{second}"),
+            "--tsc-hz",
+            "2500000000",
+        ],
+        Duration::from_secs(60),
+    );
+    let stdout = String::from_utf8(stdout).unwrap();
+    // The verdict depends on the host's TSCs, so either verdict's status ends a run.
+    assert!(matches!(status, Some(0 | 1)), "{status:?}: {stdout}");
+    assert!(stderr.is_empty(), "{}", String::from_utf8_lossy(&stderr));
+    assert!(stdout.contains(" pairs=1 verdict="), "{stdout}");
+    let prefix = format!("pair {first}-{second}: ");
+    let pair = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix(&prefix))
+        .unwrap_or_else(|| panic!("no result for the pair: {stdout}"));
+    let field = |name: &str| -> u64 {
+        pair.split(' ')
+            .find_map(|field| field.strip_prefix(name)?.strip_prefix('=')?.parse().ok())
+            .unwrap_or_else(|| panic!("no {name}: {pair}"))
+    };
+    // Each worker of the spinlock test counts its iterations, and the ping-pong test completes
+    // round trips rather than stalling.
+    assert!(field("warp_iterations") >= 2, "{pair}");
+    assert!(field("rounds") >= 1, "{pair}");
+}
+
+#[test]
+#[cfg(target_arch = "x86_64")]
 fn time_test_mode_covers_remaining_events_records_and_workers() {
     let directory = tempfile::tempdir().unwrap();
     assert_eq!(
@@ -1723,6 +1814,20 @@ fn time_test_mode_covers_remaining_events_records_and_workers() {
         let output = run("nvx-time", ["test", "parallel", &cpu.to_string()]);
         assert_eq!(output.0, Some(0));
         assert!(output.1.ends_with(b"failures=7\n"));
+        // Each CPU job that cannot run on its CPU fails C1, and every job's failures count.
+        if let [first, second, ..] = unusable_cpus()[..] {
+            let (status, output, _) = run(
+                "nvx-time",
+                ["test", "parallel", &format!("{cpu},{first},{second}")],
+            );
+            assert_eq!(status, Some(0));
+            let output = String::from_utf8(output).unwrap();
+            assert!(output.ends_with("failures=9\n"), "{output}");
+            for cpu in [first, second] {
+                let failure = format!("cannot run on cpu {cpu}: ");
+                assert!(output.contains(&failure), "{output}");
+            }
+        }
     }
     let promoted = run("nvx-time", ["test", "promote"]);
     assert_eq!(promoted.0, Some(0));

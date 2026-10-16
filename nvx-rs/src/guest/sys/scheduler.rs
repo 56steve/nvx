@@ -122,14 +122,16 @@ pub(crate) fn set_scheduling_policy(thread: Option<ProcessId>, policy: Schedulin
 }
 
 /// Returns the kernel's number of the scheduling policy of the thread `thread`, or of the
-/// calling thread for `None`, or the system call's negative result, for diagnostics.
+/// calling thread for `None`.
 ///
 /// It makes the system call through libc's `syscall` for the reason that
 /// [`set_scheduling_policy`] gives.
-pub(crate) fn scheduling_policy(thread: Option<ProcessId>) -> i64 {
+pub(crate) fn scheduling_policy(thread: Option<ProcessId>) -> Result<i32, Errno> {
     let thread = thread.map_or(CALLING_THREAD.as_raw(), ProcessId::raw);
     // SAFETY: the system call reads only its integer argument.
-    unsafe { nix::libc::syscall(nix::libc::SYS_sched_getscheduler, thread) }
+    let policy =
+        Errno::result(unsafe { nix::libc::syscall(nix::libc::SYS_sched_getscheduler, thread) })?;
+    i32::try_from(policy).map_err(|_| Errno::EINVAL)
 }
 
 /// Returns the calling thread's ID.
@@ -187,12 +189,6 @@ impl Drop for IdlePriority {
     }
 }
 
-/// Yields the calling thread's CPU, and returns whether the call failed, which it never does on
-/// Linux.
-pub(crate) fn yield_now() -> bool {
-    nix::sched::sched_yield().is_err()
-}
-
 #[cfg(test)]
 mod tests {
     //! Checks of affinity and scheduling in this test's thread.
@@ -217,23 +213,16 @@ mod tests {
     #[test]
     fn the_idle_priority_lasts_while_its_owner_lives() {
         let idle = IdlePriority::enter();
-        assert_eq!(
-            scheduling_policy(None),
-            i64::from(SchedulingPolicy::Idle.number())
-        );
-        assert_eq!(
-            scheduling_policy(Some(current_thread())),
-            i64::from(SchedulingPolicy::Idle.number())
-        );
+        let idle_policy = Ok(SchedulingPolicy::Idle.number());
+        assert_eq!(scheduling_policy(None), idle_policy);
+        assert_eq!(scheduling_policy(Some(current_thread())), idle_policy);
         drop(idle);
         let policy = scheduling_policy(None);
         // Leaving SCHED_IDLE needs CAP_SYS_NICE or an RLIMIT_NICE of at least 20.
         assert!(
-            policy == i64::from(SchedulingPolicy::Normal.number())
-                || policy == i64::from(SchedulingPolicy::Idle.number()),
-            "{policy}"
+            policy == Ok(SchedulingPolicy::Normal.number()) || policy == idle_policy,
+            "{policy:?}"
         );
         assert!(thread_count().unwrap() >= 1);
-        assert!(!yield_now());
     }
 }
