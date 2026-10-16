@@ -6,20 +6,26 @@
 //! the C program also read hexadecimal, error messages describe `errno` values with `nix`'s
 //! text, and `nvx-ingress` reads the kernel's socket tables and sysctl, and its test snapshots,
 //! only in the form in which the kernel writes them, rejecting the signed, prefixed, and other
-//! lenient forms that C's `strtoul` and `scanf` also read.
+//! lenient forms that C's `strtoul` and `scanf` also read. `nvx-time`'s test hooks keep the C
+//! program's `strtoll` and `strtoull` reading of their decimal arguments, which its
+//! compatibility tests compare.
 //!
 //! # Conventions
 //!
 //! - Program modules deny unsafe code. Only the private `sys` module may use it, behind
 //!   documented safe operations. It makes every system call through `nix`, with the enabled,
-//!   default-free feature set, except the few managed-agent operations that `nix` cannot
-//!   provide, which `sys` documents, and the programs take random bytes from the `getrandom`
-//!   crate.
+//!   default-free feature set, except the few managed-agent and time-tool operations that `nix`
+//!   cannot provide, which `sys` documents, and the programs take random bytes from the
+//!   `getrandom` crate. `sys` also names the kernel's and the processor's interfaces once: the
+//!   procfs, sysfs, and device paths, OpenVMM's I/O ports, CPUID leaves and MSRs, and the
+//!   kernel's flags, so that the programs refer to them by name.
 //! - Descriptors and mappings have owners that release them when dropped. Where a C program
 //!   reported a cleanup failure, a consuming `close` or `unmap` returns it instead. Raw
 //!   descriptor integers never leave `sys`, and no resource is dropped by hand: where a C
 //!   program released one before a later step, its scope ends there, for example in a helper
-//!   function that returns what the later step needs.
+//!   function that returns what the later step needs. State that a program changes for a while,
+//!   such as a lock, a signal mask, a thread's CPU affinity or scheduling policy, a mount, a
+//!   created file, or a kernel setting, likewise has an owner that restores it when dropped.
 //! - A descriptor stays with the library that opened it: one that `sys` opens through `nix` is
 //!   read and written only through `sys`, and one that the standard library opens only through
 //!   it, except that a test may hand one to `FileDescriptor::from_owned`, which takes it over
@@ -53,3 +59,5 @@ pub mod managed_agent;
 #[cfg(target_arch = "x86_64")]
 pub mod mmio_write;
 pub mod reseed;
+#[cfg(target_arch = "x86_64")]
+pub mod time;

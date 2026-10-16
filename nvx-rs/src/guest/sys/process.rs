@@ -1,14 +1,14 @@
 //! Safe process, signal, inherited-descriptor, and standard-stream operations.
 
 use std::ffi::{CStr, CString};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, kill};
 use nix::unistd::Pid;
 
-use super::{Errno, FileDescriptor};
+use super::{Errno, FileDescriptor, Port};
 use crate::guest::parse::parse_decimal;
 
 /// Whether this process inherited an ignored SIGPIPE across `exec`.
@@ -53,10 +53,7 @@ pub(crate) fn restore_sigpipe() {
 ///
 /// Like the C program, it ignores failures, which `signal` reports only for an invalid signal.
 pub(crate) fn ignore_interrupt_and_hangup() {
-    for signal in [Signal::SIGINT, Signal::SIGHUP] {
-        // SAFETY: `SIG_IGN` installs no Rust callback.
-        let _ = unsafe { nix::sys::signal::signal(signal, SigHandler::SigIgn) };
-    }
+    super::ignore_signals(&[Signal::SIGINT, Signal::SIGHUP]);
 }
 
 /// Returns an owned, close-on-exec duplicate of the descriptor whose decimal number `text`
@@ -95,6 +92,15 @@ impl ProcessId {
         Self(process)
     }
 
+    /// Wraps a process or thread identifier read from a file, or returns `None` for a value
+    /// that no process can have.
+    pub(crate) fn from_positive(process: i64) -> Option<Self> {
+        i32::try_from(process)
+            .ok()
+            .filter(|&process| process > 0)
+            .map(|process| Self(Pid::from_raw(process)))
+    }
+
     /// Borrows the identifier of a child created by the standard test harness.
     #[cfg(test)]
     pub(crate) fn from_child(child: &std::process::Child) -> Self {
@@ -105,6 +111,87 @@ impl ProcessId {
     pub(crate) fn line(self) -> Vec<u8> {
         format!("{}\n", self.0.as_raw()).into_bytes()
     }
+
+    /// Returns the identifier as the kernel's integer.
+    pub(crate) fn raw(self) -> i32 {
+        self.0.as_raw()
+    }
+}
+
+/// The side of a fork on which the calling process continues.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ForkResult {
+    /// The calling process is the new child.
+    Child,
+    /// The calling process is the parent of the child that this identifies.
+    Parent(ProcessId),
+}
+
+/// Forks the calling process, which must have only the calling thread, or fails with `EBUSY`.
+///
+/// A child of a multithreaded process could inherit a lock, such as the allocator's, that
+/// another thread held, and may call only async-signal-safe functions. A child of a
+/// single-threaded process inherits no such lock, and may run any code, as the time tools'
+/// children do. Only the calling thread could start another thread between the check and the
+/// fork, so the check holds at the fork.
+pub(crate) fn fork() -> Result<ForkResult, Errno> {
+    if super::thread_count()? != 1 {
+        return Err(Errno::EBUSY);
+    }
+    // SAFETY: the process is single-threaded, so the child may run any code.
+    match unsafe { nix::unistd::fork() }? {
+        nix::unistd::ForkResult::Child => Ok(ForkResult::Child),
+        nix::unistd::ForkResult::Parent { child } => {
+            Ok(ForkResult::Parent(ProcessId::from_pid(child)))
+        }
+    }
+}
+
+/// Ends the process with `status` at once, without the cleanup that `std::process::exit` runs,
+/// as a forked child ends.
+///
+/// `nix` does not wrap `_exit`, so this calls it through libc.
+pub(crate) fn exit_immediately(status: u8) -> ! {
+    // SAFETY: `_exit` accepts any status and does not return.
+    unsafe { nix::libc::_exit(i32::from(status)) }
+}
+
+/// Returns the calling process's identifier.
+pub(crate) fn current_process() -> ProcessId {
+    ProcessId::from_pid(nix::unistd::getpid())
+}
+
+/// Returns whether `process` exists, which includes a zombie, by sending it no signal.
+pub(crate) fn process_exists(process: ProcessId) -> bool {
+    kill(process.0, None).is_ok()
+}
+
+/// Returns the command name of `process`, which its procfs `comm` file holds with a newline.
+pub(crate) fn process_name(process: ProcessId) -> Result<Vec<u8>, Errno> {
+    let path = super::c_string(format!("/proc/{}/comm", process.0.as_raw()).as_bytes())?;
+    let mut descriptor = super::open(
+        &path,
+        super::OpenFlags::O_RDONLY | super::OpenFlags::O_CLOEXEC,
+        super::Mode::empty(),
+    )?;
+    let mut name = Vec::new();
+    descriptor
+        .read_to_end(&mut name)
+        .map_err(|error| super::errno_of(&error))?;
+    Ok(name)
+}
+
+/// Starts a new session, makes `null` the standard input, output, and error, and changes to
+/// the root directory, as the C programs' daemons did when they detached. Without `null`, the
+/// standard streams stay.
+pub(crate) fn detach(null: Option<&FileDescriptor>) -> Result<(), Errno> {
+    nix::unistd::setsid()?;
+    if let Some(null) = null {
+        nix::unistd::dup2_stdin(null.borrowed())?;
+        nix::unistd::dup2_stdout(null.borrowed())?;
+        nix::unistd::dup2_stderr(null.borrowed())?;
+    }
+    nix::unistd::chdir(c"/")
 }
 
 /// A terminal state observed while reaping a child.
@@ -183,6 +270,19 @@ pub(crate) fn wait(process: ProcessId) -> Option<ChildStatus> {
         }
         return None;
     }
+}
+
+/// Reaps `process` if it has ended, without blocking, and returns its state, or `None` while
+/// it runs.
+///
+/// libc is used for the same real-time signals as [`reap_any_nonblocking`].
+pub(crate) fn try_wait(process: ProcessId) -> Result<Option<ChildStatus>, Errno> {
+    let mut status = 0;
+    // SAFETY: `status` is writable, and `WNOHANG` never blocks.
+    let observed = Errno::result(unsafe {
+        nix::libc::waitpid(process.0.as_raw(), &mut status, nix::libc::WNOHANG)
+    })?;
+    Ok((observed == process.0.as_raw()).then(|| child_status(observed, status).status))
 }
 
 /// Sends `SIGKILL` to the process group led by `process`.
@@ -311,7 +411,7 @@ pub(crate) fn write_port_diagnostic(
     message: &[u8],
 ) -> Result<(), Errno> {
     for byte in message {
-        if descriptor.pwrite(std::slice::from_ref(byte), 0xe9)? != 1 {
+        if descriptor.pwrite(std::slice::from_ref(byte), Port::PortbData.offset())? != 1 {
             return Err(Errno::EIO);
         }
     }
