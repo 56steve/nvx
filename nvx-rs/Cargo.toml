@@ -133,6 +133,20 @@ required-features = ["guest"]
 doc = false
 test = false
 
+[[bin]]
+name = "nvx-time"
+path = "src/bin/nvx-time.rs"
+required-features = ["guest"]
+doc = false
+test = false
+
+[[bin]]
+name = "nvx-time-probe"
+path = "src/bin/nvx-time-probe.rs"
+required-features = ["guest"]
+doc = false
+test = false
+
 # The guest binaries: small, static, and stripped.
 [profile.guest]
 inherits = "release"

@@ -184,13 +184,20 @@ class GuestRustBuildConstants:
         "nvx-device-io",
         "nvx-managed-agent",
         "nvx-ingress",
+        "nvx-time",
+        "nvx-time-probe",
     )
     # Executables that earlier builds produced. A build removes them from the output
     # of an earlier build whose manifest records them.
     RETIRED_BINARIES: Final = ("nvx-port-io",)
     # Executables that earlier builds lacked. A build adds them to the output of an
     # earlier build whose manifest does not record them.
-    ADDED_BINARIES: Final = ("nvx-managed-agent", "nvx-ingress")
+    ADDED_BINARIES: Final = (
+        "nvx-managed-agent",
+        "nvx-ingress",
+        "nvx-time",
+        "nvx-time-probe",
+    )
 
 
 class AlpineBuildConstants:

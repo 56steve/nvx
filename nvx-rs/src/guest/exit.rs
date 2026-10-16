@@ -9,16 +9,13 @@ use std::ffi::{CStr, CString};
 use std::process::ExitCode;
 
 use super::status::{CommandError, ExitStatus};
-use super::sys::{self, Mode, OpenFlags};
-
-/// Offset of OpenVMM's control port in `/dev/port`.
-const CONTROL_PORT: u64 = 0x604;
+use super::sys::{self, Mode, OpenFlags, PORT_DEVICE, Port};
 
 /// Runs `nvx-exit` with the process's arguments. It exits with 0 after it writes the byte,
 /// unless the VM stops first, or with 1 when it cannot write the byte.
 pub fn main() -> ExitCode {
     sys::restore_sigpipe();
-    ExitStatus::from(run(&sys::args(), c"/dev/port")).into()
+    ExitStatus::from(run(&sys::args(), PORT_DEVICE)).into()
 }
 
 /// Writes the selected exit code through `port`, which stands for `/dev/port`.
@@ -29,7 +26,7 @@ pub fn main() -> ExitCode {
 fn run(args: &[CString], port: &CStr) -> Result<(), CommandError> {
     let code = exit_code(args.get(1).map(|argument| argument.as_bytes()));
     let written = sys::open(port, OpenFlags::O_WRONLY, Mode::empty())
-        .and_then(|descriptor| descriptor.pwrite(&[code], CONTROL_PORT));
+        .and_then(|descriptor| descriptor.pwrite(&[code], Port::Control.offset()));
     if written == Ok(1) {
         Ok(())
     } else {
@@ -113,14 +110,15 @@ mod tests {
         let port = CString::new(file.path().as_os_str().as_bytes()).unwrap();
         let status = ExitStatus::from(run(&args(&[b"37", b"extra"]), &port));
         assert_eq!(status, ExitStatus::Success);
-        let mut expected = vec![0; CONTROL_PORT as usize];
+        let control = Port::Control.offset() as usize;
+        let mut expected = vec![0; control];
         expected.push(37);
         assert_eq!(fs::read(file.path()).unwrap(), expected);
         assert_eq!(
             ExitStatus::from(run(&args(&[]), &port)),
             ExitStatus::Success
         );
-        expected[CONTROL_PORT as usize] = 1;
+        expected[control] = 1;
         assert_eq!(fs::read(file.path()).unwrap(), expected);
     }
 

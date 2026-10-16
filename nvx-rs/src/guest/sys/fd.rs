@@ -5,7 +5,7 @@ use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 
 pub(crate) use nix::fcntl::OFlag as OpenFlags;
-use nix::fcntl::{FcntlArg, SealFlag, fcntl};
+use nix::fcntl::{FcntlArg, Flock, FlockArg, SealFlag, fcntl};
 use nix::poll::{PollFd, PollFlags};
 use nix::sys::memfd::{MFdFlags, memfd_create};
 pub(crate) use nix::sys::stat::Mode;
@@ -132,6 +132,12 @@ impl FileDescriptor {
         nix::unistd::lseek(&self.0, 0, Whence::SeekSet).map(|_| ())
     }
 
+    /// Moves this descriptor to the end of its file. On the kernel log device, it skips the
+    /// records already written, so that reads return only later ones.
+    pub(crate) fn seek_end(&self) -> Result<(), Errno> {
+        nix::unistd::lseek(&self.0, 0, Whence::SeekEnd).map(|_| ())
+    }
+
     /// Adds the complete immutable-file seal set used by execution configurations.
     pub(crate) fn seal_immutable(&self) -> Result<(), Errno> {
         fcntl(&self.0, FcntlArg::F_ADD_SEALS(IMMUTABLE_SEALS)).map(|_| ())
@@ -206,6 +212,108 @@ pub(crate) fn create_fifo(path: &CStr, mode: Mode) -> Result<(), Errno> {
 /// Removes a filesystem entry without following it.
 pub(crate) fn unlink(path: &CStr) -> Result<(), Errno> {
     nix::unistd::unlink(path)
+}
+
+/// An exclusive advisory lock on a file. Dropping the owner releases the lock and closes the
+/// file.
+#[derive(Debug)]
+pub(crate) struct FileLock {
+    /// The locked file, which the lock holds only so that dropping it releases the lock.
+    _lock: Flock<OwnedFd>,
+}
+
+/// Opens `path`, creating it with `mode` if it is missing, and waits for its exclusive lock,
+/// resuming after interruptions.
+pub(crate) fn lock_file(path: &CStr, mode: Mode) -> Result<FileLock, Errno> {
+    let flags = OpenFlags::O_RDWR | OpenFlags::O_CREAT | OpenFlags::O_CLOEXEC;
+    let mut descriptor = nix::fcntl::open(path, flags, mode)?;
+    loop {
+        match Flock::lock(descriptor, FlockArg::LockExclusive) {
+            Ok(lock) => return Ok(FileLock { _lock: lock }),
+            Err((returned, Errno::EINTR)) => descriptor = returned,
+            Err((_, error)) => return Err(error),
+        }
+    }
+}
+
+/// A file that this process creates, which dropping the owner closes and removes unless the
+/// process [keeps](Self::keep) or [renames](Self::rename) it first.
+#[derive(Debug)]
+pub(crate) struct CreatedFile<'a> {
+    /// The file's path, until the process keeps or renames the file.
+    path: Option<&'a CStr>,
+    /// The file's write-only descriptor, until the file closes.
+    descriptor: Option<FileDescriptor>,
+}
+
+impl<'a> CreatedFile<'a> {
+    /// Creates `path` for writing with `mode`, and truncates a file that exists already, or,
+    /// for an `exclusive` creation, fails with `EEXIST`.
+    pub(crate) fn create(path: &'a CStr, exclusive: bool, mode: Mode) -> Result<Self, Errno> {
+        let existing = if exclusive {
+            OpenFlags::O_EXCL
+        } else {
+            OpenFlags::O_TRUNC
+        };
+        let flags = OpenFlags::O_WRONLY | OpenFlags::O_CREAT | OpenFlags::O_CLOEXEC | existing;
+        let descriptor = open(path, flags, mode)?;
+        Ok(Self {
+            path: Some(path),
+            descriptor: Some(descriptor),
+        })
+    }
+
+    /// Writes every byte to the file; see [`FileDescriptor::write_all`].
+    pub(crate) fn write_all(&self, bytes: &[u8]) -> Result<(), Errno> {
+        self.descriptor
+            .as_ref()
+            .map_or(Err(Errno::EBADF), |descriptor| descriptor.write_all(bytes))
+    }
+
+    /// Writes the file's data and metadata to its storage device.
+    pub(crate) fn sync(&self) -> Result<(), Errno> {
+        self.descriptor
+            .as_ref()
+            .map_or(Err(Errno::EBADF), FileDescriptor::sync)
+    }
+
+    /// Closes the file and keeps it, even when closing fails, which it reports.
+    pub(crate) fn keep(mut self) -> Result<(), Errno> {
+        self.path = None;
+        self.descriptor.take().map_or(Ok(()), FileDescriptor::close)
+    }
+
+    /// Closes the file and renames it to `destination`, which it replaces atomically. When
+    /// either step fails, the file is removed.
+    pub(crate) fn rename(mut self, destination: &CStr) -> Result<(), Errno> {
+        if let Some(descriptor) = self.descriptor.take() {
+            descriptor.close()?;
+        }
+        let source = self.path.ok_or(Errno::EBADF)?;
+        rename(source, destination)?;
+        self.path = None;
+        Ok(())
+    }
+}
+
+impl Drop for CreatedFile<'_> {
+    /// Closes the file, and removes it unless the process kept or renamed it, best effort.
+    fn drop(&mut self) {
+        drop(self.descriptor.take());
+        if let Some(path) = self.path {
+            let _ = unlink(path);
+        }
+    }
+}
+
+/// Renames `source` to `destination`, which it replaces atomically.
+pub(crate) fn rename(source: &CStr, destination: &CStr) -> Result<(), Errno> {
+    nix::fcntl::renameat(
+        nix::fcntl::AT_FDCWD,
+        source,
+        nix::fcntl::AT_FDCWD,
+        destination,
+    )
 }
 
 /// Returns the host page size when it is a positive power of two.

@@ -21,7 +21,7 @@ pub fn main() -> ExitCode {
 /// stores the value, and releases its resources.
 fn run(args: &[CString], memory: &CStr, err: &mut dyn Write) -> Result<(), CommandError> {
     let parsed = match args {
-        [_, address, value] => parse_u64(address).zip(parse_u64(value)),
+        [_, address, value] => parse_u64(address.as_bytes()).zip(parse_u64(value.as_bytes())),
         _ => None,
     };
     let Some((address, value)) = parsed.filter(|&(_, value)| value <= u64::from(u32::MAX)) else {
@@ -160,7 +160,7 @@ mod tests {
             (format!("{}", page - 4), "4294967295", page as usize - 4),
         ] {
             assert_eq!(mmio_write(file.path(), &[&address, value]), (0, Vec::new()));
-            let stored = parse_u64(&CString::new(value).unwrap()).unwrap() as u32;
+            let stored = parse_u64(value.as_bytes()).unwrap() as u32;
             let contents = fs::read(file.path()).unwrap();
             assert_eq!(&contents[offset..offset + 4], &stored.to_ne_bytes());
         }

@@ -1,12 +1,13 @@
 //! Safe operating-system interface shared by the guest programs.
 //!
 //! Guest program modules deny unsafe code. This module is their only boundary to the operating
-//! system, through `nix`: it owns descriptors and mappings, and its submodules confine the few
-//! unsafe `nix` operations, such as ioctls, memory mappings, signal dispositions, and `fork`,
-//! behind wrappers that establish their pointer, lifetime, and ownership invariants. Errors are
-//! `nix`'s [`Errno`], whose descriptions the programs print. It also builds and decodes the
-//! kernel's binary interfaces that `nix` does not model, such as the netlink messages of socket
-//! diagnostics, as explicit byte layouts, so that the programs handle only typed values.
+//! system, through `nix` and, for whole files and the MSR devices, the standard library: it owns
+//! descriptors and mappings, and its submodules confine the few unsafe `nix` operations, such as
+//! ioctls, memory mappings, signal dispositions, and `fork`, behind wrappers that establish their
+//! pointer, lifetime, and ownership invariants. Errors are `nix`'s [`Errno`], whose descriptions
+//! the programs print. It also builds and decodes the kernel's binary interfaces that `nix` does
+//! not model, such as the netlink messages of socket diagnostics, as explicit byte layouts, so
+//! that the programs handle only typed values.
 //!
 //! A descriptor that this module opens keeps one owner, its wrapper here, such as
 //! `FileDescriptor`, and the programs read and write it only through that wrapper, never through
@@ -22,20 +23,38 @@
 //! `nix`'s re-export: its forked child, which may neither allocate nor drop an owner, closes,
 //! executes, and exits through libc; its wait-status decoding keeps the real-time signals that
 //! `nix`'s `Signal` cannot represent; and its execution helper duplicates the descriptor that it
-//! inherits by number, which it cannot borrow before it knows that the descriptor is open. Each
-//! such call says why.
+//! inherits by number, which it cannot borrow before it knows that the descriptor is open. So do
+//! the time tools, for the calls that `nix` does not wrap: `ioperm`, `adjtimex`, `klogctl`,
+//! `getauxval`, `sigqueue`, and `_exit`; `sched_setscheduler`, which musl does not implement for
+//! one thread; and the `clock_gettime` and `getpid` system calls, which the latency probe
+//! measures without the vDSO's or libc's shortcuts. Each such call says why.
+//!
+//! The x86 instructions of the time tools are `core::arch` intrinsics, except the port
+//! instructions, which only `port` executes, as inline assembly. The constants of the kernel's
+//! and the processor's interfaces, such as procfs and sysfs paths, OpenVMM's ports, CPUID
+//! leaves, and MSRs, are defined here once, so that the programs name them.
 
 mod clock;
+mod discipline;
 mod fd;
 mod filesystem;
 mod ioctl;
+pub(crate) mod kernel;
 mod mapping;
+#[cfg(target_arch = "x86_64")]
+mod msr;
 mod poll;
+mod port;
 mod process;
+mod scheduler;
+mod signal;
 mod sock_diag;
 mod socket;
 mod spawn;
 mod terminal;
+mod timer;
+#[cfg(target_arch = "x86_64")]
+pub(crate) mod x86;
 
 use std::ffi::CString;
 use std::io::{self, Write};
@@ -43,26 +62,46 @@ use std::os::unix::ffi::OsStringExt;
 
 pub(crate) use nix::errno::Errno;
 pub(crate) use nix::sys::signal::Signal;
+pub(crate) use nix::sys::time::{TimeSpec, TimeValLike};
 
-pub(crate) use clock::monotonic_ms;
+pub(crate) use clock::{Clock, clock_time, monotonic_ms, sleep_once, sleep_until_monotonic};
 #[cfg(target_arch = "x86_64")]
-pub(crate) use clock::monotonic_ns;
+pub(crate) use clock::{monotonic_ns, syscall_monotonic_nanoseconds};
+pub(crate) use discipline::{ClockAdjustment, ClockDiscipline, adjust_clock};
 pub(crate) use fd::{
-    FileDescriptor, Mode, OpenFlags, create_directory, create_fifo, create_memfd, create_pipe,
-    open, page_size, unlink,
+    CreatedFile, FileDescriptor, FileLock, Mode, OpenFlags, create_directory, create_fifo,
+    create_memfd, create_pipe, lock_file, open, page_size, unlink,
 };
 pub(crate) use filesystem::{
-    MountFlags, change_directory, chmod, chown, current_directory, mount, path_c_string,
+    MountFlags, ScratchDirectory, TmpfsMount, change_directory, check_exists, chmod, chown,
+    current_directory, enter_private_mount_namespace, mount, path_c_string, path_exists, read_file,
+    read_line, read_number, write_file, write_number,
 };
 pub(crate) use ioctl::{console_pending, reseed_random};
 pub(crate) use mapping::MemoryMapping;
-pub(crate) use poll::readable_or_hung_up;
+#[cfg(target_arch = "x86_64")]
+pub(crate) use msr::{MsrAccess, MsrFile};
+pub(crate) use poll::{Pollable, poll, readable_or_hung_up};
+pub(crate) use port::{PORT_DEVICE, Port};
+#[cfg(target_arch = "x86_64")]
+pub(crate) use port::{PortAccess, power_off};
 #[cfg(test)]
 pub(crate) use process::sigpipe_disposition;
+#[cfg(target_arch = "x86_64")]
+pub(crate) use process::syscall_process_id;
 pub(crate) use process::{
-    ChildStatus, DirectStdout, ProcessId, Stdout, exec, has_exited, ignore_interrupt_and_hangup,
-    kill_process_group, reap_any_nonblocking, restore_sigpipe, take_inherited_descriptor, wait,
-    with_sigpipe_ignored, write_port_diagnostic, write_standard_error,
+    ChildStatus, DirectStdout, ForkResult, ProcessId, Stdout, current_process, detach, exec,
+    exit_immediately, fork, has_exited, ignore_interrupt_and_hangup, kill_process_group,
+    process_exists, process_name, reap_any_nonblocking, restore_sigpipe, take_inherited_descriptor,
+    try_wait, wait, with_sigpipe_ignored, write_port_diagnostic, write_standard_error,
+};
+pub(crate) use scheduler::{
+    AffinityGuard, IdlePriority, SchedulingPolicy, current_affinity, current_cpu, current_thread,
+    pin_current_thread, promote_all_threads, scheduling_policy, set_scheduling_policy,
+    thread_count,
+};
+pub(crate) use signal::{
+    ChildSignalWait, SignalDescriptor, ignore_signals, queue_user_signal, reset_child_signal,
 };
 pub(crate) use sock_diag::{
     INET_DIAG_BUFFER_LENGTH, InetDiagMessage, decode_inet_diag_dump, dump_ipv6_tcp_sockets,
@@ -72,6 +111,7 @@ pub(crate) use sock_diag::{encode_inet_diag_done, encode_inet_diag_socket};
 pub(crate) use socket::{UdpSocket, connect_datagram};
 pub(crate) use spawn::{CHILD_STAGE_CWD, PhysicalPwd, SpawnDescriptors, SpawnPlan, spawn};
 pub(crate) use terminal::{configure_raw, drain};
+pub(crate) use timer::Timer;
 
 /// Returns the process arguments, program name first, as the C strings that `main` received.
 ///

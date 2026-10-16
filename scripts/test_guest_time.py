@@ -911,13 +911,21 @@ class GuestTimeTests(unittest.TestCase):
             self.assertTrue(output.endswith("failures=7\n"), output)
             self.assertEqual(output.count("code=G_CONFORMANCE_C4"), 6, output)
             self.assertEqual(output.count("code=G_CONFORMANCE_C9"), 1, output)
-        # A CPU the checks cannot run on fails C1 in its job.
+        # A CPU the checks cannot run on fails C1 in its job, and each such
+        # job's failure counts.
         unusable = [cpu for cpu in range(64) if cpu not in allowed]
         if not unusable:
             self.skipTest("every CPU is usable")
         output = self.run_test("parallel", f"{allowed[0]},{unusable[0]}")
         self.assertTrue(output.endswith("failures=8\n"), output)
         self.assertIn(f"cannot run on cpu {unusable[0]}", output)
+        if len(unusable) < 2:
+            self.skipTest("only one CPU is unusable")
+        cpus = ",".join(map(str, [allowed[0], *unusable[:2]]))
+        output = self.run_test("parallel", cpus)
+        self.assertTrue(output.endswith("failures=9\n"), output)
+        for cpu in unusable[:2]:
+            self.assertIn(f"cannot run on cpu {cpu}: ", output)
 
     def test_idle_work_continues_at_normal_priority_after_the_bound(self):
         # The asynchronous checks leave SCHED_IDLE (5) for SCHED_OTHER (0)

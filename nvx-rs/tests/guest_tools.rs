@@ -13,6 +13,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::RwLock;
+use std::time::{Duration, Instant};
 
 use nix::errno::Errno;
 use nix::fcntl::{FcntlArg, FdFlag, fcntl};
@@ -28,6 +29,8 @@ fn binary(name: &str) -> PathBuf {
         "nvx-reseed" => env!("CARGO_BIN_EXE_nvx-reseed"),
         "nvx-managed-agent" => env!("CARGO_BIN_EXE_nvx-managed-agent"),
         "nvx-ingress" => env!("CARGO_BIN_EXE_nvx-ingress"),
+        "nvx-time" => env!("CARGO_BIN_EXE_nvx-time"),
+        "nvx-time-probe" => env!("CARGO_BIN_EXE_nvx-time-probe"),
         "nvx-exit" => env!("CARGO_BIN_EXE_nvx-exit"),
         "nvx-device-io" => env!("CARGO_BIN_EXE_nvx-device-io"),
         _ => panic!("no guest binary {name}"),
@@ -67,6 +70,41 @@ where
             .args(arguments)
             .stdout(Stdio::piped()),
     );
+    (status.code(), stdout, stderr)
+}
+
+/// Runs the guest binary `name` with `arguments` as [`run`] does, but kills it and fails the
+/// test once `timeout` passes. Its output must fit in the pipes, which nothing reads until it
+/// exits.
+fn run_within<I, S>(name: &str, arguments: I, timeout: Duration) -> (Option<i32>, Vec<u8>, Vec<u8>)
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let mut child = {
+        let _spawning = SPAWNING.read().unwrap();
+        Command::new(binary(name))
+            .args(arguments)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|error| panic!("cannot run {name}: {error}"))
+    };
+    let deadline = Instant::now() + timeout;
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("{name} did not end within {timeout:?}");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let Output {
+        status,
+        stdout,
+        stderr,
+    } = child.wait_with_output().unwrap();
     (status.code(), stdout, stderr)
 }
 
@@ -953,4 +991,910 @@ fn ingress_rejects_bad_invocations_and_test_snapshots() {
         run("nvx-ingress", [OsStr::new("test"), &overlong]),
         (Some(1), Vec::new(), Vec::new())
     );
+}
+
+#[cfg(target_arch = "x86_64")]
+/// Returns the first CPU that this process may run on.
+fn first_allowed_cpu() -> usize {
+    let affinity = nix::sched::sched_getaffinity(nix::unistd::Pid::from_raw(0)).unwrap();
+    (0..nix::sched::CpuSet::count())
+        .find(|&cpu| affinity.is_set(cpu).unwrap())
+        .unwrap()
+}
+
+#[cfg(target_arch = "x86_64")]
+/// Returns the CPUs that this process may not run on, of the 64 that the time ABI covers.
+fn unusable_cpus() -> Vec<usize> {
+    let affinity = nix::sched::sched_getaffinity(nix::unistd::Pid::from_raw(0)).unwrap();
+    (0..64)
+        .filter(|&cpu| !affinity.is_set(cpu).unwrap())
+        .collect()
+}
+
+#[cfg(target_arch = "x86_64")]
+const TIME_UTC_NS: u64 = 1_790_841_600_123_456_789;
+
+#[cfg(target_arch = "x86_64")]
+fn time_packet(
+    flags: u8,
+    online: u8,
+    ranges: &[(u64, u64)],
+    generation: u32,
+    rate_deviation: i32,
+    downtime_ns: u64,
+) -> Vec<u8> {
+    let mut packet = Vec::with_capacity(32 + ranges.len() * 16 + 64);
+    packet.extend_from_slice(b"OVR");
+    packet.extend_from_slice(&[4, flags, online, ranges.len() as u8, 0]);
+    packet.extend_from_slice(&generation.to_le_bytes());
+    packet.extend_from_slice(&rate_deviation.to_le_bytes());
+    packet.extend_from_slice(&downtime_ns.to_le_bytes());
+    packet.extend_from_slice(&TIME_UTC_NS.to_le_bytes());
+    for &(start, length) in ranges {
+        packet.extend_from_slice(&start.to_le_bytes());
+        packet.extend_from_slice(&length.to_le_bytes());
+    }
+    packet.extend(0_u8..64);
+    packet
+}
+
+#[cfg(target_arch = "x86_64")]
+fn time_fixture(directory: &Path, name: &str, contents: impl AsRef<[u8]>) -> PathBuf {
+    let path = directory.join(name);
+    fs::write(&path, contents).unwrap();
+    path
+}
+
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn time_test_mode_decodes_packets_samples_and_arithmetic() {
+    let directory = tempfile::tempdir().unwrap();
+    let packet = time_fixture(
+        directory.path(),
+        "packet",
+        time_packet(0x0d, 4, &[], 3, -13_107_200, 30_000_000_000),
+    );
+    assert_eq!(
+        run(
+            "nvx-time",
+            [
+                OsStr::new("test"),
+                OsStr::new("packet"),
+                packet.as_os_str(),
+                OsStr::new("2"),
+                OsStr::new("ffffffffffffffffffffffffffffffff"),
+            ]
+        ),
+        (
+            Some(0),
+            concat!(
+                "ok flags=13 online=4 ranges=0 generation=3 ",
+                "rate_deviation=-13107200 frequency=13107200 ",
+                "downtime_ns=30000000000 utc_ns=1790841600123456789 ",
+                "generation_id=000102030405060708090a0b0c0d0e0f\n"
+            )
+            .as_bytes()
+            .to_vec(),
+            Vec::new(),
+        )
+    );
+
+    let ranges = time_fixture(
+        directory.path(),
+        "ranges",
+        time_packet(
+            0x02,
+            0,
+            &[(0x8000_0000, 0x0800_0000), (0x1_0000_0000, 0x1000_0000)],
+            1,
+            0,
+            0,
+        ),
+    );
+    let output = run(
+        "nvx-time",
+        [
+            OsStr::new("test"),
+            OsStr::new("packet"),
+            ranges.as_os_str(),
+            OsStr::new("0"),
+            OsStr::new("ffffffffffffffffffffffffffffffff"),
+        ],
+    );
+    assert_eq!(output.0, Some(0));
+    assert!(
+        output
+            .1
+            .ends_with(b" range=2147483648:134217728 range=4294967296:268435456\n")
+    );
+
+    let mut sample = Vec::new();
+    sample.extend_from_slice(&[1, 8]);
+    sample.extend_from_slice(&0_u16.to_le_bytes());
+    sample.extend_from_slice(&4_u32.to_le_bytes());
+    sample.extend_from_slice(&TIME_UTC_NS.to_le_bytes());
+    let sample = time_fixture(directory.path(), "sample", sample);
+    assert_eq!(
+        run(
+            "nvx-time",
+            [
+                OsStr::new("test"),
+                OsStr::new("sample"),
+                sample.as_os_str(),
+                OsStr::new("4")
+            ]
+        ),
+        (
+            Some(0),
+            b"ok flags=8 generation=4 utc_ns=1790841600123456789\n".to_vec(),
+            Vec::new(),
+        )
+    );
+    assert_eq!(
+        run("nvx-time", ["test", "pair", "1000", "3000", "5000"]),
+        (
+            Some(0),
+            b"theta_ns=3000 epsilon_ns=1000\n".to_vec(),
+            Vec::new()
+        )
+    );
+    assert_eq!(
+        run("nvx-time", ["test", "frequency", "-40000000"]),
+        (
+            Some(0),
+            b"frequency=32768000 ppb=500000\n".to_vec(),
+            Vec::new()
+        )
+    );
+    assert_eq!(
+        run(
+            "nvx-time",
+            ["test", "correction", "-1128000000", "10", "slow"]
+        ),
+        (
+            Some(0),
+            b"step modes=0x2100 sec=-2 nsec=872000000\n".to_vec(),
+            Vec::new()
+        )
+    );
+}
+
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn time_test_mode_checks_logs_timer_state_and_status() {
+    let directory = tempfile::tempdir().unwrap();
+    let boot = time_fixture(
+        directory.path(),
+        "boot",
+        concat!(
+            "Hypervisor detected: Microsoft Hyper-V\n",
+            "Hyper-V: privilege flags low 0x8860, high 0x0\n",
+            "Hyper-V: LAPIC Timer Frequency: 0x1e8480\n",
+            "clocksource: Switched to clocksource tsc-early\n",
+            "clocksource: Switched to clocksource tsc\n"
+        ),
+    );
+    assert_eq!(
+        run(
+            "nvx-time",
+            [OsStr::new("test"), OsStr::new("boot-log"), boot.as_os_str()]
+        ),
+        (Some(0), b"ok\n".to_vec(), Vec::new())
+    );
+    let kmsg = time_fixture(
+        directory.path(),
+        "kmsg",
+        concat!(
+            "tsc: Marking TSC unstable due to watchdog\n",
+            "clocksource: tsc: mask: 0xffff\n"
+        ),
+    );
+    assert_eq!(
+        run(
+            "nvx-time",
+            [OsStr::new("test"), OsStr::new("kmsg"), kmsg.as_os_str()]
+        ),
+        (Some(0), b"G_TSC_UNSTABLE\nnone\n".to_vec(), Vec::new())
+    );
+
+    let timer = time_fixture(
+        directory.path(),
+        "timer",
+        concat!(
+            "Tick Device: mode:     1\n",
+            "Broadcast device\n",
+            "Clock Event Device: <NULL>\n",
+            "Tick Device: mode:     1\n",
+            "Per CPU device: 0\n",
+            "Clock Event Device: lapic\n",
+            " mode:           3\n",
+            " event_handler:  hrtimer_interrupt\n"
+        ),
+    );
+    assert_eq!(
+        run(
+            "nvx-time",
+            [
+                OsStr::new("test"),
+                OsStr::new("timer-list"),
+                timer.as_os_str(),
+                OsStr::new("0"),
+            ]
+        ),
+        (Some(0), b"ok\n".to_vec(), Vec::new())
+    );
+
+    let state_text = concat!(
+        "version=1\n",
+        "generation=2\n",
+        "boot_status=ok\n",
+        "boot_cpus=8\n",
+        "boot_elapsed_us=2400\n",
+        "boot_cpu_us=1900\n",
+        "tsc_hz=2194843000\n",
+        "lapic_hz=200000000\n",
+        "synchronized=1\n",
+        "offset_ns=-42\n",
+        "uncertainty_ns=1800\n",
+        "last_sample_error=none\n"
+    );
+    let state = time_fixture(directory.path(), "state", state_text);
+    assert_eq!(
+        run(
+            "nvx-time",
+            [OsStr::new("test"), OsStr::new("state"), state.as_os_str()]
+        )
+        .1,
+        concat!(
+            "version=1\ngeneration=2\nboot_status=ok\nboot_cpus=8\n",
+            "boot_elapsed_us=2400\nboot_cpu_us=1900\n",
+            "tsc_hz=2194843000\nlapic_hz=200000000\n",
+            "discontinuities=0\nlast_discontinuity=none\nlast_step_ns=0\n",
+            "last_step_realtime_ns=0\nlast_downtime_ns=0\n",
+            "last_downtime_source=none\nsynchronized=1\noffset_ns=-42\n",
+            "uncertainty_ns=1800\nfrequency_ppb=0\nsamples=0\n",
+            "rejected_samples=0\nlast_sample_error=none\nviolations=0\n"
+        )
+        .as_bytes()
+    );
+    let status = run(
+        "nvx-time",
+        [
+            OsStr::new("test"),
+            OsStr::new("status"),
+            state.as_os_str(),
+            OsStr::new("enforcing"),
+        ],
+    );
+    assert_eq!(status.0, Some(0));
+    assert!(
+        status
+            .1
+            .starts_with(b"NVX-TIME-ABI: v=1 phase=boot status=ok cpus=8 tsc_hz=2194843000 ")
+    );
+    assert!(status.1.ends_with(b"last_sample_error=none\nok=1\n"));
+}
+
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn time_test_mode_preserves_parser_and_usage_failures() {
+    let usage = concat!(
+        "usage: nvx-time [--report-only] COMMAND\n",
+        "  boot\n",
+        "  check --phase capture|restore [--new-cpus LIST]\n",
+        "  pre-capture\n",
+        "  capture 0|1 GENERATION_ID ENTROPY_FILE [--finish]\n",
+        "  cancel-capture\n",
+        "  restore-finish [--ack] [--new-cpus LIST]\n",
+        "  status\n",
+        "  sample\n",
+        "  generation-id\n",
+        "  exhaustive\n",
+        "  test NAME ARGUMENTS...\n"
+    )
+    .as_bytes()
+    .to_vec();
+    assert_eq!(
+        run("nvx-time", std::iter::empty::<&str>()),
+        (Some(2), Vec::new(), usage)
+    );
+    assert_eq!(
+        run("nvx-time", ["test", "deferral"]),
+        (
+            Some(0),
+            b"deferred_start_ms=150 idle_bound_ms=100\n".to_vec(),
+            Vec::new()
+        )
+    );
+    assert_eq!(
+        run(
+            "nvx-time",
+            [
+                "test",
+                "exhaustive-leaf",
+                "0x40000081",
+                "1",
+                "2",
+                "3",
+                "4",
+                "1",
+                "2",
+                "3",
+                "4"
+            ]
+        )
+        .1,
+        concat!(
+            "fail leaf 0x40000081 is 00000001 00000002 00000003 00000004 ",
+            "(signature \"............\"), expected zero\n"
+        )
+        .as_bytes()
+    );
+}
+
+#[cfg(target_arch = "x86_64")]
+fn run_time_packet(
+    directory: &Path,
+    name: &str,
+    packet: &[u8],
+    recorded: &str,
+    previous: &str,
+) -> (Option<i32>, Vec<u8>, Vec<u8>) {
+    let path = time_fixture(directory, name, packet);
+    run(
+        "nvx-time",
+        [
+            OsStr::new("test"),
+            OsStr::new("packet"),
+            path.as_os_str(),
+            OsStr::new(recorded),
+            OsStr::new(previous),
+        ],
+    )
+}
+
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn time_test_mode_checks_packet_and_sample_boundaries() {
+    let directory = tempfile::tempdir().unwrap();
+    let previous = "ffffffffffffffffffffffffffffffff";
+    let base = time_packet(0, 0, &[], 1, 0, 0);
+    let mut rejected = Vec::new();
+    let mutate = |offset: usize, bytes: &[u8]| {
+        let mut packet = base.clone();
+        packet[offset..offset + bytes.len()].copy_from_slice(bytes);
+        packet
+    };
+    rejected.push(mutate(0, b"OVX"));
+    rejected.push(mutate(3, &[3]));
+    rejected.push(mutate(4, &[0x10]));
+    rejected.push(mutate(5, &[3]));
+    rejected.push(mutate(6, &[1]));
+    rejected.push(mutate(7, &[1]));
+    rejected.push(mutate(8, &0_u32.to_le_bytes()));
+    rejected.push(mutate(12, &16_384_001_i32.to_le_bytes()));
+    rejected.push(mutate(12, &(-16_384_001_i32).to_le_bytes()));
+    rejected.push(mutate(
+        16,
+        &(2_592_000_u64 * 1_000_000_000 + 1).to_le_bytes(),
+    ));
+    rejected.push(mutate(24, &0_u64.to_le_bytes()));
+    rejected.push(time_packet(0x02, 0, &[(0, 0)], 1, 0, 0));
+    rejected.push(time_packet(0x02, 0, &[(u64::MAX - 4095, 8192)], 1, 0, 0));
+    for (index, packet) in rejected.iter().enumerate() {
+        let output = run_time_packet(
+            directory.path(),
+            &format!("rejected-{index}"),
+            packet,
+            "0",
+            previous,
+        );
+        assert_eq!(output.0, Some(0));
+        assert!(
+            output.1.starts_with(b"error G_REPAIR_PACKET "),
+            "case {index}: {:?}",
+            String::from_utf8_lossy(&output.1)
+        );
+    }
+
+    for (index, packet) in [
+        time_packet(0, 8, &[], 1, 16_384_000, 2_592_000 * 1_000_000_000),
+        time_packet(0, 0, &[], 1, -16_384_000, 0),
+    ]
+    .iter()
+    .enumerate()
+    {
+        assert!(
+            run_time_packet(
+                directory.path(),
+                &format!("accepted-{index}"),
+                packet,
+                "0",
+                previous
+            )
+            .1
+            .starts_with(b"ok ")
+        );
+    }
+    assert_eq!(
+        run_time_packet(directory.path(), "stale", &base, "1", previous).1,
+        b"stale\n"
+    );
+    assert!(
+        run_time_packet(directory.path(), "skipped", &base, "2", previous)
+            .1
+            .starts_with(b"error G_REPAIR_GENERATION ")
+    );
+    assert!(
+        run_time_packet(
+            directory.path(),
+            "unchanged",
+            &base,
+            "0",
+            "000102030405060708090a0b0c0d0e0f"
+        )
+        .1
+        .starts_with(b"error G_REPAIR_GENERATION ")
+    );
+
+    let sample_path =
+        |name: &str, version: u8, flags: u8, reserved: u16, generation: u32, utc: u64| {
+            let mut sample = vec![version, flags];
+            sample.extend_from_slice(&reserved.to_le_bytes());
+            sample.extend_from_slice(&generation.to_le_bytes());
+            sample.extend_from_slice(&utc.to_le_bytes());
+            time_fixture(directory.path(), name, sample)
+        };
+    let good = sample_path("sample-good", 1, 8, 0, 4, TIME_UTC_NS);
+    assert_eq!(
+        run(
+            "nvx-time",
+            [
+                OsStr::new("test"),
+                OsStr::new("sample"),
+                good.as_os_str(),
+                OsStr::new("4")
+            ]
+        )
+        .1,
+        b"ok flags=8 generation=4 utc_ns=1790841600123456789\n"
+    );
+    for (index, path) in [
+        sample_path("sample-version", 2, 0, 0, 0, TIME_UTC_NS),
+        sample_path("sample-flags", 1, 1, 0, 0, TIME_UTC_NS),
+        sample_path("sample-reserved", 1, 0, 1, 0, TIME_UTC_NS),
+        sample_path("sample-utc", 1, 0, 0, 0, 0),
+        sample_path("sample-generation", 1, 0, 0, 3, TIME_UTC_NS),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let output = run(
+            "nvx-time",
+            [
+                OsStr::new("test"),
+                OsStr::new("sample"),
+                path.as_os_str(),
+                OsStr::new("0"),
+            ],
+        );
+        assert!(
+            output.1.starts_with(b"error "),
+            "sample case {index}: {:?}",
+            String::from_utf8_lossy(&output.1)
+        );
+    }
+}
+
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn time_test_mode_covers_checks_events_records_and_workers() {
+    let directory = tempfile::tempdir().unwrap();
+    let good_flags = concat!(
+        "tsc msr pae constant_tsc rdtscp nonstop_tsc tsc_known_freq ",
+        "tsc_reliable hypervisor arat x2apic"
+    );
+    let cpuinfo = format!(
+        "processor : 0\ncpu MHz : 2194.843\nflags : {good_flags}\n\n\
+         processor : 1\ncpu MHz : 2194.843\nflags : {good_flags}\n"
+    );
+    let cpuinfo = time_fixture(directory.path(), "cpuinfo", cpuinfo);
+    assert_eq!(
+        run(
+            "nvx-time",
+            [
+                OsStr::new("test"),
+                OsStr::new("cpuinfo"),
+                cpuinfo.as_os_str(),
+                OsStr::new("0-1"),
+            ]
+        )
+        .1,
+        b"ok cpu0_khz=2194843 cpu1_khz=2194843\n"
+    );
+    for token in [
+        "tsc_early_khz=2194843",
+        "lapic_timer_hz=200000000",
+        "notsc",
+        "nolapic",
+        "nolapic_timer",
+        "tsc=unstable",
+        "hpet=force",
+        "clocksource=kvm-clock",
+    ] {
+        let cmdline = format!("earlycon=xe9 clocksource=tsc {token}");
+        assert!(
+            run("nvx-time", ["test", "cmdline", &cmdline])
+                .1
+                .windows(b"code=G_CONFORMANCE_C9".len())
+                .any(|window| window == b"code=G_CONFORMANCE_C9")
+        );
+    }
+}
+
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn time_probe_cli_and_small_diagnostics_run() {
+    let usage = concat!(
+        "usage: nvx-time-probe COMMAND [OPTIONS]\n",
+        "\n",
+        "Commands:\n",
+        "  latency [--iterations N] [--batch B] [--cpu C] [--tsc-hz HZ]\n",
+        "      Per-operation cost (p50/p99/min/mean ns) of rdtsc, rdtscp,\n",
+        "      lfence;rdtsc, clock_gettime(MONOTONIC/REALTIME) through the vDSO,\n",
+        "      and syscall controls. Default: 2000 timed batches of 50 operations\n",
+        "      on the current CPU.\n",
+        "  warp [--duration-ms N] [--cpus LIST] [--bound-ns N] [--tsc-hz HZ]\n",
+        "      Pairwise cross-CPU TSC checks: a check_tsc_warp-style spinlock test\n",
+        "      and a ping-pong offset estimate, each running N ms per pair\n",
+        "      (default 100). LIST looks like 0-3,6 (default: every CPU in the\n",
+        "      affinity mask). The bound defaults to 1000 ns.\n",
+        "  clock [--measure-ms N] [--tsc-hz HZ] [--msr]\n",
+        "      Clocks, clocksources, TSC flags, CPUID time leaves, hypervisor and\n",
+        "      time kernel messages, and the /proc/timer_list clock event summary.\n",
+        "      --msr also reads the TSC, Hyper-V time, and kvmclock MSRs on CPU 0\n",
+        "      through /dev/cpu/0/msr (a #GP is reported, not raised).\n",
+        "  version\n",
+        "\n",
+        "The TSC rate comes from --tsc-hz, sysfs tsc_freq_khz, the kernel log, or\n",
+        "/proc/cpuinfo, in that order, and is measured as a last resort.\n",
+        "Exit status: 0 success, 1 warp FAIL, 2 usage error, 3 runtime error.\n"
+    )
+    .as_bytes()
+    .to_vec();
+    assert_eq!(
+        run("nvx-time-probe", std::iter::empty::<&str>()),
+        (Some(2), Vec::new(), usage.clone())
+    );
+    assert_eq!(
+        run("nvx-time-probe", ["version"]),
+        (Some(0), b"nvx-time-probe 1.1\n".to_vec(), Vec::new())
+    );
+    assert_eq!(
+        run("nvx-time-probe", ["--help"]),
+        (Some(0), usage, Vec::new())
+    );
+    assert_eq!(
+        run("nvx-time-probe", ["latency", "--iterations=0"]),
+        (
+            Some(2),
+            Vec::new(),
+            b"nvx-time-probe latency: invalid option or value: --iterations=0\n".to_vec()
+        )
+    );
+
+    let cpu = first_allowed_cpu().to_string();
+    let latency = run(
+        "nvx-time-probe",
+        [
+            "latency",
+            "--iterations",
+            "16",
+            "--batch",
+            "2",
+            "--cpu",
+            &cpu,
+            "--tsc-hz",
+            "2500000000",
+        ],
+    );
+    assert_eq!(latency.0, Some(0));
+    assert!(latency.2.is_empty());
+    assert!(
+        latency
+            .1
+            .starts_with(format!("nvx-time-probe 1.1 latency: cpu={cpu} ").as_bytes())
+    );
+    assert_eq!(
+        latency
+            .1
+            .windows(b"NVX-TIME-PROBE latency method=".len())
+            .filter(|window| *window == b"NVX-TIME-PROBE latency method=")
+            .count(),
+        8
+    );
+
+    let warp = run(
+        "nvx-time-probe",
+        [
+            "warp",
+            "--duration-ms",
+            "1",
+            "--cpus",
+            &cpu,
+            "--bound-ns",
+            "1000",
+            "--tsc-hz",
+            "2500000000",
+        ],
+    );
+    assert_eq!(warp.0, Some(0));
+    assert!(warp.2.is_empty());
+    assert!(
+        warp.1.ends_with(
+            format!(
+                "NVX-TIME-PROBE warp-detail max_abs_offset_cycles=0.0 \
+                 max_uncertainty_ns=0 max_skew_bound_ns=0 total_warps=0 \
+                 inconsistent_pairs=0 stalled_pairs=0 cpus={cpu} duration_ms=1 \
+                 tsc_hz=2500000000 tsc_hz_source=option conclusive=1\n"
+            )
+            .as_bytes()
+        )
+    );
+
+    let clock = run(
+        "nvx-time-probe",
+        ["clock", "--measure-ms", "0", "--tsc-hz", "2500000000"],
+    );
+    assert_eq!(clock.0, Some(0));
+    assert!(clock.2.is_empty());
+    assert!(
+        clock
+            .1
+            .starts_with(b"nvx-time-probe 1.1 clock\n== clocks\n")
+    );
+    assert!(
+        clock
+            .1
+            .windows(b"\nNVX-TIME-PROBE clock ".len())
+            .any(|window| window == b"\nNVX-TIME-PROBE clock ")
+    );
+}
+
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn time_probe_warp_runs_a_cpu_pair() {
+    let affinity = nix::sched::sched_getaffinity(nix::unistd::Pid::from_raw(0)).unwrap();
+    let cpus = (0..nix::sched::CpuSet::count())
+        .filter(|&cpu| affinity.is_set(cpu).unwrap())
+        .take(2)
+        .collect::<Vec<_>>();
+    let [first, second] = cpus[..] else {
+        // A single CPU has no pair to run.
+        return;
+    };
+    let (status, stdout, stderr) = run_within(
+        "nvx-time-probe",
+        [
+            "warp",
+            "--duration-ms",
+            "1",
+            "--cpus",
+            &format!("{first},{second}"),
+            "--tsc-hz",
+            "2500000000",
+        ],
+        Duration::from_secs(60),
+    );
+    let stdout = String::from_utf8(stdout).unwrap();
+    // The verdict depends on the host's TSCs, so either verdict's status ends a run.
+    assert!(matches!(status, Some(0 | 1)), "{status:?}: {stdout}");
+    assert!(stderr.is_empty(), "{}", String::from_utf8_lossy(&stderr));
+    assert!(stdout.contains(" pairs=1 verdict="), "{stdout}");
+    let prefix = format!("pair {first}-{second}: ");
+    let pair = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix(&prefix))
+        .unwrap_or_else(|| panic!("no result for the pair: {stdout}"));
+    let field = |name: &str| -> u64 {
+        pair.split(' ')
+            .find_map(|field| field.strip_prefix(name)?.strip_prefix('=')?.parse().ok())
+            .unwrap_or_else(|| panic!("no {name}: {pair}"))
+    };
+    // Each worker of the spinlock test counts its iterations, and the ping-pong test completes
+    // round trips rather than stalling.
+    assert!(field("warp_iterations") >= 2, "{pair}");
+    assert!(field("rounds") >= 1, "{pair}");
+}
+
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn time_test_mode_covers_remaining_events_records_and_workers() {
+    let directory = tempfile::tempdir().unwrap();
+    assert_eq!(
+        run(
+            "nvx-time",
+            [
+                "test",
+                "clocksource",
+                "tsc\n",
+                "tsc refined-jiffies jiffies\n"
+            ]
+        )
+        .1,
+        b"ok\n"
+    );
+    for (current, available) in [
+        ("tsc-early\n", "tsc-early \n"),
+        ("tsc\n", "tsc kvm-clock \n"),
+        ("refined-jiffies\n", "refined-jiffies \n"),
+    ] {
+        assert!(
+            run("nvx-time", ["test", "clocksource", current, available])
+                .1
+                .windows(b"code=G_CONFORMANCE_C6".len())
+                .any(|window| window == b"code=G_CONFORMANCE_C6")
+        );
+    }
+
+    assert_eq!(
+        run(
+            "nvx-time",
+            [
+                "test",
+                "event",
+                "G_UNCHECKED_MSR",
+                "watcher",
+                "runtime",
+                "3",
+                "123456789",
+                "unchecked \"MSR\"\\ access\u{1}",
+            ]
+        )
+        .1,
+        concat!(
+            "NVX-TIME-ABI-VIOLATION: v=1 code=G_UNCHECKED_MSR source=watcher ",
+            "phase=runtime generation=3 boottime_ns=123456789 ",
+            "detail=\"unchecked \\\"MSR\\\"\\\\ access\\x01\"\n"
+        )
+        .as_bytes()
+    );
+    let long_event = run(
+        "nvx-time",
+        [
+            OsStr::new("test"),
+            OsStr::new("event"),
+            OsStr::new("G_HUNG_TASK"),
+            OsStr::new("watcher"),
+            OsStr::new("runtime"),
+            OsStr::new("0"),
+            OsStr::new("1"),
+            &std::ffi::OsString::from_vec(vec![2; 400]),
+        ],
+    )
+    .1;
+    assert!(long_event.len() <= 512 && long_event.ends_with(b"\\x02\"\n"));
+
+    for (name, record, expected) in [
+        (
+            "restore-cpus",
+            "generation=3\nnew_cpus=4-6,9\n",
+            "generation=3 new_cpus=4,5,6,9 count=4\n",
+        ),
+        (
+            "restore-none",
+            "generation=3\nnew_cpus=none\n",
+            "generation=3 new_cpus=none count=0\n",
+        ),
+        (
+            "restore-absent",
+            "generation=3\n",
+            "generation=3 new_cpus=none count=0\n",
+        ),
+    ] {
+        let record = time_fixture(directory.path(), name, record);
+        assert_eq!(
+            run(
+                "nvx-time",
+                [
+                    OsStr::new("test"),
+                    OsStr::new("restore-record"),
+                    record.as_os_str()
+                ]
+            )
+            .1,
+            expected.as_bytes()
+        );
+    }
+
+    // These exercise the same thread promotion, affinity merge, and at-fork CPU accounting
+    // paths as the production deferred boot and restore workers.
+    let cpu = first_allowed_cpu();
+    if cpu < 64 {
+        let output = run("nvx-time", ["test", "parallel", &cpu.to_string()]);
+        assert_eq!(output.0, Some(0));
+        assert!(output.1.ends_with(b"failures=7\n"));
+        // Each CPU job that cannot run on its CPU fails C1, and every job's failures count.
+        if let [first, second, ..] = unusable_cpus()[..] {
+            let (status, output, _) = run(
+                "nvx-time",
+                ["test", "parallel", &format!("{cpu},{first},{second}")],
+            );
+            assert_eq!(status, Some(0));
+            let output = String::from_utf8(output).unwrap();
+            assert!(output.ends_with("failures=9\n"), "{output}");
+            for cpu in [first, second] {
+                let failure = format!("cannot run on cpu {cpu}: ");
+                assert!(output.contains(&failure), "{output}");
+            }
+        }
+    }
+    let promoted = run("nvx-time", ["test", "promote"]);
+    assert_eq!(promoted.0, Some(0));
+    assert!(promoted.1.starts_with(b"promoted caller="));
+    assert!(
+        promoted
+            .1
+            .windows(b"\nstopped caller=".len())
+            .any(|window| window == b"\nstopped caller=")
+    );
+    let idle = run("nvx-time", ["test", "idle-priority"]);
+    assert_eq!(idle.0, Some(0));
+    assert!(idle.1.starts_with(b"idle=5 normal="));
+    let cpu = run(
+        "nvx-time",
+        ["test", "deferred-restore-cpu", "20", "30", "10"],
+    );
+    assert_eq!(cpu.0, Some(0));
+    let fields = String::from_utf8(cpu.1).unwrap();
+    let fields = fields
+        .split_whitespace()
+        .filter_map(|field| field.split_once('='))
+        .map(|(name, value)| (name, value.parse::<i64>().unwrap()))
+        .collect::<Vec<_>>();
+    // The preparation and the fork's share precede the worker's own CPU time in its total.
+    assert!(
+        matches!(fields[..], [("prior_ms", 20..30), ("total_ms", 60..)]),
+        "{fields:?}"
+    );
+}
+
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn time_reads_a_plain_capture_request() {
+    let previous = "ffffffffffffffffffffffffffffffff";
+    let usage = b"usage: nvx-time capture 0|1 GENERATION_ID ENTROPY_FILE [--finish]\n".to_vec();
+    for request in ["", "+1", "-0", " 1", "2", "0x1"] {
+        assert_eq!(
+            run("nvx-time", ["capture", request, previous, "/nonexistent"]),
+            (Some(2), Vec::new(), usage.clone()),
+            "{request:?}"
+        );
+    }
+}
+
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn time_probe_reads_plain_numbers_from_its_options() {
+    for (command, option) in [
+        ("latency", "--iterations=010"),
+        ("latency", "--batch=+5"),
+        ("latency", "--tsc-hz=inf"),
+        ("latency", "--tsc-hz=0x1p30"),
+        ("warp", "--cpus= 1"),
+        ("warp", "--cpus=0,0"),
+        ("warp", "--duration-ms=-1"),
+        ("clock", "--measure-ms=60001"),
+        ("clock", "--tsc-hz=1e400"),
+    ] {
+        assert_eq!(
+            run("nvx-time-probe", [command, option]),
+            (
+                Some(2),
+                Vec::new(),
+                format!("nvx-time-probe {command}: invalid option or value: {option}\n")
+                    .into_bytes()
+            ),
+        );
+    }
 }
