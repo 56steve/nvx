@@ -25,7 +25,7 @@ pub(crate) use process::{PidFd, detach};
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) use process::{clear_close_on_exec, mark_listed_descriptors_on_spawn};
 #[cfg(target_os = "linux")]
-pub(crate) use socket::{connect_nonblocking, peer_pid};
+pub(crate) use socket::{connect_nonblocking, peer_pid, send_nonblocking, wait_writable};
 
 /// Returns the effective user and group IDs of this process.
 pub(crate) fn effective_ids() -> (u32, u32) {

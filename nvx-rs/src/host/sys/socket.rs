@@ -1,11 +1,15 @@
 //! Unix stream connections to OpenVMM's control socket.
 
 use std::io;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::net::UnixStream;
+use std::time::Duration;
 
+use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::sys::socket::sockopt::PeerCredentials;
-use nix::sys::socket::{AddressFamily, SockFlag, SockType, UnixAddr, connect, getsockopt, socket};
+use nix::sys::socket::{
+    AddressFamily, MsgFlags, SockFlag, SockType, UnixAddr, connect, getsockopt, send, socket,
+};
 
 use super::Errno;
 
@@ -38,4 +42,28 @@ pub(crate) fn connect_nonblocking(path: &str) -> io::Result<UnixStream> {
 pub(crate) fn peer_pid(stream: &UnixStream) -> io::Result<u32> {
     let credentials = getsockopt(stream, PeerCredentials)?;
     u32::try_from(credentials.pid()).map_err(io::Error::other)
+}
+
+/// Sends as much of `data` as the send buffer of `stream` takes without waiting, and returns how
+/// much that was: nothing while the buffer is full.
+pub(crate) fn send_nonblocking(stream: &UnixStream, data: &[u8]) -> io::Result<usize> {
+    let flags = MsgFlags::MSG_DONTWAIT | MsgFlags::MSG_NOSIGNAL;
+    match send(stream.as_raw_fd(), data, flags) {
+        Err(Errno::EAGAIN | Errno::EINTR) => Ok(0),
+        result => result.map_err(io::Error::from),
+    }
+}
+
+/// Waits until `stream` has room to send, a signal arrives, or `timeout` passes (`None` waits
+/// indefinitely).
+pub(crate) fn wait_writable(stream: &UnixStream, timeout: Option<Duration>) -> io::Result<()> {
+    // Round up, so that a wait shorter than a millisecond does not spin.
+    let timeout = timeout.map_or(PollTimeout::NONE, |timeout| {
+        PollTimeout::try_from(timeout.as_nanos().div_ceil(1_000_000)).unwrap_or(PollTimeout::MAX)
+    });
+    let mut descriptors = [PollFd::new(stream.as_fd(), PollFlags::POLLOUT)];
+    match poll(&mut descriptors, timeout) {
+        Ok(_) | Err(Errno::EINTR) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }

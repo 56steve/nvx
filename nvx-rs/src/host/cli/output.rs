@@ -5,9 +5,10 @@
 //! Workload output passes through [`write_stdout`] and [`write_stderr`] unchanged, as
 //! `sys.stdout.buffer.write` passes it.
 //!
-//! Like Python's writes, which raise `KeyboardInterrupt`, Ctrl-C ends a write to standard output,
-//! also one that waits for a pipe's reader, which may never read. On Windows, Python cannot end a
-//! write that waits either, so such a write runs to its end there.
+//! Like Python's writes, which raise `KeyboardInterrupt`, Ctrl-C ends a write to standard output
+//! or to standard error, also one that waits for a pipe's reader, which may never read, except
+//! [`print_stderr`], which reports how the command ended, Ctrl-C included. On Windows, Python
+//! cannot end a write that waits either, so such a write runs to its end there.
 
 use std::io::{self, Write};
 #[cfg(unix)]
@@ -31,10 +32,13 @@ pub(crate) fn print_stdout(text: &str) -> io::Result<()> {
     write_stdout(line(text).as_bytes())
 }
 
-/// Prints `text` and a line end to standard error. Like Python, which prints errors on a stream
-/// that it cannot write anyway, it ignores a failure.
+/// Prints `text` and a line end to standard error, even after Ctrl-C. Like Python, which prints
+/// errors on a stream that it cannot write anyway, it ignores a failure.
 pub(crate) fn print_stderr(text: &str) {
-    let _ = write_stderr(line(text).as_bytes());
+    let mut stderr = io::stderr().lock();
+    let _ = stderr
+        .write_all(line(text).as_bytes())
+        .and_then(|()| stderr.flush());
 }
 
 /// Writes `data` to standard output as it is, and flushes it.
@@ -44,9 +48,7 @@ pub(crate) fn write_stdout(data: &[u8]) -> io::Result<()> {
 
 /// Writes `data` to standard error as it is, and flushes it.
 pub(crate) fn write_stderr(data: &[u8]) -> io::Result<()> {
-    let mut stderr = io::stderr().lock();
-    stderr.write_all(data)?;
-    stderr.flush()
+    write_all(&mut io::stderr().lock(), data)
 }
 
 /// Writes `data` to `stream` after what it buffered, and fails with

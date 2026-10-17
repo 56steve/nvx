@@ -44,6 +44,22 @@ pub trait Transport: Send {
     /// Returns `Ok(0)` at end of stream and an [`io::ErrorKind::TimedOut`] error on timeout.
     fn read(&mut self, buffer: &mut [u8], timeout: Option<Duration>) -> io::Result<usize>;
 
-    /// Writes all of `data`, waiting at most `timeout` for each write to complete.
+    /// Writes all of `data` within `timeout` (`None` waits indefinitely), and fails with an
+    /// [`io::ErrorKind::TimedOut`] error if it has not by then, however much of it the endpoint
+    /// reads meanwhile.
     fn write_all(&mut self, data: &[u8], timeout: Option<Duration>) -> io::Result<()>;
+}
+
+/// Returns the time left until `deadline`, `None` without one, or an [`io::ErrorKind::TimedOut`]
+/// error once it has passed.
+#[cfg(any(target_os = "linux", windows))]
+fn time_left(deadline: Option<std::time::Instant>) -> io::Result<Option<Duration>> {
+    match deadline {
+        None => Ok(None),
+        Some(deadline) => deadline
+            .checked_duration_since(std::time::Instant::now())
+            .filter(|left| !left.is_zero())
+            .map(Some)
+            .ok_or_else(|| io::ErrorKind::TimedOut.into()),
+    }
 }
