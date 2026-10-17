@@ -33,7 +33,8 @@
 //!
 //! Its `arbitrary_precision` feature keeps numbers as written, but not the rest, and it would
 //! change `serde_json::Number` for every crate built with `nvx-rs`. Valid policies hold none of
-//! these values, so only messages are at stake.
+//! these values, so only messages are at stake; the parity fixture,
+//! `tests/fixtures/egress-policy.json`, pins them.
 
 use super::text::PyText;
 
