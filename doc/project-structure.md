@@ -105,7 +105,7 @@ nvx/
 |   |   |-- testing/             Fake OpenVMM (feature `testing`)
 |   |   |-- guest/               Programs that run in Linux guests (feature `guest`)
 |   |   `-- bin/                 nvx-rs CLI, nvx-fake-openvmm test double, and the guest binaries
-|   |-- tests/                   Fake-OpenVMM instance lifecycle, CLI, and guest-binary tests, and the golden fixtures that Python recorded
+|   |-- tests/                   Fake-OpenVMM instance lifecycle, CLI, guest-binary, and hypervisor managed-lifecycle tests, and the golden fixtures that Python recorded
 |   |-- build.rs                 Stages the bundled artifacts (feature `bundled`)
 |   `-- artifacts.json           Release package pinned for the bundled artifacts
 |-- openvmm/                     OpenVMM Git submodule
@@ -128,11 +128,9 @@ nvx/
 |   |   |-- collect_alpine_sources.py Alpine source collection
 |   |   |-- collect_ubuntu_sources.py Ubuntu source collection
 |   |   |-- common.py            Shared process and configuration helpers
-|   |   |-- control_session.py   Control-session client for managed workloads
 |   |   |-- create_linux_source_archive.py Linux source packaging
 |   |   |-- development_release.py Resumable development release publication
 |   |   |-- doctor.py            Time ABI host qualification
-|   |   |-- egress_policy.py     Egress policy compiler for OpenVMM's rule grammar
 |   |   |-- elf.py               Static-executable check of ELF binaries
 |   |   |-- guests.py            Typed guest descriptors
 |   |   |-- host_telemetry.py    Benchmark host provenance and Windows capture storage telemetry
@@ -140,12 +138,12 @@ nvx/
 |   |   |-- managed_exec_tests.py Managed workload environment, directory, and timeout tests
 |   |   |-- microvm_test_scripts/ Guest workloads for the microVM tests
 |   |   |-- microvm_tests.py     NVX microVM correctness tests
+|   |   |-- nvx_rs.py            Finds, builds, and runs nvx-rs, to which nvx.py delegates
 |   |   |-- openvmm_process.py   Foreground OpenVMM process control for tests
 |   |   |-- performance.py       CI performance collection, persistence, and gates
 |   |   |-- process_supervisor.py Linux supervisor for one owned process tree
 |   |   |-- release.py           Release download, source collection, and packaging
-|   |   |-- sandbox.py           Host-side sandbox launch contract
-|   |   |-- sandbox_lifecycle.py Managed sandbox lifecycle operations
+|   |   |-- sandbox.py           Live-share arguments of `nvx.py run`
 |   |   |-- sandbox_lifecycle_tests.py Managed sandbox lifecycle and security tests
 |   |   |-- time_abi.py          Time ABI harness checks and CPU profile guidance
 |   |   `-- ubuntu.py            Verified Ubuntu rootfs and EROFS preparation
@@ -158,7 +156,6 @@ nvx/
 |   |-- nvx-hosts.example.json   Template for the ignored .nvx-hosts.json
 |   |-- nvx.py                   Supported command-line entry point
 |   |-- nvx_adversarial_executor.py Restricted adversarial executor entry point
-|   |-- nvx_rs_fixtures.py       Golden fixtures of the nvx-rs ports of Python code, recorded from that code
 |   |-- publish_development_release.py Development release publisher run by CI
 |   `-- test_*.py                Python tooling unit tests
 |-- SECURITY.md                 Microsoft security vulnerability reporting policy

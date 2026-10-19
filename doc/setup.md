@@ -30,7 +30,9 @@ python3 scripts/nvx.py init
 Python 3.10 or newer and Git are required on every platform. Building OpenVMM
 or the Rust crates also requires [rustup](https://rustup.rs/), which installs
 the Rust release that [`rust-toolchain.toml`](../rust-toolchain.toml) pins on
-first use.
+first use. `nvx.py run` and `nvx.py sandbox` run `nvx-rs`, which `nvx.py`
+builds with that release the first time that a command needs it, unless
+`NVX_RS` names an executable; see [Usage](usage.md#nvx-rs).
 
 By default, a microVM boots on the built-in
 [CPU profile](usage.md#cpu-profiles) of its host's CPU: four Intel
@@ -249,7 +251,8 @@ Production campaigns also require an administrator-owned, no-argument
 executor wrapper that provisions a separate disposable target and forwards
 the bounded executor protocol. See
 [Copilot-driven adversarial testing](adversarial-testing.md)
-for the containment and credential requirements.
+for the containment and credential requirements, and for the Rust toolchain
+and nvx-rs that the target needs.
 
 Apply the configured Python and POSIX shell formatters with:
 

@@ -54,7 +54,7 @@ nvx-rs/
 | `nvx::host::filesystem` | The `ExportPlan` of host paths through OpenVMM's aggregate virtio-fs device, the host-mapping table, the reserved guest targets, and `guest_path` and `resolve_guest_path` (also at `nvx::`) |
 | `nvx::host::instance` | `Instance`: a VM in a directory of its own. It starts OpenVMM with a fresh capability and waits until the guest is ready and has mounted the mapped paths, reconciles recorded state, recovers interrupted launches, runs workloads and pumps their output, and stops the VM with a forced fallback |
 | `nvx::host::session`, `process`, `platform`, `report` | The authenticated control session, OpenVMM processes, Linux and Windows primitives, and OpenVMM's outcome report |
-| `nvx::host::sandbox` | The launch profile of `nvx.py sandbox`, ported from `scripts/nvx_tools/sandbox.py`: `SandboxLaunch`, with one to three EROFS `SandboxLayer`s in role order, the ext4 scratch disk, the entrypoint, arguments, hostname, workload identity, and resource limits, and its `--microvm-sandbox-block` and `--microvm-workload-identity` arguments and kernel command line, within the 1024-byte budget that OpenVMM leaves it. `mount`: `SandboxMount` live shares of host directories and files, their guest targets and the reserved ones, their access policies and owner, the aggregate of several shares, and the checks of their host paths. `options`: the checks that `nvx.py sandbox` and `nvx.py run` apply to their options: the attribution of `--mount-deny`, `--mount-allow`, and `--mount-write` to shares, the systemd policy, the targets of `nvx.py run` shares, and the managed exec environment; see [Python parity](#python-parity) |
+| `nvx::host::sandbox` | The launch profile of `nvx.py sandbox`, ported from the one that `scripts/nvx_tools/sandbox.py` held: `SandboxLaunch`, with the EROFS distro `SandboxLayer`, the one layer that a sandbox takes, the ext4 scratch disk, the entrypoint, arguments, hostname, workload identity, and resource limits, and its `--microvm-sandbox-block` and `--microvm-workload-identity` arguments and kernel command line, within the 1024-byte budget that OpenVMM leaves it. `mount`: `SandboxMount` live shares of host directories and files, their guest targets and the reserved ones, their access policies and owner, the aggregate of several shares, and the checks of their host paths. `options`: the checks that `nvx.py sandbox` and `nvx.py run` apply to their options: the attribution of `--mount-deny`, `--mount-allow`, and `--mount-write` to shares, the systemd policy, the targets of `nvx.py run` shares, and the managed exec environment; see [Python parity](#python-parity) |
 | `nvx::testing::fake_openvmm` | A fake OpenVMM that serves the control console and runs scripted workloads without a VM, for direct launches and for the managed and one-shot sandboxes of `nvx-rs sandbox` and `nvx.py sandbox` |
 | `nvx::host::cli` | Feature `cli`: the `nvx-rs` executable; see [The nvx-rs CLI](#the-nvx-rs-cli) |
 | `nvx::guest` | The programs that run in Linux guests; see [Guest binaries](#guest-binaries) |
@@ -67,10 +67,10 @@ fields.
 
 `nvx::host::network::policy` compiles the egress policy files that
 `nvx.py run` and `nvx.py sandbox` take with `--network-egress-policy-file`
-([format](../doc/run.md#run-openvmm-directly)). It is a faithful port of
-[`egress_policy.py`](../scripts/nvx_tools/egress_policy.py), which stays
-authoritative until `nvx.py` delegates to `nvx-rs`: it accepts the same files,
-compiles them to the same rules, and fails with the same messages.
+([format](../doc/run.md#run-openvmm-directly)). It is a faithful port of the
+former `scripts/nvx_tools/egress_policy.py`, which it replaced when `nvx.py`
+delegated to `nvx-rs`: it accepts the same files, compiles them to the same
+rules, and fails with the same messages.
 
 - A policy is at most 1 MiB of UTF-8 JSON whose root has only `allow` and
   `deny` arrays. JSON is read as Python's `json.loads` reads it, so `NaN` and
@@ -105,18 +105,16 @@ from a `\ud800` escape or a path that is not Unicode, shows the surrogate as
 document nested more deeply than its stack allows; this reader has no such
 limit, so those documents fail as invalid policies instead.
 
-[`scripts/nvx_rs_fixtures.py`](../scripts/nvx_rs_fixtures.py) records the
-Python compiler's outcomes for every policy that `scripts/test_egress_policy.py`
-compiles, hand-written edge cases, and a seeded random corpus in
-[`tests/fixtures/egress-policy.json`](tests/fixtures/egress-policy.json), which
-the tests replay without Python; `NVX_EGRESS_POLICY_FIXTURE` points the tests at
-a larger corpus that the script writes with `--output` and `--random-cases`. See
-[Python parity](#python-parity) for how to regenerate and check the fixtures.
+[`tests/fixtures/egress-policy.json`](tests/fixtures/egress-policy.json) holds
+the Python compiler's outcomes for every policy that its tests compiled,
+hand-written edge cases, and a seeded random corpus, which the tests replay
+without Python; `NVX_EGRESS_POLICY_FIXTURE` points the tests at another corpus
+in the same format. See [Python parity](#python-parity).
 
 ## Python parity
 
 `nvx::host::network::policy`, `nvx::host::sandbox`, and the guest lookups of
-`nvx::host::artifacts` replace Python code that `nvx.py` runs, so they keep its
+`nvx::host::artifacts` replaced Python code that `nvx.py` ran, so they keep its
 contract byte for byte: its limits, option semantics, outputs, and messages.
 They check values as Python does: whitespace is what `str.isspace` accepts,
 integers are what `int` reads, UUIDs what `uuid.UUID` reads, and JSON what
@@ -130,22 +128,19 @@ Python decodes operating-system strings that are not valid Unicode into
 surrogates: paths print as Python prints them, and the filesystem queries
 refuse them.
 
-[`scripts/nvx_rs_fixtures.py`](../scripts/nvx_rs_fixtures.py) records what the
-Python code does with fixed inputs and seeded random corpora in
-`tests/fixtures`: `python.json` for the Python semantics, `sandbox.json` and
+`tests/fixtures` holds what the Python code did with fixed inputs and seeded
+random corpora: `python.json` for the Python semantics, `sandbox.json` and
 `sandbox_options.json` for the launch profile and the sandbox options, for
 POSIX and Windows paths alike, `egress-policy.json` for the policy compiler,
 and `cli.json` for `nvx.py sandbox` as a command; see
-[Golden scenarios](#golden-scenarios). It also generates the Unicode tables of
-`src/host/python/unicode.rs`. The golden tests compare the ports with these
-records and need no Python. The records depend on the interpreter, so
-regenerate them with CPython 3.14 after a change to the Python code or the
-generator; CI's Pythons are older, so CI does not check them:
-
-```bash
-python3 scripts/nvx_rs_fixtures.py           # rewrite every generated file
-python3 scripts/nvx_rs_fixtures.py --check   # fail if any is out of date
-```
+[Golden scenarios](#golden-scenarios). `scripts/nvx_rs_fixtures.py` recorded
+them with CPython 3.14, and generated the Unicode tables of
+`src/host/python/unicode.rs`, until `nvx.py` delegated to `nvx-rs` and
+[microsoft/nvx#359](https://github.com/microsoft/nvx/issues/359) retired the
+script with the Python code that it recorded. The golden tests compare the
+ports with these records and need no Python. The records are now the
+reference of that behavior: a deliberate change of behavior updates the
+records that it changes by hand, in the same change.
 
 ## The nvx-rs CLI
 
@@ -154,15 +149,25 @@ runtime steps of `nvx.py` that `nvx.py` delegates to it
 ([microsoft/nvx#359](https://github.com/microsoft/nvx/issues/359)):
 
 ```text
-nvx-rs [-h] [--root PATH] artifacts
-nvx-rs [-h] [--root PATH] egress compile PATH
-nvx-rs [-h] [--root PATH] sandbox [run|provision|start|exec|stop|deprovision] [OPTIONS]
+nvx-rs [-h] [--root PATH] [--prog PROG] artifacts
+nvx-rs [-h] [--root PATH] [--prog PROG] egress compile PATH
+nvx-rs [-h] [--root PATH] [--prog PROG] sandbox [run|provision|start|exec|stop|deprovision] [OPTIONS]
 ```
 
 ```bash
 cd nvx-rs
 cargo build --release --features cli   # target/release/nvx-rs
 ```
+
+`nvx.py` runs the executable that `NVX_RS` names, else
+`nvx-rs/target/release/nvx-rs[.exe]` of its checkout, and else builds that one
+with Cargo first, with its output on standard error; see
+[Usage](../doc/usage.md#nvx-rs). It runs `nvx-rs --root REPOSITORY --prog
+"nvx.py sandbox" sandbox OPERATION OPTIONS` with the options that the user
+gave, in full, and the standard streams and exit status of the command;
+`nvx-rs egress compile PATH` and `nvx-rs --root REPOSITORY artifacts` for
+`nvx.py run`; and `nvx-rs egress compile PATH` for the egress scenarios of
+`nvx.py test-microvm`.
 
 Errors print `error: MESSAGE` to standard error and exit with status 1, as
 `nvx.py` reports a `ScriptError`. Usage errors print the parser's usage and
@@ -171,6 +176,13 @@ exits with status 0. Ctrl-C prints `Interrupted` and exits with status 130.
 `sandbox run` and `sandbox exec` exit with the status of OpenVMM or of the
 workload. Text ends its lines as Python's `print` ends them, with `\r\n` on
 Windows and `\n` elsewhere, while workload output passes through unchanged.
+
+`--prog PROG` names the program in usage, help, and error messages, `nvx-rs` by
+default. `nvx.py` passes its own name, so that the usage errors of
+`nvx.py sandbox` that `nvx-rs` reports, such as an invalid `--layer`, read
+`usage: nvx.py sandbox ...` and `nvx.py sandbox: error: ...` as they did before
+`nvx.py` delegated the command. The usage wraps for the name as `argparse` wraps
+it for 80 columns.
 
 ### Artifact root
 
@@ -266,8 +278,9 @@ before them.
   "exec", "status_code": STATUS}, "schema_version": 1}`. `stop` shuts the VM
   down and prints nothing. `deprovision` removes the state directory.
 
-The state directory and its files are those of `nvx.py`, so either
-implementation can operate a sandbox that the other provisioned or started:
+The state directory and its files are those that `nvx.py` wrote before it
+delegated to `nvx-rs`, so `nvx-rs` and an older `nvx.py` can each operate a
+sandbox that the other provisioned or started:
 
 | File | Contents |
 | --- | --- |
@@ -332,19 +345,19 @@ NVX_OPENVMM=target/debug/nvx-fake-openvmm \
 
 ### Golden scenarios
 
-`tests/fixtures/cli.json` holds scenarios that the fixture script records from
-`nvx.py sandbox`, run as a command with the root's OpenVMM a copy of
-`nvx-fake-openvmm`, and from the Python functions behind `egress compile` and
-`artifacts`: the option and usage errors, dry runs, one-shot runs, the
-lifecycles of sandboxes in every configuration format, and the refusals of the
-lifecycle operations. Each step records the exit status, standard output and
-error, and the state files, with the root, process IDs, and random identifiers
-as placeholders. Its `posix` and `windows` sections are recorded on each kind
-of host, and the script rewrites or checks the section of the host that runs it.
-It then also plays every scenario with `nvx-rs`, and each lifecycle with
-`nvx.py` and `nvx-rs` taking turns both ways, and fails if any step differs
-from `nvx.py`. `tests/cli.rs` replays the section of its host with `nvx-rs`,
-without Python.
+`tests/fixtures/cli.json` holds scenarios that the fixture script recorded from
+the Python implementation of `nvx.py sandbox`, run as a command with the root's
+OpenVMM a copy of `nvx-fake-openvmm`, and from the Python functions behind
+`egress compile` and `artifacts`: the option and usage errors, dry runs,
+one-shot runs, the lifecycles of sandboxes in every configuration format, and
+the refusals of the lifecycle operations. Each step records the exit status,
+standard output and error, and the state files, with the root, process IDs, and
+random identifiers as placeholders. Its `posix` and `windows` sections were
+recorded on each kind of host, where the script also played every scenario with
+`nvx-rs`, and each lifecycle with the Python implementation and `nvx-rs` taking
+turns both ways, and found no difference. `tests/cli.rs` replays the section of
+its host with `nvx-rs`, without Python; since `nvx.py sandbox` runs `nvx-rs`,
+these scenarios are its reference.
 
 ## Features
 
@@ -509,3 +522,16 @@ rustdoc with warnings denied, the minimum supported Rust version (1.89), and a
 macOS check. On Linux, it also lints, builds, and tests the guest binaries
 through `nvx.py`. `python3 scripts/nvx.py test-aci-edge-sandboxes --backend kvm`
 exercises the crate on a real hypervisor through `aci_edge_sandboxes`.
+
+`tests/managed_lifecycle.rs` is an ignored test of the managed lifecycle of a
+guest whose init hands the boot to the managed agent, on a real hypervisor:
+authenticated sessions and reconnects, request-scoped working directories and
+environments, the workload identity, timeouts, refused working directories,
+and stop, which `nvx::host::session` drives. `nvx.py test-microvm --scenario
+managed-lifecycle` builds OpenVMM's command line for its guest and backend,
+runs the test with Cargo, and checks the outcome report and the guest console
+that it leaves:
+
+```bash
+python3 ../scripts/nvx.py test-microvm --backend kvm --scenario managed-lifecycle
+```

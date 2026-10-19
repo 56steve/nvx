@@ -1,12 +1,14 @@
 //! Replays the scenarios of `tests/fixtures/cli.json` with the `nvx-rs` binary, and checks what
 //! `nvx-rs` adds to `nvx.py`.
 //!
-//! `scripts/nvx_rs_fixtures.py` records the scenarios from `nvx.py sandbox` and from the Python
-//! functions behind `nvx-rs egress compile` and `nvx-rs artifacts`, with `nvx-fake-openvmm` as
-//! OpenVMM, in a section for POSIX hosts and one for Windows. Each scenario runs here in a fresh
-//! root, with `nvx-rs --root ROOT`, and every step must exit with the recorded status, print the
-//! recorded output, and leave the recorded files, after the root, process IDs, and random
-//! identifiers are replaced with the placeholders that the script uses.
+//! The retired `scripts/nvx_rs_fixtures.py` recorded the scenarios from the Python
+//! implementation of `nvx.py sandbox`, which `nvx-rs` replaced, and from the Python functions
+//! behind `nvx-rs egress compile` and `nvx-rs artifacts`, with `nvx-fake-openvmm` as OpenVMM, in a
+//! section for POSIX hosts and one for Windows. Each scenario runs here in a fresh root, with
+//! `nvx-rs --root ROOT`, and every step must exit with the recorded status, print the recorded
+//! output, and leave the recorded files, after the root, process IDs, and random identifiers are
+//! replaced with the placeholders that the script used. Now that `nvx.py sandbox` runs `nvx-rs`,
+//! the recordings are its reference: a deliberate change of behavior updates them by hand.
 #![cfg(all(
     feature = "cli",
     feature = "testing",
@@ -519,6 +521,36 @@ fn start_requires_the_guest_features_of_layered_sandboxes() {
 }
 
 #[test]
+fn a_sandbox_of_a_retired_layer_role_does_not_start() {
+    // An older nvx.py provisioned sandboxes with runtime and custom layers, which a sandbox no
+    // longer takes (microsoft/nvx#556): their configuration still reads, and the launch refuses
+    // it before OpenVMM starts.
+    let root = populated_root();
+    let output = run(&root, &provision(&root, "retired", ""));
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    let config = root.path.join("retired").join("config.json");
+    let mut document: Value = serde_json::from_str(&fs::read_to_string(&config).unwrap()).unwrap();
+    document["layers"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "path": root.path.join("runtime.erofs").to_str().unwrap(),
+            "role": "runtime",
+            "uuid": "22222222-2222-2222-2222-222222222222",
+        }));
+    fs::write(&config, serde_json::to_string_pretty(&document).unwrap()).unwrap();
+    let output = run(&root, &lifecycle("start", &root, "retired"));
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        text(&output.stderr),
+        "error: a sandbox requires exactly one read-only distro layer\n"
+    );
+    assert!(!root.path.join("retired").join("runtime.json").exists());
+    let output = run(&root, &lifecycle("deprovision", &root, "retired"));
+    assert!(output.status.success(), "{}", text(&output.stderr));
+}
+
+#[test]
 fn artifacts_default_to_the_checkout_that_holds_the_executable() {
     let output = Command::new(NVX_RS)
         .arg("artifacts")
@@ -563,7 +595,7 @@ fn a_relative_openvmm_override_is_relative_to_the_working_directory() {
 
 #[test]
 fn top_level_usage_errors_exit_with_status_2() {
-    let usage = "usage: nvx-rs [-h] [--root PATH] {artifacts,egress,sandbox} ...\n";
+    let usage = "usage: nvx-rs [-h] [--root PATH] [--prog PROG] {artifacts,egress,sandbox} ...\n";
     for (arguments, message) in [
         (
             &[][..],
@@ -597,6 +629,82 @@ fn top_level_usage_errors_exit_with_status_2() {
         "usage: nvx-rs egress compile [-h] PATH\n\
          nvx-rs egress compile: error: the following arguments are required: PATH\n"
     );
+}
+
+/// What `nvx.py sandbox` printed for a refused `--workload-user` before it ran `nvx-rs`, as
+/// CPython 3.14 prints it for 80 columns: the usage of its parser, wrapped after its name.
+const NVX_PY_SANDBOX_USAGE_ERROR: &str = "\
+usage: nvx.py sandbox [-h] [--layer ROLE,PATH,EROFS_UUID] [--scratch SCRATCH]
+                      [--state-dir STATE_DIR] [--entrypoint ENTRYPOINT]
+                      [--arg SANDBOX_ARG] [--hostname HOSTNAME]
+                      [--workload-user UID:GID] [--memory-max MEMORY_MAX]
+                      [--pids-max PIDS_MAX] [--memory-mib MEMORY_MIB]
+                      [--timeout TIMEOUT] [--exec-timeout-ms EXEC_TIMEOUT_MS]
+                      [--cwd CWD] [--environment KEY=VALUE]
+                      [--environment-file PATH]
+                      [--inherit-default-environment]
+                      [--hypervisor {auto,whp,kvm,mshv}]
+                      [--mount GUEST_TARGET,HOST_PATH[,ro|rw]]
+                      [--mount-deny HOST_PATH] [--mount-allow HOST_PATH]
+                      [--mount-write HOST_PATH] [--mount-owner {vmm,caller}]
+                      [--net IPV4/PREFIX] [--network-profile {portable}]
+                      [--network-egress {allow,deny}]
+                      [--network-ingress {allow,deny}]
+                      [--network-egress-allow CIDR[:PROTOCOL[:PORT[-PORT]]]]
+                      [--network-egress-deny CIDR[:PROTOCOL[:PORT[-PORT]]]]
+                      [--network-egress-policy-file PATH]
+                      [--host-loopback {allow,deny}]
+                      [--network-proxy IPV4:TCP-PORT]
+                      [--host-loopback-forward HOST_LOOPBACK_FORWARD]
+                      [--outcome-report OUTCOME_REPORT] [--cmdline CMDLINE]
+                      [--dry-run]
+                      [{run,provision,start,exec,stop,deprovision}]
+nvx.py sandbox: error: argument --workload-user: --workload-user UID must be between 1 and \
+4294967295
+";
+
+#[test]
+fn messages_name_the_program_that_prog_names() {
+    // nvx.py passes its own name, so that usage errors read as they did before it delegated.
+    let output = Command::new(NVX_RS)
+        .args(["--prog", "nvx.py", "sandbox", "--workload-user", "0:0"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(text(&output.stderr), NVX_PY_SANDBOX_USAGE_ERROR);
+    assert!(output.stdout.is_empty());
+    // The usage wraps for the name as argparse wraps it: a long name takes a line of its own.
+    let long = "a-program-whose-name-is-long-enough-to-take-its-own-line.py";
+    let output = Command::new(NVX_RS)
+        .args(["--prog", long, "egress", "compile"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(
+        text(&output.stderr),
+        format!(
+            "usage: {long} egress compile\n       [-h] PATH\n\
+             {long} egress compile: error: the following arguments are required: PATH\n"
+        )
+    );
+    // The top-level parser names it as soon as it has read it, and so does the help.
+    let output = Command::new(NVX_RS)
+        .args(["--prog=nvx.py", "build"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(
+        text(&output.stderr),
+        "usage: nvx.py [-h] [--root PATH] [--prog PROG] {artifacts,egress,sandbox} ...\n\
+         nvx.py: error: argument command: invalid choice: 'build' (choose from 'artifacts', \
+         'egress', 'sandbox')\n"
+    );
+    let output = Command::new(NVX_RS)
+        .args(["--prog", "nvx.py", "artifacts", "--help"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(text(&output.stdout).starts_with("usage: nvx.py artifacts [-h]\n\nPrint the paths"));
 }
 
 #[cfg(unix)]
