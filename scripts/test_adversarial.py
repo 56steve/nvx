@@ -2799,7 +2799,9 @@ class ExecutorCloseTests(unittest.TestCase):
                         timeout=0.5,
                     )
                 started = time.monotonic()
-                with self.assertRaises(ScriptError):
+                # If the wrapper exited before request() flushed stdin, close() can see the
+                # buffered stdin data fail with BrokenPipeError instead of the stdout ScriptError.
+                with self.assertRaises((ScriptError, BrokenPipeError)):
                     client.close()
                 self.assertLess(time.monotonic() - started, 8.0)
             finally:
