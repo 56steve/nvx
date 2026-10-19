@@ -71,6 +71,16 @@ try {
     }
 }
 finally { $archive.Dispose(); $stream.Dispose() }
-& powershell.exe -NoProfile -ExecutionPolicy Bypass `
-    -File (Join-Path $root 'bootstrap-runner.ps1') -ConfigPath (Join-Path $root 'config.json')
-if ($LASTEXITCODE -ne 0) { throw "Runner bootstrap failed: $LASTEXITCODE" }
+$continuationTask = 'Nvx-Setup-GitHub-Runner'
+$bootstrapPath = Join-Path $root 'bootstrap-runner.ps1'
+$runnerConfigPath = Join-Path $root 'config.json'
+$action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument (
+    "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$bootstrapPath`" -ConfigPath `"$runnerConfigPath`""
+)
+$principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+$settings = New-ScheduledTaskSettingsSet -StartWhenAvailable `
+    -ExecutionTimeLimit (New-TimeSpan -Hours 4) -RestartCount 60 -RestartInterval (New-TimeSpan -Minutes 2)
+Register-ScheduledTask -TaskName $continuationTask -Action $action `
+    -Trigger (New-ScheduledTaskTrigger -AtStartup) -Principal $principal -Settings $settings -Force | Out-Null
+Start-ScheduledTask -TaskName $continuationTask
+Write-Output 'NVX_CLOUD_RUNNER_BOOTSTRAP_STAGED=1'

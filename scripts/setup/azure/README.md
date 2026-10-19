@@ -80,9 +80,11 @@ initialization; the continuation budget matches the runner's four-hour setup
 budget. Existing unmarked GPT disks with no data partition are preserved,
 not claimed as interrupted setup. A fresh marker is created only after verified
 initialization in that invocation.
-Bootstrap resumes through a SYSTEM startup task after disk or feature
-reboots, then removes the task after successful registration. GitHub jobs
-run as Network Service with access to Azure instance metadata blocked.
+The extension verifies and stages the package, then immediately starts an
+independent SYSTEM startup task so long-running bootstrap does not consume
+the extension's execution budget. Bootstrap resumes through that task after
+disk or feature reboots, then removes it after successful registration.
+GitHub jobs run as Network Service with access to Azure instance metadata blocked.
 Linux jobs run as `nvx-runner`, whose metadata block is installed before
 registration. The runner service requires the block on every start; root
 retains metadata access for bootstrap and token retrieval. Metadata-rule updates
@@ -148,6 +150,14 @@ the helper's interrupted-initialization marker; existing incompatible or
 ambiguous layouts fail closed. Bootstrap can enable virtualization features,
 re-register a runner, and reboot an instance. Never run it on a busy or
 shared runner without a separately approved maintenance window.
+
+On Windows, `NVX_CLOUD_RUNNER_BOOTSTRAP_STAGED=1` acknowledges only the
+scheduled-task handoff, not runner readiness. Follow
+`C:\ProgramData\NvxBootstrap\setup-runner.log` and the
+`Nvx-Setup-GitHub-Runner` task for bootstrap attempts. Operational failures emit
+`NVX_CLOUD_RUNNER_SETUP_FAILED=1`, log the error, and preserve a failing task
+result for retries; they do not change the already completed extension's
+staging result.
 
 `NVX_CLOUD_RUNNER_REBOOT_SCHEDULED=1` means setup will continue after boot,
 not that registration has succeeded. Require

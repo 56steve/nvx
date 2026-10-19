@@ -1066,9 +1066,60 @@ function Set-Acl {
     $script:trustedOwners++
 }
 $script:bootstraps = 0
+$script:taskRegistrations = 0
+$script:taskStarts = 0
+$script:handoffFailure = ''
 function powershell.exe {
     $script:bootstraps++
-    $global:LASTEXITCODE = 0
+    throw 'Installer executed bootstrap synchronously'
+}
+function New-ScheduledTaskAction {
+    param($Execute, $Argument)
+    $expected = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' +
+        (Join-Path $env:NVX_TEST_BOOTSTRAP 'bootstrap-runner.ps1') +
+        '" -ConfigPath "' + (Join-Path $env:NVX_TEST_BOOTSTRAP 'config.json') + '"'
+    if ($Execute -ne 'powershell.exe' -or $Argument -ne $expected) {
+        throw 'Scheduled bootstrap action does not use the extracted sources'
+    }
+    return [pscustomobject]@{ Execute = $Execute; Argument = $Argument }
+}
+function New-ScheduledTaskPrincipal {
+    param($UserId, $LogonType, $RunLevel)
+    if ($UserId -ne 'SYSTEM' -or $LogonType -ne 'ServiceAccount' -or $RunLevel -ne 'Highest') {
+        throw 'Bootstrap task does not run as privileged SYSTEM'
+    }
+    return [pscustomobject]@{ UserId = $UserId }
+}
+function New-ScheduledTaskTrigger {
+    param([switch]$AtStartup)
+    if (-not $AtStartup) { throw 'Bootstrap task cannot continue after reboot' }
+    return 'startup'
+}
+function New-ScheduledTaskSettingsSet {
+    param([switch]$StartWhenAvailable, $ExecutionTimeLimit, $RestartCount, $RestartInterval)
+    if (-not $StartWhenAvailable -or $ExecutionTimeLimit -ne (New-TimeSpan -Hours 4) -or
+        $RestartCount -ne 60 -or $RestartInterval -ne (New-TimeSpan -Minutes 2)) {
+        throw 'Bootstrap task lost its execution budget or retry settings'
+    }
+    return [pscustomobject]@{ ExecutionTimeLimit = $ExecutionTimeLimit }
+}
+function Register-ScheduledTask {
+    param($TaskName, $Action, $Trigger, $Principal, $Settings, [switch]$Force)
+    if ($TaskName -ne 'Nvx-Setup-GitHub-Runner' -or -not $Force -or
+        $Trigger -ne 'startup' -or $Principal.UserId -ne 'SYSTEM' -or
+        $script:trustedOwners -lt 1) {
+        throw 'Bootstrap was dispatched without trusted ownership and continuation'
+    }
+    if ($script:handoffFailure -eq 'registration') { throw 'fixture registration failure' }
+    $script:taskRegistrations++
+}
+function Start-ScheduledTask {
+    param($TaskName)
+    if ($TaskName -ne 'Nvx-Setup-GitHub-Runner' -or $script:taskRegistrations -lt 1) {
+        throw 'Bootstrap task was started before registration'
+    }
+    if ($script:handoffFailure -eq 'start') { throw 'fixture start failure' }
+    $script:taskStarts++
 }
 $scriptText = [IO.File]::ReadAllText($env:NVX_TEST_INSTALLER)
 $needle = '$root = ' + [char]39 + 'C:\ProgramData\NvxBootstrap' + [char]39
@@ -1077,9 +1128,12 @@ $replacement = '$root = ' + [char]39 +
 $source = $scriptText.Replace($needle, $replacement)
 $configPath = Join-Path $env:NVX_TEST_PACKAGE 'custom-data.json'
 New-Item -ItemType Directory -Path $env:NVX_TEST_BOOTSTRAP | Out-Null
-& ([scriptblock]::Create($source)) -ConfigPath $configPath
-if ($script:bootstraps -ne 1 -or $script:trustedOwners -ne 1) {
-    throw 'Installer did not establish ownership before dispatching bootstrap'
+$staging = @(& ([scriptblock]::Create($source)) -ConfigPath $configPath)
+if ($script:bootstraps -ne 0 -or $script:trustedOwners -ne 1 -or
+    $script:taskRegistrations -ne 1 -or $script:taskStarts -ne 1 -or
+    $staging -notcontains 'NVX_CLOUD_RUNNER_BOOTSTRAP_STAGED=1' -or
+    $staging -contains 'NVX_CLOUD_RUNNER_SETUP_COMPLETE=1') {
+    throw 'Installer did not stage bootstrap independently of extension execution'
 }
 $manifest = Get-Content -LiteralPath (Join-Path $env:NVX_TEST_PACKAGE 'manifest.json') -Raw |
     ConvertFrom-Json
@@ -1103,8 +1157,26 @@ catch {
     if ($_.Exception.Message -notmatch 'checksum mismatch') { throw }
     $rejected = $true
 }
-if (-not $rejected -or $script:bootstraps -ne 1) {
+if (-not $rejected -or $script:bootstraps -ne 0 -or
+    $script:taskRegistrations -ne 1 -or $script:taskStarts -ne 1) {
     throw 'Invalid package was not rejected before bootstrap'
+}
+foreach ($failure in @('registration', 'start')) {
+    $script:handoffFailure = $failure
+    $captured = [Collections.Generic.List[string]]::new()
+    $rejected = $false
+    try {
+        & ([scriptblock]::Create($source)) -ConfigPath $configPath |
+            ForEach-Object { $captured.Add([string]$_) }
+    }
+    catch {
+        if ($_.Exception.Message -ne "fixture $failure failure") { throw }
+        $rejected = $true
+    }
+    if (-not $rejected -or
+        $captured -contains 'NVX_CLOUD_RUNNER_BOOTSTRAP_STAGED=1') {
+        throw 'Installer reported successful staging after a task handoff failure'
+    }
 }
 $tokens = $null
 $errors = $null
@@ -1187,6 +1259,69 @@ Write-Output NVX_AZURE_WINDOWS_MOCK_OK
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn("NVX_AZURE_WINDOWS_MOCK_OK", result.stdout)
             self.assertEqual(len(manifest["guestFiles"]), 5)
+
+    def test_windows_bootstrap_reports_failure_after_scheduled_handoff(self):
+        script = r"""
+Set-StrictMode -Version 2.0
+$ErrorActionPreference = 'Stop'
+$tokens = $null
+$errors = $null
+$ast = [Management.Automation.Language.Parser]::ParseFile(
+    $env:NVX_TEST_WINDOWS_BOOTSTRAP, [ref]$tokens, [ref]$errors)
+if ($errors.Count -ne 0) { throw 'Windows bootstrap has parse errors' }
+$main = @($ast.EndBlock.Statements | Where-Object {
+    $_ -is [Management.Automation.Language.TryStatementAst]
+})
+if ($main.Count -ne 1) { throw 'Expected one top-level bootstrap operation' }
+$continuationTask = 'Nvx-Setup-GitHub-Runner'
+$ConfigPath = 'fixture-config.json'
+$script:stops = 0
+function Stop-Transcript { $script:stops++ }
+function New-ScheduledTaskAction { throw 'Bootstrap must reuse the staged task' }
+function powershell.exe { throw 'Unexpected disk or prerequisite operation' }
+function Get-Content {
+    param($LiteralPath, [switch]$Raw)
+    if ($LiteralPath -ne $ConfigPath -or -not $Raw) { throw 'Unexpected configuration read' }
+    if ($script:scenario -eq 'invalid-config') { return '{"os":"linux"}' }
+    return '{"os":"windows"}'
+}
+function Get-ScheduledTask {
+    param($TaskName)
+    if ($TaskName -ne $continuationTask) { throw 'Wrong continuation task' }
+    if ($script:scenario -ne 'missing-task') { return [pscustomobject]@{ TaskName = $TaskName } }
+}
+function Get-RunnerName { throw 'fixture metadata failure' }
+foreach ($scenario in @('invalid-config', 'missing-task', 'metadata-failure')) {
+    $script:scenario = $scenario
+    $captured = [Collections.Generic.List[string]]::new()
+    $rejected = $false
+    try {
+        & ([scriptblock]::Create($main[0].Extent.Text)) |
+            ForEach-Object { $captured.Add([string]$_) }
+    }
+    catch {
+        $expected = if ($scenario -eq 'invalid-config') {
+            'Expected a Windows runner configuration'
+        } elseif ($scenario -eq 'missing-task') {
+            'Runner continuation task is missing'
+        } else { 'fixture metadata failure' }
+        if ($_.Exception.Message -notlike "$expected*") { throw }
+        $rejected = $true
+    }
+    if (-not $rejected -or
+        $captured -notcontains 'NVX_CLOUD_RUNNER_SETUP_FAILED=1' -or
+        $captured -contains 'NVX_CLOUD_RUNNER_SETUP_COMPLETE=1') {
+        throw 'Bootstrap failure was swallowed or reported as completed staging'
+    }
+}
+if ($script:stops -ne 3) { throw 'Bootstrap did not close its transcript after failure' }
+"""
+        self.execute_windows(
+            script,
+            NVX_TEST_WINDOWS_BOOTSTRAP=str(
+                builder.ROOT / "windows/bootstrap-runner.ps1"
+            ),
+        )
 
     def test_windows_disk_selection_requires_exact_guest_lun(self):
         powershell = shutil.which("powershell.exe")

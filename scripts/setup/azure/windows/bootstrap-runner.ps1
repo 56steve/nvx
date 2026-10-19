@@ -6,8 +6,6 @@ param(
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
-$config = Get-Content -LiteralPath $ConfigPath -Raw | ConvertFrom-Json
-if ($config.os -ne 'windows') { throw 'Expected a Windows runner configuration.' }
 $stateRoot = 'C:\ProgramData\NvxBootstrap'
 $setupScript = Join-Path $stateRoot 'setup-windows-whp.ps1'
 $diskScript = Join-Path $stateRoot 'setup-data-disk.ps1'
@@ -205,20 +203,16 @@ function Get-RegistrationToken {
     }
 }
 
-$runnerName = Get-RunnerName
 New-Item -ItemType Directory -Path $stateRoot -Force | Out-Null
 Start-Transcript -Path (Join-Path $stateRoot 'setup-runner.log') -Append | Out-Null
 $registrationToken = $null
 try {
-    $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument (
-        "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -ConfigPath `"$ConfigPath`""
-    )
-    $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
-    $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable `
-        -ExecutionTimeLimit (New-TimeSpan -Hours 4) -RestartCount 60 -RestartInterval (New-TimeSpan -Minutes 2)
-    Register-ScheduledTask -TaskName $continuationTask -Action $action `
-        -Trigger (New-ScheduledTaskTrigger -AtStartup) -Principal $principal -Settings $settings -Force | Out-Null
-
+    $config = Get-Content -LiteralPath $ConfigPath -Raw | ConvertFrom-Json
+    if ($config.os -ne 'windows') { throw 'Expected a Windows runner configuration.' }
+    if (-not (Get-ScheduledTask -TaskName $continuationTask -ErrorAction SilentlyContinue)) {
+        throw 'Runner continuation task is missing; stage the package before starting bootstrap.'
+    }
+    $runnerName = Get-RunnerName
     $drive = $config.dataDisk.driveLetter
     if ($drive -eq $env:SystemDrive.TrimEnd(':')) { throw 'Data disk must not use the system drive letter.' }
     & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $diskScript `
@@ -308,6 +302,11 @@ try {
     if ($result -ne 0) { throw "Runner registration failed: $result; see setup-registration.log." }
     Unregister-ScheduledTask -TaskName $continuationTask -Confirm:$false -ErrorAction Stop
     Write-Output 'NVX_CLOUD_RUNNER_SETUP_COMPLETE=1'
+}
+catch {
+    Write-Output 'NVX_CLOUD_RUNNER_SETUP_FAILED=1'
+    Write-Error -ErrorRecord $_ -ErrorAction Continue
+    throw
 }
 finally {
     $registrationToken = $null
