@@ -2198,10 +2198,60 @@ if (-not $rejected) { throw 'Firewall creation failure was ignored' }
         config["benchmarkScratchDirectory"] = r"C:\scratch"
         with self.assertRaisesRegex(ValueError, "configured data drive"):
             builder.normalize_config(config)
+        for value in ("", False, 0):
+            with self.subTest(scratch=value):
+                invalid: dict[str, object] = dict(self.configuration("windows"))
+                invalid["benchmarkScratchDirectory"] = value
+                with self.assertRaisesRegex(ValueError, "benchmarkScratchDirectory"):
+                    builder.normalize_config(invalid)
         config = self.configuration("windows")
         config["runnerLabels"] = ["windows", "virtual-machine", "whp"]
         with self.assertRaisesRegex(ValueError, "runnerLabels must start"):
             builder.normalize_config(config)
+
+    def test_windows_default_scratch_uses_configured_data_drive(self):
+        for drive in ("f", "G"):
+            for include_null in (False, True):
+                with self.subTest(drive=drive, include_null=include_null):
+                    config = self.configuration("windows")
+                    config["dataDisk"]["driveLetter"] = drive
+                    config["runnerDirectory"] = (
+                        rf"{drive.upper()}:\nvx-benchmark-scratch2\runner"
+                    )
+                    raw: dict[str, object] = dict(config)
+                    raw.pop("benchmarkScratchDirectory")
+                    if include_null:
+                        raw["benchmarkScratchDirectory"] = None
+                    expected = rf"{drive.upper()}:\nvx-benchmark-scratch"
+                    normalized = builder.normalize_config(raw)
+                    self.assertEqual(
+                        normalized.get("benchmarkScratchDirectory"), expected
+                    )
+                    with tempfile.TemporaryDirectory() as temporary:
+                        builder.build_package(raw, temporary)
+                        with zipfile.ZipFile(
+                            Path(temporary) / "sources.zip"
+                        ) as archive:
+                            packaged = json.loads(archive.read("config.json"))
+                        self.assertEqual(
+                            packaged["benchmarkScratchDirectory"], expected
+                        )
+
+    def test_windows_default_scratch_rejects_runner_overlap(self):
+        for include_null in (False, True):
+            for directory in (
+                r"F:\nvx-benchmark-scratch",
+                r"f:\NVX-BENCHMARK-SCRATCH",
+                r"F:\nvx-benchmark-scratch\runner",
+            ):
+                with self.subTest(directory=directory, include_null=include_null):
+                    config: dict[str, object] = dict(self.configuration("windows"))
+                    config["runnerDirectory"] = directory
+                    config.pop("benchmarkScratchDirectory")
+                    if include_null:
+                        config["benchmarkScratchDirectory"] = None
+                    with self.assertRaisesRegex(ValueError, "runner installation"):
+                        builder.normalize_config(config)
 
     def test_windows_paths_reject_trailing_period_aliases(self):
         for field in ("runnerDirectory", "benchmarkScratchDirectory"):

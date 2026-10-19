@@ -56,7 +56,7 @@ class WindowsConfig(CommonConfig):
     os: Literal["windows"]
     runnerDirectory: str
     dataDisk: WindowsDisk
-    benchmarkScratchDirectory: str | None
+    benchmarkScratchDirectory: str
     sshDefaultShell: str
     publicKeys: list[str]
 
@@ -325,29 +325,25 @@ def normalize_config(config: object) -> LinuxConfig | WindowsConfig:
             "Windows runnerDirectory must not be inside an operating system directory"
         )
     scratch_value = values.get("benchmarkScratchDirectory")
-    scratch = (
-        windows_path(scratch_value, "benchmarkScratchDirectory")
-        if scratch_value is not None
-        else None
+    scratch = windows_path(
+        rf"{drive}:\nvx-benchmark-scratch" if scratch_value is None else scratch_value,
+        "benchmarkScratchDirectory",
     )
-    if scratch is not None and not scratch.upper().startswith(drive + ":\\"):
+    if not scratch.upper().startswith(drive + ":\\"):
         raise ValueError(
             "benchmarkScratchDirectory must be on the configured data drive"
         )
-    if scratch is not None:
-        runner_path = ntpath.normcase(directory)
-        scratch_path = ntpath.normcase(scratch)
-        work_path = ntpath.join(runner_path, "_work")
-        if (
-            scratch_path == runner_path
-            or scratch_path.startswith(runner_path + "\\")
-            or runner_path.startswith(scratch_path + "\\")
-        ) and not (
-            scratch_path == work_path or scratch_path.startswith(work_path + "\\")
-        ):
-            raise ValueError(
-                "benchmarkScratchDirectory must not overlap the runner installation outside _work"
-            )
+    runner_path = ntpath.normcase(directory)
+    scratch_path = ntpath.normcase(scratch)
+    work_path = ntpath.join(runner_path, "_work")
+    if (
+        scratch_path == runner_path
+        or scratch_path.startswith(runner_path + "\\")
+        or runner_path.startswith(scratch_path + "\\")
+    ) and not (scratch_path == work_path or scratch_path.startswith(work_path + "\\")):
+        raise ValueError(
+            "benchmarkScratchDirectory must not overlap the runner installation outside _work"
+        )
     default_shell = text(
         values.get("sshDefaultShell", "powershell"),
         "sshDefaultShell",

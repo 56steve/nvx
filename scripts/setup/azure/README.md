@@ -68,7 +68,9 @@ The owned interrupted-initialization recovery path remains separate.
 Windows uses WHP and defines `dataDisk.driveLetter`,
 `dataDisk.temporaryDriveFallback`, optional
 `benchmarkScratchDirectory` on the managed data volume, `sshDefaultShell`,
-and `publicKeys`. Scratch must neither contain the runner installation nor
+and `publicKeys`. Omitted or null scratch paths resolve to
+`<driveLetter>:\nvx-benchmark-scratch` before validation and are passed
+explicitly to setup. Scratch must neither contain the runner installation nor
 overlap it outside its writable `_work` subtree. Windows paths cannot contain
 trailing-period components or reserved DOS device basenames, including names
 with extensions. A nonempty public-key array becomes the configured
