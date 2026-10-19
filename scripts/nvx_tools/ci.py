@@ -406,6 +406,10 @@ OPENVMM_REQUIRED_MICROVM_TESTS = (
 OPENVMM_LINUX_TEST_FILTER = "test(openvmm) | test(ttrpc) | " + " | ".join(
     _exact_openvmm_test(test) for test in OPENVMM_REQUIRED_MICROVM_TESTS
 )
+# A nested test runs inside an L1 VM host whose test function, vm_host or a
+# variant, appears in its name. The Linux runners support neither nested
+# virtualization nor the aarch64-unknown-linux-musl archive of aarch64 hosts.
+OPENVMM_NESTED_TEST_EXCLUSION = " & !test(vm_host)"
 
 
 def _exclude_openvmm_tests(
@@ -426,6 +430,7 @@ OPENVMM_KVM_EXCLUDED_TESTS = (
 )
 OPENVMM_KVM_TEST_FILTER = _exclude_openvmm_tests(
     f"({OPENVMM_LINUX_TEST_FILTER})"
+    f"{OPENVMM_NESTED_TEST_EXCLUSION}"
     " & !test(no_vmbus_prepped_boot_no_vmbus_windows)"
     " & !test(windows_datacenter_core_2022_x64)"
     " & !test(virtio_net_windows)",
@@ -441,7 +446,8 @@ OPENVMM_MSHV_EXCLUDED_TESTS = (
     "multiarch::pcie::openvmm_linux_x64_pcie_save_restore",
 )
 OPENVMM_MSHV_TEST_FILTER = _exclude_openvmm_tests(
-    f"({OPENVMM_LINUX_TEST_FILTER}) & !test(windows_datacenter_core_2022_x64)",
+    f"({OPENVMM_LINUX_TEST_FILTER}){OPENVMM_NESTED_TEST_EXCLUSION}"
+    " & !test(windows_datacenter_core_2022_x64)",
     OPENVMM_MSHV_EXCLUDED_TESTS,
 )
 # ttrpc::test_ttrpc_interface stays on the Linux backends: it boots Linux

@@ -3474,6 +3474,8 @@ class CiTests(unittest.TestCase):
                     "test_ttrpc_interface",
                     ci.OPENVMM_TEST_FILTERS[backend],
                 )
+                self.assertIn("!test(vm_host)", ci.OPENVMM_TEST_FILTERS[backend])
+        self.assertNotIn("vm_host", ci.OPENVMM_TEST_FILTERS["whp"])
         self.assertEqual(ci.OPENVMM_WHP_EXCLUDED_TESTS, ())
         self.assertNotIn(
             "multiarch::openvmm_pcat_x64_windows_datacenter_core_2022_x64_boot_heavy",
