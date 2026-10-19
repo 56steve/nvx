@@ -27,19 +27,35 @@ which it runs entirely, and for the egress-policy and artifact steps of
 
 1. the executable that the `NVX_RS` environment variable names;
 2. `nvx-rs/target/release/nvx-rs`, or `nvx-rs.exe` on Windows, in the
-   checkout, where `cargo build --release` puts it; or else
+   checkout, where `cargo build --release` puts it, and where
+   [`download`](#download) installs the `nvx-rs` of a release; or else
 3. that executable, after it builds it from the repository root with
    `cargo build --release --locked --features cli --manifest-path
    nvx-rs/Cargo.toml --target-dir nvx-rs/target`, the Rust release that
    `rust-toolchain.toml` pins, and Cargo's output on standard error, so that
    it never mixes with the output of the command.
 
-Without `NVX_RS`, a built executable, or Cargo, such a command fails and names
+After `download`, `nvx.py` needs no Cargo: every release package ships
+`bin/nvx-rs`, or `bin/nvx-rs.exe`, which `download` installs when the
+release was built from the checkout's `nvx-rs` sources. Without `NVX_RS`, a
+built or installed executable, or Cargo, such a command fails and names
 these choices; [rustup](https://rustup.rs) installs Cargo. `nvx.py` rebuilds
 nothing on its own once the executable exists, so run the build command again,
 or delete the executable, after changing `nvx-rs`. The `managed-lifecycle`
 scenario of [`test-microvm`](#test-microvm) also needs Cargo, which runs its
 `nvx-rs` test.
+
+The provenance of the `nvx-rs` that `nvx.py` runs,
+`build/nvx-rs.provenance.json`, binds the SHA-256 of its executable to a
+digest of the `nvx-rs` sources that built it, the crate's manifest, lock
+file, build script, and `src/` tree and `rust-toolchain.toml`, and to the
+Rust release, target, and Cargo features of the build. `nvx.py` records it
+when it builds `nvx-rs`, `download` installs a release's, and
+[`record-nvx-rs-provenance`](#record-nvx-rs-provenance) records it for a
+build made otherwise. [`package`](#package) and the
+[adversarial executor](adversarial-testing.md#nvx-rs-on-the-target) refuse an
+`nvx-rs` that it does not describe as built from the checkout's sources, so a
+stale build never ships or runs unnoticed.
 
 ## Commands
 
@@ -56,6 +72,7 @@ scenario of [`test-microvm`](#test-microvm) also needs Cargo, which runs its
 | `verify-guest-determinism` | Rebuild Ubuntu guest artifacts twice and compare SHA-256 values. |
 | `build-openvmm` | Build the OpenVMM release binary. |
 | `record-openvmm-provenance` | Bind an existing OpenVMM binary to the pinned source revision. |
+| `record-nvx-rs-provenance` | Bind an existing `nvx-rs` executable to its sources, Rust release, target, and features. |
 | `materialize-kernel-provenance-inputs` | Write kernel provenance inputs from raw run-head blobs. |
 | `setup-cross-os-cache` | Install GNU tar and zstd for GitHub Actions cross-OS caches. |
 | `classify-ci-changes` | Select the CI suites that a list of changed files runs. |
@@ -334,6 +351,26 @@ already exist at `openvmm/target/release/openvmm` on POSIX or
 `openvmm/target/release/openvmm.exe` on Windows. The command fails if either
 prerequisite is missing.
 
+### `record-nvx-rs-provenance`
+
+```text
+python3 scripts/nvx.py record-nvx-rs-provenance [--target TARGET]
+```
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `--target TARGET` | the host target that `rustc -vV` reports | Rust target that built `nvx-rs`. |
+
+Records `build/nvx-rs.provenance.json` for the `nvx-rs` that `nvx.py` runs
+without building it, the one that `NVX_RS` names or else
+`nvx-rs/target/release/nvx-rs[.exe]`; see [nvx-rs](#nvx-rs). The record binds
+the executable's SHA-256 to the digest of this checkout's `nvx-rs` sources,
+the Rust release that `rust-toolchain.toml` pins, the target, and the `cli`
+feature, so record it right after building `nvx-rs` from this checkout. For
+`x86_64-unknown-linux-musl`, the target of the Linux release packages, the
+executable must be static. CI's NVX CLI jobs record the builds that they hand
+to the packages, and `nvx.py` records the builds that it makes itself.
+
 ### `build`
 
 ```text
@@ -591,7 +628,22 @@ checkout to install a newer release.
 
 Installing a release replaces the packaged guest artifacts under `build/` and
 removes any known guest artifact that the release does not declare, such as the
-Azure Linux guest that source-inclusive packages omit.
+Azure Linux guest that source-inclusive packages omit. It installs the
+packaged OpenVMM at `openvmm/target/release/openvmm[.exe]` and the packaged
+`nvx-rs` at `nvx-rs/target/release/nvx-rs[.exe]`, both executable, with their
+provenance in `build/`, so that [`run`](#run) and [`sandbox`](#sandbox) need
+no Cargo.
+
+`download` installs the packaged `nvx-rs` only when its provenance describes
+the build of the checkout's `nvx-rs` sources that `nvx.py` runs, with the Rust
+release that the checkout pins, the release target, and the `cli` feature,
+because `nvx.py` runs that executable without rebuilding it. A fallback
+release built from other `nvx-rs` sources, and a release from before packages
+shipped `nvx-rs`, still install everything else: `download` then removes any
+earlier `nvx-rs` and its provenance and reports why, and `nvx.py` builds
+`nvx-rs` from the checkout with Cargo when a command needs it; see
+[nvx-rs](#nvx-rs). A package whose `nvx-rs` does not match its own provenance
+fails the download before it replaces anything.
 
 Windows release downloads support WHP. Linux release downloads support KVM
 and MSHV. `download` first uses `GH_TOKEN` or `GITHUB_TOKEN` when configured.
@@ -1168,7 +1220,13 @@ python3 scripts/nvx.py package
 | `--binary-only` | Stage binaries only; publish corresponding source separately. |
 | `--force` | Replace an existing staging destination. |
 
-Exactly one of `--include-source` and `--binary-only` is required. See
+Exactly one of `--include-source` and `--binary-only` is required. Every
+package ships `nvx-rs` with its provenance, which must describe
+`nvx-rs/target/release/nvx-rs[.exe]` as built from the checkout's sources
+for the release target of the host's operating system:
+`x86_64-unknown-linux-musl`, a static executable, on Linux, and
+`x86_64-pc-windows-msvc` on Windows; see
+[`record-nvx-rs-provenance`](#record-nvx-rs-provenance). See
 [Package and source delivery](distribution.md) for release procedures and
 source-publication requirements.
 

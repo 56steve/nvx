@@ -127,7 +127,11 @@ input configuration, generated configuration, and output hash; bind the
 initramfs and package manifest to the pinned Alpine inputs, Rust guest inputs,
 and source files; and bind OpenVMM to the exact clean gitlink revision and
 executable hash. Packaging rejects missing, dirty, stale, or mismatched
-provenance.
+provenance. `build/nvx-rs.provenance.json` likewise binds the `nvx-rs`
+executable that `nvx.py` runs to the digest of its sources and its build's
+Rust release, target, and features; `nvx.py` writes it when it builds
+`nvx-rs`, and [`record-nvx-rs-provenance`](usage.md#record-nvx-rs-provenance)
+writes it for a build made otherwise.
 
 Ubuntu adds:
 
@@ -326,13 +330,20 @@ and SHA-256. The debug kernel is a CI artifact and is never packaged. The
 
 Release packaging needs the OpenVMM binary, the guest artifacts in the layout
 below, and the OpenVMM, kernel, and Alpine initramfs provenance sidecars, so run
-`build-openvmm` and `build-guest --guest all` first. A source-inclusive package
+`build-openvmm` and `build-guest --guest all` first. It also needs the release
+build of `nvx-rs` at `nvx-rs/target/release/nvx-rs[.exe]`, a static
+`x86_64-unknown-linux-musl` executable on Linux and an
+`x86_64-pc-windows-msvc` one on Windows, with the provenance that
+[`record-nvx-rs-provenance`](usage.md#record-nvx-rs-provenance) writes to
+`build/nvx-rs.provenance.json`. A source-inclusive package
 does not need the Azure Linux artifacts. Packaging stages and verifies a
 complete output before replacing an existing `dist/` version, which requires
 `--force`. Its `SOURCE-MANIFEST.json` records the package version and exact
 hashes for OpenVMM, Linux, the generated kernel config, each packaged guest
 initramfs and its package manifest, and the Ubuntu distro layer and its
-manifest. Its `guest_rust` section pins Rust 1.95.0 and
+manifest. Its `nvx_rs` section records the `nvx-rs` executable's SHA-256, the
+digest of the `nvx-rs` sources that built it, and the build's Rust release,
+target, and features. Its `guest_rust` section pins Rust 1.95.0 and
 `x86_64-unknown-linux-musl`, and each guest's `guest_sources` includes
 `nvx-rs` and `rust-toolchain.toml`. The OpenVMM section advertises microVM ABI 2,
 control-session protocol 1, and contract
@@ -343,6 +354,7 @@ A binary release directory has this layout:
 
 ```text
 bin/openvmm[.exe]
+bin/nvx-rs[.exe]
 guest/vmlinux
 guest/vmlinux.config
 guest/initramfs.cpio.gz
@@ -356,6 +368,7 @@ guest/initramfs-azurelinux.cpio.gz.packages.json
 provenance/openvmm.provenance.json
 provenance/initramfs.provenance.json
 provenance/vmlinux.provenance.json
+provenance/nvx-rs.provenance.json
 licenses/LICENSE-OPENVMM
 licenses/COPYING-LINUX
 LICENSE

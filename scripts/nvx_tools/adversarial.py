@@ -638,6 +638,8 @@ def _validate_artifact_evidence(value: object) -> None:
         "openvmm",
         "kernel_provenance",
         "openvmm_provenance",
+        "nvx_rs",
+        "nvx_rs_provenance",
     }
     artifacts = _exact_object(
         value,

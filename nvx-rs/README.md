@@ -159,10 +159,22 @@ cd nvx-rs
 cargo build --release --features cli   # target/release/nvx-rs
 ```
 
+Every NVX release package ships the release build as `bin/nvx-rs`, a static
+`x86_64-unknown-linux-musl` executable, in the Linux packages, and as
+`bin/nvx-rs.exe`, with a static C runtime, in the Windows package, with its
+provenance in `provenance/nvx-rs.provenance.json`
+([Package and source delivery](../doc/distribution.md)). The `nvx-rs` of an
+extracted release runs as is: without `--root`, it uses the release that holds
+it; see [Artifact root](#artifact-root).
+[`nvx.py download`](../doc/usage.md#download) installs it in a checkout of the
+sources that built it, so that `nvx.py` runs it without Cargo.
+
 `nvx.py` runs the executable that `NVX_RS` names, else
 `nvx-rs/target/release/nvx-rs[.exe]` of its checkout, and else builds that one
 with Cargo first, with its output on standard error; see
-[Usage](../doc/usage.md#nvx-rs). It runs `nvx-rs --root REPOSITORY --prog
+[Usage](../doc/usage.md#nvx-rs). `nvx.py` records the provenance of the builds
+that it makes and installs, and `nvx.py record-nvx-rs-provenance` that of a
+build made otherwise. It runs `nvx-rs --root REPOSITORY --prog
 "nvx.py sandbox" sandbox OPERATION OPTIONS` with the options that the user
 gave, in full, and the standard streams and exit status of the command;
 `nvx-rs egress compile PATH` and `nvx-rs --root REPOSITORY artifacts` for
@@ -455,7 +467,10 @@ Without `NVX_BUNDLE_DIR`, the build script downloads the release package that
 Windows packages are ZIP archives, which need bsdtar (Windows' own `tar`) or
 `unzip`. Every staged file must match the source's `SHA256SUMS`, a download
 must match its pinned digest, and the release must declare the control contract
-of `nvx::contract`. The build scripts of dependents receive the staged
+of `nvx::contract`. The build script extracts and verifies only the files that
+the bundle holds, so a release that ships `bin/nvx-rs[.exe]` stages as the
+older release that `artifacts.json` pins, which doesn't. The build scripts of
+dependents receive the staged
 directory as `DEP_NVX_ARTIFACTS_DIR` and can ship it next to their executables
 as `nvx/`.
 

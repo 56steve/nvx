@@ -29,7 +29,7 @@ import urllib.error
 import urllib.request
 import uuid
 import zipfile
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Mapping
 from pathlib import Path, PurePosixPath
 from typing import cast
 from unittest.mock import MagicMock, call, patch
@@ -252,6 +252,15 @@ def _write_release_fixture(
     ):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(path.name.encode("ascii"))
+    # The release build of nvx-rs, static as the Linux packages require, and
+    # its provenance.
+    nvx_rs_binary = root / "nvx-rs" / "target" / "release" / nvx_rs.binary_path().name
+    nvx_rs_binary.parent.mkdir(parents=True, exist_ok=True)
+    nvx_rs_binary.write_bytes(_elf_file())
+    (build_dir / nvx_rs.PROVENANCE_NAME).write_text(
+        json.dumps(nvx_rs.provenance_record(nvx_rs_binary, nvx_rs.release_target())),
+        encoding="utf-8",
+    )
     for artifact_name, manifest_name in (
         (
             "initramfs-ubuntu.cpio.gz",
@@ -455,6 +464,7 @@ def _write_release_fixture(
         "source": source_dir,
         "openvmm": openvmm_dir,
         "binary": binary,
+        "nvx_rs": nvx_rs_binary,
     }
     return paths, kernel_inputs, revision
 
@@ -2098,11 +2108,14 @@ class NvxRsTests(unittest.TestCase):
                 patch("shutil.which", return_value="cargo"),
                 patch("subprocess.run", side_effect=build) as run,
                 patch.object(nvx_rs, "_stderr_target", return_value=2),
+                patch.object(nvx_rs, "record_provenance") as record,
                 contextlib.redirect_stdout(stdout),
                 contextlib.redirect_stderr(stderr),
             ):
                 self.assertEqual(nvx_rs.require_binary(), binary)
         run.assert_called_once()
+        # The build records the provenance of what it built, for the host.
+        record.assert_called_once_with()
         self.assertEqual(
             run.call_args.args[0],
             (
@@ -2161,6 +2174,184 @@ class NvxRsTests(unittest.TestCase):
         ):
             self.assertIn(expected, message)
 
+    def test_release_targets_follow_the_operating_system(self):
+        self.assertEqual(
+            nvx_rs.release_target(),
+            "x86_64-pc-windows-msvc"
+            if os.name == "nt"
+            else "x86_64-unknown-linux-musl",
+        )
+        self.assertEqual(nvx_rs.FEATURES, ("cli",))
+        # BUILD_COMMAND builds the features that releases ship.
+        features = nvx_rs.BUILD_COMMAND.index("--features") + 1
+        self.assertEqual(nvx_rs.BUILD_COMMAND[features].split(","), ["cli"])
+
+    def test_source_digest_covers_the_build_inputs_in_any_line_endings(self):
+        relative = [
+            path.relative_to(BuildConstants.REPO_ROOT).as_posix()
+            for path in nvx_rs.source_files()
+        ]
+        self.assertEqual(relative, sorted(relative))
+        for name in (
+            "nvx-rs/Cargo.toml",
+            "nvx-rs/Cargo.lock",
+            "nvx-rs/build.rs",
+            "nvx-rs/src/bin/nvx-rs.rs",
+            "rust-toolchain.toml",
+        ):
+            self.assertIn(name, relative)
+        # Tests, documentation, and the bundled release pin build no part of
+        # the executable.
+        for name in relative:
+            self.assertNotRegex(name, r"^nvx-rs/(tests/|README\.md$|artifacts\.json$)")
+        self.assertEqual(nvx_rs.source_sha256(), nvx_rs.source_sha256())
+
+        with tempfile.TemporaryDirectory() as temporary:
+            checkouts = [Path(temporary) / "lf", Path(temporary) / "crlf"]
+            for checkout, newline in zip(checkouts, (b"\n", b"\r\n"), strict=True):
+                for name in (
+                    "nvx-rs/Cargo.toml",
+                    "nvx-rs/Cargo.lock",
+                    "nvx-rs/build.rs",
+                    "nvx-rs/src/lib.rs",
+                    "nvx-rs/src/bin/nvx-rs.rs",
+                    "rust-toolchain.toml",
+                ):
+                    path = checkout / name
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(newline.join((name.encode(), b"line", b"")))
+            digest = nvx_rs.source_sha256(checkouts[0])
+            # Checkouts differ only in line endings, as on Windows.
+            self.assertEqual(nvx_rs.source_sha256(checkouts[1]), digest)
+            source = checkouts[0] / "nvx-rs" / "src" / "lib.rs"
+            source.write_bytes(b"changed\n")
+            self.assertNotEqual(nvx_rs.source_sha256(checkouts[0]), digest)
+            # A new source file changes the digest too.
+            (checkouts[1] / "nvx-rs" / "src" / "new.rs").write_bytes(b"")
+            self.assertNotEqual(nvx_rs.source_sha256(checkouts[1]), digest)
+            shutil.rmtree(checkouts[1] / "nvx-rs" / "src")
+            with self.assertRaisesRegex(
+                common.ScriptError, "nvx-rs source directory not found"
+            ):
+                nvx_rs.source_sha256(checkouts[1])
+
+    def test_host_target_is_the_host_of_the_pinned_rust(self):
+        version = (
+            "rustc 1.95.0 (abc 2026-01-01)\nbinary: rustc\n"
+            "host: x86_64-unknown-linux-gnu\nrelease: 1.95.0\n"
+        )
+        with patch(
+            "subprocess.run",
+            return_value=subprocess.CompletedProcess(["rustc"], 0, version, ""),
+        ) as run:
+            self.assertEqual(nvx_rs.host_target(), "x86_64-unknown-linux-gnu")
+        self.assertEqual(run.call_args.args[0], ("rustc", "-vV"))
+        # From the repository root, so that rust-toolchain.toml applies.
+        self.assertEqual(run.call_args.kwargs["cwd"], BuildConstants.REPO_ROOT)
+        for result in (
+            subprocess.CompletedProcess(["rustc"], 1, "", "no rustc"),
+            subprocess.CompletedProcess(["rustc"], 0, "release: 1.95.0\n", ""),
+        ):
+            with (
+                self.subTest(result=result),
+                patch("subprocess.run", return_value=result),
+                self.assertRaisesRegex(common.ScriptError, "host target"),
+            ):
+                nvx_rs.host_target()
+        with (
+            patch("subprocess.run", side_effect=OSError("missing")),
+            self.assertRaisesRegex(common.ScriptError, "failed to run rustc"),
+        ):
+            nvx_rs.host_target()
+
+    def test_provenance_binds_the_executable_that_nvx_py_runs(self):
+        linux = nvx_rs.RELEASE_TARGETS["linux"]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            binary = root / "nvx-rs"
+            other = root / "other-nvx-rs"
+            provenance = root / "build" / nvx_rs.PROVENANCE_NAME
+            with (
+                patch.object(nvx_rs, "binary_path", return_value=binary),
+                patch.object(nvx_rs, "provenance_path", return_value=provenance),
+                patch.object(nvx_rs, "host_target", return_value="host-triple"),
+            ):
+                with (
+                    _without_nvx_rs_variable(),
+                    self.assertRaisesRegex(
+                        common.ScriptError,
+                        f"nvx-rs is not built at {re.escape(str(binary))}",
+                    ),
+                ):
+                    nvx_rs.record_provenance()
+                self.assertFalse(provenance.exists())
+
+                binary.write_bytes(b"nvx-rs")
+                with _without_nvx_rs_variable():
+                    self.assertEqual(nvx_rs.record_provenance(), provenance)
+                self.assertEqual(
+                    json.loads(provenance.read_text(encoding="utf-8")),
+                    {
+                        "format": 1,
+                        "source_sha256": nvx_rs.source_sha256(),
+                        "toolchain": GuestRustBuildConstants.TOOLCHAIN,
+                        "target": "host-triple",
+                        "features": ["cli"],
+                        "executable_sha256": common.sha256_file(binary),
+                    },
+                )
+
+                # The executable that NVX_RS names is the one that nvx.py
+                # runs, and so the one that the record describes.
+                other.write_bytes(b"other nvx-rs")
+                with patch.dict(os.environ, {nvx_rs.VARIABLE: str(other)}):
+                    nvx_rs.record_provenance("x86_64-pc-windows-msvc")
+                record = json.loads(provenance.read_text(encoding="utf-8"))
+                self.assertEqual(record["target"], "x86_64-pc-windows-msvc")
+                self.assertEqual(record["executable_sha256"], common.sha256_file(other))
+
+                # A record for the Linux release target needs the static
+                # executable that such a build gives.
+                with (
+                    _without_nvx_rs_variable(),
+                    self.assertRaisesRegex(
+                        common.ScriptError, f"invalid {linux} nvx-rs executable"
+                    ),
+                ):
+                    nvx_rs.record_provenance(linux)
+                binary.write_bytes(
+                    _elf_file(((1, b"code"), (3, b"/lib/ld-musl.so.1\0")), elf_type=3)
+                )
+                with (
+                    _without_nvx_rs_variable(),
+                    self.assertRaisesRegex(common.ScriptError, "is not static"),
+                ):
+                    nvx_rs.record_provenance(linux)
+                binary.write_bytes(_elf_file(elf_type=3))
+                with _without_nvx_rs_variable():
+                    nvx_rs.record_provenance(linux)
+                self.assertEqual(
+                    json.loads(provenance.read_text(encoding="utf-8"))["target"],
+                    linux,
+                )
+
+    def test_record_command_records_the_provenance(self):
+        args = nvx.parse_args(
+            ["record-nvx-rs-provenance", "--target", "x86_64-unknown-linux-musl"]
+        )
+        self.assertEqual(args.target, "x86_64-unknown-linux-musl")
+        self.assertIsNone(nvx.parse_args(["record-nvx-rs-provenance"]).target)
+        recorded = Path("build") / nvx_rs.PROVENANCE_NAME
+        with (
+            patch.object(nvx_rs, "record_provenance", return_value=recorded) as record,
+            contextlib.redirect_stdout(io.StringIO()) as stdout,
+        ):
+            args.handler(args)
+        record.assert_called_once_with("x86_64-unknown-linux-musl")
+        self.assertEqual(
+            stdout.getvalue(), f">> recorded the provenance of nvx-rs in {recorded}\n"
+        )
+
     def test_failed_builds_report_cargo(self):
         with tempfile.TemporaryDirectory() as temporary:
             binary = Path(temporary) / "nvx-rs"
@@ -2174,10 +2365,12 @@ class NvxRsTests(unittest.TestCase):
                     patch.object(nvx_rs, "binary_path", return_value=binary),
                     patch("shutil.which", return_value="cargo"),
                     patch("subprocess.run", return_value=_completed(returncode)),
+                    patch.object(nvx_rs, "record_provenance") as record,
                     contextlib.redirect_stderr(io.StringIO()),
                     self.assertRaisesRegex(common.ScriptError, message),
                 ):
                     nvx_rs.require_binary()
+                record.assert_not_called()
 
     def test_commands_name_the_program_and_the_repository_root(self):
         binary = Path("bin") / "nvx-rs"
@@ -3393,6 +3586,31 @@ class CiConfigurationTests(unittest.TestCase):
                 self.assertIn("os: [ubuntu-latest, windows-latest]", definition)
                 self.assertIn(f"uses: ./.github/actions/{action}", definition)
         self.assertEqual(ci.REQUIRED_CI_RESULT_ENVIRONMENTS["nvx-rs"], "NVX_RS_RESULT")
+
+    def test_nvx_rs_bundles_a_release_in_the_current_layout(self):
+        # The bundled feature stages what a release holds besides nvx-rs, so
+        # its synthetic release ships nvx-rs and its provenance, as releases
+        # do, and the pinned older release, which doesn't, stages as well.
+        action = (
+            BuildConstants.REPO_ROOT
+            / ".github"
+            / "actions"
+            / "check-nvx-rs"
+            / "action.yml"
+        ).read_text(encoding="utf-8")
+        script = _composite_action_script(action, "Check artifact bundling")
+        for member in (
+            "bin/${executable}",
+            "bin/${cli}",
+            "guest/vmlinux",
+            "guest/initramfs.cpio.gz",
+            f"provenance/{nvx_rs.PROVENANCE_NAME}",
+        ):
+            with self.subTest(member=member):
+                self.assertIn(f'"${{bundle}}/{member}"', script)
+                self.assertIn(member, script.split("sha256sum", 1)[1])
+        self.assertIn("cli=nvx-rs.exe", script)
+        self.assertIn("--features bundled artifacts", script)
 
     def test_nvx_rs_builds_and_checks_every_guest_binary_for_musl(self):
         crate = BuildConstants.REPO_ROOT / "nvx-rs"
@@ -5072,45 +5290,82 @@ python3() {
                             f"        needs.{cli}.result == 'success' &&\n", job
                         )
 
-    def test_ci_hands_nvx_rs_to_the_microvm_jobs(self):
+    def test_ci_hands_nvx_rs_to_the_microvm_and_platform_jobs(self):
         # nvx.py runs nvx-rs for its sandbox command and for run's egress and
         # artifact steps, and finds it where `cargo build --release` puts it.
-        # Each NVX CLI job builds it for its OS, tests with it, and hands it to
-        # the microVM jobs, as the OpenVMM build jobs hand over OpenVMM.
-        workflows = BuildConstants.REPO_ROOT / ".github" / "workflows"
-        workflow = (workflows / "ci.yml").read_text(encoding="utf-8")
-        microvm = (workflows / "run-nvx-microvm-tests.yml").read_text(encoding="utf-8")
-        executables = {
+        # Each NVX CLI job builds it for its OS, records its provenance, tests
+        # with it, and hands both to the microVM jobs, which run it, and to the
+        # platform jobs, which package it, as the OpenVMM build jobs hand
+        # over OpenVMM.
+        github = BuildConstants.REPO_ROOT / ".github"
+        workflow = (github / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        microvm = (github / "workflows" / "run-nvx-microvm-tests.yml").read_text(
+            encoding="utf-8"
+        )
+        platform = (github / "workflows" / "run-platform.yml").read_text(
+            encoding="utf-8"
+        )
+        package = (github / "actions" / "package-release" / "action.yml").read_text(
+            encoding="utf-8"
+        )
+        builds = {
             "nvx-cli-linux": (
-                "nvx-rs-linux-musl-executable",
+                "nvx-rs-linux-musl",
                 "nvx-rs/target/release/nvx-rs",
+                "x86_64-unknown-linux-musl",
             ),
             "nvx-cli-windows": (
-                "nvx-rs-windows-msvc-executable",
+                "nvx-rs-windows-msvc",
                 "nvx-rs/target/release/nvx-rs.exe",
+                "x86_64-pc-windows-msvc",
             ),
         }
+        current = builds["nvx-cli-windows" if os.name == "nt" else "nvx-cli-linux"]
         self.assertEqual(
             nvx_rs.binary_path().relative_to(BuildConstants.REPO_ROOT).as_posix(),
-            executables["nvx-cli-windows" if os.name == "nt" else "nvx-cli-linux"][1],
+            current[1],
         )
-        for job_name, (artifact, path) in executables.items():
+        # Packages ship the build for the release target of their OS.
+        self.assertEqual(nvx_rs.release_target(), current[2])
+        self.assertEqual(
+            set(nvx_rs.RELEASE_TARGETS.values()),
+            {target for _, _, target in builds.values()},
+        )
+        for job_name, (artifact, path, target) in builds.items():
             with self.subTest(job=job_name):
                 job = _workflow_job(workflow, job_name)
                 build = _workflow_step(workflow, job_name, "Build nvx-rs")
+                record = _workflow_step(workflow, job_name, "Record nvx-rs provenance")
                 upload = _workflow_step(workflow, job_name, "Upload nvx-rs executable")
+                provenance = _workflow_step(
+                    workflow, job_name, "Upload nvx-rs provenance"
+                )
                 for option in ("--release", "--locked", "--features cli"):
                     self.assertIn(option, build)
                 self.assertIn("--manifest-path nvx-rs/Cargo.toml", build)
-                self.assertIn(f"name: {artifact}\n", upload)
+                self.assertIn(
+                    f"record-nvx-rs-provenance --target {target}",
+                    _yaml_scalar(record, "run"),
+                )
+                self.assertIn(f"name: {artifact}-executable\n", upload)
                 self.assertIn(f"path: {path}\n", upload)
-                self.assertIn("if-no-files-found: error", upload)
-                # The CLI tests run with the build, and only a validated build
-                # leaves the job.
+                self.assertIn(f"name: {artifact}-provenance\n", provenance)
+                self.assertIn(f"path: build/{nvx_rs.PROVENANCE_NAME}\n", provenance)
+                for step in (upload, provenance):
+                    self.assertIn("if-no-files-found: error", step)
+                # The build is recorded as it is built, the CLI tests run with
+                # it, and only a validated build leaves the job.
                 validate = job.index("uses: ./.github/actions/validate-nvx")
-                self.assertLess(job.index("- name: Build nvx-rs"), validate)
+                self.assertLess(
+                    job.index("- name: Build nvx-rs"),
+                    job.index("- name: Record nvx-rs provenance"),
+                )
+                self.assertLess(job.index("- name: Record nvx-rs provenance"), validate)
                 self.assertGreater(
                     job.index("- name: Upload nvx-rs executable"), validate
+                )
+                self.assertGreater(
+                    job.index("- name: Upload nvx-rs provenance"), validate
                 )
         # Self-contained executables run on every self-hosted runner.
         linux = _workflow_step(workflow, "nvx-cli-linux", "Build nvx-rs")
@@ -5144,34 +5399,36 @@ python3() {
             *ci.REQUIRED_CI_MICROVM_TEST_JOBS,
             *ci.REQUIRED_CI_MICROVM_DEBUG_JOBS,
             *ci.REQUIRED_CI_MICROVM_DEBUG_PUSH_JOBS,
+            *ci.REQUIRED_CI_PLATFORM_JOBS,
         ):
             cli = "nvx-cli-windows" if job_name.endswith("-whp") else "nvx-cli-linux"
             with self.subTest(consumer=job_name):
                 job = _workflow_job(workflow, job_name)
                 self.assertIn(
-                    "uses: ./.github/workflows/run-nvx-microvm-tests.yml", job
+                    "uses: ./.github/workflows/run-platform.yml"
+                    if job_name in ci.REQUIRED_CI_PLATFORM_JOBS
+                    else "uses: ./.github/workflows/run-nvx-microvm-tests.yml",
+                    job,
                 )
                 self.assertEqual(
                     re.findall(r"^      nvx-rs-artifact: (\S+)$", job, re.MULTILINE),
-                    [executables[cli][0]],
+                    [builds[cli][0]],
                 )
-        for job_name in ci.REQUIRED_CI_PLATFORM_JOBS:
-            with self.subTest(consumer=job_name):
-                self.assertNotIn("nvx-rs", _workflow_job(workflow, job_name))
 
-        self.assertIn(
-            "      nvx-rs-artifact:\n"
-            "        description: Name of the nvx-rs executable artifact for the "
-            "runner's OS\n"
-            "        required: true\n"
-            "        type: string\n",
-            microvm,
-        )
+        for configuration in (microvm, platform):
+            self.assertIn(
+                "      nvx-rs-artifact:\n"
+                "        description: Base name of the nvx-rs artifacts for the "
+                "runner's OS\n"
+                "        required: true\n"
+                "        type: string\n",
+                configuration,
+            )
         download = microvm.index("      - name: Download nvx-rs executable\n")
         self.assertIn(
             "        uses: actions/download-artifact@v8\n"
             "        with:\n"
-            "          name: ${{ inputs.nvx-rs-artifact }}\n"
+            "          name: ${{ inputs.nvx-rs-artifact }}-executable\n"
             "          path: nvx-rs/target/release\n",
             microvm[download:],
         )
@@ -5184,6 +5441,67 @@ python3() {
         )
         self.assertLess(download, chmod)
         self.assertLess(chmod, microvm.index("scripts/nvx.py"))
+
+        # The platform jobs package nvx-rs with its provenance: they download
+        # both where nvx.py package looks for them, before they package.
+        self.assertIn(
+            "          nvx-rs-artifact: ${{ inputs.nvx-rs-artifact }}",
+            _workflow_step(platform, "run", "Package release").splitlines(),
+        )
+        steps = _composite_action_steps(package)
+        names = [_yaml_scalar(step, "name") for step in steps]
+        executable = steps[names.index("Download nvx-rs executable")]
+        provenance = steps[names.index("Download nvx-rs provenance")]
+        self.assertIn("name: ${{ inputs.nvx-rs-artifact }}-executable\n", executable)
+        self.assertIn("path: nvx-rs/target/release\n", executable)
+        self.assertIn("name: ${{ inputs.nvx-rs-artifact }}-provenance\n", provenance)
+        self.assertIn("path: build\n", provenance)
+        self.assertIn(
+            "run: chmod +x nvx-rs/target/release/nvx-rs",
+            steps[names.index("Make nvx-rs executable")],
+        )
+        for name in ("Package Linux release", "Package Windows release"):
+            self.assertLess(
+                names.index("Download nvx-rs executable"), names.index(name)
+            )
+            self.assertLess(
+                names.index("Download nvx-rs provenance"), names.index(name)
+            )
+            self.assertLess(names.index("Make nvx-rs executable"), names.index(name))
+
+    def test_pull_requests_package_releases_that_only_dev_uploads(self):
+        # Pull requests package and archive each platform's release, which
+        # proves that it builds; only a dev push uploads it for publication.
+        github = BuildConstants.REPO_ROOT / ".github"
+        platform = (github / "workflows" / "run-platform.yml").read_text(
+            encoding="utf-8"
+        )
+        package = (github / "actions" / "package-release" / "action.yml").read_text(
+            encoding="utf-8"
+        )
+        step = _workflow_step(platform, "run", "Package release")
+        self.assertIn("        if: inputs.package-release\n", step)
+        self.assertNotIn("github.event_name", _yaml_scalar(step, "if"))
+        self.assertIn(
+            "          upload: ${{ github.event_name == 'push' && "
+            "github.ref == 'refs/heads/dev' }}",
+            step,
+        )
+        steps = _composite_action_steps(package)
+        names = [_yaml_scalar(step, "name") for step in steps]
+        for name, operating_system in (
+            ("Upload Linux release", "runner.os != 'Windows'"),
+            ("Upload Windows release", "runner.os == 'Windows'"),
+        ):
+            with self.subTest(step=name):
+                self.assertEqual(
+                    _yaml_scalar(steps[names.index(name)], "if"),
+                    f"{operating_system} && inputs.upload == 'true'",
+                )
+        for name in ("Package Linux release", "Package Windows release"):
+            self.assertNotIn("upload", _yaml_scalar(steps[names.index(name)], "if"))
+            self.assertIn("--binary-only", steps[names.index(name)])
+            self.assertIn("archive-release", steps[names.index(name)])
 
     def test_ci_preserves_failed_openvmm_test_diagnostics(self):
         workflow = (
@@ -7048,6 +7366,93 @@ class BuildConstantsTests(unittest.TestCase):
         ):
             with self.subTest(component=component):
                 self.assertIn(component, notices)
+
+    def test_nvx_rs_third_party_notices_cover_every_linked_crate(self):
+        # The crates of `cargo tree --locked --features cli -e normal` for the
+        # release targets, x86_64-unknown-linux-musl and x86_64-pc-windows-msvc:
+        # what bin/nvx-rs[.exe] links, and serde_derive with the crates that it
+        # runs on while nvx-rs builds.
+        shipped = {
+            "bitflags",
+            "block-buffer",
+            "cfg-if",
+            "cpufeatures",
+            "crypto-common",
+            "digest",
+            "generic-array",
+            "getrandom",
+            "itoa",
+            "libc",
+            "memchr",
+            "memoffset",
+            "nix",
+            "proc-macro2",
+            "quote",
+            "serde",
+            "serde_core",
+            "serde_derive",
+            "serde_json",
+            "sha2",
+            "syn",
+            "typenum",
+            "unicode-ident",
+            "windows-link",
+            "windows-sys",
+            "zmij",
+        }
+        # Build scripts, other targets, and the tests.
+        unshipped = {
+            "autocfg",
+            "cfg_aliases",
+            "errno",
+            "fastrand",
+            "linux-raw-sys",
+            "once_cell",
+            "r-efi",
+            "rustix",
+            "tempfile",
+            "version_check",
+        }
+        lock = (BuildConstants.REPO_ROOT / "nvx-rs" / "Cargo.lock").read_text(
+            encoding="utf-8"
+        )
+        versions = dict(
+            re.findall(
+                r'^\[\[package\]\]\nname = "([^"]+)"\nversion = "([^"]+)"$',
+                lock,
+                re.MULTILINE,
+            )
+        )
+        # A new dependency is one or the other, and a shipped one needs notices.
+        self.assertEqual(set(versions) - {"nvx-rs"}, shipped | unshipped)
+        self.assertFalse(shipped & unshipped)
+        notices = (BuildConstants.REPO_ROOT / "THIRD_PARTY_NOTICES.md").read_text(
+            encoding="utf-8"
+        )
+        rows = {
+            line.split(" | ", 1)[0]: line
+            for line in notices.splitlines()
+            if line.startswith("| ")
+        }
+        for name in sorted(shipped):
+            with self.subTest(crate=name):
+                row = rows[f"| Rust `{name}` crate {versions[name]}"]
+                self.assertIn("bin/nvx-rs", row)
+                self.assertIn("nvx-rs/Cargo.lock", row)
+        # The runtimes that the release executables link statically.
+        for component, location in (
+            ("| Rust core and standard libraries", "`bin/nvx-rs`"),
+            ("| Rust `compiler_builtins`", "`bin/nvx-rs[.exe]`"),
+            ("| musl libc", "`bin/nvx-rs` of the `linux-kvm` and `linux-mshv`"),
+            ("| LLVM `libunwind`", "the Linux `bin/nvx-rs`"),
+            (
+                "| Microsoft C runtime: the Visual C++ runtime and the Universal C "
+                "Runtime",
+                "`bin/nvx-rs.exe`",
+            ),
+        ):
+            with self.subTest(component=component):
+                self.assertIn(location, rows[component])
 
     def test_project_source_archive_excludes_the_nvx_rs_target(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -16207,6 +16612,17 @@ def _missing_release() -> urllib.error.HTTPError:
 
 
 class ReleaseTests(unittest.TestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        # Installing a release replaces or removes nvx-rs; no test may do
+        # either to the nvx-rs of this checkout.
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.nvx_rs_path = Path(temporary.name) / nvx_rs.binary_path().name
+        patcher = patch.object(nvx_rs, "binary_path", return_value=self.nvx_rs_path)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_alpine_source_validation_rejects_malformed_manifest(self):
         with tempfile.TemporaryDirectory() as temporary:
             source_dir = Path(temporary)
@@ -16927,6 +17343,7 @@ class ReleaseTests(unittest.TestCase):
                     side_effect=artifact_path,
                 ),
                 patch.object(release, "openvmm_binary_path", return_value=binary),
+                patch.object(nvx_rs, "binary_path", return_value=paths["nvx_rs"]),
                 patch.object(
                     release,
                     "kernel_provenance_inputs",
@@ -16947,6 +17364,14 @@ class ReleaseTests(unittest.TestCase):
                 )
 
             self.assertTrue((destination / "bin" / binary.name).is_file())
+            # The release build of nvx-rs ships beside OpenVMM, under the name
+            # that nvx.py download installs on this OS.
+            packaged_nvx_rs = destination / "bin" / nvx_rs.binary_path().name
+            self.assertEqual(packaged_nvx_rs.read_bytes(), paths["nvx_rs"].read_bytes())
+            self.assertEqual(
+                sorted(path.name for path in (destination / "bin").iterdir()),
+                sorted((binary.name, packaged_nvx_rs.name)),
+            )
             for name in ReleaseBuildConstants.GUEST_ARTIFACT_NAMES:
                 self.assertTrue((destination / "guest" / name).is_file())
             self.assertTrue(
@@ -17008,7 +17433,44 @@ class ReleaseTests(unittest.TestCase):
                     / AzureLinuxBuildConstants.PACKAGE_MANIFEST_NAME
                 ),
             )
-            common.verify_sha256_sums(destination)
+            # The package ships the provenance of nvx-rs, which binds it to the
+            # sources that build it, the Rust release, the target, and the
+            # features, and the manifest records them with its digest.
+            packaged_provenance = json.loads(
+                (destination / "provenance" / nvx_rs.PROVENANCE_NAME).read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(
+                packaged_provenance,
+                {
+                    "format": 1,
+                    "source_sha256": nvx_rs.source_sha256(root),
+                    "toolchain": GuestRustBuildConstants.TOOLCHAIN,
+                    "target": nvx_rs.release_target(),
+                    "features": ["cli"],
+                    "executable_sha256": common.sha256_file(packaged_nvx_rs),
+                },
+            )
+            self.assertEqual(
+                packaged_provenance["source_sha256"], nvx_rs.source_sha256()
+            )
+            self.assertEqual(
+                manifest["nvx_rs"],
+                {
+                    "executable_sha256": common.sha256_file(packaged_nvx_rs),
+                    "features": ["cli"],
+                    "source_sha256": nvx_rs.source_sha256(root),
+                    "target": nvx_rs.release_target(),
+                    "toolchain": GuestRustBuildConstants.TOOLCHAIN,
+                },
+            )
+            inventory = dict(common.verify_sha256_sums(destination).files)
+            self.assertEqual(
+                inventory[f"bin/{packaged_nvx_rs.name}"],
+                common.sha256_file(paths["nvx_rs"]),
+            )
+            self.assertIn(f"provenance/{nvx_rs.PROVENANCE_NAME}", inventory)
             self.assertIn("binary-only package", stderr.getvalue())
 
     def test_source_package_omits_azure_linux_artifacts(self):
@@ -17070,6 +17532,7 @@ class ReleaseTests(unittest.TestCase):
                 side_effect=artifact_path,
             ),
             patch.object(release, "openvmm_binary_path", return_value=binary),
+            patch.object(nvx_rs, "binary_path", return_value=paths["nvx_rs"]),
             patch.object(
                 release,
                 "kernel_provenance_inputs",
@@ -17121,12 +17584,98 @@ class ReleaseTests(unittest.TestCase):
             (destination / "SOURCE-MANIFEST.json").read_text(encoding="utf-8")
         )
         self.assertNotIn("azurelinux", manifest)
+        # Source-inclusive packages ship nvx-rs too; the project source
+        # archive holds the sources that build it.
+        packaged_nvx_rs = destination / "bin" / paths["nvx_rs"].name
+        self.assertEqual(packaged_nvx_rs.read_bytes(), paths["nvx_rs"].read_bytes())
+        self.assertEqual(
+            manifest["nvx_rs"]["executable_sha256"],
+            common.sha256_file(packaged_nvx_rs),
+        )
         common.verify_sha256_sums(destination)
         self.assertIn("omits the Azure Linux guest", stderr.getvalue())
+
+    def test_packages_require_the_release_build_of_nvx_rs(self):
+        # A package ships the nvx-rs build for the release target of its
+        # operating system, with the provenance that binds it to the current
+        # sources. On Linux, that build is the static musl executable that
+        # runs on every host, which a build for the host's own target is not.
+        linux = nvx_rs.RELEASE_TARGETS["linux"]
+        windows = nvx_rs.RELEASE_TARGETS["windows"]
+        dynamic = _elf_file(
+            ((1, b"code"), (3, b"/lib64/ld-linux-x86-64.so.2\0")), elf_type=3
+        )
+        mismatch = "from the current nvx-rs sources"
+        with tempfile.TemporaryDirectory() as temporary:
+            build_dir = Path(temporary) / "build"
+            build_dir.mkdir()
+            executable = Path(temporary) / "nvx-rs"
+            provenance = build_dir / nvx_rs.PROVENANCE_NAME
+            cases: tuple[
+                tuple[str, bytes | None, dict[str, object] | None, str | None], ...
+            ] = (
+                (linux, _elf_file(), {}, None),
+                (linux, _elf_file(elf_type=3), {}, None),
+                (windows, b"MZ", {}, None),
+                (linux, dynamic, {}, "is not static"),
+                (linux, b"MZ", {}, f"invalid {linux} nvx-rs executable"),
+                (linux, _elf_file(), {"target": windows}, f"as a {linux} build"),
+                (windows, b"MZ", {"target": linux}, f"as a {windows} build"),
+                (linux, _elf_file(), {"source_sha256": "0" * 64}, mismatch),
+                (linux, _elf_file(), {"executable_sha256": "0" * 64}, mismatch),
+                (linux, _elf_file(), {"toolchain": "1.0.0"}, mismatch),
+                (linux, _elf_file(), {"features": []}, mismatch),
+                (linux, _elf_file(), {"format": 2}, mismatch),
+                (linux, _elf_file(), None, "nvx-rs build provenance not found"),
+                (linux, None, {}, "nvx-rs release executable not found"),
+            )
+            for target, contents, changes, error in cases:
+                with self.subTest(target=target, changes=changes, error=error):
+                    executable.unlink(missing_ok=True)
+                    provenance.unlink(missing_ok=True)
+                    if contents is not None:
+                        executable.write_bytes(contents)
+                    if contents is not None and changes is not None:
+                        record = nvx_rs.provenance_record(executable, target)
+                        record.update(changes)
+                        provenance.write_text(json.dumps(record), encoding="utf-8")
+                    with (
+                        patch.object(nvx_rs, "binary_path", return_value=executable),
+                        patch.object(nvx_rs, "release_target", return_value=target),
+                        patch.object(
+                            release, "artifact_path", side_effect=build_dir.joinpath
+                        ),
+                    ):
+                        if error is None:
+                            self.assertEqual(
+                                release._require_release_nvx_rs(),
+                                (
+                                    executable,
+                                    provenance,
+                                    json.loads(provenance.read_text(encoding="utf-8")),
+                                ),
+                            )
+                            continue
+                        with self.assertRaisesRegex(
+                            common.ScriptError, re.escape(error)
+                        ) as raised:
+                            release._require_release_nvx_rs()
+                    if error == "is not static":
+                        # The message names the build that packages need.
+                        self.assertIn(
+                            f"--features cli --manifest-path nvx-rs/Cargo.toml "
+                            f"--target {linux}",
+                            str(raised.exception),
+                        )
+                    if error == mismatch:
+                        self.assertIn(
+                            "nvx.py record-nvx-rs-provenance", str(raised.exception)
+                        )
 
     def test_runtime_provenance_validation_uses_required_paths(self):
         build_dir = Path("build")
         binary = Path("openvmm")
+        nvx_rs_binary = Path("nvx-rs")
 
         def artifact_path(name: str) -> Path:
             return build_dir / name
@@ -17137,6 +17686,7 @@ class ReleaseTests(unittest.TestCase):
         with (
             patch.object(release, "artifact_path", side_effect=artifact_path),
             patch.object(release, "openvmm_binary_path", return_value=binary),
+            patch.object(nvx_rs, "find_binary", return_value=nvx_rs_binary),
             patch.object(
                 release,
                 "require_file",
@@ -17145,11 +17695,12 @@ class ReleaseTests(unittest.TestCase):
             patch.object(release, "_validate_openvmm_provenance") as openvmm,
             patch.object(release, "_validate_kernel_provenance"),
             patch.object(release, "_validate_initramfs_provenance"),
+            patch.object(release, "_validate_nvx_rs_provenance") as nvx_rs_check,
         ):
             release.validate_runtime_artifact_provenance()
 
         self.assertEqual(
-            require.call_args_list[-3:],
+            require.call_args_list[-4:],
             [
                 call(
                     build_dir / OpenVMMBuildConstants.PROVENANCE_NAME,
@@ -17163,11 +17714,83 @@ class ReleaseTests(unittest.TestCase):
                     build_dir / InitramfsBuildConstants.PROVENANCE_NAME,
                     "initramfs build provenance",
                 ),
+                call(build_dir / nvx_rs.PROVENANCE_NAME, "nvx-rs build provenance"),
             ],
         )
         openvmm.assert_called_once_with(
             binary, build_dir / OpenVMMBuildConstants.PROVENANCE_NAME
         )
+        # The nvx-rs that nvx.py runs, of any target.
+        nvx_rs_check.assert_called_once_with(
+            nvx_rs_binary, build_dir / nvx_rs.PROVENANCE_NAME, target=None
+        )
+
+    def test_runtime_provenance_validation_rejects_a_stale_nvx_rs(self):
+        # nvx.py never rebuilds an nvx-rs that exists, so one left from
+        # before a change of its sources, or that its provenance does not
+        # describe, would run. The adversarial executor validates it first.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            build_dir = root / "build"
+            build_dir.mkdir()
+            provenance = build_dir / nvx_rs.PROVENANCE_NAME
+            other = root / "other-nvx-rs"
+            other.write_bytes(b"another nvx-rs")
+
+            def require_file(path: Path, _description: str) -> Path:
+                return path
+
+            def validate() -> None:
+                with (
+                    patch.object(
+                        release, "artifact_path", side_effect=build_dir.joinpath
+                    ),
+                    patch.object(release, "openvmm_binary_path"),
+                    patch.object(release, "require_file", side_effect=require_file),
+                    patch.object(release, "_validate_openvmm_provenance"),
+                    patch.object(release, "_validate_kernel_provenance"),
+                    patch.object(release, "_validate_initramfs_provenance"),
+                ):
+                    release.validate_runtime_artifact_provenance()
+
+            self.nvx_rs_path.write_bytes(b"nvx-rs")
+            provenance.write_text(
+                json.dumps(
+                    nvx_rs.provenance_record(
+                        self.nvx_rs_path, "x86_64-unknown-linux-gnu"
+                    )
+                ),
+                encoding="utf-8",
+            )
+            with _without_nvx_rs_variable():
+                validate()
+                # A rebuild after the record.
+                self.nvx_rs_path.write_bytes(b"rebuilt nvx-rs")
+                with self.assertRaisesRegex(
+                    common.ScriptError, "does not describe .* as a build from the"
+                ):
+                    validate()
+            # The nvx-rs that NVX_RS names is the one that nvx.py runs.
+            with (
+                patch.dict(os.environ, {nvx_rs.VARIABLE: str(other)}),
+                self.assertRaisesRegex(common.ScriptError, re.escape(str(other))),
+            ):
+                validate()
+            provenance.write_text(
+                json.dumps(nvx_rs.provenance_record(other, "x86_64-unknown-linux-gnu")),
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {nvx_rs.VARIABLE: str(other)}):
+                validate()
+            # A record of other sources.
+            record = nvx_rs.provenance_record(other, "x86_64-unknown-linux-gnu")
+            record["source_sha256"] = "0" * 64
+            provenance.write_text(json.dumps(record), encoding="utf-8")
+            with (
+                patch.dict(os.environ, {nvx_rs.VARIABLE: str(other)}),
+                self.assertRaisesRegex(common.ScriptError, "current nvx-rs sources"),
+            ):
+                validate()
 
     def test_package_rejects_dirty_openvmm_provenance(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -17493,6 +18116,7 @@ class ReleaseTests(unittest.TestCase):
                         "openvmm_binary_path",
                         return_value=paths["binary"],
                     ),
+                    patch.object(nvx_rs, "binary_path", return_value=paths["nvx_rs"]),
                     patch.object(
                         release,
                         "kernel_provenance_inputs",
@@ -17522,6 +18146,14 @@ class ReleaseTests(unittest.TestCase):
                 )
 
     def test_failed_staged_verification_preserves_existing_release(self):
+        for corrupted, error in (
+            ("binary", "packaged OpenVMM executable"),
+            ("nvx_rs", "packaged nvx-rs executable does not match its build"),
+        ):
+            with self.subTest(corrupted=corrupted):
+                self._check_failed_staged_verification(corrupted, error)
+
+    def _check_failed_staged_verification(self, corrupted: str, error: str) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             paths, kernel_inputs, revision = _write_release_fixture(root)
@@ -17538,7 +18170,7 @@ class ReleaseTests(unittest.TestCase):
 
             def corrupt_packaged_binary(source: Path, target: Path) -> None:
                 original_copy(source, target)
-                if target.name == paths["binary"].name:
+                if target.name == paths[corrupted].name:
                     target.write_bytes(b"corrupt")
 
             with (
@@ -17556,6 +18188,7 @@ class ReleaseTests(unittest.TestCase):
                     "openvmm_binary_path",
                     return_value=paths["binary"],
                 ),
+                patch.object(nvx_rs, "binary_path", return_value=paths["nvx_rs"]),
                 patch.object(
                     release,
                     "kernel_provenance_inputs",
@@ -17572,10 +18205,7 @@ class ReleaseTests(unittest.TestCase):
                     side_effect=corrupt_packaged_binary,
                 ),
                 patch("sys.stderr", io.StringIO()),
-                self.assertRaisesRegex(
-                    common.ScriptError,
-                    "packaged OpenVMM executable",
-                ),
+                self.assertRaisesRegex(common.ScriptError, error),
             ):
                 release.package_release(
                     version="1.0.0",
@@ -17721,59 +18351,98 @@ class ReleaseTests(unittest.TestCase):
             )
             self.assertFalse(staging.exists())
 
+    def _runtime_release_archive(
+        self,
+        root: Path,
+        *,
+        nvx_rs_contents: bytes | None,
+        nvx_rs_provenance: Mapping[str, object] | None,
+    ) -> Path:
+        """Write the archive of a binary package for this OS, with or without
+        nvx-rs, and with or without its provenance, which `nvx_rs_provenance`
+        changes from the record of a build of this checkout's sources."""
+        package_root = root / "package" / "nvx-1.2.3-test"
+        binary_name = "openvmm.exe" if os.name == "nt" else "openvmm"
+        binary = package_root / "bin" / binary_name
+        binary.parent.mkdir(parents=True)
+        binary.write_bytes(b"openvmm")
+        for name in ReleaseBuildConstants.GUEST_ARTIFACT_NAMES:
+            guest = package_root / "guest" / name
+            guest.parent.mkdir(parents=True, exist_ok=True)
+            guest.write_bytes(name.encode("ascii"))
+        for name in (
+            OpenVMMBuildConstants.PROVENANCE_NAME,
+            KernelBuildConstants.PROVENANCE_NAME,
+            InitramfsBuildConstants.PROVENANCE_NAME,
+        ):
+            provenance = package_root / "provenance" / name
+            provenance.parent.mkdir(parents=True, exist_ok=True)
+            provenance.write_bytes(name.encode("ascii"))
+        if nvx_rs_contents is not None:
+            packaged_nvx_rs = package_root / "bin" / self.nvx_rs_path.name
+            packaged_nvx_rs.write_bytes(nvx_rs_contents)
+            # The installed nvx-rs is executable, whatever mode the archive
+            # records.
+            packaged_nvx_rs.chmod(0o644)
+            if nvx_rs_provenance is not None:
+                record = nvx_rs.provenance_record(
+                    packaged_nvx_rs, nvx_rs.release_target()
+                )
+                record.update(nvx_rs_provenance)
+                (package_root / "provenance" / nvx_rs.PROVENANCE_NAME).write_text(
+                    json.dumps(record), encoding="utf-8"
+                )
+        (package_root / "SOURCE-MANIFEST.json").write_text(
+            json.dumps({"linux": {}, "alpine": {}, "ubuntu": {}, "azurelinux": {}}),
+            encoding="utf-8",
+        )
+        common.write_sha256_sums(package_root)
+        if os.name == "nt":
+            archive_path = root / "nvx-1.2.3-windows-whp.zip"
+            with zipfile.ZipFile(archive_path, "w") as package:
+                for path in package_root.rglob("*"):
+                    package.write(path, path.relative_to(package_root.parent))
+        else:
+            archive_path = root / "nvx-1.2.3-linux-kvm.tar.gz"
+            with tarfile.open(archive_path, "w:gz") as package:
+                package.add(package_root, arcname=package_root.name)
+        return archive_path
+
+    def _install_runtime_archive(self, root: Path, archive_path: Path) -> str:
+        """Install the archive into the runtime directory below `root`, and
+        return what the installer printed."""
+        binary_name = "openvmm.exe" if os.name == "nt" else "openvmm"
+        with (
+            patch.object(
+                release,
+                "artifact_path",
+                side_effect=(root / "runtime" / "build").joinpath,
+            ),
+            patch.object(
+                release,
+                "openvmm_binary_path",
+                return_value=root / "runtime" / "openvmm" / binary_name,
+            ),
+            contextlib.redirect_stdout(io.StringIO()) as stdout,
+        ):
+            release._install_release_archive(archive_path)
+        return stdout.getvalue()
+
     def test_release_archive_installs_runtime_layout(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            package_root = root / "package" / "nvx-1.2.3-test"
-            binary_name = "openvmm.exe" if os.name == "nt" else "openvmm"
-            binary = package_root / "bin" / binary_name
-            binary.parent.mkdir(parents=True)
-            binary.write_bytes(b"openvmm")
-            for name in ReleaseBuildConstants.GUEST_ARTIFACT_NAMES:
-                guest = package_root / "guest" / name
-                guest.parent.mkdir(parents=True, exist_ok=True)
-                guest.write_bytes(name.encode("ascii"))
-            for name in (
-                OpenVMMBuildConstants.PROVENANCE_NAME,
-                KernelBuildConstants.PROVENANCE_NAME,
-                InitramfsBuildConstants.PROVENANCE_NAME,
-            ):
-                provenance = package_root / "provenance" / name
-                provenance.parent.mkdir(parents=True, exist_ok=True)
-                provenance.write_bytes(name.encode("ascii"))
-            common.write_sha256_sums(package_root)
-
-            if os.name == "nt":
-                archive_path = root / "nvx-1.2.3-windows-whp.zip"
-                with zipfile.ZipFile(archive_path, "w") as package:
-                    for path in package_root.rglob("*"):
-                        package.write(path, path.relative_to(package_root.parent))
-            else:
-                archive_path = root / "nvx-1.2.3-linux-kvm.tar.gz"
-                with tarfile.open(archive_path, "w:gz") as package:
-                    package.add(package_root, arcname=package_root.name)
-
+            archive_path = self._runtime_release_archive(
+                root, nvx_rs_contents=b"nvx-rs", nvx_rs_provenance={}
+            )
             build_dir = root / "runtime" / "build"
             binary_destination = (
-                root / "runtime" / "openvmm" / "target" / "release" / binary_name
+                root
+                / "runtime"
+                / "openvmm"
+                / ("openvmm.exe" if os.name == "nt" else "openvmm")
             )
 
-            def artifact_path(name: str) -> Path:
-                return build_dir / name
-
-            with (
-                patch.object(
-                    release,
-                    "artifact_path",
-                    side_effect=artifact_path,
-                ),
-                patch.object(
-                    release,
-                    "openvmm_binary_path",
-                    return_value=binary_destination,
-                ),
-            ):
-                release._install_release_archive(archive_path)
+            output = self._install_runtime_archive(root, archive_path)
 
             self.assertEqual(binary_destination.read_bytes(), b"openvmm")
             for name in ReleaseBuildConstants.GUEST_ARTIFACT_NAMES:
@@ -17790,6 +18459,130 @@ class ReleaseTests(unittest.TestCase):
                     (build_dir / name).read_bytes(),
                     name.encode("ascii"),
                 )
+            # nvx-rs, which this checkout's sources built, goes where nvx.py
+            # finds it, executable, with its provenance beside OpenVMM's.
+            self.assertEqual(self.nvx_rs_path.read_bytes(), b"nvx-rs")
+            self.assertEqual(output, "")
+            if os.name != "nt":
+                self.assertEqual(self.nvx_rs_path.stat().st_mode & 0o777, 0o755)
+                self.assertEqual(binary_destination.stat().st_mode & 0o777, 0o755)
+            installed_provenance = build_dir / nvx_rs.PROVENANCE_NAME
+            self.assertEqual(
+                json.loads(installed_provenance.read_text(encoding="utf-8")),
+                nvx_rs.provenance_record(self.nvx_rs_path, nvx_rs.release_target()),
+            )
+            release._validate_nvx_rs_provenance(
+                self.nvx_rs_path, installed_provenance, target=None
+            )
+            # nvx.py then runs it without Cargo.
+            with (
+                _without_nvx_rs_variable(),
+                patch("shutil.which", return_value=None),
+                patch("subprocess.run") as run,
+            ):
+                self.assertEqual(nvx_rs.require_binary(), self.nvx_rs_path)
+            run.assert_not_called()
+
+    def test_release_archive_leaves_nvx_rs_of_other_sources_to_cargo(self):
+        # nvx.py runs the nvx-rs that download installs without rebuilding it,
+        # so download installs only the build of the checkout's nvx-rs sources
+        # that nvx.py runs, and removes an earlier one and its provenance, so
+        # that nvx.py builds nvx-rs from the checkout instead. Releases that
+        # predate nvx-rs install too.
+        name = self.nvx_rs_path.name
+        archive_name = (
+            "nvx-1.2.3-windows-whp.zip"
+            if os.name == "nt"
+            else "nvx-1.2.3-linux-kvm.tar.gz"
+        )
+        target = nvx_rs.release_target()
+        other_target = (
+            "x86_64-unknown-linux-gnu"
+            if target == nvx_rs.RELEASE_TARGETS["linux"]
+            else nvx_rs.RELEASE_TARGETS["linux"]
+        )
+        other_build = (
+            f"the bin/{name} of {archive_name} is not the {target} build of this "
+            "checkout's nvx-rs sources that nvx.py runs"
+        )
+        cases: tuple[tuple[str, bytes | None, dict[str, object] | None, str], ...] = (
+            ("older release", None, None, f"{archive_name} ships no bin/{name}"),
+            (
+                "no provenance",
+                b"nvx-rs",
+                None,
+                f"{archive_name} ships no provenance for its bin/{name}",
+            ),
+            ("other sources", b"nvx-rs", {"source_sha256": "0" * 64}, other_build),
+            ("other Rust release", b"nvx-rs", {"toolchain": "1.0.0"}, other_build),
+            ("other features", b"nvx-rs", {"features": ["cli", "x"]}, other_build),
+            ("other target", b"nvx-rs", {"target": other_target}, other_build),
+            ("other format", b"nvx-rs", {"format": 2}, other_build),
+        )
+        for case, contents, provenance, reason in cases:
+            with (
+                self.subTest(case=case),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                root = Path(temporary)
+                archive_path = self._runtime_release_archive(
+                    root, nvx_rs_contents=contents, nvx_rs_provenance=provenance
+                )
+                build_dir = root / "runtime" / "build"
+                build_dir.mkdir(parents=True)
+                stale_provenance = build_dir / nvx_rs.PROVENANCE_NAME
+                stale_provenance.write_text("{}", encoding="utf-8")
+                self.nvx_rs_path.write_bytes(b"stale nvx-rs")
+
+                output = self._install_runtime_archive(root, archive_path)
+
+                self.assertTrue(
+                    (build_dir / KernelBuildConstants.BINARY_NAME).is_file()
+                )
+                self.assertFalse(self.nvx_rs_path.exists())
+                self.assertFalse(stale_provenance.exists())
+                self.assertIn(reason, output)
+                self.assertIn(
+                    "so nvx.py builds nvx-rs from this checkout with Cargo when a "
+                    "command needs it, unless NVX_RS names one",
+                    output,
+                )
+                # Without Cargo, nvx.py names the ways to get nvx-rs.
+                with (
+                    _without_nvx_rs_variable(),
+                    patch("shutil.which", return_value=None),
+                    self.assertRaisesRegex(common.ScriptError, "nvx.py download"),
+                ):
+                    nvx_rs.require_binary()
+
+    def test_release_archive_with_inconsistent_nvx_rs_installs_nothing(self):
+        # A package whose nvx-rs does not match its own provenance is broken,
+        # even when its sources differ, so download replaces nothing.
+        for provenance in (
+            {"executable_sha256": "0" * 64},
+            {"source_sha256": "0" * 64, "executable_sha256": "0" * 64},
+        ):
+            with (
+                self.subTest(provenance=provenance),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                root = Path(temporary)
+                archive_path = self._runtime_release_archive(
+                    root,
+                    nvx_rs_contents=b"nvx-rs",
+                    nvx_rs_provenance=provenance,
+                )
+                self.nvx_rs_path.write_bytes(b"earlier nvx-rs")
+                with self.assertRaisesRegex(
+                    common.ScriptError,
+                    re.escape(
+                        f"the bin/{self.nvx_rs_path.name} of {archive_path.name} "
+                        "does not match its build provenance"
+                    ),
+                ):
+                    self._install_runtime_archive(root, archive_path)
+                self.assertFalse((root / "runtime").exists())
+                self.assertEqual(self.nvx_rs_path.read_bytes(), b"earlier nvx-rs")
 
     def test_source_release_archive_removes_stale_azure_artifacts(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -17851,6 +18644,7 @@ class ReleaseTests(unittest.TestCase):
                     "openvmm_binary_path",
                     return_value=binary_destination,
                 ),
+                contextlib.redirect_stdout(io.StringIO()),
             ):
                 release._install_release_archive(archive_path)
 
@@ -18183,6 +18977,45 @@ class SharedFileTests(unittest.TestCase):
                                 for member in members.values()
                             )
                         )
+
+    def test_release_archives_ship_both_executables_executable(self):
+        # Every package ships OpenVMM and nvx-rs in bin/, executable whatever
+        # mode the staging host stored, and publication finds both.
+        for suffix, platform, extension in (
+            (".tar.gz", "linux-kvm", ""),
+            (".zip", "windows-whp", ".exe"),
+        ):
+            with (
+                self.subTest(suffix=suffix),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                root = Path(temporary)
+                source = root / f"nvx-1.0.0-{platform}"
+                for name in (f"openvmm{extension}", f"nvx-rs{extension}"):
+                    executable = source / "bin" / name
+                    executable.parent.mkdir(parents=True, exist_ok=True)
+                    executable.write_bytes(name.encode("ascii"))
+                    executable.chmod(0o644)
+                common.write_sha256_sums(source)
+                package = root / f"nvx-1.0.0-{platform}{suffix}"
+                release.create_release_archive(source, package)
+
+                if suffix == ".tar.gz":
+                    with tarfile.open(package, "r:gz") as archive_file:
+                        modes = {
+                            member.name: member.mode
+                            for member in archive_file.getmembers()
+                        }
+                else:
+                    with zipfile.ZipFile(package) as archive_file:
+                        modes = {
+                            member.filename: (member.external_attr >> 16) & 0o777
+                            for member in archive_file.infolist()
+                        }
+                for path in release.release_package_executables(platform):
+                    self.assertEqual(modes[f"{source.name}/{path}"], 0o755)
+                self.assertEqual(modes[f"{source.name}/SHA256SUMS"], 0o644)
+                release.require_release_package_executables(package, platform)
 
     def test_release_archive_rejects_internally_inconsistent_staging(self):
         with tempfile.TemporaryDirectory() as temporary:
