@@ -94,8 +94,6 @@ pub(crate) fn run(
 
     let started = Instant::now();
     let mut output_bytes = 0usize;
-    let mut stdout_open = true;
-    let mut stderr_open = true;
     let mut timed_out = false;
     let mut output_limited = false;
     let mut cancelled = false;
@@ -103,19 +101,11 @@ pub(crate) fn run(
     let mut stragglers_killed = false;
     let mut wait_status = None;
 
-    while wait_status.is_none() || stdout_open || stderr_open {
+    while wait_status.is_none() || stdout_pipe.is_some() || stderr_pipe.is_some() {
         let ready = match sys::readable_or_hung_up(
             [
-                if stdout_open {
-                    stdout_pipe.as_ref()
-                } else {
-                    None
-                },
-                if stderr_open {
-                    stderr_pipe.as_ref()
-                } else {
-                    None
-                },
+                stdout_pipe.as_ref(),
+                stderr_pipe.as_ref(),
                 (!session_lost).then_some(session.descriptor()),
             ],
             POLL_INTERVAL_MS,
@@ -149,43 +139,18 @@ pub(crate) fn run(
                 }
             }
         }
-        let stdout_result = if stdout_open && ready[0] {
-            if session_lost {
-                drain(stdout_pipe.as_ref().expect("stdout reader is open"))
-            } else {
-                stream(
-                    session,
-                    request_id,
-                    stdout_pipe.as_ref().expect("stdout reader is open"),
-                    APP_STDOUT,
-                    &mut output_bytes,
-                )
-            }
-        } else {
-            StreamResult::Open
+        let mut read_output = |pipe: Option<&FileDescriptor>, readable: bool, kind: u8| match pipe {
+            Some(pipe) if readable && session_lost => drain(pipe),
+            Some(pipe) if readable => stream(session, request_id, pipe, kind, &mut output_bytes),
+            _ => StreamResult::Open,
         };
-        let stderr_result = if stderr_open && ready[1] {
-            if session_lost {
-                drain(stderr_pipe.as_ref().expect("stderr reader is open"))
-            } else {
-                stream(
-                    session,
-                    request_id,
-                    stderr_pipe.as_ref().expect("stderr reader is open"),
-                    APP_STDERR,
-                    &mut output_bytes,
-                )
-            }
-        } else {
-            StreamResult::Open
-        };
+        let stdout_result = read_output(stdout_pipe.as_ref(), ready[0], APP_STDOUT);
+        let stderr_result = read_output(stderr_pipe.as_ref(), ready[1], APP_STDERR);
         if stdout_result == StreamResult::Closed {
             stdout_pipe = None;
-            stdout_open = false;
         }
         if stderr_result == StreamResult::Closed {
             stderr_pipe = None;
-            stderr_open = false;
         }
         if stdout_result.is_failure() || stderr_result.is_failure() {
             output_limited =
@@ -196,7 +161,7 @@ pub(crate) fn run(
         if wait_status.is_some()
             && config.direct
             && !stragglers_killed
-            && (stdout_open || stderr_open)
+            && (stdout_pipe.is_some() || stderr_pipe.is_some())
         {
             stragglers_killed = true;
             let _ = cgroup::kill(system);
