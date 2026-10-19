@@ -8,16 +8,16 @@ use super::checks::{self, BootLog, Checks};
 use super::cpu_mask::CpuMask;
 use super::daemon::{self, Promoter, RestoreSignal};
 use super::decoders::{self, GENERATION_ID_SIZE, PACKET_HEADER_SIZE, PacketHeader, RestorePacket};
-use super::events::{CheckId, EventSource, ViolationCode};
+use super::events::{CheckId, ViolationCode};
 use super::state::{
     CheckState, CheckStatus, Discontinuity, DowntimeSource, SampleRejection, TimeState,
 };
 use super::system::{
     self, PORTB_GENERATION_ID_AVAILABLE, PORTB_PACKET_AVAILABLE, PORTB_TIME_WINDOW,
-    PRIVATE_FILE_MODE, PortIo, PowerOffStatus, RESTORE_PATH, RESTORE_TEMP_PATH, Runtime,
-    SELECT_GENERATION_ID, SELECT_PACKET, SNAPSHOT_ACKNOWLEDGE, SampleError, clock_ns, cpu_time_ns,
-    current_frequency, initial_sample, portb_read, set_frequency, state_apply, state_load,
-    state_store, step_clock, suppression_restore, suppression_save,
+    PRIVATE_FILE_MODE, PortIo, RESTORE_PATH, RESTORE_TEMP_PATH, Runtime, SELECT_GENERATION_ID,
+    SELECT_PACKET, SNAPSHOT_ACKNOWLEDGE, SampleError, clock_ns, cpu_time_ns, current_frequency,
+    initial_sample, portb_read, set_frequency, state_apply, state_load, state_store, step_clock,
+    suppression_restore, suppression_save,
 };
 use super::{DEFERRED_START_NS, NSEC_PER_USEC, Phase, USAGE};
 use crate::guest::parse::parse_decimal;
@@ -399,13 +399,7 @@ fn repair_failed(
     code: ViolationCode,
     detail: impl AsRef<[u8]>,
 ) -> Result<(), CommandError> {
-    runtime.fail_fatal(
-        PowerOffStatus::Repair,
-        code,
-        EventSource::Repair,
-        Phase::Restore,
-        detail.as_ref(),
-    );
+    runtime.repair_failure(code, detail.as_ref());
     Err(CommandError::Operation)
 }
 
