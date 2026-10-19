@@ -1,11 +1,11 @@
 use std::collections::VecDeque;
-use std::ffi::{CStr, CString};
+use std::ffi::CString;
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::guest::sys::{self, Errno, FileDescriptor, Mode, MountFlags, ProcessId, c_string};
+use crate::guest::sys::{self, Errno, FileDescriptor, ProcessId, c_string};
 use crate::host::platform::Transport;
 use crate::protocol::{
     self, OUTER_ACK, OUTER_CREDIT, OUTER_DATA, OUTER_GUEST_ATTACH, OUTER_HEADER_LEN,
@@ -13,7 +13,7 @@ use crate::protocol::{
 };
 
 use super::launch::SpawnRequest;
-use super::seam::{Paths, System, TestSystem};
+use super::seam::{Paths, TestSystem};
 
 struct BrokerCore {
     guest: UnixStream,
@@ -262,71 +262,6 @@ impl BrokerHandle {
     }
 }
 
-struct LoopbackSystem {
-    inner: TestSystem,
-}
-
-impl System for LoopbackSystem {
-    fn paths(&self) -> &Paths {
-        self.inner.paths()
-    }
-
-    fn mount(
-        &mut self,
-        source: Option<&CStr>,
-        target: &CStr,
-        filesystem: Option<&CStr>,
-        flags: MountFlags,
-    ) -> Result<(), Errno> {
-        self.inner.mount(source, target, filesystem, flags)
-    }
-
-    fn chown(&mut self, path: &CStr, uid: u32, gid: u32) -> Result<(), Errno> {
-        self.inner.chown(path, uid, gid)
-    }
-
-    fn chmod(&mut self, path: &CStr, mode: Mode) -> Result<(), Errno> {
-        self.inner.chmod(path, mode)
-    }
-
-    fn configure_tty(&mut self, descriptor: &FileDescriptor) -> Result<(), Errno> {
-        self.inner.configure_tty(descriptor)
-    }
-
-    fn drain_tty(&mut self, descriptor: &FileDescriptor) -> Result<(), Errno> {
-        self.inner.drain_tty(descriptor)
-    }
-
-    fn write_diagnostic(&mut self, message: &[u8]) -> Result<(), Errno> {
-        self.inner.write_diagnostic(message)
-    }
-
-    fn write_barrier(&mut self, descriptor: &FileDescriptor, message: &[u8]) -> Result<(), Errno> {
-        self.inner.write_barrier(descriptor, message)
-    }
-
-    fn take_inherited_descriptor(&mut self, text: &CStr) -> Result<FileDescriptor, Errno> {
-        self.inner.take_inherited_descriptor(text)
-    }
-
-    fn validate_environment(&mut self, name: &CStr, value: &CStr) -> Result<(), Errno> {
-        self.inner.validate_environment(name, value)
-    }
-
-    fn exec(
-        &mut self,
-        path: &CStr,
-        arguments: &[CString],
-        environment: Option<&[CString]>,
-    ) -> Result<(), Errno> {
-        self.inner.exec(path, arguments, environment)
-    }
-
-    fn spawn(&mut self, request: SpawnRequest<'_>) -> Result<ProcessId, Errno> {
-        spawn_unprivileged(request)
-    }
-}
-
 fn spawn_unprivileged(request: SpawnRequest<'_>) -> Result<ProcessId, Errno> {
     let arguments: Vec<CString> = request
         .execution
@@ -428,8 +363,9 @@ mod tests {
             hostfs_dir: hostfs,
             ..Paths::default()
         };
-        let system = LoopbackSystem {
-            inner: TestSystem::new(paths),
+        let system = TestSystem {
+            spawner: Some(spawn_unprivileged),
+            ..TestSystem::new(paths)
         };
         let (broker_guest, agent) = UnixStream::pair().unwrap();
         let agent_descriptor = FileDescriptor::from_owned(agent.into());
@@ -556,7 +492,7 @@ mod tests {
         drop(session);
 
         let (_outcome, system) = agent_thread.join().unwrap();
-        assert_eq!(system.inner.mounts.len(), 2);
-        assert!(system.inner.diagnostics.is_empty());
+        assert_eq!(system.mounts.len(), 2);
+        assert!(system.diagnostics.is_empty());
     }
 }
