@@ -121,6 +121,10 @@ impl Root {
             let path = self.below(entry["path"].as_str().unwrap());
             if entry.get("openvmm").is_some() {
                 fs::create_dir_all(path.parent().unwrap()).unwrap();
+                // Concurrent forks must not inherit a writable fixture executable.
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(FAKE_OPENVMM, &path).unwrap();
+                #[cfg(windows)]
                 fs::copy(FAKE_OPENVMM, &path).unwrap();
             } else if let Some(text) = entry.get("text") {
                 fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -457,6 +461,14 @@ fn populated_root() -> Root {
     let root = Root::new();
     root.populate(fixture["tree"].as_array().unwrap());
     root
+}
+
+#[cfg(unix)]
+#[test]
+fn fixture_roots_link_the_built_executable() {
+    let root = populated_root();
+    let executable = root.below("openvmm/target/release/openvmm");
+    assert_eq!(fs::read_link(executable).unwrap(), Path::new(FAKE_OPENVMM));
 }
 
 fn run(root: &Root, arguments: &[String]) -> Output {
