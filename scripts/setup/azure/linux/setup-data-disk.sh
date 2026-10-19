@@ -108,6 +108,34 @@ has_signatures() {
     [ -n "${output//[[:space:]]/}" ]
 }
 
+verify_blank_device() {
+    local disk_bytes status=0
+    command -v cmp >/dev/null 2>&1 || {
+        echo "ERROR: cmp is required to verify disk blankness" >&2
+        exit 1
+    }
+    disk_bytes=$(blockdev --getsize64 "$1") || {
+        echo "ERROR: could not read the size of $1; refusing to initialize it" >&2
+        exit 1
+    }
+    [[ "$disk_bytes" =~ ^[0-9]+$ ]] && [ "$disk_bytes" -gt 0 ] || {
+        echo "ERROR: invalid device size for $1; refusing to initialize it" >&2
+        exit 1
+    }
+    cmp -n "$disk_bytes" -- "$1" /dev/zero >/dev/null || status=$?
+    case "$status" in
+        0) ;;
+        1)
+            echo "ERROR: $1 is not entirely zero-filled; preserving unrecognized data" >&2
+            exit 1
+            ;;
+        *)
+            echo "ERROR: could not verify blankness of $1 (exit=$status); refusing to initialize it" >&2
+            exit 1
+            ;;
+    esac
+}
+
 verify_new_filesystem() {
     local rc=0
     sync
@@ -147,8 +175,8 @@ TARGETDEV=""
 if [ -n "$WHOLE_FSTYPE" ]; then
     TARGETDEV="$DISKDEV"
 elif [ "${#PARTITIONS[@]}" -eq 0 ]; then
-    # Only a truly empty disk reaches this path. Refuse to overwrite any
-    # unknown signatures even if lsblk did not recognize a filesystem.
+    # A missing signature does not establish blankness. Only zero-filled
+    # disks or our interrupted initialization marker may be repartitioned.
     if has_signatures "$DISKDEV"; then
         dump=$(sfdisk --dump "$DISKDEV" 2>/dev/null || true)
         table_id=$(printf '%s\n' "$dump" | awk -F: '$1 == "label-id" { gsub(/[[:space:]]/, "", $2); print tolower($2) }')
@@ -158,6 +186,8 @@ elif [ "${#PARTITIONS[@]}" -eq 0 ]; then
             exit 1
         fi
         echo "Recovering an interrupted empty GPT-table creation on $DISKDEV"
+    else
+        verify_blank_device "$DISKDEV"
     fi
 
     echo "Atomically creating a GPT partition on blank disk $DISKDEV"

@@ -251,8 +251,8 @@ def normalize_config(config: object) -> LinuxConfig | WindowsConfig:
         "runnerNumberOffset": offset,
     }
     if os_type == "linux":
-        if admin_username == "root":
-            raise ValueError("Linux adminUsername must not be root")
+        if admin_username in ("root", "nvx-runner"):
+            raise ValueError("Linux adminUsername must not be root or nvx-runner")
         if set(disk) != {"lun", "mountPoint"}:
             raise ValueError("Linux dataDisk must contain only lun and mountPoint")
         mount_point = linux_path(disk["mountPoint"], "dataDisk.mountPoint")
@@ -400,6 +400,8 @@ def source(path: str) -> bytes:
     data = location.read_bytes()
     if path.endswith(".sh") and b"\r" in data:
         raise ValueError(f"Shell source must use LF line endings: {path}")
+    if path.endswith(".ps1"):
+        data = data.replace(b"\r\n", b"\n")
     return data
 
 
@@ -478,7 +480,14 @@ def linux_payload(
     )
     document = {
         "package_upgrade": False,
-        "packages": ["ca-certificates", "curl", "python3", "util-linux", "e2fsprogs"],
+        "packages": [
+            "ca-certificates",
+            "curl",
+            "python3",
+            "util-linux",
+            "e2fsprogs",
+            "diffutils",
+        ],
         "write_files": entries,
         "runcmd": [
             ["systemctl", "daemon-reload"],

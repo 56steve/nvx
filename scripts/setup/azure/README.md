@@ -55,11 +55,15 @@ and verifies `/dev/mshv` afterwards; it is not an Ubuntu kernel installer.
 It does not install or require cloud-hypervisor or Kata.
 Place `runnerDirectory` under the mounted data directory if runner work
 and cache must use that disk; merely mounting it does not move `_work`.
+The administrator must not be `root` or the reserved job account `nvx-runner`.
 Disk setup installs the distribution's partitioning utility when it is
 missing, verifies an existing mount before changing fstab, and verifies the
 selected device again after mounting it. MSHV setup accepts only a Dom0
 default wired into the active GRUB configuration; a saved entry alone is
 insufficient.
+An unmarked disk with no recognized signature must also pass a full-device
+zero comparison before initialization; this can add I/O to first provisioning.
+The owned interrupted-initialization recovery path remains separate.
 
 Windows uses WHP and defines `dataDisk.driveLetter`,
 `dataDisk.temporaryDriveFallback`, optional
@@ -79,7 +83,9 @@ stop setup without deleting that protection. Successful Linux registration
 disables the provisioning unit without restarting the runner;
 the metadata-block unit remains enabled. Windows requires an unrestricted,
 all-profile metadata block for Network Service and rejects existing rules
-with narrower filters. Windows selects
+with narrower filters. It also requires running firewall services, enforcing
+profiles, and the effective rule in `ActiveStore`; a stored rule alone is
+insufficient. Windows selects
 managed NVMe disks by physical drive number and the documented
 [Azure namespace mapping](https://learn.microsoft.com/en-us/azure/virtual-machines/enable-nvme-remote-faqs)
 (namespace ID = data-disk LUN + 1); unknown or ambiguous mappings stop setup.
@@ -108,6 +114,8 @@ For Windows, pass the edited Windows configuration instead. Packaging makes
 no Azure or GitHub API calls. It rejects unknown or credential-like
 configuration values, generates SHA-256 hashes for the exact source files
 and payload, and enforces Azure's 65,535-byte decoded custom-data limit.
+Packaged PowerShell source uses canonical LF line endings so checkout-specific
+CRLF conversion does not change the distributed bytes or hashes.
 The output directory must be outside the repository.
 It must be new or empty so files from another platform cannot be reused.
 

@@ -13,6 +13,8 @@ with open(sys.argv[1],encoding="utf-8") as stream:
     config=json.load(stream)
 if config["os"]!="linux" or config["backend"] not in ("kvm","mshv"):
     raise SystemExit("Expected a Linux KVM or MSHV configuration")
+if config["adminUsername"] in ("root","nvx-runner"):
+    raise SystemExit("The runner administrator must not be root or nvx-runner")
 required=["linux",config["backend"],"virtual-machine"]
 if [label.lower() for label in config["runnerLabels"][:3]]!=required:
     raise SystemExit("Runner labels must preserve the platform and backend labels")

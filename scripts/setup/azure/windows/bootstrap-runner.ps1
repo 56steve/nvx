@@ -86,12 +86,46 @@ function Get-ExtraRunnerLabels {
 function Set-RunnerMetadataFirewall {
     $name = 'NvxRunnerDenyMetadata'
     $principal = 'D:(A;;CC;;;S-1-5-20)'
-    $rule = Get-NetFirewallRule -Name $name -ErrorAction SilentlyContinue
+    $failure = 'The runner account is not blocked from Azure instance metadata.'
+    foreach ($serviceName in @('BFE', 'MpsSvc')) {
+        if ((Get-Service -Name $serviceName -ErrorAction Stop).Status -ne 'Running') {
+            throw "$failure Windows Firewall service $serviceName is not running."
+        }
+    }
+    $profiles = @(Get-NetFirewallProfile -PolicyStore ActiveStore -ErrorAction Stop)
+    if ($profiles.Count -ne 3 -or
+        @(Compare-Object @('Domain', 'Private', 'Public') @($profiles.Name)).Count -ne 0) {
+        throw "$failure Effective firewall profiles are unavailable."
+    }
+    foreach ($profile in $profiles) {
+        $disabledInterfaces = @($profile.DisabledInterfaceAliases | Where-Object {
+            $_ -and $_ -ne 'NotConfigured'
+        })
+        if ($profile.Enabled -ne 'True' -or
+            [string]$profile.AllowLocalFirewallRules -notin @('True', 'NotConfigured') -or
+            $disabledInterfaces.Count -ne 0) {
+            throw "$failure Profile $($profile.Name) does not enforce local rules on all interfaces."
+        }
+    }
+    $rule = Get-NetFirewallRule -Name $name -PolicyStore PersistentStore `
+        -ErrorAction SilentlyContinue
     if (-not $rule) {
         $rule = New-NetFirewallRule -Name $name -DisplayName $name `
             -Direction Outbound -Action Block -RemoteAddress '169.254.169.254' `
             -LocalUser $principal -Profile Any `
             -Authentication NotRequired -Encryption NotRequired
+    }
+    $effectiveRules = @(Get-NetFirewallRule -Name $name -PolicyStore ActiveStore `
+        -TracePolicyStore -ErrorAction Stop)
+    if ($effectiveRules.Count -ne 1 -or -not $effectiveRules[0]) {
+        throw "$failure No unique effective metadata rule is available."
+    }
+    $rule = $effectiveRules[0]
+    # Provider value 1 means enforced; the display strings are localized.
+    $enforcement = @($rule.CimInstanceProperties['EnforcementStatus'].Value)
+    if ($rule.PrimaryStatus -ne 'OK' -or $enforcement.Count -eq 0 -or
+        @($enforcement | Where-Object { $_ -ne 1 }).Count -ne 0) {
+        throw "$failure The effective metadata rule is not fully enforced."
     }
     $addressFilter = $rule | Get-NetFirewallAddressFilter
     $portFilter = $rule | Get-NetFirewallPortFilter
@@ -136,7 +170,7 @@ function Set-RunnerMetadataFirewall {
         @($unrestricted | Where-Object { $_ -ne 'Any' }).Count -ne 0 -or
         $addresses.Count -ne 1 -or $addresses[0] -ne '169.254.169.254' -or
         $canonicalUsers -ne $canonicalPrincipal) {
-        throw 'The runner account is not blocked from Azure instance metadata.'
+        throw $failure
     }
 }
 

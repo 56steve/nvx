@@ -29,6 +29,7 @@ class HttpOpener(Protocol):
 
 class CloudFiles(TypedDict):
     write_files: list[dict[str, str]]
+    packages: list[str]
 
 
 class PackageTests(unittest.TestCase):
@@ -141,6 +142,16 @@ class PackageTests(unittest.TestCase):
             ],
         )
 
+    def test_linux_rejects_reserved_administrator_before_host_setup(self):
+        for administrator in ("root", "nvx-runner"):
+            with self.subTest(administrator=administrator):
+                config = self.configuration("linux")
+                config["adminUsername"] = administrator
+                with self.assertRaisesRegex(ValueError, "root or nvx-runner"):
+                    builder.normalize_config(config)
+                with self.assertRaisesRegex(SystemExit, "root or nvx-runner"):
+                    self.execute_linux(0, config)
+
     def test_embedded_linux_passes_only_extra_labels_to_generic_setup(self):
         config = self.configuration("linux")
         config["runnerLabels"].append("isolated")
@@ -229,6 +240,7 @@ class PackageTests(unittest.TestCase):
                 CloudFiles,
                 yaml.safe_load((Path(temporary) / "cloud-init.yaml").read_text()),
             )
+            self.assertIn("diffutils", cloud["packages"])
             names: dict[str, bytes] = {}
             for entry in cloud["write_files"]:
                 if entry.get("encoding") == "gz+b64":
@@ -550,6 +562,91 @@ dnf() { install_mock dnf "$@"; }
                     )
                 if installed == "1":
                     self.assertNotIn(b"install -y", result.stdout)
+
+    def test_linux_initialization_requires_verified_blankness_or_owned_marker(self):
+        source = builder.source("linux/setup-data-disk.sh").decode()
+        start = source.index('\n    if has_signatures "$DISKDEV"; then')
+        end = source.index('\n    echo "Atomically creating a GPT', start)
+        guard = source[start:end]
+        self.assertIn('verify_blank_device "$DISKDEV"', guard)
+        table_id = source.split("INIT_TABLE_ID=", 1)[1].splitlines()[0]
+        functions = self.shell_function(
+            "linux/setup-data-disk.sh", "has_signatures"
+        ) + self.shell_function("linux/setup-data-disk.sh", "verify_blank_device")
+        mock = r"""
+set -euo pipefail
+DISKDEV=$1
+device_size=$2
+marker=$3
+INIT_TABLE_ID=$4
+blockdev() {
+    [ "$*" = "--getsize64 $DISKDEV" ] || return 1
+    if [ "$device_size" = error ]; then
+        echo 'ERROR: mock device size probe failed' >&2
+        return 1
+    fi
+    printf '%s\n' "$device_size"
+}
+wipefs() {
+    [ "$*" = "-n $DISKDEV" ] || return 1
+    if [ "$marker" != none ]; then echo 'recognized GPT signature'; fi
+}
+sfdisk() {
+    [ "$*" = "--dump $DISKDEV" ] || {
+        echo 'ERROR: unexpected destructive disk operation' >&2
+        exit 91
+    }
+    if [ "$marker" = other ]; then
+        echo 'label-id: unrelated'
+    else
+        printf 'label-id: %s\n' "$INIT_TABLE_ID"
+    fi
+    if [ "$marker" = partitioned ]; then
+        echo '/dev/mock1 : start=2048, size=2048'
+    fi
+}
+"""
+        zeros = b"\0" * (2 * 1024 * 1024)
+        raw_data = zeros[:-1] + b"X"
+        cases: tuple[tuple[str, bytes | None, str, str, bool], ...] = (
+            ("zero", zeros, str(len(zeros)), "none", True),
+            ("unrecognized-tail", raw_data, str(len(raw_data)), "none", False),
+            ("owned-recovery", raw_data, str(len(raw_data)), "owned", True),
+            ("unknown-marker", raw_data, str(len(raw_data)), "other", False),
+            (
+                "owned-with-partition",
+                raw_data,
+                str(len(raw_data)),
+                "partitioned",
+                False,
+            ),
+            ("short-read", zeros[:1024], str(len(zeros)), "none", False),
+            ("read-error", None, str(len(zeros)), "none", False),
+            ("empty-size", zeros, "0", "none", False),
+            ("size-error", zeros, "error", "none", False),
+        )
+        for case, contents, size, marker, succeeds in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                disk = Path(temporary) / "disk"
+                if contents is not None:
+                    disk.write_bytes(contents)
+                result = self.execute_bash(
+                    mock + functions + guard + "\necho INITIALIZATION_ALLOWED=1\n",
+                    disk.as_posix(),
+                    size,
+                    marker,
+                    table_id,
+                )
+                self.assertEqual(
+                    result.returncode == 0,
+                    succeeds,
+                    (result.stdout + result.stderr).decode(),
+                )
+                if succeeds:
+                    self.assertIn(b"INITIALIZATION_ALLOWED=1", result.stdout)
+                else:
+                    self.assertNotIn(b"INITIALIZATION_ALLOWED=1", result.stdout)
+                    self.assertIn(b"ERROR:", result.stderr)
 
     def test_linux_runner_finalization_does_not_restart_registered_service(self):
         source = builder.source("linux/bootstrap-runner.sh").decode()
@@ -1286,7 +1383,22 @@ function Reset-Firewall {
         Direction = 'Outbound'; Action = 'Block'; Enabled = 'True'
         Profile = 'Any'; Platform = @()
         PolicyAppId = ''; PackageFamilyName = ''; RemoteDynamicKeywordAddresses = @()
+        IsEffective = $false
     }
+    $script:services = @{ BFE = 'Running'; MpsSvc = 'Running' }
+    $script:profiles = @('Domain', 'Private', 'Public' | ForEach-Object {
+        [pscustomobject]@{
+            Name = $_; Enabled = 'True'; AllowLocalFirewallRules = 'NotConfigured'
+            DisabledInterfaceAliases = @('NotConfigured')
+        }
+    })
+    $script:missingEffective = $false
+    $script:duplicateEffective = $false
+    $script:effectiveAction = $null
+    $script:effectivePorts = $null
+    $script:primaryStatus = 'OK'
+    $script:enforcement = [uint16[]]@(1)
+    $script:activeQueries = 0
     $script:addresses = @('169.254.169.254')
     $script:localAddresses = @('Any')
     $script:ports = [pscustomobject]@{
@@ -1305,10 +1417,39 @@ function Reset-Firewall {
     $script:creations = 0
     $script:failCreation = $false
 }
-function Get-NetFirewallRule {
+function Get-Service {
     param($Name, $ErrorAction)
+    if (-not $script:services.ContainsKey($Name) -or $ErrorAction -ne 'Stop') {
+        throw 'Unexpected firewall service query'
+    }
+    return [pscustomobject]@{ Name = $Name; Status = $script:services[$Name] }
+}
+function Get-NetFirewallProfile {
+    param($PolicyStore, $ErrorAction)
+    if ($PolicyStore -ne 'ActiveStore' -or $ErrorAction -ne 'Stop') {
+        throw 'Expected effective firewall profile query'
+    }
+    return $script:profiles
+}
+function Get-NetFirewallRule {
+    param($Name, $PolicyStore, [switch]$TracePolicyStore, $ErrorAction)
     if ($Name -ne 'NvxRunnerDenyMetadata') { throw 'Unexpected firewall rule name' }
-    return $script:rule
+    if ($PolicyStore -eq 'PersistentStore') { return $script:rule }
+    if ($PolicyStore -ne 'ActiveStore' -or -not $TracePolicyStore -or
+        $ErrorAction -ne 'Stop') { throw 'Expected traced effective firewall rule query' }
+    $script:activeQueries++
+    if ($script:missingEffective) { return $null }
+    $effective = $script:rule | Select-Object *
+    $effective.IsEffective = $true
+    $effective | Add-Member -NotePropertyMembers @{
+        PrimaryStatus = $script:primaryStatus
+        CimInstanceProperties = @{
+            EnforcementStatus = [pscustomobject]@{ Value = $script:enforcement }
+        }
+    }
+    if ($script:effectiveAction) { $effective.Action = $script:effectiveAction }
+    if ($script:duplicateEffective) { return @($effective, $effective) }
+    return $effective
 }
 function New-NetFirewallRule {
     param($Name, $DisplayName, $Direction, $Action, $RemoteAddress, $LocalUser, $Profile,
@@ -1326,14 +1467,20 @@ function New-NetFirewallRule {
         Direction = $Direction; Action = $Action; Enabled = 'True'
         Profile = $Profile; Platform = @()
         PolicyAppId = ''; PackageFamilyName = ''; RemoteDynamicKeywordAddresses = @()
+        IsEffective = $false
     }
     $script:addresses = @($RemoteAddress)
     $script:users = $LocalUser
     return $script:rule
 }
+function Assert-EffectiveRule {
+    param($Rule)
+    if (-not $Rule.IsEffective) { throw 'Filters were read from the stored rule' }
+}
 function Get-NetFirewallAddressFilter {
     param([Parameter(ValueFromPipeline = $true)]$InputObject)
     process {
+        Assert-EffectiveRule $InputObject
         [pscustomobject]@{
             LocalAddress = $script:localAddresses; RemoteAddress = $script:addresses
         }
@@ -1341,27 +1488,31 @@ function Get-NetFirewallAddressFilter {
 }
 function Get-NetFirewallPortFilter {
     param([Parameter(ValueFromPipeline = $true)]$InputObject)
-    process { $script:ports }
+    process {
+        Assert-EffectiveRule $InputObject
+        if ($script:effectivePorts) { $script:effectivePorts } else { $script:ports }
+    }
 }
 function Get-NetFirewallApplicationFilter {
     param([Parameter(ValueFromPipeline = $true)]$InputObject)
-    process { $script:application }
+    process { Assert-EffectiveRule $InputObject; $script:application }
 }
 function Get-NetFirewallServiceFilter {
     param([Parameter(ValueFromPipeline = $true)]$InputObject)
-    process { $script:service }
+    process { Assert-EffectiveRule $InputObject; $script:service }
 }
 function Get-NetFirewallInterfaceFilter {
     param([Parameter(ValueFromPipeline = $true)]$InputObject)
-    process { $script:interface }
+    process { Assert-EffectiveRule $InputObject; $script:interface }
 }
 function Get-NetFirewallInterfaceTypeFilter {
     param([Parameter(ValueFromPipeline = $true)]$InputObject)
-    process { $script:interfaceType }
+    process { Assert-EffectiveRule $InputObject; $script:interfaceType }
 }
 function Get-NetFirewallSecurityFilter {
     param([Parameter(ValueFromPipeline = $true)]$InputObject)
     process {
+        Assert-EffectiveRule $InputObject
         [pscustomobject]@{
             LocalUser = $script:users
             RemoteUser = $script:security.RemoteUser
@@ -1373,7 +1524,15 @@ function Get-NetFirewallSecurityFilter {
 }
 Reset-Firewall
 Set-RunnerMetadataFirewall
-if ($script:creations -ne 0) { throw 'Valid existing firewall rule was replaced' }
+if ($script:creations -ne 0 -or $script:activeQueries -ne 1) {
+    throw 'Existing firewall rule was not verified in the effective store'
+}
+Reset-Firewall
+foreach ($profile in $script:profiles) {
+    $profile.AllowLocalFirewallRules = 'True'
+    $profile.DisabledInterfaceAliases = @()
+}
+Set-RunnerMetadataFirewall
 Reset-Firewall
 $script:ports.Protocol = 256
 Set-RunnerMetadataFirewall
@@ -1393,7 +1552,12 @@ foreach ($case in @('principal', 'address', 'extra-address', 'missing-address',
         'protocol', 'local-port', 'remote-port', 'icmp-type', 'dynamic-target',
         'program', 'package', 'service', 'interface', 'interface-type',
         'remote-user', 'remote-machine', 'authentication', 'encryption',
-        'policy-app', 'package-family', 'dynamic-address')) {
+        'policy-app', 'package-family', 'dynamic-address', 'firewall-stopped',
+        'filter-engine-stopped', 'profile-disabled', 'profile-unconfigured',
+        'local-rules-disabled', 'local-rules-unknown', 'disabled-interface',
+        'missing-profile', 'duplicate-profile', 'missing-effective',
+        'duplicate-effective', 'unenforced', 'not-applicable', 'empty-enforcement',
+        'bad-status', 'effective-allow', 'effective-port')) {
     Reset-Firewall
     switch ($case) {
         'principal' { $script:users = 'D:(A;;CC;;;S-1-5-18)' }
@@ -1423,12 +1587,33 @@ foreach ($case in @('principal', 'address', 'extra-address', 'missing-address',
         'policy-app' { $script:rule.PolicyAppId = 'RestrictedPolicy' }
         'package-family' { $script:rule.PackageFamilyName = 'RestrictedPackage' }
         'dynamic-address' { $script:rule.RemoteDynamicKeywordAddresses = @('{00000000-0000-0000-0000-000000000001}') }
+        'firewall-stopped' { $script:services.MpsSvc = 'Stopped' }
+        'filter-engine-stopped' { $script:services.BFE = 'Stopped' }
+        'profile-disabled' { $script:profiles[0].Enabled = 'False' }
+        'profile-unconfigured' { $script:profiles[0].Enabled = 'NotConfigured' }
+        'local-rules-disabled' { $script:profiles[0].AllowLocalFirewallRules = 'False' }
+        'local-rules-unknown' { $script:profiles[0].AllowLocalFirewallRules = 'Unknown' }
+        'disabled-interface' { $script:profiles[0].DisabledInterfaceAliases = @('Ethernet') }
+        'missing-profile' { $script:profiles = @($script:profiles | Select-Object -First 2) }
+        'duplicate-profile' { $script:profiles[0].Name = 'Public' }
+        'missing-effective' { $script:missingEffective = $true }
+        'duplicate-effective' { $script:duplicateEffective = $true }
+        'unenforced' { $script:enforcement = [uint16[]]@(2) }
+        'not-applicable' { $script:enforcement = [uint16[]]@(0) }
+        'empty-enforcement' { $script:enforcement = [uint16[]]@() }
+        'bad-status' { $script:primaryStatus = 'Error' }
+        'effective-allow' { $script:effectiveAction = 'Allow' }
+        'effective-port' {
+            $script:effectivePorts = $script:ports | Select-Object *
+            $script:effectivePorts.RemotePort = @('443')
+        }
     }
     $rejected = $false
     try { Set-RunnerMetadataFirewall }
     catch {
-        if ($_.Exception.Message -ne
-            'The runner account is not blocked from Azure instance metadata.') { throw }
+        if (-not $_.Exception.Message.StartsWith(
+            'The runner account is not blocked from Azure instance metadata.',
+            [StringComparison]::Ordinal)) { throw }
         $rejected = $true
     }
     if (-not $rejected -or $script:creations -ne 0) {
@@ -1533,6 +1718,32 @@ if (-not $rejected) { throw 'Firewall creation failure was ignored' }
                 self.assertEqual(entry.create_system, 3)
                 self.assertEqual(entry.date_time, (1980, 1, 1, 0, 0, 0))
                 self.assertEqual(entry.external_attr, 0o100644 << 16)
+
+    def test_windows_packages_normalize_powershell_checkout_line_endings(self):
+        outputs: list[dict[str, bytes]] = []
+        original_read_bytes = Path.read_bytes
+        for ending in (b"\n", b"\r\n"):
+
+            def read_checkout(path: Path, newline: bytes = ending) -> bytes:
+                data = original_read_bytes(path)
+                if path.suffix == ".ps1" and path.is_relative_to(builder.SETUP):
+                    return data.replace(b"\r\n", b"\n").replace(b"\n", newline)
+                return data
+
+            with (
+                self.subTest(ending=ending),
+                tempfile.TemporaryDirectory() as temporary,
+                patch.object(Path, "read_bytes", read_checkout),
+            ):
+                builder.build_package(self.configuration("windows"), temporary)
+                outputs.append(
+                    {path.name: path.read_bytes() for path in Path(temporary).iterdir()}
+                )
+        self.assertEqual(outputs[0], outputs[1])
+        with zipfile.ZipFile(io.BytesIO(outputs[0]["sources.zip"])) as archive:
+            for name in archive.namelist():
+                if name.endswith(".ps1"):
+                    self.assertNotIn(b"\r", archive.read(name))
 
     def test_generated_outputs_stay_outside_source_tree(self):
         with self.assertRaisesRegex(ValueError, "outside"):
