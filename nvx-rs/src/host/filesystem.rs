@@ -347,22 +347,18 @@ pub fn plan(request: &ExportRequest<'_>) -> Result<Option<ExportPlan>> {
                 root.display()
             )));
         };
-        let read_write: Vec<&Mapped> = inside
+        let read_write: Vec<PathBuf> = inside
             .iter()
-            .copied()
             .filter(|entry| !entry.read_only)
+            .map(|entry| entry.canonical.clone())
             .collect();
         let writable = !read_write.is_empty();
         // Unless the read-write mappings cover the whole child, OpenVMM limits writes to them.
-        let mut write: Vec<PathBuf> = if writable && own.read_only {
-            outermost(&read_write)
-                .iter()
-                .map(|entry| entry.canonical.clone())
-                .collect()
+        let write = if writable && own.read_only {
+            outermost(read_write)
         } else {
             Vec::new()
         };
-        write.sort();
         let child_denied: Vec<PathBuf> = denied
             .iter()
             .filter(|path| path.starts_with(&root))
@@ -448,18 +444,7 @@ fn volume_root_refusal(canonical: &Path) -> Option<&'static str> {
 /// Returns the paths to export, in order: the outermost mapped directories and the mapped files
 /// outside them, each exported alone. Distinct paths must not name one directory or file.
 fn export_roots(mapped: &[Mapped]) -> Result<Vec<PathBuf>> {
-    let mut candidates: Vec<PathBuf> = mapped.iter().map(|entry| entry.canonical.clone()).collect();
-    candidates.sort();
-    candidates.dedup();
-    let roots: Vec<PathBuf> = candidates
-        .iter()
-        .filter(|candidate| {
-            !candidates
-                .iter()
-                .any(|other| other != *candidate && candidate.starts_with(other))
-        })
-        .cloned()
-        .collect();
+    let roots = outermost(mapped.iter().map(|entry| entry.canonical.clone()).collect());
     // OpenVMM refuses one object exported twice, which bind mounts and hard links make
     // possible.
     let mut identities: Vec<(FileIdentity, &Path)> = Vec::with_capacity(roots.len());
@@ -517,31 +502,21 @@ fn denied_paths(list: PathList<'_>, mapped: &[Mapped]) -> Result<Vec<PathBuf>> {
         }
         denied.push(canonical);
     }
-    denied.sort();
-    denied.dedup();
-    let nested: Vec<PathBuf> = denied
+    Ok(outermost(denied))
+}
+
+/// Sorts `paths`, drops duplicates, and returns those that no other of them contains.
+fn outermost(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    paths.sort();
+    paths.dedup();
+    paths
         .iter()
         .filter(|path| {
-            denied
+            !paths
                 .iter()
                 .any(|other| other != *path && path.starts_with(other))
         })
         .cloned()
-        .collect();
-    denied.retain(|path| !nested.contains(path));
-    Ok(denied)
-}
-
-/// Returns the entries that no other entry contains.
-fn outermost<'a>(entries: &[&'a Mapped]) -> Vec<&'a Mapped> {
-    entries
-        .iter()
-        .copied()
-        .filter(|entry| {
-            !entries.iter().any(|other| {
-                other.canonical != entry.canonical && entry.canonical.starts_with(&other.canonical)
-            })
-        })
         .collect()
 }
 
@@ -1356,6 +1331,17 @@ mod tests {
         assert_eq!(
             option_values(&mapping.openvmm_arguments(), "--mount-deny").len(),
             2
+        );
+    }
+
+    /// Checks the order, duplicates, and containment by whole components that the roots, denied
+    /// paths, and writable paths share, which needs no host paths.
+    #[test]
+    fn outermost_paths_are_sorted_once_without_the_paths_inside_others() {
+        let paths = ["/b/c", "/a/bc", "/b", "/a/b", "/b/c/d", "/a/b"].map(PathBuf::from);
+        assert_eq!(
+            outermost(paths.to_vec()),
+            ["/a/b", "/a/bc", "/b"].map(PathBuf::from)
         );
     }
 
