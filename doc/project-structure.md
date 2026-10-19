@@ -21,7 +21,7 @@ are build products or caches and are not part of the tracked source tree. The
 | `azurelinux` | Checksum-pinned Azure Linux supplemental RPM lock |
 | `aci_edge_sandboxes` | Rust crate `aci_edge_sandboxes`: state-aware sandbox API with an OpenVMM backend and an opt-in native-agent backend |
 | `nvx-rs` | Rust crate `nvx-rs`, library `nvx`: the NVX mechanics that the OpenVMM backend builds on |
-| `openvmm` | Public OpenVMM Git submodule from `nanvix/openvmm`, tracking its `main` branch |
+| `openvmm` | Public OpenVMM Git submodule from `microsoft/openvmm`, tracking its `feature/microvm/dev` branch |
 | `data` | Tracked performance history and generated benchmark data |
 | `scripts/nvx_tools` | Implementation of the `nvx.py` commands |
 | `scripts/nvx.py` | Canonical build, run, test, benchmark, and packaging CLI |
@@ -283,7 +283,7 @@ builds independently of the OpenVMM submodule. See its
 
 ### `openvmm/`
 
-A Git submodule of `nanvix/openvmm`. `.gitmodules` records its URL and tracked
+A Git submodule of `microsoft/openvmm`. `.gitmodules` records its URL and tracked
 branch, and the parent repository's Git tree pins its exact revision. It
 contains the VMM implementation and its own source layout, documentation,
 tests, and build configuration. Changes to OpenVMM are made in that repository

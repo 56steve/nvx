@@ -125,25 +125,27 @@ describes what the OpenVMM VMM tests and the NVX microVM suite cover.
 ### Access
 
 `openvmm/` is a Git submodule of the public
-[nanvix/openvmm](https://github.com/nanvix/openvmm) repository.
-`.gitmodules` records its URL and tracked `main` branch, and each NVX commit
-pins one exact revision. Clone with `--recurse-submodules`, or run
-`scripts/nvx.py init` in an existing checkout, as [Setup](setup.md#initialize)
-describes. `scripts/nvx.py verify` fails until the submodule is checked out at
-the pinned revision.
+[microsoft/openvmm](https://github.com/microsoft/openvmm) repository.
+`.gitmodules` records its URL and tracked `feature/microvm/dev` branch, and
+each NVX commit pins one exact revision. Clone with `--recurse-submodules`, or
+run `scripts/nvx.py init` in an existing checkout, as
+[Setup](setup.md#initialize) describes. `scripts/nvx.py verify` fails until the
+submodule is checked out at the pinned revision. A checkout that predates the
+move from `nanvix/openvmm` keeps fetching from there until
+`git submodule sync -- openvmm` adopts the recorded URL.
 
 ### Source changes
 
-Change OpenVMM through a pull request to `nanvix/openvmm` that follows
-[its contributor instructions](https://github.com/nanvix/openvmm/blob/main/.github/copilot-instructions.md),
+Change OpenVMM through a pull request to the `feature/microvm/dev` branch of
+`microsoft/openvmm` that follows
+[its contributor instructions](https://github.com/microsoft/openvmm/blob/feature/microvm/dev/.github/copilot-instructions.md),
 including their Clippy, rustdoc, test, and formatting checks, then promote
 the reviewed revision into NVX.
 
-`nanvix/openvmm` is a fork of
-[microsoft/openvmm](https://github.com/microsoft/openvmm). The
-[OpenVMM upstream roadmap](openvmm-upstream-roadmap.md) groups the fork's
-microVM commits into planned upstream pull requests and marks those that stay
-fork-only.
+`feature/microvm/dev` carries the microVM commits on top of the `main` branch
+of `microsoft/openvmm`. The
+[OpenVMM upstream roadmap](openvmm-upstream-roadmap.md) groups those commits
+into planned pull requests to `main` and marks those that stay fork-only.
 
 ### Pin promotion
 
