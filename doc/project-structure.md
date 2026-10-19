@@ -101,11 +101,11 @@ nvx/
 |   |   |-- protocol/            Control-console codec shared by the host and the guest
 |   |   |-- contract.rs          Control-contract versions and release compatibility
 |   |   |-- net/                 CIDR parsing and subtraction, and hostname and guest-network forms
-|   |   |-- host/                Artifacts, launch, network and egress-policy lowering, sessions, and VM instances
+|   |   |-- host/                Artifacts, launch, network and egress-policy lowering, sessions, VM instances, and the sandbox launch profile
 |   |   |-- testing/             Fake OpenVMM (feature `testing`)
 |   |   |-- guest/               Programs that run in Linux guests (feature `guest`)
 |   |   `-- bin/                 nvx-fake-openvmm test double and the guest binaries
-|   |-- tests/                   Fake-OpenVMM instance lifecycle and guest-binary tests, and the egress policy parity fixture
+|   |-- tests/                   Fake-OpenVMM instance lifecycle and guest-binary tests, and the golden fixtures that Python recorded
 |   |-- build.rs                 Stages the bundled artifacts (feature `bundled`)
 |   `-- artifacts.json           Release package pinned for the bundled artifacts
 |-- openvmm/                     OpenVMM Git submodule
@@ -155,10 +155,10 @@ nvx/
 |   |   |-- setup-windows-whp.ps1 Windows/WHP development-host and Actions runner bootstrap
 |   |   `-- tool-versions.conf    Shared tool release and checksum pins
 |   |-- check_markdown_links.py  Markdown link, anchor, and doc/ path check run by CI
-|   |-- generate_egress_policy_fixtures.py Egress policy parity fixture of nvx-rs, from egress_policy.py
 |   |-- nvx-hosts.example.json   Template for the ignored .nvx-hosts.json
 |   |-- nvx.py                   Supported command-line entry point
 |   |-- nvx_adversarial_executor.py Restricted adversarial executor entry point
+|   |-- nvx_rs_fixtures.py       Golden fixtures of the nvx-rs ports of Python code, recorded from that code
 |   |-- publish_development_release.py Development release publisher run by CI
 |   `-- test_*.py                Python tooling unit tests
 |-- SECURITY.md                 Microsoft security vulnerability reporting policy
@@ -274,7 +274,8 @@ authenticated control protocol of the guest agent, artifact discovery and
 bundled-release staging, OpenVMM's command line, the lowering of network and
 filesystem policies, the compiler of `nvx.py`'s egress policy files, process
 and platform primitives for Linux and Windows
-hosts, the supervision of VM instances, and a fake OpenVMM for tests. Its
+hosts, the supervision of VM instances, the sandbox launch profile of
+`nvx.py sandbox`, and a fake OpenVMM for tests. Its
 `guest` feature builds the nine static executables that every guest image
 installs at `/sbin/nvx-*`. It is a
 standalone crate with its own `Cargo.lock`, like `aci_edge_sandboxes`, and
