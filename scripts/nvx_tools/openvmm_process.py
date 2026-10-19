@@ -302,14 +302,28 @@ class OpenvmmProcess:
             self._finished = True
 
     def _drain_available(self) -> None:
-        """Keep the output still queued; failure paths only, so no scan."""
+        """Keep the output still queued; failure paths only, so no scan.
+
+        A transcript write error does not stop the drain: every queued chunk is
+        kept in memory, and the first error is re-raised once the queue is empty.
+        """
+        error: Exception | None = None
         while True:
             try:
                 chunk = self._chunks.get_nowait()
             except queue.Empty:
-                return
-            if chunk is not None:
-                self._record(chunk)
+                break
+            if chunk is None:
+                continue
+            self._output.extend(chunk)
+            if error is None:
+                try:
+                    self._log.write(chunk)
+                    self._log.flush()
+                except Exception as write_error:
+                    error = write_error
+        if error is not None:
+            raise error
 
     def _record(self, chunk: bytes) -> None:
         """Keep a consumed chunk in memory and in the transcript, flushed for readers."""

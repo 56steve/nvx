@@ -4933,6 +4933,33 @@ class MicrovmTests(unittest.TestCase):
             interaction.return_value.close.assert_called_once_with()
             failing.close.assert_called_once_with()
 
+    def test_process_close_keeps_every_queued_chunk_when_the_transcript_write_fails(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            log_path = Path(temporary) / "output.log"
+            with (
+                patch.object(openvmm_process, "InteractiveProcess") as interaction,
+                patch.object(openvmm_process.threading, "Thread"),
+                patch.object(openvmm_process.queue, "Queue") as queues,
+            ):
+                interaction.return_value.process.poll.return_value = None
+                queues.return_value.get_nowait.side_effect = [
+                    b"FIRST\n",
+                    b"SECOND\n",
+                    b"THIRD\n",
+                    queue.Empty,
+                ]
+                process = openvmm_process.OpenvmmProcess(["openvmm"], log_path)
+                failing = MagicMock()
+                failing.closed = False
+                failing.write.side_effect = OSError("no space left on device")
+                process._log.close()
+                process._log = failing
+                with self.assertRaises(OSError):
+                    process.close()
+                self.assertEqual(bytes(process._output), b"FIRST\nSECOND\nTHIRD\n")
+            interaction.return_value.close.assert_called_once_with()
+            failing.close.assert_called_once_with()
+
     def test_process_wait_clamps_elapsed_process_timeout(self):
         with tempfile.TemporaryDirectory() as temporary:
             with (
