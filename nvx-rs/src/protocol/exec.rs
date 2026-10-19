@@ -198,16 +198,30 @@ pub struct GuestExecPayload {
     pub inherit_default_env: bool,
 }
 
-/// Decodes the payload of an `EXEC` request.
+/// The fixed fields of an `EXEC` payload, which both decoders read and check alike.
+struct ExecHeader {
+    /// Timeout in milliseconds; zero disables it.
+    timeout_ms: u32,
+    /// Number of arguments, from 1 to [`MAX_ARGUMENTS`].
+    count: usize,
+    /// Flags of an extended payload; zero for a legacy one.
+    flags: u16,
+    /// Number of environment entries.
+    environment_count: usize,
+    /// Length of the working directory; zero without one.
+    cwd_len: usize,
+    /// Offset of the first argument.
+    offset: usize,
+}
+
+/// Decodes the fixed fields of an `EXEC` payload, whose working directory may be 1 to `max_cwd`
+/// bytes long.
 ///
-/// It refuses what the guest agent refuses: a truncated payload, a number of arguments outside 1
-/// to [`MAX_ARGUMENTS`], an unknown extension or flag, a working-directory length without the
-/// working-directory flag or the reverse, environment entries without the environment flag, more
-/// than [`MAX_ENVIRONMENT`] entries, an empty argument, working directory, or entry, or one
-/// longer than [`MAX_ARGUMENT_BYTES`], text that is not UTF-8 or contains NUL characters, a
-/// relative program or working directory, an entry without a name, a name that repeats, and
-/// trailing bytes.
-pub fn decode_exec_payload(payload: &[u8]) -> Result<ExecPayload, ProtocolError> {
+/// It refuses a truncated header, a number of arguments outside 1 to [`MAX_ARGUMENTS`], an
+/// unknown extension or flag, a working-directory length without the working-directory flag or
+/// the reverse, environment entries without the environment flag, and more than
+/// [`MAX_ENVIRONMENT`] entries.
+fn decode_exec_header(payload: &[u8], max_cwd: usize) -> Result<ExecHeader, ProtocolError> {
     let truncated = || violation("the exec request is truncated");
     if payload.len() < 8 {
         return Err(truncated());
@@ -220,7 +234,7 @@ pub fn decode_exec_payload(payload: &[u8]) -> Result<ExecPayload, ProtocolError>
             "exec requires 1 to {MAX_ARGUMENTS} arguments"
         )));
     }
-    let (flags, environment_count, cwd_len, mut offset) = match extension {
+    let (flags, environment_count, cwd_len, offset) = match extension {
         0 => (0, 0, 0, 8),
         EXEC_EXTENDED if payload.len() >= 16 => {
             let flags = u16_at(payload, 8).ok_or_else(truncated)?;
@@ -230,7 +244,7 @@ pub fn decode_exec_payload(payload: &[u8]) -> Result<ExecPayload, ProtocolError>
             let cwd_valid = if flags & EXEC_CWD_PRESENT == 0 {
                 cwd_len == 0
             } else {
-                (1..=MAX_ARGUMENT_BYTES).contains(&cwd_len)
+                (1..=max_cwd).contains(&cwd_len)
             };
             let environment_valid = flags & EXEC_ENVIRONMENT_PRESENT != 0
                 || (environment_count == 0 && flags & EXEC_INHERIT_DEFAULT_ENV == 0);
@@ -248,6 +262,34 @@ pub fn decode_exec_payload(payload: &[u8]) -> Result<ExecPayload, ProtocolError>
         EXEC_EXTENDED => return Err(truncated()),
         _ => return Err(violation("the exec request has an unknown extension")),
     };
+    Ok(ExecHeader {
+        timeout_ms,
+        count,
+        flags,
+        environment_count,
+        cwd_len,
+        offset,
+    })
+}
+
+/// Decodes the payload of an `EXEC` request.
+///
+/// It refuses what the guest agent refuses: a truncated payload, a number of arguments outside 1
+/// to [`MAX_ARGUMENTS`], an unknown extension or flag, a working-directory length without the
+/// working-directory flag or the reverse, environment entries without the environment flag, more
+/// than [`MAX_ENVIRONMENT`] entries, an empty argument, working directory, or entry, or one
+/// longer than [`MAX_ARGUMENT_BYTES`], text that is not UTF-8 or contains NUL characters, a
+/// relative program or working directory, an entry without a name, a name that repeats, and
+/// trailing bytes.
+pub fn decode_exec_payload(payload: &[u8]) -> Result<ExecPayload, ProtocolError> {
+    let ExecHeader {
+        timeout_ms,
+        count,
+        flags,
+        environment_count,
+        cwd_len,
+        mut offset,
+    } = decode_exec_header(payload, MAX_ARGUMENT_BYTES)?;
     let mut argv = Vec::with_capacity(count);
     for _ in 0..count {
         argv.push(prefixed_text(payload, &mut offset, "arguments")?);
@@ -303,46 +345,14 @@ pub fn decode_exec_payload(payload: &[u8]) -> Result<ExecPayload, ProtocolError>
 /// and at the C guest's 4096-byte working-directory boundary. The host-facing decoder remains
 /// text-oriented, so this guest decoder does not broaden host behavior.
 pub fn decode_guest_exec_payload(payload: &[u8]) -> Result<GuestExecPayload, ProtocolError> {
-    let truncated = || violation("the exec request is truncated");
-    if payload.len() < 8 {
-        return Err(truncated());
-    }
-    let timeout_ms = u32_at(payload, 0).ok_or_else(truncated)?;
-    let count = usize::from(u16_at(payload, 4).ok_or_else(truncated)?);
-    let extension = u16_at(payload, 6).ok_or_else(truncated)?;
-    if count == 0 || count > MAX_ARGUMENTS {
-        return Err(violation(format!(
-            "exec requires 1 to {MAX_ARGUMENTS} arguments"
-        )));
-    }
-    let (flags, environment_count, cwd_len, mut offset) = match extension {
-        0 => (0, 0, 0, 8),
-        EXEC_EXTENDED if payload.len() >= 16 => {
-            let flags = u16_at(payload, 8).ok_or_else(truncated)?;
-            let environment_count = usize::from(u16_at(payload, 10).ok_or_else(truncated)?);
-            let cwd_len = u32_at(payload, 12).ok_or_else(truncated)? as usize;
-            let known = EXEC_CWD_PRESENT | EXEC_ENVIRONMENT_PRESENT | EXEC_INHERIT_DEFAULT_ENV;
-            let cwd_valid = if flags & EXEC_CWD_PRESENT == 0 {
-                cwd_len == 0
-            } else {
-                (1..=MAX_GUEST_CWD_BYTES).contains(&cwd_len)
-            };
-            let environment_valid = flags & EXEC_ENVIRONMENT_PRESENT != 0
-                || (environment_count == 0 && flags & EXEC_INHERIT_DEFAULT_ENV == 0);
-            if flags & !known != 0
-                || !cwd_valid
-                || !environment_valid
-                || environment_count > MAX_ENVIRONMENT
-            {
-                return Err(violation(
-                    "the exec request has unknown flags or inconsistent fields",
-                ));
-            }
-            (flags, environment_count, cwd_len, 16)
-        }
-        EXEC_EXTENDED => return Err(truncated()),
-        _ => return Err(violation("the exec request has an unknown extension")),
-    };
+    let ExecHeader {
+        timeout_ms,
+        count,
+        flags,
+        environment_count,
+        cwd_len,
+        mut offset,
+    } = decode_exec_header(payload, MAX_GUEST_CWD_BYTES)?;
     let mut argv = Vec::with_capacity(count);
     for _ in 0..count {
         argv.push(prefixed_bytes(payload, &mut offset, "arguments")?);
@@ -397,17 +407,7 @@ pub fn decode_guest_exec_payload(payload: &[u8]) -> Result<GuestExecPayload, Pro
 /// Reads the text at `offset` that its `u32` length precedes, of 1 to [`MAX_ARGUMENT_BYTES`]
 /// bytes, and advances `offset` past it.
 fn prefixed_text(payload: &[u8], offset: &mut usize, what: &str) -> Result<String, ProtocolError> {
-    let length = u32_at(payload, *offset)
-        .ok_or_else(|| violation("the exec request is truncated"))? as usize;
-    *offset += 4;
-    if length == 0 || length > MAX_ARGUMENT_BYTES {
-        return Err(violation(format!(
-            "exec {what} must be 1 to {MAX_ARGUMENT_BYTES} bytes"
-        )));
-    }
-    let text = text_at(payload, *offset, length, what)?;
-    *offset += length;
-    Ok(text)
+    utf8_text(prefixed_bytes(payload, offset, what)?, what)
 }
 
 /// Reads the `length` bytes at `offset` as text. Like the guest agent, refuses a NUL byte, which
@@ -418,17 +418,12 @@ fn text_at(
     length: usize,
     what: &str,
 ) -> Result<String, ProtocolError> {
-    let bytes = offset
-        .checked_add(length)
-        .and_then(|end| payload.get(offset..end))
-        .ok_or_else(|| violation("the exec request is truncated"))?;
-    if bytes.contains(&0) {
-        return Err(violation(format!(
-            "exec {what} must not contain NUL characters"
-        )));
-    }
-    String::from_utf8(bytes.to_vec())
-        .map_err(|_| violation(format!("exec {what} must be valid UTF-8")))
+    utf8_text(bytes_at(payload, offset, length, what)?.to_vec(), what)
+}
+
+/// Converts the bytes of a field to text, refusing bytes that are not UTF-8.
+fn utf8_text(bytes: Vec<u8>, what: &str) -> Result<String, ProtocolError> {
+    String::from_utf8(bytes).map_err(|_| violation(format!("exec {what} must be valid UTF-8")))
 }
 
 /// Reads one little-endian length-prefixed byte string and advances `offset`.
