@@ -87,6 +87,7 @@ from nvx_tools.elf import check_static_executables
 from nvx_tools.guest_binaries import (
     build_guest_binaries,
     check_guest_binaries,
+    guest_binary_source_sha256,
     test_guest_binaries,
 )
 from nvx_tools.guests import GUEST_NAMES, guest_descriptor
@@ -391,6 +392,10 @@ def command_classify_ci_changes(args: argparse.Namespace) -> None:
 
 def command_kernel_patch_identity(args: argparse.Namespace) -> None:
     print(kernel_patch_identity(args.root))
+
+
+def command_guest_binary_source_identity(args: argparse.Namespace) -> None:
+    print(guest_binary_source_sha256(args.root))
 
 
 def command_check_required_ci(args: argparse.Namespace) -> None:
@@ -1123,6 +1128,20 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     patch_identity.set_defaults(handler=command_kernel_patch_identity)
 
+    source_identity = subparsers.add_parser(
+        "guest-binary-source-identity",
+        help=(
+            "print the digest of the Rust guest binary source paths and contents "
+            "that keys the guest image caches"
+        ),
+    )
+    source_identity.add_argument(
+        "--root",
+        type=Path,
+        default=BuildConstants.REPO_ROOT,
+    )
+    source_identity.set_defaults(handler=command_guest_binary_source_identity)
+
     required_ci = subparsers.add_parser(
         "check-required-ci",
         help="validate required GitHub Actions job results",
@@ -1151,7 +1170,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
     static_elf = subparsers.add_parser(
         "check-static-elf",
-        help="check that executables are static ELF files without an interpreter",
+        help=(
+            "check that executables are static ELF files without an interpreter "
+            "or an executable stack"
+        ),
     )
     static_elf.add_argument("paths", nargs="+", type=Path, metavar="PATH")
     static_elf.set_defaults(handler=command_check_static_elf)

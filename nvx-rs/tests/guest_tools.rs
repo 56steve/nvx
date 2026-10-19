@@ -1003,12 +1003,42 @@ fn first_allowed_cpu() -> usize {
 }
 
 #[cfg(target_arch = "x86_64")]
+/// Returns the CPUs in the time ABI's mask that this process may run on.
+fn allowed_time_cpus() -> Vec<usize> {
+    let affinity = nix::sched::sched_getaffinity(nix::unistd::Pid::from_raw(0)).unwrap();
+    (0..64)
+        .filter(|&cpu| affinity.is_set(cpu).unwrap())
+        .collect()
+}
+
+#[cfg(target_arch = "x86_64")]
 /// Returns the CPUs that this process may not run on, of the 64 that the time ABI covers.
 fn unusable_cpus() -> Vec<usize> {
     let affinity = nix::sched::sched_getaffinity(nix::unistd::Pid::from_raw(0)).unwrap();
     (0..64)
         .filter(|&cpu| !affinity.is_set(cpu).unwrap())
         .collect()
+}
+
+#[cfg(target_arch = "x86_64")]
+/// Returns whether this process may switch itself from `SCHED_IDLE` to `SCHED_OTHER`.
+fn can_leave_idle_priority() -> bool {
+    let status = fs::read_to_string("/proc/self/status").unwrap();
+    let capabilities = status
+        .lines()
+        .find_map(|line| line.strip_prefix("CapEff:"))
+        .and_then(|value| u64::from_str_radix(value.trim(), 16).ok())
+        .unwrap_or(0);
+    if capabilities & (1 << 23) != 0 {
+        return true;
+    }
+    let limits = fs::read_to_string("/proc/self/limits").unwrap();
+    let nice = limits.lines().find_map(|line| {
+        line.strip_prefix("Max nice priority")?
+            .split_ascii_whitespace()
+            .next()
+    });
+    nice.is_some_and(|value| value == "unlimited" || value.parse::<u64>().is_ok_and(|n| n >= 20))
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1106,6 +1136,28 @@ fn time_test_mode_decodes_packets_samples_and_arithmetic() {
         output
             .1
             .ends_with(b" range=2147483648:134217728 range=4294967296:268435456\n")
+    );
+    let no_ranges = time_fixture(
+        directory.path(),
+        "no-ranges",
+        time_packet(0x02, 0, &[], 1, 0, 0),
+    );
+    let no_ranges = run(
+        "nvx-time",
+        [
+            OsStr::new("test"),
+            OsStr::new("packet"),
+            no_ranges.as_os_str(),
+            OsStr::new("0"),
+            OsStr::new("ffffffffffffffffffffffffffffffff"),
+        ],
+    );
+    assert_eq!(no_ranges.0, Some(0));
+    assert!(
+        no_ranges
+            .1
+            .windows(b" ranges=0 ".len())
+            .any(|window| window == b" ranges=0 ")
     );
 
     let mut sample = Vec::new();
@@ -1257,6 +1309,22 @@ fn time_test_mode_checks_logs_timer_state_and_status() {
         )
         .as_bytes()
     );
+    let malformed_state = time_fixture(
+        directory.path(),
+        "malformed-state",
+        b"unknown=x\nsamples=bad\n",
+    );
+    assert_eq!(
+        run(
+            "nvx-time",
+            [
+                OsStr::new("test"),
+                OsStr::new("state"),
+                malformed_state.as_os_str()
+            ]
+        ),
+        (Some(0), b"error\n".to_vec(), Vec::new())
+    );
     let status = run(
         "nvx-time",
         [
@@ -1273,6 +1341,158 @@ fn time_test_mode_checks_logs_timer_state_and_status() {
             .starts_with(b"NVX-TIME-ABI: v=1 phase=boot status=ok cpus=8 tsc_hz=2194843000 ")
     );
     assert!(status.1.ends_with(b"last_sample_error=none\nok=1\n"));
+}
+
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn time_test_mode_preserves_boot_log_and_syslog_results() {
+    let directory = tempfile::tempdir().unwrap();
+    let run_log = |name: &str, mode: &str, text: &str| {
+        let fixture = time_fixture(directory.path(), name, text);
+        run(
+            "nvx-time",
+            [OsStr::new("test"), OsStr::new(mode), fixture.as_os_str()],
+        )
+    };
+    let boot = concat!(
+        "Hypervisor detected: Microsoft Hyper-V\n",
+        "Hyper-V: privilege flags low 0x8860, high 0x0, ext 0x0, hints 0x0, misc 0x100\n",
+        "Hyper-V: LAPIC Timer Frequency: 0x1e8480\n",
+        "tsc: Detected 2194.843 MHz processor\n",
+        "clocksource: Switched to clocksource tsc-early\n",
+        "clocksource: Switched to clocksource tsc\n"
+    );
+    assert_eq!(
+        run_log(
+            "boot-kvm-rate",
+            "boot-log",
+            &boot.replace("0x1e8480", "0x989680")
+        ),
+        (Some(0), b"ok\n".to_vec(), Vec::new())
+    );
+
+    let mut syslog = boot
+        .lines()
+        .enumerate()
+        .map(|(index, line)| format!("<6>[{index:5}.{:06}] {line}", index * 7919 % 1_000_000))
+        .collect::<Vec<_>>();
+    syslog.insert(
+        1,
+        "<6>[    0.123456] [drm] a bracketed message is kept".to_owned(),
+    );
+    let syslog = syslog.join("\n") + "\n";
+    assert_eq!(
+        run_log("syslog-good", "syslog", &syslog),
+        (Some(0), b"ok\n".to_vec(), Vec::new())
+    );
+    let own_c4 = concat!(
+        "<2>[    3.000000] NVX-TIME-REPORT-VIOLATION: v=1 code=G_CONFORMANCE_C4 ",
+        "detail=\"forbidden record: kvm-clock: Using msrs\"\n"
+    );
+    assert_eq!(
+        run_log("syslog-own-c4", "syslog", &format!("{syslog}{own_c4}")),
+        (Some(0), b"ok\n".to_vec(), Vec::new())
+    );
+    let kvm = run_log(
+        "syslog-kvm",
+        "syslog",
+        &format!("{syslog}<6>[    4.000000] kvm-clock: Using msrs\n"),
+    );
+    assert_eq!(kvm.0, Some(0));
+    assert!(kvm.2.is_empty());
+    assert!(
+        kvm.1.starts_with(b"fail forbidden record: kvm-clock"),
+        "{}",
+        String::from_utf8_lossy(&kvm.1)
+    );
+    let missing = syslog.lines().skip(2).collect::<Vec<_>>().join("\n") + "\n";
+    let missing = run_log("syslog-missing", "syslog", &missing);
+    assert_eq!(missing.0, Some(0));
+    assert!(missing.2.is_empty());
+    assert!(
+        missing.1.starts_with(b"fail no 'Hypervisor"),
+        "{}",
+        String::from_utf8_lossy(&missing.1)
+    );
+
+    let lines = boot
+        .lines()
+        .map(|line| format!("<6>[    0.100000] {line}"))
+        .collect::<Vec<_>>();
+    let warning = [
+        "<4>[    0.412345] ------------[ cut here ]------------",
+        "<4>[    0.412346] x86/mm: Found insecure W+X mapping at address \
+         0xffffffffc0000000",
+        "<4>[    0.412400] WARNING: CPU: 0 PID: 1 at \
+         arch/x86/mm/dump_pagetables.c:246 note_wx+0x5a/0x70",
+        "<6>[    0.412500] x86/mm: Checked W+X mappings: FAILED, 4 W+X pages found.",
+    ];
+    let with_warning = lines[..2]
+        .iter()
+        .map(String::as_str)
+        .chain(warning.iter().copied())
+        .chain(lines[2..].iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    assert_eq!(
+        run_log("syslog-wx", "syslog", &with_warning),
+        (
+            Some(0),
+            concat!(
+                "ok\n",
+                "wx x86/mm: Found insecure W+X mapping at address 0xffffffffc0000000\n"
+            )
+            .as_bytes()
+            .to_vec(),
+            Vec::new()
+        )
+    );
+    let passed = lines
+        .iter()
+        .map(String::as_str)
+        .chain(std::iter::once(
+            "<6>[    0.412500] x86/mm: Checked W+X mappings: passed, no W+X pages found.",
+        ))
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    assert_eq!(
+        run_log("syslog-wx-passed", "syslog", &passed),
+        (Some(0), b"ok\n".to_vec(), Vec::new())
+    );
+    let missing_with_warning = warning
+        .iter()
+        .copied()
+        .chain(lines[1..].iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    assert_eq!(
+        run_log("syslog-wx-missing", "syslog", &missing_with_warning),
+        (
+            Some(0),
+            concat!(
+                "fail no 'Hypervisor detected: Microsoft Hyper-V'\n",
+                "wx x86/mm: Found insecure W+X mapping at address 0xffffffffc0000000\n"
+            )
+            .as_bytes()
+            .to_vec(),
+            Vec::new()
+        )
+    );
+    let own_wx = concat!(
+        "<2>[    3.000000] NVX-TIME-REPORT-VIOLATION: v=1 code=G_KERNEL_WX ",
+        "detail=\"x86/mm: Found insecure W+X mapping at address 0x0\"\n"
+    );
+    assert_eq!(
+        run_log(
+            "syslog-own-wx",
+            "syslog",
+            &(lines.join("\n") + "\n" + own_wx)
+        ),
+        (Some(0), b"ok\n".to_vec(), Vec::new())
+    );
 }
 
 #[test]
@@ -1425,6 +1645,12 @@ fn time_test_mode_checks_packet_and_sample_boundaries() {
             .1
             .starts_with(b"error G_REPAIR_GENERATION ")
     );
+    let forward_gap = time_packet(0, 0, &[], 7, 0, 0);
+    assert!(
+        run_time_packet(directory.path(), "forward-gap", &forward_gap, "5", previous)
+            .1
+            .starts_with(b"error G_REPAIR_GENERATION ")
+    );
     assert!(
         run_time_packet(
             directory.path(),
@@ -1512,6 +1738,46 @@ fn time_test_mode_covers_checks_events_records_and_workers() {
         .1,
         b"ok cpu0_khz=2194843 cpu1_khz=2194843\n"
     );
+    let cpuinfo_text = |flags: &str, cpus: usize| {
+        (0..cpus)
+            .map(|cpu| format!("processor : {cpu}\ncpu MHz : 2194.843\nflags : {flags}\n\n"))
+            .collect::<String>()
+    };
+    for (name, flags, cpus) in [
+        (
+            "cpuinfo-no-reliable",
+            good_flags.replace("tsc_reliable ", ""),
+            2,
+        ),
+        (
+            "cpuinfo-deadline",
+            format!("{good_flags} tsc_deadline_timer"),
+            2,
+        ),
+        ("cpuinfo-adjust", format!("{good_flags} tsc_adjust"), 2),
+        ("cpuinfo-missing", good_flags.to_owned(), 1),
+    ] {
+        let fixture = time_fixture(directory.path(), name, cpuinfo_text(&flags, cpus));
+        let output = run(
+            "nvx-time",
+            [
+                OsStr::new("test"),
+                OsStr::new("cpuinfo"),
+                fixture.as_os_str(),
+                OsStr::new("0-1"),
+            ],
+        );
+        assert_eq!(output.0, Some(0));
+        assert!(output.2.is_empty());
+        assert!(
+            output
+                .1
+                .windows(b"code=G_CONFORMANCE_C5".len())
+                .any(|window| window == b"code=G_CONFORMANCE_C5"),
+            "{name}: {}",
+            String::from_utf8_lossy(&output.1)
+        );
+    }
     for token in [
         "tsc_early_khz=2194843",
         "lapic_timer_hz=200000000",
@@ -1806,6 +2072,29 @@ fn time_test_mode_covers_remaining_events_records_and_workers() {
             expected.as_bytes()
         );
     }
+    for (index, record) in [
+        "",
+        "new_cpus=4\ngeneration=3\n",
+        "generation=3\nnew_cpus=7-4\n",
+        "generation=3\nnew_cpus=64\n",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let record = time_fixture(directory.path(), &format!("restore-error-{index}"), record);
+        assert_eq!(
+            run(
+                "nvx-time",
+                [
+                    OsStr::new("test"),
+                    OsStr::new("restore-record"),
+                    record.as_os_str()
+                ]
+            ),
+            (Some(0), b"error\n".to_vec(), Vec::new()),
+            "case {index}"
+        );
+    }
 
     // These exercise the same thread promotion, affinity merge, and at-fork CPU accounting
     // paths as the production deferred boot and restore workers.
@@ -1814,7 +2103,50 @@ fn time_test_mode_covers_remaining_events_records_and_workers() {
         let output = run("nvx-time", ["test", "parallel", &cpu.to_string()]);
         assert_eq!(output.0, Some(0));
         assert!(output.1.ends_with(b"failures=7\n"));
+    }
+    let allowed = allowed_time_cpus();
+    if let Some(&cpu) = allowed.first() {
+        let mut sizes = vec![1, allowed.len().min(2), allowed.len().min(4)];
+        sizes.sort_unstable();
+        sizes.dedup();
+        for size in sizes {
+            let selected = allowed[..size]
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            let (status, output, stderr) = run("nvx-time", ["test", "parallel", &selected]);
+            assert_eq!(status, Some(0));
+            assert!(stderr.is_empty());
+            let output = String::from_utf8(output).unwrap();
+            assert!(output.ends_with("failures=7\n"), "{output}");
+            assert_eq!(
+                output.matches("code=G_CONFORMANCE_C4").count(),
+                6,
+                "{output}"
+            );
+            assert_eq!(
+                output.matches("code=G_CONFORMANCE_C9").count(),
+                1,
+                "{output}"
+            );
+        }
+
         // Each CPU job that cannot run on its CPU fails C1, and every job's failures count.
+        if let Some(&unusable) = unusable_cpus().first() {
+            let (status, output, stderr) = run(
+                "nvx-time",
+                ["test", "parallel", &format!("{cpu},{unusable}")],
+            );
+            assert_eq!(status, Some(0));
+            assert!(stderr.is_empty());
+            let output = String::from_utf8(output).unwrap();
+            assert!(output.ends_with("failures=8\n"), "{output}");
+            assert!(
+                output.contains(&format!("cannot run on cpu {unusable}")),
+                "{output}"
+            );
+        }
         if let [first, second, ..] = unusable_cpus()[..] {
             let (status, output, _) = run(
                 "nvx-time",
@@ -1829,6 +2161,7 @@ fn time_test_mode_covers_remaining_events_records_and_workers() {
             }
         }
     }
+    let normal_policy = if can_leave_idle_priority() { 0 } else { 5 };
     let promoted = run("nvx-time", ["test", "promote"]);
     assert_eq!(promoted.0, Some(0));
     assert!(promoted.1.starts_with(b"promoted caller="));
@@ -1838,9 +2171,32 @@ fn time_test_mode_covers_remaining_events_records_and_workers() {
             .windows(b"\nstopped caller=".len())
             .any(|window| window == b"\nstopped caller=")
     );
+    assert!(promoted.2.is_empty());
+    let promoted = String::from_utf8(promoted.1).unwrap();
+    let mut promoted_lines = promoted.lines();
+    assert_eq!(
+        promoted_lines.next(),
+        Some(format!("promoted caller={normal_policy} thread={normal_policy}").as_str())
+    );
+    let stopped = promoted_lines.next().unwrap();
+    let stop_ms = stopped
+        .strip_prefix("stopped caller=5 stop_ms=")
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or_else(|| panic!("unexpected stop line: {stopped}"));
+    assert!(stop_ms < 1000, "{stopped}");
+    assert_eq!(promoted_lines.next(), None);
+
     let idle = run("nvx-time", ["test", "idle-priority"]);
     assert_eq!(idle.0, Some(0));
     assert!(idle.1.starts_with(b"idle=5 normal="));
+    assert_eq!(
+        idle,
+        (
+            Some(0),
+            format!("idle=5 normal={normal_policy}\n").into_bytes(),
+            Vec::new()
+        )
+    );
     let cpu = run(
         "nvx-time",
         ["test", "deferred-restore-cpu", "20", "30", "10"],
@@ -1855,6 +2211,10 @@ fn time_test_mode_covers_remaining_events_records_and_workers() {
     // The preparation and the fork's share precede the worker's own CPU time in its total.
     assert!(
         matches!(fields[..], [("prior_ms", 20..30), ("total_ms", 60..)]),
+        "{fields:?}"
+    );
+    assert!(
+        matches!(fields[..], [("prior_ms", 20..30), ("total_ms", 60..90)]),
         "{fields:?}"
     );
 }

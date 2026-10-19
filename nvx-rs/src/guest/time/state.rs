@@ -391,6 +391,75 @@ impl fmt::Display for TimeState {
 mod tests {
     use super::*;
 
+    const ROUND_TRIP_STATE: &str = concat!(
+        "version=1\n",
+        "generation=2\n",
+        "boot_status=ok\n",
+        "capture_status=ok\n",
+        "restore_status=pending\n",
+        "boot_cpus=8\n",
+        "capture_cpus=8\n",
+        "restore_cpus=0\n",
+        "boot_elapsed_us=2400\n",
+        "capture_elapsed_us=310\n",
+        "restore_elapsed_us=1830\n",
+        "boot_cpu_us=1900\n",
+        "capture_cpu_us=290\n",
+        "restore_cpu_us=640\n",
+        "capture_generation=1\n",
+        "restore_generation=2\n",
+        "tsc_hz=2194843000\n",
+        "lapic_hz=200000000\n",
+        "discontinuities=3\n",
+        "last_discontinuity=step\n",
+        "last_step_ns=-200000000\n",
+        "last_step_realtime_ns=1790841600000000000\n",
+        "last_downtime_ns=31000000000\n",
+        "last_downtime_source=utc\n",
+        "synchronized=1\n",
+        "offset_ns=-42\n",
+        "uncertainty_ns=1800\n",
+        "frequency_ppb=-1200\n",
+        "samples=17\n",
+        "rejected_samples=1\n",
+        "last_sample_error=none\n",
+        "violations=0\n"
+    );
+
+    const STATUS_STATE: &str = concat!(
+        "version=1\n",
+        "generation=2\n",
+        "boot_status=ok\n",
+        "capture_status=ok\n",
+        "restore_status=ok\n",
+        "boot_cpus=8\n",
+        "capture_cpus=8\n",
+        "restore_cpus=4\n",
+        "boot_elapsed_us=2400\n",
+        "capture_elapsed_us=310\n",
+        "restore_elapsed_us=1830\n",
+        "boot_cpu_us=1900\n",
+        "capture_cpu_us=290\n",
+        "restore_cpu_us=640\n",
+        "capture_generation=1\n",
+        "restore_generation=2\n",
+        "tsc_hz=2194843000\n",
+        "lapic_hz=200000000\n",
+        "discontinuities=2\n",
+        "synchronized=1\n",
+        "offset_ns=-42\n",
+        "uncertainty_ns=1800\n",
+        "rejected_samples=2\n",
+        "last_sample_error=G_SAMPLE_UNCERTAIN\n"
+    );
+
+    fn status(text: &str, report_only: bool) -> String {
+        let state = TimeState::parse(text.as_bytes()).unwrap();
+        let mut output = state.status_markers(report_only);
+        output.push_str(&format!("ok={}\n", u8::from(state.checks_ok())));
+        output
+    }
+
     #[test]
     fn fresh_state_has_only_a_pending_boot_check() {
         let state = TimeState::parse(b"version=1\n").unwrap();
@@ -399,6 +468,10 @@ mod tests {
                 .to_string()
                 .starts_with("version=1\ngeneration=0\nboot_status=pending\nboot_cpus=0\n")
         );
+        assert!(state.to_string().starts_with(
+            "version=1\ngeneration=0\nboot_status=pending\nboot_cpus=0\n\
+                 boot_elapsed_us=0\nboot_cpu_us=0\ntsc_hz=0\nlapic_hz=0\n"
+        ));
         assert_eq!(state.checks[1].status, None);
         assert!(state.pending(true) && state.pending(false) && !state.checks_ok());
     }
@@ -436,6 +509,91 @@ mod tests {
             Some(
                 "NVX-TIME-REPORT: v=1 phase=boot status=ok cpus=8 tsc_hz=0 lapic_hz=0 \
                  generation=0 elapsed_us=1 cpu_us=3 failures=0"
+            )
+        );
+    }
+
+    #[test]
+    fn enforcing_and_report_only_states_round_trip_exactly() {
+        let state = TimeState::parse(ROUND_TRIP_STATE.as_bytes()).unwrap();
+        assert_eq!(state.to_string(), ROUND_TRIP_STATE);
+        assert!(state.pending(false) && !state.checks_ok());
+
+        let report = ROUND_TRIP_STATE
+            .replace("restore_status=pending", "restore_status=fail")
+            .replace(
+                "restore_generation=2\n",
+                "restore_generation=2\nboot_failures=0\ncapture_failures=0\n\
+                 restore_failures=3\n",
+            );
+        assert_eq!(
+            TimeState::parse(report.as_bytes()).unwrap().to_string(),
+            report
+        );
+    }
+
+    #[test]
+    fn status_prints_every_recorded_check_and_the_runtime_line() {
+        const RATES: &str = "tsc_hz=2194843000 lapic_hz=200000000";
+        assert_eq!(
+            status(STATUS_STATE, false),
+            format!(
+                "NVX-TIME-ABI: v=1 phase=boot status=ok cpus=8 {RATES} \
+                 generation=0 elapsed_us=2400 cpu_us=1900\n\
+                 NVX-TIME-ABI: v=1 phase=capture status=ok cpus=8 {RATES} \
+                 generation=1 elapsed_us=310 cpu_us=290\n\
+                 NVX-TIME-ABI: v=1 phase=restore status=ok cpus=4 {RATES} \
+                 generation=2 elapsed_us=1830 cpu_us=640\n\
+                 NVX-TIME-ABI: v=1 phase=runtime status=synchronized generation=2 \
+                 discontinuities=2 offset_ns=-42 uncertainty_ns=1800 rejected_samples=2 \
+                 last_sample_error=G_SAMPLE_UNCERTAIN\n\
+                 ok=1\n"
+            )
+        );
+
+        let pending = status(
+            &STATUS_STATE.replace("restore_status=ok", "restore_status=pending"),
+            false,
+        );
+        assert!(pending.contains(&format!(
+            "NVX-TIME-ABI: v=1 phase=restore status=pending cpus=4 {RATES} generation=2\n"
+        )));
+        assert!(pending.ends_with("ok=0\n"));
+
+        let fresh = concat!(
+            "NVX-TIME-ABI: v=1 phase=boot status=pending cpus=0 tsc_hz=0 ",
+            "lapic_hz=0 generation=0\n",
+            "NVX-TIME-ABI: v=1 phase=runtime status=unsynchronized generation=0 ",
+            "discontinuities=0 offset_ns=0 uncertainty_ns=0 rejected_samples=0 ",
+            "last_sample_error=none\n",
+            "ok=0\n"
+        );
+        for text in [
+            "version=1\ngeneration=0\nboot_status=pending\n",
+            "version=1\n",
+        ] {
+            assert_eq!(status(text, false), fresh, "{text:?}");
+        }
+
+        let report_state = STATUS_STATE
+            .replace("restore_status=ok", "restore_status=fail")
+            .replace(
+                "restore_generation=2\n",
+                "restore_generation=2\nboot_failures=0\nrestore_failures=3\n",
+            );
+        assert_eq!(
+            status(&report_state, true),
+            format!(
+                "NVX-TIME-REPORT: v=1 phase=boot status=ok cpus=8 {RATES} \
+                 generation=0 elapsed_us=2400 cpu_us=1900 failures=0\n\
+                 NVX-TIME-REPORT: v=1 phase=capture status=ok cpus=8 {RATES} \
+                 generation=1 elapsed_us=310 cpu_us=290 failures=0\n\
+                 NVX-TIME-REPORT: v=1 phase=restore status=fail cpus=4 {RATES} \
+                 generation=2 elapsed_us=1830 cpu_us=640 failures=3\n\
+                 NVX-TIME-REPORT: v=1 phase=runtime status=synchronized generation=2 \
+                 discontinuities=2 offset_ns=-42 uncertainty_ns=1800 rejected_samples=2 \
+                 last_sample_error=G_SAMPLE_UNCERTAIN\n\
+                 ok=0\n"
             )
         );
     }

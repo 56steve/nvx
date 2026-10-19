@@ -157,14 +157,17 @@ class GuestRustBuildConstants:
     """Pinned inputs and outputs of the Rust guest-binary build."""
 
     DIRECTORY: Final = BuildConstants.REPO_ROOT / "nvx-rs"
-    MANIFEST: Final = DIRECTORY / "Cargo.toml"
-    LOCKFILE: Final = DIRECTORY / "Cargo.lock"
-    BUILD_SCRIPT: Final = DIRECTORY / "build.rs"
-    SOURCE_DIRECTORIES: Final = (DIRECTORY / "src",)
-    BUILD_RECIPE_FILES: Final = (
-        BuildConstants.REPO_ROOT / "scripts" / "nvx_tools" / "build_constants.py",
-        BuildConstants.REPO_ROOT / "scripts" / "nvx_tools" / "guest_binaries.py",
+    # The inputs of every guest executable, relative to a checkout's root: these
+    # files and every file under SOURCE_DIRECTORY outside a `target` tree.
+    SOURCE_FILES: Final = (
+        Path("nvx-rs") / "Cargo.toml",
+        Path("nvx-rs") / "Cargo.lock",
+        Path("nvx-rs") / "build.rs",
+        Path("rust-toolchain.toml"),
+        Path("scripts") / "nvx_tools" / "build_constants.py",
+        Path("scripts") / "nvx_tools" / "guest_binaries.py",
     )
+    SOURCE_DIRECTORY: Final = Path("nvx-rs") / "src"
     TOOLCHAIN_FILE: Final = BuildConstants.REPO_ROOT / "rust-toolchain.toml"
     TOOLCHAIN: Final = OpenVMMBuildConstants.RUST_TOOLCHAIN
     TARGET: Final = OpenVMMBuildConstants.MUSL_RUST_TARGET
@@ -176,6 +179,8 @@ class GuestRustBuildConstants:
     BUILD_MANIFEST_NAME: Final = "manifest.json"
     BUILD_MANIFEST_FORMAT: Final = 1
     BUILD_MANIFEST_DOMAIN: Final = "nvx-rust-guest-binary-build"
+    OUTPUT_DIRECTORY_NAME: Final = "guest-binaries"
+    SOURCE_PATHS: Final = ("nvx-rs", "rust-toolchain.toml")
     BINARIES: Final = (
         "nvx-console-pending",
         "nvx-mmio-write",
@@ -358,53 +363,14 @@ class InitramfsBuildConstants:
     TIMESTAMP: Final = 0
     CPIO_FORMAT: Final = "newc"
     GZIP_COMPRESSION_LEVEL: Final = 9
-    STATIC_HELPER_CFLAGS: Final = (
-        "-static",
-        "-Os",
-        "-s",
-        "-Wall",
-        "-Wextra",
-        "-Werror",
-    )
-    DEVICE_IO_CFLAGS: Final = (
-        "-nostdlib",
-        "-static",
-        "-Os",
-        "-fno-builtin",
-        "-fno-pie",
-        "-fno-stack-protector",
-        "-no-pie",
-        "-Wl,--build-id=none",
-        "-Wl,-z,noexecstack",
-        "-s",
-    )
-    STATIC_HELPERS: Final = (
-        "nvx-reseed",
-        "nvx-mmio-write",
-        "nvx-console-pending",
-        "nvx-managed-agent",
-    )
-    # Time tools, nvx-exit, and nvx-ingress are linked against musl: a static
-    # glibc binary adds about 700 KB to the initramfs, and every unpacked
-    # kilobyte delays cold boot. nvx-exit is also a restored guest's usual
-    # first exec.
-    MUSL_COMPILER: Final = "musl-gcc"
-    MUSL_STATIC_HELPERS: Final = ("nvx-time", "nvx-exit", "nvx-ingress")
-    TIME_PROBE_NAME: Final = "nvx-time-probe"
-    TIME_PROBE_CFLAGS: Final = (
-        "-std=gnu11",
-        "-static",
-        "-O2",
-        "-pthread",
-        "-s",
-        "-Wall",
-        "-Wextra",
-        "-Werror",
-    )
 
 
 class DockerBuildConstants:
     DOCKERFILE: Final = Path("docker") / "Dockerfile"
+    RUST_BUILDER_IMAGE: Final = (
+        f"rust:{GuestRustBuildConstants.TOOLCHAIN}-slim-bookworm@"
+        "sha256:d7482085ff5b415f84dba5647ae71606650bdef00db7aeb69f4b3d170c3e4082"
+    )
     ALPINE_TARGET: Final = "artifacts"
     UBUNTU_TARGET: Final = "ubuntu-guest-artifacts"
     AZURELINUX_TARGET: Final = "azurelinux-guest-artifacts"
@@ -450,6 +416,7 @@ class ReleaseBuildConstants:
     PROJECT_SOURCE_PATHS: Final = (
         ".github/agents/nvx-adversary.md",
         "guest",
+        "nvx-rs",
         "ubuntu",
         "azurelinux",
         "data/linux-kvm-virtual-machine.csv",
@@ -471,6 +438,7 @@ class ReleaseBuildConstants:
         "requirements-dev.txt",
         "rust-toolchain.toml",
     )
+    PROJECT_SOURCE_EXCLUDES: Final = (Path("nvx-rs") / "target",)
     GUEST_ARTIFACT_NAMES: Final = (
         KernelBuildConstants.BINARY_NAME,
         KernelBuildConstants.CONFIG_NAME,

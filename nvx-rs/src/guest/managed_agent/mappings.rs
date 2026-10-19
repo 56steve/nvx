@@ -285,9 +285,17 @@ mod tests {
             ),
             payload(
                 0,
+                &[good, (b"0/s\0rc", target.as_os_str().as_bytes(), 0)],
+                None,
+            ),
+            payload(
+                0,
                 &[good, (b"0/src", target.as_os_str().as_bytes(), 2)],
                 None,
             ),
+            payload(0, &[good, (b"", target.as_os_str().as_bytes(), 0)], None),
+            [payload(0, &[good], None), vec![0]].concat(),
+            payload(0, &[good], Some(2)),
             payload(0, &[], Some(0)),
             vec![0, 0, 0],
         ];

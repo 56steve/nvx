@@ -854,136 +854,81 @@ fn maps_decoding_refuses_what_the_guest_agent_refuses() {
     }
 }
 
-fn guest_agent_source() -> Option<String> {
-    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()?
-        .join("guest")
-        .join("common")
-        .join("nvx-managed-agent.c");
-    std::fs::read_to_string(source).ok()
+// Hosts and guests share the wire constants, so changing one passes every round trip between
+// them yet breaks compatibility with released peers. These tests pin each value literally.
+
+#[test]
+fn record_definitions_keep_their_wire_values() {
+    assert_eq!(OUTER_HEADER_LEN, 44);
+    assert_eq!(OUTER_MAX_PAYLOAD, 65_536);
+    assert_eq!(OUTER_VERSION, 1);
+    assert_eq!(OUTER_GUEST_ATTACH, 1);
+    assert_eq!(OUTER_RESET, 3);
+    assert_eq!(OUTER_ACK, 4);
+    assert_eq!(OUTER_DATA, 5);
+    assert_eq!(OUTER_CREDIT, 9);
+    assert_eq!(OUTER_RECEIVE_WINDOW, 1024 * 1024);
+    assert_eq!(APP_HEADER_LEN, 24);
+    assert_eq!(APP_VERSION, 1);
+    assert_eq!(APP_PING, 1);
+    assert_eq!(APP_EXEC, 2);
+    assert_eq!(APP_STOP, 3);
+    assert_eq!(APP_CANCEL, 4);
+    assert_eq!(APP_READY, 0x81);
+    assert_eq!(APP_STDOUT, 0x82);
+    assert_eq!(APP_STDERR, 0x83);
+    assert_eq!(APP_EXIT, 0x84);
+    assert_eq!(APP_STOPPED, 0x85);
+    assert_eq!(APP_ERROR, 0xff);
 }
 
 #[test]
-fn feature_definitions_match_the_guest_agent_source() {
-    let Some(source) = guest_agent_source() else {
-        return;
-    };
-    let mut definitions = vec![
-        format!("#define APP_FEATURES {APP_FEATURES}U"),
-        format!("#define APP_MAPS {APP_MAPS}U"),
-    ];
-    for (name, feature) in [
-        ("CANCEL", GuestFeatures::CANCEL),
-        ("WORKLOAD_ACCOUNT", GuestFeatures::WORKLOAD_ACCOUNT),
-        ("EXEC_CGROUP", GuestFeatures::EXEC_CGROUP),
-        ("EXEC_ENVIRONMENT", GuestFeatures::EXEC_ENVIRONMENT),
-        ("EXEC_CWD", GuestFeatures::EXEC_CWD),
-        ("HOST_MAPPING_TABLE", GuestFeatures::HOST_MAPPING_TABLE),
-    ] {
-        let bit = feature.bits().trailing_zeros();
-        definitions.push(format!("#define FEATURE_{name} (1U << {bit})"));
-    }
-    for definition in definitions {
-        assert!(
-            source.contains(&definition),
-            "the guest agent does not define `{definition}`"
-        );
-    }
-    // The retired bit stays unused, so hosts that need it refuse the image.
-    assert!(!source.contains("(1U << 1)"));
+fn feature_definitions_keep_their_wire_values() {
+    assert_eq!(APP_FEATURES, 5);
+    assert_eq!(APP_MAPS, 6);
+    assert_eq!(GuestFeatures::CANCEL.bits(), 0x01);
+    // Bit 1 is retired and stays unused, so hosts that still need it refuse the image.
+    assert_eq!(GuestFeatures::WORKLOAD_ACCOUNT.bits(), 0x04);
+    assert_eq!(GuestFeatures::EXEC_CGROUP.bits(), 0x08);
+    assert_eq!(GuestFeatures::EXEC_ENVIRONMENT.bits(), 0x10);
+    assert_eq!(GuestFeatures::EXEC_CWD.bits(), 0x20);
+    assert_eq!(GuestFeatures::HOST_MAPPING_TABLE.bits(), 0x40);
 }
 
 #[test]
-fn host_mapping_table_matches_the_guest_agent_source() {
-    let Some(source) = guest_agent_source() else {
-        return;
-    };
-    for expected in [
-        format!("#define MAX_HOST_MAPPINGS {MAX_HOST_MAPPINGS}U"),
-        format!("#define MAX_GUEST_PATH {}U", MAX_MAP_PATH_BYTES + 1),
-        format!("#define MAPS_HEADER_LEN {MAPS_HEADER_LEN}U"),
-        format!("#define MAP_ENTRY_HEADER_LEN {MAP_ENTRY_HEADER_LEN}U"),
-        format!("#define MAP_READ_ONLY {MAP_READ_ONLY}U"),
-        format!("#define MAPS_TOKEN \"{MAPS_TOKEN}\""),
-        format!("\"{MAPPINGS_INCOMPLETE}\""),
-        format!("\"{MAPPING_FAILED}\""),
-    ] {
-        assert!(
-            source.contains(&expected),
-            "the guest agent does not contain `{expected}`"
-        );
-    }
+fn host_mapping_table_keeps_its_wire_values() {
+    assert_eq!(MAX_HOST_MAPPINGS, 4096);
+    assert_eq!(MAX_MAP_PATH_BYTES, 4095);
+    assert_eq!(MAPS_HEADER_LEN, 8);
+    assert_eq!(MAP_ENTRY_HEADER_LEN, 6);
+    assert_eq!(MAP_READ_ONLY, 1);
+    assert_eq!(MAPS_TOKEN, "nvx_maps=");
+    assert_eq!(MAPPINGS_INCOMPLETE, "mappings-incomplete");
+    assert_eq!(MAPPING_FAILED, "mapping-failed");
 }
 
 #[test]
-fn exec_extension_matches_the_guest_agent_source() {
-    // The agent accepts a working directory as long as one argument, more than any directory
-    // that a workload can enter.
+fn exec_extension_keeps_its_wire_values() {
+    assert_eq!(EXEC_EXTENDED, 1);
+    assert_eq!(EXEC_CWD_PRESENT, 1);
+    assert_eq!(EXEC_ENVIRONMENT_PRESENT, 2);
+    assert_eq!(EXEC_INHERIT_DEFAULT_ENV, 4);
+    assert_eq!(MAX_ARGUMENTS, 64);
+    assert_eq!(MAX_ARGUMENT_BYTES, 4096);
+    assert_eq!(MAX_ENVIRONMENT, 256);
+    assert_eq!(MAX_OUTPUT_BYTES, 1024 * 1024);
+    assert_eq!(CWD_FAILED, "cwd-failed");
+    assert_eq!(LAUNCH_FAILED, "launch-failed");
+    assert_eq!(INVALID_REQUEST, "invalid-request");
+    assert_eq!(BUSY, "busy");
+    assert_eq!(UNSUPPORTED_OPERATION, b"unsupported-operation");
+}
+
+#[test]
+fn exec_limits_support_linux_paths() {
+    // A working directory may be as long as one argument, and Linux cannot
+    // enter a directory longer than that argument limit.
     const { assert!(MAX_CWD_BYTES < MAX_ARGUMENT_BYTES) };
-    let Some(source) = guest_agent_source() else {
-        return;
-    };
-    for expected in [
-        format!("#define EXEC_EXTENDED {EXEC_EXTENDED}U"),
-        format!("#define EXEC_CWD_PRESENT {EXEC_CWD_PRESENT}U"),
-        format!("#define EXEC_ENVIRONMENT_PRESENT {EXEC_ENVIRONMENT_PRESENT}U"),
-        format!("#define EXEC_INHERIT_DEFAULT_ENV {EXEC_INHERIT_DEFAULT_ENV}U"),
-        format!("#define MAX_ARGUMENTS {MAX_ARGUMENTS}U"),
-        format!("#define MAX_ARGUMENT_LEN {MAX_ARGUMENT_BYTES}U"),
-        format!("#define MAX_ENVIRONMENT {MAX_ENVIRONMENT}U"),
-        format!(
-            "#define MAX_OUTPUT_BYTES ({}U * 1024U)",
-            MAX_OUTPUT_BYTES / 1024
-        ),
-        format!("\"{CWD_FAILED}\""),
-        format!("\"{LAUNCH_FAILED}\""),
-        format!("\"{INVALID_REQUEST}\""),
-        format!("\"{BUSY}\""),
-        format!("\"{}\"", String::from_utf8_lossy(UNSUPPORTED_OPERATION)),
-    ] {
-        assert!(
-            source.contains(&expected),
-            "the guest agent does not contain `{expected}`"
-        );
-    }
-}
-
-#[test]
-fn record_definitions_match_the_guest_agent_source() {
-    let Some(source) = guest_agent_source() else {
-        return;
-    };
-    for expected in [
-        format!("#define OUTER_HEADER_LEN {OUTER_HEADER_LEN}U"),
-        format!("#define OUTER_MAX_PAYLOAD {OUTER_MAX_PAYLOAD}U"),
-        format!("#define OUTER_VERSION {OUTER_VERSION}U"),
-        format!("#define OUTER_GUEST_ATTACH {OUTER_GUEST_ATTACH}U"),
-        format!("#define OUTER_RESET {OUTER_RESET}U"),
-        format!("#define OUTER_ACK {OUTER_ACK}U"),
-        format!("#define OUTER_DATA {OUTER_DATA}U"),
-        format!("#define OUTER_CREDIT {OUTER_CREDIT}U"),
-        format!(
-            "#define OUTER_RECEIVE_WINDOW ({}U * 1024U)",
-            OUTER_RECEIVE_WINDOW / 1024
-        ),
-        format!("#define APP_HEADER_LEN {APP_HEADER_LEN}U"),
-        format!("#define APP_VERSION {APP_VERSION}U"),
-        format!("#define APP_PING {APP_PING}U"),
-        format!("#define APP_EXEC {APP_EXEC}U"),
-        format!("#define APP_STOP {APP_STOP}U"),
-        format!("#define APP_CANCEL {APP_CANCEL}U"),
-        format!("#define APP_READY {APP_READY:#x}U"),
-        format!("#define APP_STDOUT {APP_STDOUT:#x}U"),
-        format!("#define APP_STDERR {APP_STDERR:#x}U"),
-        format!("#define APP_EXIT {APP_EXIT:#x}U"),
-        format!("#define APP_STOPPED {APP_STOPPED:#x}U"),
-        format!("#define APP_ERROR {APP_ERROR:#x}U"),
-    ] {
-        assert!(
-            source.contains(&expected),
-            "the guest agent does not contain `{expected}`"
-        );
-    }
 }
 
 #[test]
@@ -1166,6 +1111,152 @@ fn guest_exec_decoder_accepts_linux_bytes_and_the_c_cwd_boundary() {
     assert_eq!(decoded.argv, [b"/\xff".to_vec()]);
     assert_eq!(decoded.cwd.as_ref().unwrap().len(), MAX_GUEST_CWD_BYTES);
     assert_eq!(decoded.environment, Some(vec![b"K=\xff".to_vec()]));
+}
+
+/// Encodes an extended exec request field by field, so that its flags, environment count, and
+/// working-directory length may contradict what follows them.
+fn raw_extended(
+    flags: u16,
+    environment_count: u16,
+    cwd: &[u8],
+    argv: &[&[u8]],
+    environment: &[&[u8]],
+) -> Vec<u8> {
+    let length = |bytes: &[u8]| u32::try_from(bytes.len()).unwrap().to_le_bytes();
+    let mut payload = 0u32.to_le_bytes().to_vec();
+    payload.extend_from_slice(&u16::try_from(argv.len()).unwrap().to_le_bytes());
+    payload.extend_from_slice(&EXEC_EXTENDED.to_le_bytes());
+    payload.extend_from_slice(&flags.to_le_bytes());
+    payload.extend_from_slice(&environment_count.to_le_bytes());
+    payload.extend_from_slice(&length(cwd));
+    for argument in argv {
+        payload.extend_from_slice(&length(argument));
+        payload.extend_from_slice(argument);
+    }
+    payload.extend_from_slice(cwd);
+    for entry in environment {
+        payload.extend_from_slice(&length(entry));
+        payload.extend_from_slice(entry);
+    }
+    payload
+}
+
+#[test]
+fn guest_exec_decoder_accepts_what_the_c_agent_accepted() {
+    fn with_environment(flags: u16, entries: &[&[u8]]) -> GuestExecPayload {
+        let count = u16::try_from(entries.len()).unwrap();
+        decode_guest_exec_payload(&raw_extended(flags, count, b"", &[b"/bin/true"], entries))
+            .unwrap()
+    }
+
+    let empty = with_environment(EXEC_ENVIRONMENT_PRESENT, &[]);
+    assert_eq!(empty.environment, Some(Vec::new()));
+    assert!(!empty.inherit_default_env);
+    let exact = with_environment(
+        EXEC_ENVIRONMENT_PRESENT,
+        &[b"EMPTY=", b"VALUE=space = value"],
+    );
+    assert_eq!(
+        exact.environment,
+        Some(vec![b"EMPTY=".to_vec(), b"VALUE=space = value".to_vec()])
+    );
+    assert!(!exact.inherit_default_env);
+    let layered = with_environment(
+        EXEC_ENVIRONMENT_PRESENT | EXEC_INHERIT_DEFAULT_ENV,
+        &[b"VALUE=layered"],
+    );
+    assert_eq!(layered.environment, Some(vec![b"VALUE=layered".to_vec()]));
+    assert!(layered.inherit_default_env);
+
+    for timeout_ms in [0, 3_600_001, 86_400_000, u32::MAX] {
+        let mut payload = raw_extended(EXEC_ENVIRONMENT_PRESENT, 0, b"", &[b"/bin/true"], &[]);
+        payload[..4].copy_from_slice(&timeout_ms.to_le_bytes());
+        assert_eq!(
+            decode_guest_exec_payload(&payload).unwrap().timeout_ms,
+            timeout_ms
+        );
+    }
+}
+
+#[test]
+fn guest_exec_decoder_refuses_what_the_c_agent_refused() {
+    // The agent decodes with its own byte-oriented decoder, so each refusal that the host
+    // decoder's table pins is pinned here too, with the cases that the C agent refused.
+    const PROGRAM: &[u8] = b"/bin/true";
+    fn with_environment(entries: &[&[u8]]) -> Vec<u8> {
+        let count = u16::try_from(entries.len()).unwrap();
+        raw_extended(EXEC_ENVIRONMENT_PRESENT, count, b"", &[PROGRAM], entries)
+    }
+    fn with_cwd(flags: u16, environment_count: u16, cwd: &[u8]) -> Vec<u8> {
+        raw_extended(flags, environment_count, cwd, &[PROGRAM], &[])
+    }
+
+    let mut unknown_extension = 0u32.to_le_bytes().to_vec();
+    unknown_extension.extend_from_slice(&1u16.to_le_bytes());
+    unknown_extension.extend_from_slice(&2u16.to_le_bytes());
+    unknown_extension.extend_from_slice(&9u32.to_le_bytes());
+    unknown_extension.extend_from_slice(PROGRAM);
+    let mut truncated_header = 0u32.to_le_bytes().to_vec();
+    truncated_header.extend_from_slice(&1u16.to_le_bytes());
+    truncated_header.extend_from_slice(&EXEC_EXTENDED.to_le_bytes());
+    truncated_header.extend_from_slice(&EXEC_CWD_PRESENT.to_le_bytes());
+    let longest_cwd = [b"/".as_slice(), &[b'd'; MAX_GUEST_CWD_BYTES]].concat();
+    let mut truncated_cwd = with_cwd(EXEC_CWD_PRESENT, 0, b"/work");
+    truncated_cwd.pop();
+    let mut trailing = with_cwd(EXEC_CWD_PRESENT, 0, b"/work");
+    trailing.push(b'x');
+
+    for (case, payload) in [
+        (
+            "repeated name",
+            with_environment(&[b"VALUE=one", b"VALUE=two"]),
+        ),
+        ("entry without a value", with_environment(&[b"NO_EQUALS"])),
+        ("entry without a name", with_environment(&[b"=empty-key"])),
+        ("NUL in an entry", with_environment(&[b"KEY=embedded\0nul"])),
+        ("unknown extension", unknown_extension),
+        ("truncated extended header", truncated_header),
+        (
+            "unknown flag",
+            with_cwd(EXEC_CWD_PRESENT | 0x08, 0, b"/work"),
+        ),
+        // Only the agent tells its launch helper that it entered the directory.
+        (
+            "launch-helper flag",
+            with_cwd(EXEC_CWD_PRESENT | 0x8000, 0, b"/work"),
+        ),
+        (
+            "layering without an environment",
+            with_cwd(EXEC_CWD_PRESENT | EXEC_INHERIT_DEFAULT_ENV, 0, b"/work"),
+        ),
+        (
+            "entries without the environment flag",
+            with_cwd(EXEC_CWD_PRESENT, 1, b"/work"),
+        ),
+        (
+            "flag without a directory",
+            with_cwd(EXEC_CWD_PRESENT, 0, b""),
+        ),
+        ("directory without the flag", with_cwd(0, 0, b"/work")),
+        (
+            "directory over the limit",
+            with_cwd(EXEC_CWD_PRESENT, 0, &longest_cwd),
+        ),
+        ("relative directory", with_cwd(EXEC_CWD_PRESENT, 0, b"work")),
+        (
+            "NUL in the directory",
+            with_cwd(EXEC_CWD_PRESENT, 0, b"/wo\0rk"),
+        ),
+        ("truncated directory", truncated_cwd),
+        ("trailing bytes", trailing),
+        ("no arguments", raw_extended(0, 0, b"", &[], &[])),
+        (
+            "relative program",
+            raw_extended(0, 0, b"", &[b"bin/true"], &[]),
+        ),
+    ] {
+        assert!(decode_guest_exec_payload(&payload).is_err(), "{case}");
+    }
 }
 
 #[test]

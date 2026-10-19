@@ -193,6 +193,7 @@ pub(crate) struct TestSystem {
     pub(crate) diagnostics: Vec<u8>,
     pub(crate) fail_environment: Option<Vec<u8>>,
     pub(crate) execs: Vec<RecordedExec>,
+    pub(crate) spawn_calls: usize,
     pub(crate) tty_configured: usize,
     pub(crate) tty_drained: usize,
     pub(crate) close_barrier_reader: Option<FileDescriptor>,
@@ -211,6 +212,7 @@ impl TestSystem {
             diagnostics: Vec::new(),
             fail_environment: None,
             execs: Vec::new(),
+            spawn_calls: 0,
             tty_configured: 0,
             tty_drained: 0,
             close_barrier_reader: None,
@@ -326,6 +328,7 @@ impl System for TestSystem {
     }
 
     fn spawn(&mut self, _request: SpawnRequest<'_>) -> Result<ProcessId, Errno> {
+        self.spawn_calls += 1;
         Err(Errno::ENOSYS)
     }
 }

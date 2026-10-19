@@ -151,21 +151,24 @@ fn handle_data(
 mod tests {
     use std::ffi::CString;
     use std::io::{Read, Write};
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::net::UnixStream;
     use std::thread;
 
     use crate::protocol::{
-        APP_ERROR, OUTER_ACK, OUTER_CREDIT, OUTER_GUEST_ATTACH, OUTER_HEADER_LEN,
-        OUTER_RECEIVE_WINDOW, OuterHeader, decode_ack_payload, decode_app, decode_credit_payload,
-        decode_outer_header, encode_app, encode_outer,
+        APP_ERROR, APP_EXIT, APP_STDERR, OUTER_ACK, OUTER_CREDIT, OUTER_GUEST_ATTACH,
+        OUTER_HEADER_LEN, OUTER_RECEIVE_WINDOW, OuterHeader, Workload, WorkloadEnvironment,
+        decode_ack_payload, decode_app, decode_credit_payload, decode_outer_header, encode_app,
+        encode_exec_payload, encode_outer,
     };
 
     use super::super::seam::{Paths, TestSystem};
     use super::*;
-    use crate::guest::sys::FileDescriptor;
+    use crate::guest::sys::{FileDescriptor, MountFlags};
 
     const INSTANCE: [u8; 16] = [7; 16];
 
+    #[derive(Debug, PartialEq, Eq)]
     struct Response {
         kind: u8,
         request_id: u64,
@@ -182,10 +185,13 @@ mod tests {
 
     impl Harness {
         fn new(direct: bool) -> Self {
+            Self::with_system(direct, TestSystem::new(Paths::default()), 0)
+        }
+
+        fn with_system(direct: bool, mut system: TestSystem, expected_mappings: u32) -> Self {
             let (host, guest) = UnixStream::pair().unwrap();
             let descriptor = FileDescriptor::from_owned(guest.into());
             let thread = thread::spawn(move || {
-                let mut system = TestSystem::new(Paths::default());
                 let config = AgentConfig {
                     rootfs: CString::new(if direct { "-" } else { "/rootfs" }).unwrap(),
                     hostname: c"test".to_owned(),
@@ -196,7 +202,10 @@ mod tests {
                     direct,
                 };
                 let mut session = Session::new(descriptor);
-                let mut mappings = HostMappings::default();
+                let mut mappings = HostMappings {
+                    expected: expected_mappings,
+                    ..HostMappings::default()
+                };
                 let outcome = run(&mut system, &mut session, &config, &mut mappings);
                 (outcome, system)
             });
@@ -220,7 +229,13 @@ mod tests {
         }
 
         fn request(&mut self, kind: u8, payload: &[u8]) -> Response {
-            let frame = encode_app(kind, 42, 0, payload);
+            let mut responses = self.request_all(42, kind, payload);
+            assert_eq!(responses.len(), 1, "{responses:?}");
+            responses.pop().unwrap()
+        }
+
+        fn request_all(&mut self, request_id: u64, kind: u8, payload: &[u8]) -> Vec<Response> {
+            let frame = encode_app(kind, request_id, 0, payload);
             self.host
                 .write_all(
                     &encode_outer(OUTER_DATA, &INSTANCE, 1, self.host_sequence, &frame).unwrap(),
@@ -234,18 +249,25 @@ mod tests {
             );
             assert_eq!(decode_credit_payload(&payload).unwrap(), frame.len() as u32);
             self.guest_sequence += 1;
-            let (data, frame) = self.read_outer();
-            assert_eq!(
-                (data.record_type, data.sequence),
-                (OUTER_DATA, self.guest_sequence)
-            );
-            self.guest_sequence += 1;
-            let frame = decode_app(&frame).unwrap();
-            Response {
-                kind: frame.kind,
-                request_id: frame.request_id,
-                status: frame.status,
-                payload: frame.payload.to_vec(),
+            let mut responses = Vec::new();
+            loop {
+                let (data, frame) = self.read_outer();
+                assert_eq!(
+                    (data.record_type, data.sequence),
+                    (OUTER_DATA, self.guest_sequence)
+                );
+                self.guest_sequence += 1;
+                let frame = decode_app(&frame).unwrap();
+                let terminal = matches!(frame.kind, APP_READY | APP_ERROR | APP_EXIT | APP_STOPPED);
+                responses.push(Response {
+                    kind: frame.kind,
+                    request_id: frame.request_id,
+                    status: frame.status,
+                    payload: frame.payload.to_vec(),
+                });
+                if terminal {
+                    return responses;
+                }
             }
         }
 
@@ -282,6 +304,86 @@ mod tests {
         }
     }
 
+    fn response(kind: u8, request_id: u64, status: i32, payload: &[u8]) -> Response {
+        Response {
+            kind,
+            request_id,
+            status,
+            payload: payload.to_vec(),
+        }
+    }
+
+    fn exec_payload(cwd: Option<&str>) -> Vec<u8> {
+        encode_exec_payload(&Workload {
+            argv: vec!["/bin/true".to_owned()],
+            timeout_ms: 0,
+            cwd,
+            environment: WorkloadEnvironment::Default,
+        })
+        .unwrap()
+    }
+
+    fn direct_system() -> (tempfile::TempDir, TestSystem) {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("cgroup");
+        let execution = root.join("nvx-exec");
+        std::fs::create_dir_all(&execution).unwrap();
+        std::fs::write(root.join("cgroup.procs"), b"").unwrap();
+        std::fs::write(root.join("cgroup.subtree_control"), b"").unwrap();
+        std::fs::write(execution.join("pids.current"), b"0\n").unwrap();
+        std::fs::write(execution.join("cgroup.kill"), b"").unwrap();
+        std::fs::write(execution.join("cgroup.procs"), b"").unwrap();
+        let paths = Paths {
+            cgroup_root: root,
+            ..Paths::default()
+        };
+        (temporary, TestSystem::new(paths))
+    }
+
+    fn mapping_system() -> (tempfile::TempDir, TestSystem) {
+        let temporary = tempfile::tempdir().unwrap();
+        let hostfs = temporary.path().join("hostfs");
+        std::fs::create_dir_all(hostfs.join("root/0/src")).unwrap();
+        std::fs::write(hostfs.join("root/0/notes.txt"), b"notes").unwrap();
+        std::fs::create_dir(hostfs.join("root/1")).unwrap();
+        let paths = Paths {
+            hostfs_dir: hostfs,
+            ..Paths::default()
+        };
+        (temporary, TestSystem::new(paths))
+    }
+
+    fn maps_payload(first: u32, entries: &[(&[u8], &[u8], u16)], count: Option<u32>) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&first.to_le_bytes());
+        payload.extend_from_slice(&count.unwrap_or(entries.len() as u32).to_le_bytes());
+        for (source, target, flags) in entries {
+            payload.extend_from_slice(&flags.to_le_bytes());
+            payload.extend_from_slice(&(source.len() as u16).to_le_bytes());
+            payload.extend_from_slice(&(target.len() as u16).to_le_bytes());
+            payload.extend_from_slice(source);
+            payload.extend_from_slice(target);
+        }
+        payload
+    }
+
+    fn assert_environment_failure(mut harness: Harness, diagnostic_prefix: &[u8]) {
+        let replies = harness.request_all(42, APP_EXEC, &exec_payload(None));
+        assert_eq!(replies.len(), 2, "{replies:?}");
+        assert_eq!(
+            (replies[0].kind, replies[0].request_id, replies[0].status),
+            (APP_STDERR, 42, 0)
+        );
+        assert!(
+            replies[0].payload.starts_with(diagnostic_prefix),
+            "{:?}",
+            replies[0].payload
+        );
+        assert_eq!(replies[1], response(APP_EXIT, 42, 125, b"exit"));
+        let system = harness.stop();
+        assert_eq!(system.spawn_calls, 0);
+    }
+
     #[test]
     fn agent_advertises_the_control_features_of_its_mode_and_stops() {
         for (direct, expected) in [
@@ -315,6 +417,273 @@ mod tests {
             assert_eq!(response.payload, INVALID_REQUEST.as_bytes());
         }
         harness.stop();
+    }
+
+    #[test]
+    fn containment_failures_refuse_consecutive_execs_until_verified_empty() {
+        if super::super::isolate_process_test(
+            "NVX_DISPATCH_CONTAINMENT_TEST_CHILD",
+            "guest::managed_agent::dispatch::tests::containment_failures_refuse_consecutive_execs_until_verified_empty",
+        ) {
+            return;
+        }
+        let _process = super::super::PROCESS_TEST_LOCK.lock().unwrap();
+        let payload = exec_payload(None);
+        for state in ["missing", "directory", "malformed", "charged"] {
+            let (_temporary, system) = direct_system();
+            let tasks = system.paths.cgroup_root.join("nvx-exec/pids.current");
+            match state {
+                "missing" => std::fs::remove_file(&tasks).unwrap(),
+                "directory" => {
+                    std::fs::remove_file(&tasks).unwrap();
+                    std::fs::create_dir(&tasks).unwrap();
+                }
+                "malformed" => std::fs::write(&tasks, b"max\n").unwrap(),
+                "charged" => std::fs::write(&tasks, b"1\n").unwrap(),
+                _ => unreachable!(),
+            }
+            let mut harness = Harness::with_system(true, system, 0);
+            for request_id in [42, 43] {
+                assert_eq!(
+                    harness.request_all(request_id, APP_EXEC, &payload),
+                    vec![response(APP_ERROR, request_id, 125, b"containment-failed")],
+                    "{state}"
+                );
+            }
+
+            if state == "directory" {
+                std::fs::remove_dir(&tasks).unwrap();
+            }
+            std::fs::write(&tasks, b"0\n").unwrap();
+            assert_eq!(
+                harness.request_all(44, APP_EXEC, &payload),
+                vec![response(
+                    APP_ERROR,
+                    44,
+                    125,
+                    protocol::LAUNCH_FAILED.as_bytes()
+                )],
+                "{state}"
+            );
+            let system = harness.stop();
+            assert_eq!(system.spawn_calls, 1, "{state}");
+        }
+    }
+
+    #[test]
+    fn mappings_mount_in_order_and_unblock_workloads_through_dispatch() {
+        let (temporary, system) = mapping_system();
+        let export = system.paths.hostfs_dir.join("root");
+        let guest = temporary.path().join("guest");
+        let source = guest.join("src");
+        let notes = guest.join("src/notes.txt");
+        let out = guest.join("out");
+        let first = maps_payload(
+            0,
+            &[
+                (
+                    b"0/src",
+                    source.as_os_str().as_bytes(),
+                    protocol::MAP_READ_ONLY,
+                ),
+                (b"0/notes.txt", notes.as_os_str().as_bytes(), 0),
+            ],
+            None,
+        );
+        let second = maps_payload(2, &[(b"1", out.as_os_str().as_bytes(), 0)], None);
+        let mut harness = Harness::with_system(true, system, 3);
+        let mut replies = Vec::new();
+        replies.extend(harness.request_all(1, APP_EXEC, &[]));
+        replies.extend(harness.request_all(2, APP_MAPS, &first));
+        replies.extend(harness.request_all(3, APP_EXEC, &[]));
+        replies.extend(harness.request_all(4, APP_MAPS, &second));
+        replies.extend(harness.request_all(5, APP_EXEC, &[]));
+        assert_eq!(
+            replies,
+            vec![
+                response(APP_ERROR, 1, Errno::EAGAIN as i32, b"mappings-incomplete"),
+                response(APP_READY, 2, 0, b""),
+                response(APP_ERROR, 3, Errno::EAGAIN as i32, b"mappings-incomplete"),
+                response(APP_READY, 4, 0, b""),
+                response(APP_ERROR, 5, Errno::EINVAL as i32, b"invalid-request"),
+            ]
+        );
+
+        let system = harness.stop();
+        let remount = MountFlags::MS_BIND
+            | MountFlags::MS_REMOUNT
+            | MountFlags::MS_NOSUID
+            | MountFlags::MS_NODEV;
+        assert_eq!(
+            system.mounts,
+            vec![
+                (
+                    Some(export.join("0/src").as_os_str().as_bytes().to_vec()),
+                    source.as_os_str().as_bytes().to_vec(),
+                    MountFlags::MS_BIND,
+                ),
+                (
+                    None,
+                    source.as_os_str().as_bytes().to_vec(),
+                    remount | MountFlags::MS_RDONLY,
+                ),
+                (
+                    Some(export.join("0/notes.txt").as_os_str().as_bytes().to_vec()),
+                    notes.as_os_str().as_bytes().to_vec(),
+                    MountFlags::MS_BIND,
+                ),
+                (None, notes.as_os_str().as_bytes().to_vec(), remount,),
+                (
+                    Some(export.join("1").as_os_str().as_bytes().to_vec()),
+                    out.as_os_str().as_bytes().to_vec(),
+                    MountFlags::MS_BIND,
+                ),
+                (None, out.as_os_str().as_bytes().to_vec(), remount),
+            ]
+        );
+        assert!(source.is_dir());
+        assert!(notes.is_file());
+        assert!(out.is_dir());
+        assert_eq!(system.spawn_calls, 0);
+    }
+
+    #[test]
+    fn mapping_sequence_errors_are_reported_through_dispatch() {
+        let (temporary, system) = mapping_system();
+        let target = temporary.path().join("guest/src");
+        let target = target.as_os_str().as_bytes();
+        let entry = [(b"0/src".as_slice(), target, 0)];
+        let mut harness = Harness::with_system(true, system, 1);
+        let mut replies = Vec::new();
+        replies.extend(harness.request_all(1, APP_MAPS, &maps_payload(1, &entry, None)));
+        replies.extend(harness.request_all(
+            2,
+            APP_MAPS,
+            &maps_payload(0, &[(b"0/src", target, 0), (b"0/src", target, 0)], None),
+        ));
+        replies.extend(harness.request_all(3, APP_MAPS, &maps_payload(0, &entry, None)));
+        replies.extend(harness.request_all(4, APP_MAPS, &maps_payload(1, &entry, None)));
+        assert_eq!(
+            replies,
+            vec![
+                response(APP_ERROR, 1, Errno::EINVAL as i32, b"invalid-request"),
+                response(APP_ERROR, 2, Errno::EINVAL as i32, b"invalid-request"),
+                response(APP_READY, 3, 0, b""),
+                response(APP_ERROR, 4, Errno::EINVAL as i32, b"invalid-request"),
+            ]
+        );
+        let system = harness.stop();
+        assert_eq!(system.mounts.len(), 2);
+        assert_eq!(system.spawn_calls, 0);
+    }
+
+    #[test]
+    fn a_failed_mapping_keeps_refusing_workloads_through_dispatch() {
+        let (temporary, system) = mapping_system();
+        let target = temporary.path().join("guest/missing");
+        let missing = maps_payload(0, &[(b"0/missing", target.as_os_str().as_bytes(), 0)], None);
+        let valid = maps_payload(0, &[(b"0/src", target.as_os_str().as_bytes(), 0)], None);
+        let mut harness = Harness::with_system(true, system, 2);
+        let mut replies = Vec::new();
+        replies.extend(harness.request_all(1, APP_MAPS, &missing));
+        replies.extend(harness.request_all(2, APP_EXEC, &[]));
+        replies.extend(harness.request_all(3, APP_MAPS, &valid));
+        assert_eq!(
+            replies,
+            vec![
+                response(APP_ERROR, 1, Errno::ENOENT as i32, b"mapping-failed"),
+                response(APP_ERROR, 2, Errno::EAGAIN as i32, b"mappings-incomplete"),
+                response(APP_ERROR, 3, Errno::EINVAL as i32, b"invalid-request"),
+            ]
+        );
+        let system = harness.stop();
+        assert!(system.mounts.is_empty());
+        assert_eq!(system.spawn_calls, 0);
+    }
+
+    #[test]
+    fn unannounced_mapping_tables_are_refused_through_dispatch() {
+        let (temporary, system) = mapping_system();
+        let target = temporary.path().join("guest/src");
+        let mapping = maps_payload(0, &[(b"0/src", target.as_os_str().as_bytes(), 0)], None);
+        let mut harness = Harness::with_system(true, system, 0);
+        assert_eq!(
+            harness.request_all(1, APP_MAPS, &mapping),
+            vec![response(
+                APP_ERROR,
+                1,
+                Errno::EINVAL as i32,
+                b"invalid-request"
+            )]
+        );
+        assert_eq!(
+            harness.request_all(2, APP_EXEC, &[]),
+            vec![response(
+                APP_ERROR,
+                2,
+                Errno::EINVAL as i32,
+                b"invalid-request"
+            )]
+        );
+        let system = harness.stop();
+        assert!(system.mounts.is_empty());
+        assert_eq!(system.spawn_calls, 0);
+    }
+
+    #[test]
+    fn sandbox_does_not_launch_when_descriptor_export_fails() {
+        let mut system = TestSystem::new(Paths::default());
+        system.fail_environment = Some(b"NVX_EXEC_CONFIG_FD".to_vec());
+        assert_environment_failure(
+            Harness::with_system(false, system, 0),
+            b"nvx-managed-agent: cannot export execution configuration: ",
+        );
+    }
+
+    #[test]
+    fn direct_does_not_launch_when_identity_export_fails() {
+        // Direct mode verifies the exec cgroup first, which reaps any child of this process.
+        if super::super::isolate_process_test(
+            "NVX_DISPATCH_HOME_EXPORT_TEST_CHILD",
+            "guest::managed_agent::dispatch::tests::direct_does_not_launch_when_identity_export_fails",
+        ) {
+            return;
+        }
+        let _process = super::super::PROCESS_TEST_LOCK.lock().unwrap();
+        let (_temporary, mut system) = direct_system();
+        system.fail_environment = Some(b"HOME".to_vec());
+        assert_environment_failure(
+            Harness::with_system(true, system, 0),
+            b"nvx-managed-agent: cannot configure workload environment: ",
+        );
+    }
+
+    #[test]
+    fn pwd_export_failures_refuse_launch_without_spawning() {
+        // Direct mode verifies the exec cgroup first, which reaps any child of this process.
+        if super::super::isolate_process_test(
+            "NVX_DISPATCH_PWD_EXPORT_TEST_CHILD",
+            "guest::managed_agent::dispatch::tests::pwd_export_failures_refuse_launch_without_spawning",
+        ) {
+            return;
+        }
+        let _process = super::super::PROCESS_TEST_LOCK.lock().unwrap();
+        let (temporary, mut system) = direct_system();
+        system.fail_environment = Some(b"PWD".to_vec());
+        let mut harness = Harness::with_system(true, system, 0);
+        for (request_id, cwd) in [(42, None), (43, Some(temporary.path().to_str().unwrap()))] {
+            assert_eq!(
+                harness.request_all(request_id, APP_EXEC, &exec_payload(cwd)),
+                vec![response(
+                    APP_ERROR,
+                    request_id,
+                    125,
+                    protocol::LAUNCH_FAILED.as_bytes()
+                )]
+            );
+        }
+        let system = harness.stop();
+        assert_eq!(system.spawn_calls, 0);
     }
 
     #[test]

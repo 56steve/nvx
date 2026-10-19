@@ -1055,6 +1055,105 @@ mod tests {
     }
 
     #[test]
+    fn watcher_rules_match_linux_6_18_messages() {
+        let messages = [
+            (
+                "tsc: Marking TSC unstable due to clocksource watchdog",
+                Some(ViolationCode::TscUnstable),
+            ),
+            (
+                "clocksource: timekeeping watchdog on CPU0: Marking clocksource \
+                 'tsc-early' as unstable because the skew is too large:",
+                Some(ViolationCode::ClocksourceUnstable),
+            ),
+            (
+                "clocksource: Switched to clocksource refined-jiffies",
+                Some(ViolationCode::ClocksourceSwitch),
+            ),
+            (
+                "clocksource:         CPUs 1 ahead of CPU 0 for clocksource tsc.",
+                Some(ViolationCode::ClocksourceSkew),
+            ),
+            (
+                "clocksource:         CPUs 2-3 behind CPU 0 for clocksource tsc.",
+                Some(ViolationCode::ClocksourceSkew),
+            ),
+            (
+                "TSC synchronization [CPU#0 -> CPU#1]:",
+                Some(ViolationCode::TscWarp),
+            ),
+            (
+                "Measured 45 cycles TSC warp between CPUs, turning off TSC clock.",
+                Some(ViolationCode::TscWarp),
+            ),
+            (
+                "TSC warped randomly between CPUs",
+                Some(ViolationCode::TscWarp),
+            ),
+            (
+                "[Firmware Bug]: TSC ADJUST differs: CPU1 0 --> 100. Restoring",
+                Some(ViolationCode::TscAdjust),
+            ),
+            (
+                "rcu: INFO: rcu_preempt detected stalls on CPUs/tasks:",
+                Some(ViolationCode::RcuStall),
+            ),
+            (
+                "rcu: INFO: rcu_preempt self-detected stall on CPU",
+                Some(ViolationCode::RcuStall),
+            ),
+            (
+                "rcu: INFO: rcu_preempt detected expedited stalls on CPUs/tasks: { 1-... }",
+                Some(ViolationCode::RcuStall),
+            ),
+            (
+                "rcu: rcu_preempt kthread starved for 2603 jiffies! g345 f0x0",
+                Some(ViolationCode::RcuStarved),
+            ),
+            (
+                "rcu: rcu_preempt kthread timer wakeup didn't happen for 2602 jiffies! \
+                 g345 f0x0",
+                Some(ViolationCode::RcuStarved),
+            ),
+            (
+                "watchdog: BUG: soft lockup - CPU#0 stuck for 22s! [sh:123]",
+                Some(ViolationCode::SoftLockup),
+            ),
+            (
+                "watchdog: Watchdog detected hard LOCKUP on cpu 1",
+                Some(ViolationCode::HardLockup),
+            ),
+            (
+                "INFO: task kworker/0:1:12 blocked for more than 120 seconds.",
+                Some(ViolationCode::HungTask),
+            ),
+            (
+                "unchecked MSR access error: RDMSR from 0x1ad at rIP: \
+                 0xffffffff816f11ee (__rdmsr_on_cpu+0x1e/0x30)",
+                Some(ViolationCode::UncheckedMsr),
+            ),
+            (
+                "[Firmware Bug]: CPU   1: APIC ID mismatch. CPUID: 0x0000 APIC: 0x0001",
+                Some(ViolationCode::ApicIdMismatch),
+            ),
+            (
+                "clocksource: tsc: mask: 0xffffffffffffffff max_cycles: 0x1fa3",
+                None,
+            ),
+            ("Hyper-V: LAPIC Timer Frequency: 0x1e8480", None),
+            ("rcu: Hierarchical RCU implementation.", None),
+            (
+                "NVX-TIME-ABI-VIOLATION: v=1 code=G_UNCHECKED_MSR \
+                 detail=\"unchecked MSR access error\"",
+                None,
+            ),
+        ];
+        for (message, expected) in messages {
+            assert_eq!(match_watch_rule(message.as_bytes()), expected, "{message}");
+        }
+    }
+
+    #[test]
     fn boot_log_reads_syslog_lines() {
         let log = scan_boot_log(
             b"<6>[    0.000000] Hypervisor detected: Microsoft Hyper-V\n\
@@ -1077,6 +1176,149 @@ mod tests {
     }
 
     #[test]
+    fn boot_log_requires_the_identity_and_a_final_switch_to_tsc() {
+        const BOOT_LOG: &str = "Hypervisor detected: Microsoft Hyper-V\n\
+            Hyper-V: privilege flags low 0x8860, high 0x0, ext 0x0, hints 0x0, misc 0x100\n\
+            Hyper-V: LAPIC Timer Frequency: 0x1e8480\n\
+            tsc: Detected 2194.843 MHz processor\n\
+            clocksource: Switched to clocksource tsc-early\n\
+            clocksource: Switched to clocksource tsc\n";
+        assert_eq!(scan_boot_log(BOOT_LOG.as_bytes(), false).verdict(), Ok(()));
+        assert_eq!(
+            scan_boot_log(BOOT_LOG.replace("0x1e8480", "0x989680").as_bytes(), false).verdict(),
+            Ok(())
+        );
+        for (name, log) in [
+            (
+                "missing identity",
+                BOOT_LOG.lines().skip(1).collect::<Vec<_>>().join("\n"),
+            ),
+            ("wrong LAPIC rate", BOOT_LOG.replace("0x1e8480", "0x1e8481")),
+            (
+                "last switch",
+                format!("{BOOT_LOG}clocksource: Switched to clocksource refined-jiffies\n"),
+            ),
+            (
+                "kvm-clock",
+                format!("{BOOT_LOG}kvm-clock: Using msrs 4b564d01\n"),
+            ),
+            (
+                "refinement",
+                format!("{BOOT_LOG}tsc: Refined TSC clocksource calibration: 2194.843 MHz\n"),
+            ),
+            (
+                "lapic token",
+                format!("{BOOT_LOG}APIC timer: using supplied frequency 200000000 Hz\n"),
+            ),
+            (
+                "watcher record",
+                format!("{BOOT_LOG}tsc: Marking TSC unstable due to clocksource watchdog\n"),
+            ),
+        ] {
+            assert!(
+                scan_boot_log(log.as_bytes(), false).verdict().is_err(),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn boot_log_reads_syslog_read_all_lines() {
+        let lines = concat!(
+            "<6>[    0.000000] Hypervisor detected: Microsoft Hyper-V\n",
+            "<6>[    0.123456] [drm] a bracketed message is kept\n",
+            "<6>[    1.007919] Hyper-V: privilege flags low 0x8860, high 0x0, ",
+            "ext 0x0, hints 0x0, misc 0x100\n",
+            "<6>[    2.015838] Hyper-V: LAPIC Timer Frequency: 0x1e8480\n",
+            "<6>[    3.023757] tsc: Detected 2194.843 MHz processor\n",
+            "<6>[    4.031676] clocksource: Switched to clocksource tsc-early\n",
+            "<6>[    5.039595] clocksource: Switched to clocksource tsc\n"
+        );
+        assert_eq!(scan_boot_log(lines.as_bytes(), true).verdict(), Ok(()));
+        let own = concat!(
+            "<2>[    3.000000] NVX-TIME-REPORT-VIOLATION: v=1 ",
+            "code=G_CONFORMANCE_C4 detail=\"forbidden record: kvm-clock: Using msrs\"\n"
+        );
+        assert_eq!(
+            scan_boot_log(format!("{lines}{own}").as_bytes(), true).verdict(),
+            Ok(())
+        );
+        assert!(
+            scan_boot_log(
+                format!("{lines}<6>[    4.000000] kvm-clock: Using msrs\n").as_bytes(),
+                true
+            )
+            .verdict()
+            .unwrap_err()
+            .starts_with(b"forbidden record: kvm-clock")
+        );
+        assert!(
+            scan_boot_log(
+                lines
+                    .lines()
+                    .skip(2)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+                    .as_bytes(),
+                true
+            )
+            .verdict()
+            .unwrap_err()
+            .starts_with(b"no 'Hypervisor")
+        );
+    }
+
+    #[test]
+    fn boot_log_reports_a_kernel_wx_mapping_apart_from_c4() {
+        const BOOT_LOG: &str = "<6>[    0.100000] Hypervisor detected: Microsoft Hyper-V\n\
+            <6>[    0.100000] Hyper-V: privilege flags low 0x8860, high 0x0, ext 0x0\n\
+            <6>[    0.100000] Hyper-V: LAPIC Timer Frequency: 0x1e8480\n\
+            <6>[    0.100000] clocksource: Switched to clocksource tsc\n";
+        const WX: &str = "<4>[    0.412345] ------------[ cut here ]------------\n\
+            <4>[    0.412346] x86/mm: Found insecure W+X mapping at address 0xffffffffc0000000\n\
+            <4>[    0.412400] WARNING: CPU: 0 PID: 1 at \
+            arch/x86/mm/dump_pagetables.c:246 note_wx+0x5a/0x70\n\
+            <6>[    0.412500] x86/mm: Checked W+X mappings: FAILED, 4 W+X pages found.\n";
+        let log = scan_boot_log(format!("{WX}{BOOT_LOG}").as_bytes(), true);
+        assert_eq!(log.verdict(), Ok(()));
+        assert_eq!(
+            log.wx.as_deref(),
+            Some(b"x86/mm: Found insecure W+X mapping at address 0xffffffffc0000000".as_slice())
+        );
+        let passed = scan_boot_log(
+            format!(
+                "{BOOT_LOG}<6>[    0.412500] x86/mm: Checked W+X mappings: passed, \
+                 no W+X pages found.\n"
+            )
+            .as_bytes(),
+            true,
+        );
+        assert_eq!((passed.verdict(), passed.wx), (Ok(()), None));
+        let missing = scan_boot_log(
+            format!(
+                "{WX}<6>[    0.100000] Hyper-V: privilege flags low 0x8860, high 0x0\n\
+                 <6>[    0.100000] Hyper-V: LAPIC Timer Frequency: 0x1e8480\n\
+                 <6>[    0.100000] clocksource: Switched to clocksource tsc\n"
+            )
+            .as_bytes(),
+            true,
+        );
+        assert!(
+            missing
+                .verdict()
+                .unwrap_err()
+                .starts_with(b"no 'Hypervisor")
+        );
+        assert!(missing.wx.is_some());
+        let own = concat!(
+            "<2>[    3.000000] NVX-TIME-REPORT-VIOLATION: v=1 code=G_KERNEL_WX ",
+            "detail=\"x86/mm: Found insecure W+X mapping at address 0x0\"\n"
+        );
+        let ignored = scan_boot_log(format!("{BOOT_LOG}{own}").as_bytes(), true);
+        assert_eq!((ignored.verdict(), ignored.wx), (Ok(()), None));
+    }
+
+    #[test]
     fn timer_list_requires_one_shot_lapic_ticks() {
         let list = b"Tick Device: mode:     1\n\
                      Broadcast device\n\
@@ -1095,6 +1337,83 @@ mod tests {
     }
 
     #[test]
+    fn timer_list_covers_two_cpu_linux_6_18_variants() {
+        fn cpu(cpu: usize, device: &str, state: i32, handler: &str, mode: i32) -> String {
+            format!(
+                "Tick Device: mode:     {mode}\n\
+                 Per CPU device: {cpu}\n\
+                 Clock Event Device: {device}\n\
+                  max_delta_ns:   1374389534634\n\
+                  min_delta_ns:   1000\n\
+                  mult:           6710886\n\
+                  shift:          26\n\
+                  mode:           {state}\n\
+                  next_event:     1342000000 nsecs\n\
+                  set_next_event: lapic_next_event\n\
+                  shutdown:       lapic_timer_shutdown\n\
+                  periodic:       lapic_timer_set_periodic\n\
+                  oneshot:        lapic_timer_set_oneshot\n\
+                  oneshot stopped: lapic_timer_shutdown\n\
+                  event_handler:  {handler}\n\
+                  retries:        0\n\n"
+            )
+        }
+        fn list(broadcast: &str, second: Option<(&str, i32, &str, i32)>) -> String {
+            let mut text = format!(
+                "Tick Device: mode:     1\n\
+                 Broadcast device\n\
+                 Clock Event Device: {broadcast}\n\
+                 tick_broadcast_mask: 00\n\
+                 tick_broadcast_oneshot_mask: 00\n\n"
+            );
+            text.push_str(&cpu(0, "lapic", 3, "hrtimer_interrupt", 1));
+            if let Some((device, state, handler, mode)) = second {
+                text.push_str(&cpu(1, device, state, handler, mode));
+            }
+            text
+        }
+        let selected = CpuMask::EMPTY.with(0).with(1);
+        assert_eq!(
+            timer_list_verdict(
+                list("<NULL>", Some(("lapic", 4, "hrtimer_interrupt", 1))).as_bytes(),
+                selected
+            ),
+            Ok(())
+        );
+        for (name, text) in [
+            (
+                "deadline",
+                list(
+                    "<NULL>",
+                    Some(("lapic-deadline", 3, "hrtimer_interrupt", 1)),
+                ),
+            ),
+            (
+                "periodic tick",
+                list("<NULL>", Some(("lapic", 3, "hrtimer_interrupt", 0))),
+            ),
+            (
+                "periodic state",
+                list("<NULL>", Some(("lapic", 2, "hrtimer_interrupt", 1))),
+            ),
+            (
+                "handler",
+                list("<NULL>", Some(("lapic", 3, "tick_handle_periodic", 1))),
+            ),
+            ("missing cpu", list("<NULL>", None)),
+            (
+                "broadcast",
+                list("pit", Some(("lapic", 4, "hrtimer_interrupt", 1))),
+            ),
+        ] {
+            assert!(
+                timer_list_verdict(text.as_bytes(), selected).is_err(),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
     fn cpuinfo_rates_round_down_to_khz() {
         assert_eq!(parse_khz("2194.8439"), Some(2_194_843));
         assert_eq!(parse_khz("2194.8"), Some(2_194_800));
@@ -1107,6 +1426,48 @@ mod tests {
         );
         assert_eq!((info.khz[0], info.khz[1]), (None, Some(2_194_843)));
         assert_eq!(verdict, Err("cpu 0 is not in /proc/cpuinfo".to_owned()));
+
+        const FLAGS: &str = "tsc msr pae constant_tsc rdtscp nonstop_tsc tsc_known_freq \
+                             tsc_reliable hypervisor arat x2apic";
+        let fixture = |flags: &str, cpus: usize| {
+            (0..cpus)
+                .map(|cpu| {
+                    format!(
+                        "processor\t: {cpu}\n\
+                         vendor_id\t: GenuineIntel\n\
+                         cpu family\t: 6\n\
+                         model\t\t: 85\n\
+                         cpu MHz\t\t: 2194.843\n\
+                         flags\t\t: fpu vme {flags}\n\
+                         bugs\t\t: spectre_v1\n\n"
+                    )
+                })
+                .collect::<String>()
+        };
+        let selected = CpuMask::EMPTY.with(0).with(1);
+        let (info, verdict) = check_cpuinfo(fixture(FLAGS, 2).as_bytes(), selected, true);
+        assert_eq!(verdict, Ok(()));
+        assert_eq!(
+            (info.khz[0], info.khz[1]),
+            (Some(2_194_843), Some(2_194_843))
+        );
+        for (name, flags) in [
+            ("tsc_reliable", FLAGS.replace("tsc_reliable ", "")),
+            ("deadline", format!("{FLAGS} tsc_deadline_timer")),
+            ("adjust", format!("{FLAGS} tsc_adjust")),
+        ] {
+            assert!(
+                check_cpuinfo(fixture(&flags, 2).as_bytes(), selected, true)
+                    .1
+                    .is_err(),
+                "{name}"
+            );
+        }
+        assert!(
+            check_cpuinfo(fixture(FLAGS, 1).as_bytes(), selected, true)
+                .1
+                .is_err()
+        );
     }
 
     #[test]
@@ -1125,8 +1486,10 @@ mod tests {
             Some((3, CpuMask::EMPTY))
         );
         for record in [
+            &b""[..],
             &b"new_cpus=4\ngeneration=3\n"[..],
             b"generation=3 new_cpus=1",
+            b"generation=3\nnew_cpus=7-4\n",
             b"generation=3\nnew_cpus= 1-2\n",
             b"generation=3\nnew_cpus=64\n",
             b"generation=3\nnew_cpus=\ntrailing=value\n",
