@@ -244,7 +244,9 @@ impl<'a> SpawnDescriptors<'a> {
         }
     }
 
-    /// Creates an unprivileged-child descriptor action set.
+    /// Creates an unprivileged-child descriptor action set: the [`managed`](Self::managed) one,
+    /// except that the child closes the configuration descriptor instead of keeping it across
+    /// `exec`.
     #[cfg(all(test, feature = "host"))]
     pub(crate) fn plain(
         config: &'a FileDescriptor,
@@ -253,14 +255,8 @@ impl<'a> SpawnDescriptors<'a> {
         launch: Option<(&'a FileDescriptor, &'a FileDescriptor)>,
     ) -> Self {
         Self {
-            config,
-            stdout_reader: stdout.0,
-            stdout_writer: stdout.1,
-            stderr_reader: stderr.0,
-            stderr_writer: stderr.1,
-            launch_reader: launch.map(|pair| pair.0),
-            launch_writer: launch.map(|pair| pair.1),
             inherit_config: false,
+            ..Self::managed(config, stdout, stderr, launch)
         }
     }
 }
