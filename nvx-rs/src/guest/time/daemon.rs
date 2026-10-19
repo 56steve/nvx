@@ -497,23 +497,12 @@ pub(crate) fn restore_work(
         grace_period_release()
     };
     if !released {
-        runtime.fail_fatal(
-            PowerOffStatus::Repair,
+        runtime.repair_failure(
             ViolationCode::RepairSuppression,
-            EventSource::Repair,
-            Phase::Restore,
             b"the RCU grace-period release failed",
         );
     }
-    if let Err(detail) = suppression_restore(true) {
-        runtime.fail_fatal(
-            PowerOffStatus::Repair,
-            ViolationCode::RepairSuppression,
-            EventSource::Repair,
-            Phase::Restore,
-            &detail,
-        );
-    }
+    release_suppression(runtime);
     let verdict = checks::check_timer_list(checks.online, checks::TIMER_LIST_WAIT);
     checks.record(runtime, verdict);
     if let Err(error) = checks::record_check(
@@ -559,13 +548,7 @@ fn start_restore(runtime: &Runtime<'_>, daemon: &mut Daemon, restore: PendingRes
     let (new_cpus, generation) = match parse_restore_state() {
         Ok(value) => value,
         Err(detail) => {
-            runtime.fail_fatal(
-                PowerOffStatus::Repair,
-                ViolationCode::RepairSuppression,
-                EventSource::Repair,
-                Phase::Restore,
-                &detail,
-            );
+            runtime.repair_failure(ViolationCode::RepairSuppression, &detail);
             return;
         }
     };
@@ -586,11 +569,8 @@ fn start_restore(runtime: &Runtime<'_>, daemon: &mut Daemon, restore: PendingRes
         }
         Ok(ForkResult::Parent(process)) => process,
         Err(error) => {
-            runtime.fail_fatal(
-                PowerOffStatus::Repair,
+            runtime.repair_failure(
                 ViolationCode::RepairSuppression,
-                EventSource::Repair,
-                Phase::Restore,
                 format!("cannot start the restore work: {}", error.desc()).as_bytes(),
             );
             return;
@@ -603,16 +583,11 @@ fn start_restore(runtime: &Runtime<'_>, daemon: &mut Daemon, restore: PendingRes
     });
 }
 
-/// Restores saved stall settings after a worker deadline or completion.
+/// Restores the saved stall-detector settings when repair step 7 ends, or when its worker passes
+/// its deadline or fails, and reports a repair failure if it cannot.
 fn release_suppression(runtime: &Runtime<'_>) {
     if let Err(detail) = suppression_restore(true) {
-        runtime.fail_fatal(
-            PowerOffStatus::Repair,
-            ViolationCode::RepairSuppression,
-            EventSource::Repair,
-            Phase::Restore,
-            &detail,
-        );
+        runtime.repair_failure(ViolationCode::RepairSuppression, &detail);
     }
 }
 
@@ -629,11 +604,8 @@ fn reap_children(runtime: &Runtime<'_>, daemon: &mut Daemon) {
                 ChildStatus::Signaled(signal) => signal,
                 _ => 0,
             };
-            runtime.fail_fatal(
-                PowerOffStatus::Repair,
+            runtime.repair_failure(
                 ViolationCode::RepairSuppression,
-                EventSource::Repair,
-                Phase::Restore,
                 format!("the restore work ended with signal {signal}").as_bytes(),
             );
         }

@@ -150,6 +150,11 @@ pub(crate) trait PrivilegedOps: Sync {
     fn adjust_clock(&self, adjustment: ClockAdjustment) -> Result<ClockDiscipline, Errno>;
     /// Stops the VM with `status`, which in production does not return.
     fn power_off(&self, status: PowerOffStatus);
+    /// Appends `record` to the kernel log, when the process may write it.
+    fn write_kernel_log(&self, record: &[u8]);
+    /// Writes `separator` and then `line` to the console, or to standard error when the console
+    /// does not open.
+    fn write_console(&self, separator: &[u8], line: &[u8]);
 }
 
 /// An MSR device, or the token of a test's fake.
@@ -213,6 +218,27 @@ impl PrivilegedOps for RealOps {
 
     fn power_off(&self, status: PowerOffStatus) {
         sys::power_off(status.code())
+    }
+
+    fn write_kernel_log(&self, record: &[u8]) {
+        let flags = OpenFlags::O_WRONLY | OpenFlags::O_CLOEXEC;
+        if let Ok(log) = sys::open(kernel::KERNEL_LOG_DEVICE, flags, Mode::empty()) {
+            let _ = log.write_all(record);
+        }
+    }
+
+    fn write_console(&self, separator: &[u8], line: &[u8]) {
+        let flags = OpenFlags::O_WRONLY | OpenFlags::O_NOCTTY | OpenFlags::O_CLOEXEC;
+        match sys::open(kernel::CONSOLE_DEVICE, flags, Mode::empty()) {
+            Ok(console) => {
+                let _ = console.write_all(separator);
+                let _ = console.write_all(line);
+            }
+            Err(_) => {
+                sys::write_standard_error(separator);
+                sys::write_standard_error(line);
+            }
+        }
     }
 }
 
@@ -302,10 +328,8 @@ impl<'a> Runtime<'a> {
             clock_ns(sys::Clock::Boottime),
             detail,
         );
-        let flags = OpenFlags::O_WRONLY | OpenFlags::O_CLOEXEC;
-        if let Ok(log) = sys::open(kernel::KERNEL_LOG_DEVICE, flags, Mode::empty()) {
-            let _ = log.write_all(&[KERNEL_LOG_PRIORITY, line.as_bytes()].concat());
-        }
+        self.ops
+            .write_kernel_log(&[KERNEL_LOG_PRIORITY, line.as_bytes()].concat());
         if let Ok(ports) = self.ports() {
             if self.async_output.load(Ordering::Relaxed) {
                 ports.outb(Port::PortbData, b'\n');
@@ -314,7 +338,12 @@ impl<'a> Runtime<'a> {
                 ports.outb(Port::PortbData, byte);
             }
         }
-        self.console_write(line.as_bytes());
+        let separator: &[u8] = if self.async_output.load(Ordering::Relaxed) {
+            b"\n"
+        } else {
+            b""
+        };
+        self.ops.write_console(separator, line.as_bytes());
         let _ = count_violation();
     }
 
@@ -342,24 +371,16 @@ impl<'a> Runtime<'a> {
         }
     }
 
-    /// Writes one event to the console or standard error fallback.
-    fn console_write(&self, line: &[u8]) {
-        let flags = OpenFlags::O_WRONLY | OpenFlags::O_NOCTTY | OpenFlags::O_CLOEXEC;
-        let separator: &[u8] = if self.async_output.load(Ordering::Relaxed) {
-            b"\n"
-        } else {
-            b""
-        };
-        match sys::open(kernel::CONSOLE_DEVICE, flags, Mode::empty()) {
-            Ok(console) => {
-                let _ = console.write_all(separator);
-                let _ = console.write_all(line);
-            }
-            Err(_) => {
-                sys::write_standard_error(separator);
-                sys::write_standard_error(line);
-            }
-        }
+    /// Reports that restore-time repair failed, a fatal event of the restore phase, and powers off
+    /// with the repair status unless report-only.
+    pub(crate) fn repair_failure(&self, code: ViolationCode, detail: &[u8]) {
+        self.fail_fatal(
+            PowerOffStatus::Repair,
+            code,
+            EventSource::Repair,
+            Phase::Restore,
+            detail,
+        );
     }
 }
 
@@ -712,6 +733,10 @@ pub(crate) mod tests {
         pub(crate) adjustments: Mutex<Vec<ClockAdjustment>>,
         /// The last power-off status, or zero.
         pub(crate) power: AtomicUsize,
+        /// Kernel log records, in order.
+        pub(crate) kernel_log: Mutex<Vec<u8>>,
+        /// Console output, in order.
+        pub(crate) console: Mutex<Vec<u8>>,
     }
 
     impl FakeOps {
@@ -723,6 +748,8 @@ pub(crate) mod tests {
                 output: Mutex::new(Vec::new()),
                 adjustments: Mutex::new(Vec::new()),
                 power: AtomicUsize::new(0),
+                kernel_log: Mutex::new(Vec::new()),
+                console: Mutex::new(Vec::new()),
             }
         }
     }
@@ -766,6 +793,16 @@ pub(crate) mod tests {
         fn power_off(&self, status: PowerOffStatus) {
             self.power
                 .store(usize::from(status.code()), Ordering::Relaxed);
+        }
+
+        fn write_kernel_log(&self, record: &[u8]) {
+            self.kernel_log.lock().unwrap().extend_from_slice(record);
+        }
+
+        fn write_console(&self, separator: &[u8], line: &[u8]) {
+            let mut console = self.console.lock().unwrap();
+            console.extend_from_slice(separator);
+            console.extend_from_slice(line);
         }
     }
 
@@ -859,6 +896,33 @@ pub(crate) mod tests {
         );
         runtime.ops.power_off(PowerOffStatus::Repair);
         assert_eq!(ops.power.load(Ordering::Relaxed), 195);
+    }
+
+    #[test]
+    fn repair_failures_report_restore_events_and_power_off_unless_report_only() {
+        for (report_only, prefix, power) in [
+            (false, "NVX-TIME-ABI", PowerOffStatus::Repair.code()),
+            (true, "NVX-TIME-REPORT", 0),
+        ] {
+            let ops = FakeOps::new([]);
+            let runtime = Runtime::new(&ops, report_only);
+            runtime.set_generation(4);
+            runtime.repair_failure(ViolationCode::RepairSuppression, b"cannot restore");
+            let line = String::from_utf8(ops.console.lock().unwrap().clone()).unwrap();
+            let start = format!(
+                "{prefix}-VIOLATION: v=1 code=G_REPAIR_SUPPRESSION source=repair phase=restore \
+                 generation=4 boottime_ns="
+            );
+            assert!(line.starts_with(&start), "{line}");
+            assert!(line.ends_with(" detail=\"cannot restore\"\n"), "{line}");
+            assert_eq!(
+                *ops.kernel_log.lock().unwrap(),
+                [KERNEL_LOG_PRIORITY, line.as_bytes()].concat()
+            );
+            let port: Vec<_> = line.bytes().map(|byte| (Port::PortbData, byte)).collect();
+            assert_eq!(*ops.output.lock().unwrap(), port);
+            assert_eq!(ops.power.load(Ordering::Relaxed), usize::from(power));
+        }
     }
 
     #[test]
