@@ -194,6 +194,8 @@ pub(crate) struct TestSystem {
     pub(crate) fail_environment: Option<Vec<u8>>,
     pub(crate) execs: Vec<RecordedExec>,
     pub(crate) spawn_calls: usize,
+    /// Spawns each workload when set; `spawn` otherwise fails with `ENOSYS`.
+    pub(crate) spawner: Option<fn(SpawnRequest<'_>) -> Result<ProcessId, Errno>>,
     pub(crate) tty_configured: usize,
     pub(crate) tty_drained: usize,
     pub(crate) close_barrier_reader: Option<FileDescriptor>,
@@ -213,6 +215,7 @@ impl TestSystem {
             fail_environment: None,
             execs: Vec::new(),
             spawn_calls: 0,
+            spawner: None,
             tty_configured: 0,
             tty_drained: 0,
             close_barrier_reader: None,
@@ -327,8 +330,11 @@ impl System for TestSystem {
         Ok(())
     }
 
-    fn spawn(&mut self, _request: SpawnRequest<'_>) -> Result<ProcessId, Errno> {
+    fn spawn(&mut self, request: SpawnRequest<'_>) -> Result<ProcessId, Errno> {
         self.spawn_calls += 1;
-        Err(Errno::ENOSYS)
+        match self.spawner {
+            Some(spawner) => spawner(request),
+            None => Err(Errno::ENOSYS),
+        }
     }
 }
