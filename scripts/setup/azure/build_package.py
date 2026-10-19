@@ -155,6 +155,12 @@ def windows_path(value: object, name: str) -> str:
         )
     if any(part.endswith(".") for part in parts):
         raise ValueError(f"{name} must not contain trailing-period path components")
+    for part in parts:
+        stem = part.split(".", 1)[0].upper()
+        if stem in ("CON", "PRN", "AUX", "NUL") or re.fullmatch(
+            r"(?:COM|LPT)[1-9]", stem
+        ):
+            raise ValueError(f"{name} must not contain reserved DOS device names")
     return ntpath.normpath(value)
 
 
@@ -423,6 +429,15 @@ def configuration_bytes(config: RunnerConfig) -> bytes:
     return (json.dumps(config, sort_keys=True, indent=2) + "\n").encode()
 
 
+def gzip_bytes(data: bytes) -> bytes:
+    stream = io.BytesIO()
+    with gzip.GzipFile(
+        filename="", mode="wb", fileobj=stream, compresslevel=9, mtime=0
+    ) as compressed:
+        compressed.write(data)
+    return stream.getvalue()
+
+
 def linux_payload(
     config: LinuxConfig,
 ) -> tuple[bytes, dict[str, bytes], dict[str, bytes]]:
@@ -445,7 +460,7 @@ def linux_payload(
             if name.endswith(".json")
             else ("0644" if name.endswith(".conf") else "0755"),
             "encoding": "gz+b64",
-            "content": base64.b64encode(gzip.compress(data, mtime=0)).decode(),
+            "content": base64.b64encode(gzip_bytes(data)).decode(),
         }
         for name, data in files.items()
     ]

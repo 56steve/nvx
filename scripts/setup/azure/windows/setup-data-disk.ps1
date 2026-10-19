@@ -25,6 +25,7 @@ $continuationTask = 'NvxRunner-SetupDataDisk'
 $pendingPath = 'HKLM:\SOFTWARE\NvxRunner\DataDiskSetup'
 $initMarkerType = '{8f8f0f40-5c84-4a2a-8c22-8fbff2e8bc91}'
 $basicDataType = '{ebd0a0a2-b9e5-4433-87c0-68b6b72699c7}'
+$setupTimeout = New-TimeSpan -Hours 4
 
 New-Item -ItemType Directory -Path $logDir -Force | Out-Null
 New-Item -ItemType Directory -Path $stateDir -Force | Out-Null
@@ -32,7 +33,7 @@ $logFile = Join-Path $logDir 'setup-datadisk.log'
 $mutex = [System.Threading.Mutex]::new($false, 'Global\NvxRunner-SetupDataDisk')
 $mutexHeld = $false
 try {
-    $mutexHeld = $mutex.WaitOne((New-TimeSpan -Minutes 15))
+    $mutexHeld = $mutex.WaitOne($setupTimeout)
 }
 catch [System.Threading.AbandonedMutexException] {
     $mutexHeld = $true
@@ -174,14 +175,62 @@ function Register-Continuation {
     $trigger = New-ScheduledTaskTrigger -AtStartup
     $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
     $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable `
-        -ExecutionTimeLimit (New-TimeSpan -Minutes 15) `
+        -ExecutionTimeLimit $setupTimeout `
         -RestartCount 10 -RestartInterval (New-TimeSpan -Minutes 1)
     Register-ScheduledTask -TaskName $continuationTask -Action $action -Trigger $trigger `
         -Principal $principal -Settings $settings -Force | Out-Null
 }
 
-function Test-DiskPrefixIsZero {
+function Test-ZeroFilledStream {
+    param(
+        [Parameter(Mandatory = $true)][System.IO.Stream] $Stream,
+        [Parameter(Mandatory = $true)][long] $Length
+    )
+    # Keep the per-byte scan compiled and the buffer bounded.
+    if (-not ('NvxBootstrap.DiskContent' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+
+namespace NvxBootstrap
+{
+    public static class DiskContent
+    {
+        public static bool IsZero(Stream stream, long length)
+        {
+            if (stream == null) throw new ArgumentNullException("stream");
+            if (length <= 0) throw new ArgumentOutOfRangeException("length");
+            byte[] buffer = new byte[1024 * 1024];
+            long remaining = length;
+            while (remaining > 0)
+            {
+                int requested = (int)Math.Min((long)buffer.Length, remaining);
+                int read = stream.Read(buffer, 0, requested);
+                if (read <= 0)
+                    throw new EndOfStreamException("Disk ended before its reported size.");
+                for (int index = 0; index < read; index++)
+                {
+                    if (buffer[index] != 0) return false;
+                }
+                remaining -= read;
+            }
+            return true;
+        }
+    }
+}
+'@
+    }
+    return [NvxBootstrap.DiskContent]::IsZero($Stream, $Length)
+}
+
+function Test-DiskIsZero {
     param([Parameter(Mandatory = $true)] $Disk)
+    $size = $Disk.Size
+    $integerTypes = @([byte], [sbyte], [int16], [uint16], [int32], [uint32], [int64], [uint64])
+    if ($null -eq $size -or $integerTypes -notcontains $size.GetType() -or
+        $size -le 0 -or $size -gt [long]::MaxValue) {
+        throw "Invalid disk size for disk $($Disk.Number); refusing to initialize it."
+    }
     $path = "\\.\PhysicalDrive$($Disk.Number)"
     $stream = $null
     try {
@@ -191,17 +240,7 @@ function Test-DiskPrefixIsZero {
             [System.IO.FileAccess]::Read,
             [System.IO.FileShare]::ReadWrite
         )
-        $buffer = New-Object byte[] (1MB)
-        $totalRead = 0
-        while ($totalRead -lt $buffer.Length) {
-            $read = $stream.Read($buffer, $totalRead, $buffer.Length - $totalRead)
-            if ($read -le 0) { return $false }
-            $totalRead += $read
-        }
-        for ($index = 0; $index -lt $buffer.Length; $index++) {
-            if ($buffer[$index] -ne 0) { return $false }
-        }
-        return $true
+        return Test-ZeroFilledStream -Stream $stream -Length ([long]$size)
     }
     finally {
         if ($stream) { $stream.Dispose() }
@@ -313,14 +352,17 @@ if ($markerPartitions.Count -gt 1 -or $dataPartitions.Count -gt 1) {
     exit 1
 }
 
+$initializedThisRun = $false
 if ($dataDisk.PartitionStyle -eq 'RAW') {
-    if (-not (Test-DiskPrefixIsZero $dataDisk)) {
-        Write-DiskLog 'ERROR: RAW disk contains nonzero data in its first MiB; refusing to initialize it.'
+    Write-DiskLog "Verifying the full contents of RAW disk $($dataDisk.Number) before initialization."
+    if (-not (Test-DiskIsZero $dataDisk)) {
+        Write-DiskLog 'ERROR: RAW disk contains nonzero data; refusing to initialize it.'
         exit 1
     }
     Write-DiskLog 'Initializing truly RAW managed data disk as GPT.'
     Initialize-Disk -Number $dataDisk.Number -PartitionStyle GPT
     $dataDisk = Get-Disk -Number $dataDisk.Number
+    $initializedThisRun = $true
     $allPartitions = @()
     $markerPartitions = @()
     $dataPartitions = @()
@@ -333,6 +375,10 @@ if ($dataDisk.PartitionStyle -ne 'GPT') {
 
 if ($dataPartitions.Count -eq 0) {
     if ($markerPartitions.Count -eq 0) {
+        if (-not $initializedThisRun) {
+            Write-DiskLog 'ERROR: existing GPT disk has no owned initialization marker; preserving it without creating partitions.'
+            exit 1
+        }
         Write-DiskLog 'Creating persistent on-disk initialization marker.'
         $markerPartitions = @(New-Partition -DiskNumber $dataDisk.Number -Size 16MB -GptType $initMarkerType)
     }

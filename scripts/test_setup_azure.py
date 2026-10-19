@@ -298,6 +298,41 @@ class PackageTests(unittest.TestCase):
             )
             self.assertLessEqual(manifest["customDataBytes"], 65535)
 
+    def test_linux_gzip_headers_are_independent_of_builder_platform(self):
+        original_compress = gzip.compress
+        outputs: list[bytes] = []
+        for host_os in (0, 3):
+
+            def host_compress(
+                data: bytes,
+                compresslevel: int = 9,
+                *,
+                mtime: int | None = None,
+                os_byte: int = host_os,
+            ) -> bytes:
+                compressed = bytearray(
+                    original_compress(data, compresslevel=compresslevel, mtime=mtime)
+                )
+                compressed[9] = os_byte
+                return bytes(compressed)
+
+            with patch.object(builder.gzip, "compress", side_effect=host_compress):
+                payload, files, _ = builder.linux_payload(self.configuration("linux"))
+                outputs.append(payload)
+                cloud = cast(CloudFiles, yaml.safe_load(payload))
+                for entry in cloud["write_files"]:
+                    if entry.get("encoding") != "gz+b64":
+                        continue
+                    compressed = base64.b64decode(entry["content"], validate=True)
+                    self.assertEqual(compressed[:4], b"\x1f\x8b\x08\x00")
+                    self.assertEqual(compressed[4:8], b"\0" * 4)
+                    self.assertEqual(compressed[9], 255)
+                    self.assertEqual(
+                        gzip.decompress(compressed),
+                        files[entry["path"].split("/")[-1]],
+                    )
+        self.assertEqual(outputs[0], outputs[1])
+
     def test_mshv_modes(self):
         config = self.configuration("linux")
         config["backend"] = "mshv"
@@ -1248,6 +1283,281 @@ if ($null -ne (Select-ManagedDataDisk -Disks @($scsi, $nvme) `
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_windows_raw_disk_scan_is_complete_bounded_and_fail_closed(self):
+        source = builder.source("windows/setup-data-disk.ps1").decode()
+        self.assertIn("$setupTimeout = New-TimeSpan -Hours 4", source)
+        self.assertIn("$mutex.WaitOne($setupTimeout)", source)
+        self.assertIn("-ExecutionTimeLimit $setupTimeout", source)
+        script = r"""
+Set-StrictMode -Version 2.0
+$ErrorActionPreference = 'Stop'
+$tokens = $null
+$errors = $null
+$ast = [Management.Automation.Language.Parser]::ParseFile(
+    $env:NVX_TEST_DISK_SCRIPT, [ref]$tokens, [ref]$errors)
+if ($errors.Count -ne 0) { throw 'Disk setup has parse errors' }
+foreach ($name in @('Test-ZeroFilledStream', 'Test-DiskIsZero')) {
+    $definition = $ast.Find({
+        param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -eq $name
+    }, $true)
+    if (-not $definition) { throw "Missing disk verification function: $name" }
+    $source = $definition.Extent.Text
+    if ($name -eq 'Test-DiskIsZero') {
+        $needle = '$path = "\\.\PhysicalDrive$($Disk.Number)"'
+        if (-not $source.Contains($needle)) { throw 'Unexpected physical-drive path' }
+        $source = $source.Replace($needle, '$path = $env:NVX_TEST_STREAM_FILE')
+    }
+    . ([scriptblock]::Create($source))
+}
+Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+namespace NvxDiskTests
+{
+    public sealed class ObservedStream : MemoryStream
+    {
+        public int MaxChunk = Int32.MaxValue;
+        public long ThrowAt = -1;
+        public int MaxRequested;
+        public long BytesRead;
+        public ObservedStream(byte[] bytes) : base(bytes) {}
+        public override int Read(byte[] buffer, int offset, int count)
+        {
+            MaxRequested = Math.Max(MaxRequested, count);
+            if (ThrowAt >= 0 && Position >= ThrowAt)
+                throw new IOException("Mock disk read failure.");
+            int read = base.Read(buffer, offset, Math.Min(count, MaxChunk));
+            BytesRead += read;
+            return read;
+        }
+    }
+}
+'@
+$bytes = New-Object byte[] (2MB + 17)
+foreach ($partial in @($false, $true)) {
+    $stream = [NvxDiskTests.ObservedStream]::new($bytes)
+    try {
+        if ($partial) { $stream.MaxChunk = 4093 }
+        if (-not (Test-ZeroFilledStream -Stream $stream -Length $bytes.Length)) {
+            throw 'A zero-filled stream was rejected'
+        }
+        if ($stream.BytesRead -ne $bytes.Length -or $stream.MaxRequested -gt 1MB) {
+            throw 'Disk verification did not use complete bounded reads'
+        }
+    }
+    finally { $stream.Dispose() }
+}
+$bytes[$bytes.Length - 1] = 1
+[IO.File]::WriteAllBytes($env:NVX_TEST_STREAM_FILE, $bytes)
+$disk = [pscustomobject]@{ Number = 7; Size = [uint64]$bytes.Length }
+if (Test-DiskIsZero $disk) { throw 'Nonzero data beyond the first MiB was accepted' }
+$bytes[$bytes.Length - 1] = 0
+[IO.File]::WriteAllBytes($env:NVX_TEST_STREAM_FILE, $bytes)
+if (-not (Test-DiskIsZero $disk)) { throw 'A complete zero-filled disk was rejected' }
+
+foreach ($failure in @('short', 'read')) {
+    $stream = [NvxDiskTests.ObservedStream]::new($bytes)
+    try {
+        $length = [long]$bytes.Length
+        if ($failure -eq 'short') { $length++ } else { $stream.ThrowAt = 1MB }
+        $rejected = $false
+        try { Test-ZeroFilledStream -Stream $stream -Length $length | Out-Null }
+        catch {
+            $expected = if ($failure -eq 'short') { 'reported size' } else { 'Mock disk read failure' }
+            if ($_.Exception.Message -notlike "*$expected*") { throw }
+            $rejected = $true
+        }
+        if (-not $rejected) { throw "Disk verification ignored a $failure failure" }
+    }
+    finally { $stream.Dispose() }
+}
+foreach ($size in @($null, 0, -1, $true, '1024', 1.5, [double]::NaN, [uint64]::MaxValue)) {
+    $rejected = $false
+    try { Test-DiskIsZero ([pscustomobject]@{ Number = 7; Size = $size }) | Out-Null }
+    catch {
+        if ($_.Exception.Message -notlike 'Invalid disk size*') { throw }
+        $rejected = $true
+    }
+    if (-not $rejected) { throw "Invalid device size was accepted: $size" }
+}
+"""
+        with tempfile.TemporaryDirectory() as temporary:
+            self.execute_windows(
+                script,
+                NVX_TEST_DISK_SCRIPT=str(builder.ROOT / "windows/setup-data-disk.ps1"),
+                NVX_TEST_STREAM_FILE=str(Path(temporary) / "disk"),
+            )
+
+    def test_windows_disk_initialization_requires_owned_state(self):
+        script = r"""
+Set-StrictMode -Version 2.0
+$ErrorActionPreference = 'Stop'
+$text = [IO.File]::ReadAllText($env:NVX_TEST_DISK_SCRIPT)
+$start = $text.IndexOf("`n`$allPartitions = @(Get-Partition -DiskNumber")
+$end = $text.IndexOf("`nif (`$volume.FileSystem -ne 'NTFS')", $start)
+if ($start -lt 0 -or $end -le $start) { throw 'Missing initialization/formatting block' }
+$body = $text.Substring($start, $end - $start).
+    Replace('exit 1', "throw 'NVX_DISK_SETUP_REJECTED'")
+$initialize = [scriptblock]::Create($body)
+$initMarkerType = '{8f8f0f40-5c84-4a2a-8c22-8fbff2e8bc91}'
+$basicDataType = '{ebd0a0a2-b9e5-4433-87c0-68b6b72699c7}'
+function Write-DiskLog {
+    param($Message)
+    $script:messages += $Message
+}
+function Test-DiskIsZero {
+    param($Disk)
+    $script:scans++
+    if ($script:scanError) { throw 'Mock disk read failure' }
+    return $script:blank
+}
+function Initialize-Disk {
+    param($Number, $PartitionStyle)
+    if ($Number -ne 7 -or $PartitionStyle -ne 'GPT' -or
+        $script:disk.PartitionStyle -ne 'RAW' -or -not $script:blank) {
+        throw 'Unexpected disk initialization'
+    }
+    $script:initializations++
+    $script:disk.PartitionStyle = 'GPT'
+}
+function Get-Disk {
+    param($Number)
+    if ($Number -ne 7) { throw 'Unexpected disk query' }
+    return $script:disk
+}
+function Get-Partition {
+    param($DiskNumber, $PartitionNumber, $ErrorAction)
+    if ($DiskNumber -ne 7) { throw 'Unexpected partition query' }
+    return @($script:parts | Where-Object {
+        -not $PartitionNumber -or $_.PartitionNumber -eq $PartitionNumber
+    })
+}
+function New-Partition {
+    param($DiskNumber, $Size, $GptType, [switch]$UseMaximumSize)
+    if ($DiskNumber -ne 7) { throw 'Unexpected partition target' }
+    if ($GptType -eq $initMarkerType) {
+        if ($script:initializations -ne 1 -or $Size -ne 16MB) {
+            throw 'An unowned disk was claimed with a new marker'
+        }
+        $script:newMarkers++
+        $partition = [pscustomobject]@{
+            DiskNumber = 7; PartitionNumber = 1; Type = 'Unknown'; GptType = $GptType
+        }
+    }
+    elseif ($GptType -eq $basicDataType -and $UseMaximumSize) {
+        if (@($script:parts | Where-Object GptType -eq $initMarkerType).Count -ne 1) {
+            throw 'Data partition created without an owned marker'
+        }
+        $script:newData++
+        $partition = [pscustomobject]@{
+            DiskNumber = 7; PartitionNumber = 2; Type = 'Basic'; GptType = $GptType
+        }
+    }
+    else { throw 'Unexpected partition creation' }
+    $script:parts += $partition
+    return $partition
+}
+function Get-Volume {
+    param($Partition, $ErrorAction)
+    if (-not $Partition -or $Partition.DiskNumber -ne 7) {
+        throw 'Unexpected volume query'
+    }
+    return $script:volume
+}
+function Format-Volume {
+    param($Partition, $FileSystem, $NewFileSystemLabel, [switch]$Force, $Confirm)
+    if ($args.Count -ne 0 -or -not $Partition -or
+        $Partition.DiskNumber -ne 7 -or $Partition.PartitionNumber -ne 2 -or
+        $FileSystem -ne 'NTFS' -or $NewFileSystemLabel -ne 'data' -or
+        -not $Force -or $Confirm) { throw 'Unexpected formatting request' }
+    if (@($script:parts | Where-Object GptType -eq $initMarkerType).Count -ne 1) {
+        throw 'Unowned partition was formatted'
+    }
+    $script:formats++
+    $script:volume.FileSystem = 'NTFS'
+    $script:volume.FileSystemType = 'NTFS'
+}
+$cases = @(
+    @{ Name='raw-zero'; Style='RAW'; Blank=$true; Marker=0; Data='none';
+       Reject=$false; Init=1; NewMarker=1; Format=1 },
+    @{ Name='raw-data'; Style='RAW'; Blank=$false; Marker=0; Data='none';
+       Reject=$true; Init=0; NewMarker=0; Format=0 },
+    @{ Name='raw-read-error'; Style='RAW'; Blank=$true; Marker=0; Data='none';
+       Reject=$true; Init=0; NewMarker=0; Format=0 },
+    @{ Name='unmarked-gpt'; Style='GPT'; Blank=$true; Marker=0; Data='none';
+       Reject=$true; Init=0; NewMarker=0; Format=0 },
+    @{ Name='reserved-only'; Style='GPT'; Blank=$true; Marker=0; Data='none';
+       Reject=$true; Init=0; NewMarker=0; Format=0 },
+    @{ Name='owned-empty'; Style='GPT'; Blank=$true; Marker=1; Data='none';
+       Reject=$false; Init=0; NewMarker=0; Format=1 },
+    @{ Name='owned-unformatted'; Style='GPT'; Blank=$true; Marker=1; Data='Unknown';
+       Reject=$false; Init=0; NewMarker=0; Format=1 },
+    @{ Name='owned-incomplete-ntfs'; Style='GPT'; Blank=$true; Marker=1; Data='NTFS';
+       Reject=$false; Init=0; NewMarker=0; Format=1 },
+    @{ Name='existing-ntfs'; Style='GPT'; Blank=$true; Marker=0; Data='NTFS';
+       Reject=$false; Init=0; NewMarker=0; Format=0 },
+    @{ Name='unowned-unformatted'; Style='GPT'; Blank=$true; Marker=0; Data='Unknown';
+       Reject=$true; Init=0; NewMarker=0; Format=0 }
+)
+foreach ($case in $cases) {
+    $script:disk = [pscustomobject]@{ Number=7; PartitionStyle=$case.Style }
+    $script:parts = @()
+    $script:initializations = 0
+    $script:newMarkers = 0
+    $script:newData = 0
+    $script:formats = 0
+    $script:scans = 0
+    $script:messages = @()
+    $script:blank = $case.Blank
+    $script:scanError = $case.Name -eq 'raw-read-error'
+    $script:volume = [pscustomobject]@{
+        FileSystem = if ($case.Data -eq 'NTFS') { 'NTFS' } else { '' }
+        FileSystemType = if ($case.Data -eq 'NTFS') { 'NTFS' } else { 'Unknown' }
+    }
+    if ($case.Marker) {
+        $script:parts += [pscustomobject]@{
+            DiskNumber=7; PartitionNumber=1; Type='Unknown'; GptType=$initMarkerType
+        }
+    }
+    if ($case.Data -ne 'none') {
+        $script:parts += [pscustomobject]@{
+            DiskNumber=7; PartitionNumber=2; Type='Basic'; GptType=$basicDataType
+        }
+    }
+    if ($case.Name -eq 'reserved-only') {
+        $script:parts += [pscustomobject]@{
+            DiskNumber=7; PartitionNumber=1; Type='Reserved'; GptType='reserved'
+        }
+    }
+    $dataDisk = $script:disk
+    $rejected = $false
+    try { & $initialize }
+    catch {
+        if ($_.Exception.Message -notin @('NVX_DISK_SETUP_REJECTED', 'Mock disk read failure')) {
+            throw
+        }
+        $rejected = $true
+    }
+    if ($rejected -ne $case.Reject -or
+        $script:initializations -ne $case.Init -or
+        $script:newMarkers -ne $case.NewMarker -or $script:formats -ne $case.Format) {
+        throw "Unexpected disk operations for $($case.Name)"
+    }
+    if ($case.Style -eq 'RAW' -and $script:scans -ne 1) {
+        throw 'RAW initialization skipped device verification'
+    }
+    if ($case.Style -eq 'GPT' -and $script:scans -ne 0) {
+        throw 'An existing GPT disk was treated as a blank RAW disk'
+    }
+}
+"""
+        self.execute_windows(
+            script,
+            NVX_TEST_DISK_SCRIPT=str(builder.ROOT / "windows/setup-data-disk.ps1"),
+        )
+
     def test_windows_pending_disk_reboot_invalidates_completion_before_continuing(self):
         script = r"""
 Set-StrictMode -Version 2.0
@@ -1910,6 +2220,19 @@ if (-not $rejected) { throw 'Firewall creation failure was ignored' }
             builder.windows_path(r"F:\pool.v1\runner", "path"),
             r"F:\pool.v1\runner",
         )
+
+    def test_windows_paths_reject_reserved_dos_components(self):
+        for field in ("runnerDirectory", "benchmarkScratchDirectory"):
+            for component in ("NUL", "con", "PRN.txt", "aux.log", "COM1.txt", "lpt9"):
+                for path in (rf"F:\{component}\runner", rf"F:\pool\{component}"):
+                    with self.subTest(field=field, path=path):
+                        config: dict[str, object] = dict(self.configuration("windows"))
+                        config[field] = path
+                        with self.assertRaisesRegex(ValueError, "reserved DOS"):
+                            builder.normalize_config(config)
+        for component in ("COM10", "LPT10", "AUXILIARY", "CONSOLE", "file.NUL"):
+            path = rf"F:\pool\{component}"
+            self.assertEqual(builder.windows_path(path, "path"), path)
 
     def test_windows_scratch_does_not_overlap_protected_runner_paths(self):
         for scratch, valid in (

@@ -70,8 +70,14 @@ Windows uses WHP and defines `dataDisk.driveLetter`,
 `benchmarkScratchDirectory` on the managed data volume, `sshDefaultShell`,
 and `publicKeys`. Scratch must neither contain the runner installation nor
 overlap it outside its writable `_work` subtree. Windows paths cannot contain
-trailing-period components. A nonempty public-key array becomes the configured
+trailing-period components or reserved DOS device basenames, including names
+with extensions. A nonempty public-key array becomes the configured
 administrator authorized-key set; an empty array preserves existing keys.
+Windows RAW disks must pass a full-device zero scan with bounded memory before
+initialization; the continuation budget matches the runner's four-hour setup
+budget. Existing unmarked GPT disks with no data partition are preserved,
+not claimed as interrupted setup. A fresh marker is created only after verified
+initialization in that invocation.
 Bootstrap resumes through a SYSTEM startup task after disk or feature
 reboots, then removes the task after successful registration. GitHub jobs
 run as Network Service with access to Azure instance metadata blocked.
@@ -116,6 +122,8 @@ configuration values, generates SHA-256 hashes for the exact source files
 and payload, and enforces Azure's 65,535-byte decoded custom-data limit.
 Packaged PowerShell source uses canonical LF line endings so checkout-specific
 CRLF conversion does not change the distributed bytes or hashes.
+Embedded gzip files use a fixed timestamp, no filename, and a host-neutral
+header rather than the platform-dependent shortcut in Python 3.11/3.12.
 The output directory must be outside the repository.
 It must be new or empty so files from another platform cannot be reused.
 
