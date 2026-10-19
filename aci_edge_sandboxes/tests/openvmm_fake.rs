@@ -15,6 +15,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use aci_edge_sandboxes::nvx::Hypervisor;
+use aci_edge_sandboxes::nvx::host::platform;
 use aci_edge_sandboxes::openvmm::OpenVmmConfig;
 use aci_edge_sandboxes::{
     Access, AciEdgeSandbox, EgressPolicy, ErrorCode, ExecFailure, ExecOutcome, ExecOutput,
@@ -981,20 +982,20 @@ fn crashed_vms_fall_back_to_provisioned() {
     });
     let sandbox_id = nvx.provision(&ProvisionRequest::new()).unwrap().sandbox_id;
     nvx.start(&sandbox_id).unwrap();
+    // Wait until the VM is gone, as the backend tells it: an exec that the crash interrupts fails
+    // as a broken control session instead, with `BackendError`.
+    let runtime = state_json(&fixture, &sandbox_id, "runtime.json");
+    let pid = u32::try_from(runtime["pid"].as_u64().unwrap()).unwrap();
+    let start_time = runtime["startTime"].as_u64().unwrap();
     let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        match nvx.exec(&sandbox_id, &ExecRequest::command_line("echo alive")) {
-            Err(error) => {
-                assert_eq!(error.code(), ErrorCode::NotStarted, "{error}");
-                break;
-            }
-            Ok(execution) => {
-                let _ = execution.wait();
-            }
-        }
+    while platform::process_start_time(pid).unwrap() == Some(start_time) {
         assert!(Instant::now() < deadline, "the crash was never observed");
-        thread::sleep(Duration::from_millis(100));
+        thread::sleep(Duration::from_millis(50));
     }
+    let error = nvx
+        .exec(&sandbox_id, &ExecRequest::command_line("echo alive"))
+        .unwrap_err();
+    assert_eq!(error.code(), ErrorCode::NotStarted, "{error}");
     assert_eq!(
         nvx.stop(&sandbox_id).unwrap_err().code(),
         ErrorCode::AlreadyStopped

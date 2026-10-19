@@ -1,5 +1,5 @@
 use std::fs::{self, DirBuilder, OpenOptions, Permissions};
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -10,6 +10,9 @@ use std::time::{Duration, Instant};
 use super::Transport;
 use crate::host::sys::{self, Errno};
 use crate::hypervisor::Hypervisor;
+
+#[cfg(feature = "cli")]
+pub(crate) use crate::host::sys::{interrupted, watch_interrupts, write_interruptibly};
 
 /// Whether this host can run NVX microVMs.
 pub const SUPPORTED: bool = true;
@@ -231,8 +234,18 @@ impl Transport for UnixTransport {
         }
     }
 
-    fn write_all(&mut self, data: &[u8], timeout: Option<Duration>) -> io::Result<()> {
-        self.stream.set_write_timeout(socket_timeout(timeout))?;
-        self.stream.write_all(data).map_err(map_timeout)
+    fn write_all(&mut self, mut data: &[u8], timeout: Option<Duration>) -> io::Result<()> {
+        // A blocking send restarts its timeout whenever the endpoint makes room, so one that
+        // drains slowly would hold the write past `timeout`. Sends therefore never wait, and
+        // polls wait for room within what is left of `timeout`.
+        let deadline = timeout.map(|timeout| Instant::now() + timeout);
+        while !data.is_empty() {
+            let left = super::time_left(deadline)?;
+            match sys::send_nonblocking(&self.stream, data)? {
+                0 => sys::wait_writable(&self.stream, left)?,
+                sent => data = &data[sent..],
+            }
+        }
+        Ok(())
     }
 }
