@@ -148,10 +148,13 @@ def linux_path(value: object, name: str) -> str:
 
 def windows_path(value: object, name: str) -> str:
     value = text(value, name, r"[A-Za-z]:\\[A-Za-z0-9_.\\-]+")
-    if any(part in (".", "..", "") for part in value[3:].split("\\")):
+    parts = value[3:].split("\\")
+    if any(part in (".", "..", "") for part in parts):
         raise ValueError(
             f"{name} must be an absolute drive path without traversal or empty segments"
         )
+    if any(part.endswith(".") for part in parts):
+        raise ValueError(f"{name} must not contain trailing-period path components")
     return ntpath.normpath(value)
 
 
@@ -330,7 +333,9 @@ def normalize_config(config: object) -> LinuxConfig | WindowsConfig:
         scratch_path = ntpath.normcase(scratch)
         work_path = ntpath.join(runner_path, "_work")
         if (
-            scratch_path == runner_path or scratch_path.startswith(runner_path + "\\")
+            scratch_path == runner_path
+            or scratch_path.startswith(runner_path + "\\")
+            or runner_path.startswith(scratch_path + "\\")
         ) and not (
             scratch_path == work_path or scratch_path.startswith(work_path + "\\")
         ):
@@ -501,6 +506,7 @@ def windows_payload(
     with zipfile.ZipFile(stream, "w") as archive:
         for name, data in files.items():
             entry = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
+            entry.create_system = 3  # Unix, matching the file attributes below.
             entry.compress_type = zipfile.ZIP_DEFLATED
             entry.external_attr = 0o100644 << 16
             archive.writestr(entry, data, compresslevel=9)

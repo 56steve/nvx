@@ -1,11 +1,7 @@
 #!/bin/bash
 # Installs the MSHV host stack and makes the Dom0 boot entry the default.
 #
-# Azure Linux 3 ships the whole stack in the kata-packages-host
-# meta-package: mshv, mshv-bootloader-lx, kernel-mshv, kernel-uvm,
-# edk2-hvloader, cloud-hypervisor and kata-containers. This mirrors what
-# AgentBaker does when it bakes the AKS V3katagen2 node image
-# (parts/linux/cloud-init/artifacts/mariner/cse_install_mariner.sh).
+# Install only the hypervisor, boot loaders, and host kernel needed for Dom0.
 #
 # Booting the mshv kernel on its own is NOT enough: GRUB has to chainload
 # HvLoader.efi first so the hypervisor is running before the Linux root
@@ -50,10 +46,10 @@ fi
 echo "preflight OK (arch=$arch, UEFI, ESP mounted, nested virt available)"
 
 # ---------------------------------------------------------------- step 2
-echo "--- installing kata-packages-host ---"
+echo "--- installing MSHV boot components ---"
 installed=0
 for attempt in 1 2 3; do
-    if dnf install -y kata-packages-host; then
+    if dnf install -y mshv mshv-bootloader-lx kernel-mshv edk2-hvloader; then
         installed=1
         break
     fi
@@ -63,10 +59,10 @@ for attempt in 1 2 3; do
     echo "dnf attempt $attempt failed, retrying in 30s"
     sleep 30
 done
-[ "$installed" = "1" ] || fail "could not install kata-packages-host after 3 attempts"
+[ "$installed" = "1" ] || fail "could not install MSHV boot components after 3 attempts"
 
 echo "--- installed MSHV stack ---"
-rpm -qa | grep -Ei 'mshv|hvloader|cloud-hypervisor|kata' | sort || true
+rpm -qa | grep -Ei 'mshv|hvloader' | sort || true
 
 # Confirm the pieces the Dom0 boot path actually depends on. A partial
 # install would otherwise only show up as a silent fail-open boot.
@@ -171,7 +167,6 @@ echo "--- resulting menuentries ---"
 grep -n '^menuentry ' "$GRUB_CFG" || true
 
 # Marker meaning "configuration succeeded". It does NOT mean MSHV is
-# running: that can only be confirmed after the reboot, by
-# mshv-verify.service.
+# running: that can only be confirmed after the reboot by verify-mshv.sh.
 touch /var/log/enable-mshv.done
 echo "=== enable-mshv finished, rebooting into Dom0 ==="

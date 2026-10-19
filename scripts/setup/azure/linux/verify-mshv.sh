@@ -40,22 +40,8 @@ else
 fi
 
 echo
-echo "== VMM and runtime =="
-if command -v cloud-hypervisor >/dev/null 2>&1; then
-    cloud-hypervisor --version
-else
-    echo "FAIL: cloud-hypervisor not found"
-    rc=1
-fi
-if command -v kata-runtime >/dev/null 2>&1; then
-    kata-runtime --version 2>/dev/null | head -n 3
-else
-    echo "WARN: kata-runtime not found"
-fi
-
-echo
 echo "== packages =="
-rpm -qa 2>/dev/null | grep -Ei 'mshv|hvloader|cloud-hypervisor|kata' | sort || true
+rpm -qa 2>/dev/null | grep -Ei 'mshv|hvloader' | sort || true
 
 echo
 if [ "$rc" = "0" ]; then

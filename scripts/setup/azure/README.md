@@ -50,8 +50,9 @@ fresh registration token.
 Linux additionally selects `backend` (`kvm` or `mshv`), `kernelMode`, and
 `dataDisk.mountPoint` below `/mnt` or `/srv`. `kernelMode: "preinstalled"`
 expects the selected device to be ready. `azurelinux-mshv` installs the
-Azure Linux 3 MSHV host stack, checks the Dom0 boot entry, requests a reboot,
+Azure Linux 3 MSHV boot components, checks the Dom0 boot entry, requests a reboot,
 and verifies `/dev/mshv` afterwards; it is not an Ubuntu kernel installer.
+It does not install or require cloud-hypervisor or Kata.
 Place `runnerDirectory` under the mounted data directory if runner work
 and cache must use that disk; merely mounting it does not move `_work`.
 Disk setup installs the distribution's partitioning utility when it is
@@ -63,16 +64,19 @@ insufficient.
 Windows uses WHP and defines `dataDisk.driveLetter`,
 `dataDisk.temporaryDriveFallback`, optional
 `benchmarkScratchDirectory` on the managed data volume, `sshDefaultShell`,
-and `publicKeys`. Scratch must not overlap the runner installation outside
-its writable `_work` subtree. A nonempty public-key array becomes the configured
+and `publicKeys`. Scratch must neither contain the runner installation nor
+overlap it outside its writable `_work` subtree. Windows paths cannot contain
+trailing-period components. A nonempty public-key array becomes the configured
 administrator authorized-key set; an empty array preserves existing keys.
 Bootstrap resumes through a SYSTEM startup task after disk or feature
 reboots, then removes the task after successful registration. GitHub jobs
 run as Network Service with access to Azure instance metadata blocked.
 Linux jobs run as `nvx-runner`, whose metadata block is installed before
 registration. The runner service requires the block on every start; root
-retains metadata access for bootstrap and token retrieval. Successful Linux
-registration disables the provisioning unit without restarting the runner;
+retains metadata access for bootstrap and token retrieval. Metadata-rule updates
+keep existing protection until a replacement is installed and verified; failures
+stop setup without deleting that protection. Successful Linux registration
+disables the provisioning unit without restarting the runner;
 the metadata-block unit remains enabled. Windows requires an unrestricted,
 all-profile metadata block for Network Service and rejects existing rules
 with narrower filters. Windows selects

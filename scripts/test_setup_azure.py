@@ -314,11 +314,43 @@ class PackageTests(unittest.TestCase):
                     self.assertLessEqual(manifest["customDataBytes"], 65535)
 
     def test_linux_runner_metadata_firewall_is_idempotent_and_fail_closed(self):
-        shell = shutil.which("bash")
-        if shell is None:
-            self.skipTest("Bash is unavailable")
         source = builder.source("linux/block-runner-metadata.sh").decode()
+        lock = "exec 9>/run/nvx-runner-metadata.lock"
+        self.assertEqual(source.count(lock), 1)
+        source = source.replace(lock, 'exec 9>"$test_lock"')
         mock = r"""
+set -euo pipefail
+initial=$1
+fail_insert=$2
+fail_probe=$3
+fail_delete=$4
+test_lock=$5
+rules=()
+if [ -n "$initial" ]; then read -r -a rules <<<"$initial"; fi
+insertions=0
+locked=0
+protection_required=0
+assert_protected() {
+    local item
+    for item in "${rules[@]}"; do
+        case "$item" in
+            old | pending | stable) return ;;
+            ACCEPT) break ;;
+        esac
+    done
+    echo 'ERROR: metadata protection was removed during replacement' >&2
+    exit 99
+}
+for item in "${rules[@]}"; do
+    case "$item" in old | pending | stable) protection_required=1 ;; esac
+done
+dump_state() {
+    local status=$?
+    printf 'RULES:%s\n' "${rules[*]}"
+    if [ "$protection_required" -eq 1 ]; then assert_protected; fi
+    return "$status"
+}
+trap dump_state EXIT
 id() {
     case "$*" in
         -u) printf '0\n' ;;
@@ -326,45 +358,123 @@ id() {
         *) return 1 ;;
     esac
 }
+flock() {
+    [ "$*" = '-x -w 30 9' ] || return 1
+    locked=1
+}
 iptables() {
+    [ "$locked" -eq 1 ] || {
+        echo 'ERROR: firewall operation without update lock' >&2
+        return 2
+    }
+    [ "$1 $2" = '-w 10' ] || return 2
+    local operation=$3 kind index item
+    shift 3
+    [ "$1" = OUTPUT ] || return 2
+    shift
+    if [ "$operation" = -I ]; then
+        [ "$1" = 1 ] || return 2
+        shift
+    fi
     case "$*" in
-        '-w 10 -C OUTPUT -d 169.254.169.254/32 -m owner --uid-owner 1001 -j REJECT')
-            [ "$installed" -eq 1 ] ;;
-        '-w 10 -D OUTPUT -d 169.254.169.254/32 -m owner --uid-owner 1001 -j REJECT')
-            [ "$installed" -eq 1 ] || return 1
-            installed=0 ;;
-        '-w 10 -I OUTPUT 1 -d 169.254.169.254/32 -m owner --uid-owner 1001 -j REJECT')
-            [ "$fail_insert" -eq 0 ] || return 1
-            installed=1
-            insertions=$((insertions + 1)) ;;
-        *) printf 'Unexpected firewall operation: %s\n' "$*" >&2; return 1 ;;
+        '-d 169.254.169.254/32 -m owner --uid-owner 1001 -j REJECT') kind=old ;;
+        '-d 169.254.169.254/32 -m owner --uid-owner 1001 -m comment --comment nvx-runner-metadata-pending -j REJECT')
+            kind=pending ;;
+        '-d 169.254.169.254/32 -m owner --uid-owner 1001 -m comment --comment nvx-runner-metadata -j REJECT')
+            kind=stable ;;
+        *) echo "ERROR: unexpected firewall match: $*" >&2; return 2 ;;
+    esac
+    case "$operation" in
+        -C)
+            if { [ "$fail_probe" = pending ] && [ "$insertions" -eq 1 ] && [ "$kind" = pending ]; } ||
+                { [ "$fail_probe" = stable ] && [ "$insertions" -eq 2 ] && [ "$kind" = stable ]; }; then
+                return 2
+            fi
+            for item in "${rules[@]}"; do
+                if [ "$item" = "$kind" ]; then return 0; fi
+            done
+            return 1 ;;
+        -I)
+            insertions=$((insertions + 1))
+            if [ "$insertions" -eq "$fail_insert" ]; then
+                echo 'ERROR: mock firewall insertion failed' >&2
+                return 1
+            fi
+            rules=("$kind" "${rules[@]}")
+            protection_required=1
+            assert_protected ;;
+        -D)
+            if [ "$fail_delete" -eq 1 ]; then
+                echo 'ERROR: mock firewall deletion failed' >&2
+                return 1
+            fi
+            for index in "${!rules[@]}"; do
+                if [ "${rules[index]}" = "$kind" ]; then
+                    unset 'rules[index]'
+                    rules=("${rules[@]}")
+                    assert_protected
+                    return
+                fi
+            done
+            echo 'ERROR: missing rule for deletion' >&2
+            return 1 ;;
+        *) echo 'ERROR: unexpected firewall operation' >&2; return 2 ;;
     esac
 }
-""".replace("\r\n", "\n")
-        for initially_installed, fail_insert in ((0, 0), (1, 0), (0, 1)):
-            with self.subTest(existing=initially_installed, failure=fail_insert):
-                script = (
-                    f"installed={initially_installed}\nfail_insert={fail_insert}\n"
-                    "insertions=0\n"
-                    + mock
-                    + source
-                    + '\ntest "$installed" -eq 1 && test "$insertions" -eq 1\n'
+"""
+        cases = (
+            ("", "0", "none", "0", True),
+            ("old", "0", "none", "0", True),
+            ("stable", "0", "none", "0", True),
+            ("pending", "0", "none", "0", True),
+            ("ACCEPT old stable pending old", "0", "none", "0", True),
+            ("", "1", "none", "0", False),
+            ("old", "1", "none", "0", False),
+            ("old", "2", "none", "0", False),
+            ("old", "0", "pending", "0", False),
+            ("old", "0", "stable", "0", False),
+            ("old", "0", "none", "1", False),
+        )
+        for initial, insertion, probe, deletion, succeeds in cases:
+            with (
+                self.subTest(
+                    initial=initial, insertion=insertion, probe=probe, deletion=deletion
+                ),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                result = self.execute_bash(
+                    mock + source,
+                    initial,
+                    insertion,
+                    probe,
+                    deletion,
+                    (Path(temporary) / "metadata.lock").as_posix(),
                 )
-                result = subprocess.run(
-                    [shell, "-s"],
-                    input=script.encode(),
-                    capture_output=True,
-                    timeout=30,
-                    check=False,
+                self.assertEqual(
+                    result.returncode == 0,
+                    succeeds,
+                    (result.stdout + result.stderr).decode(),
                 )
-                if fail_insert:
-                    self.assertNotEqual(result.returncode, 0)
+                [state] = [
+                    line.removeprefix("RULES:").split()
+                    for line in result.stdout.decode().splitlines()
+                    if line.startswith("RULES:")
+                ]
+                self.assertEqual(state.count("ACCEPT"), initial.split().count("ACCEPT"))
+                self.assertNotEqual(result.returncode, 99, result.stderr.decode())
+                if succeeds:
+                    self.assertEqual(state[0], "stable")
+                    self.assertEqual(state.count("stable"), 1)
+                    self.assertNotIn("old", state)
+                    self.assertNotIn("pending", state)
                 else:
-                    self.assertEqual(
-                        result.returncode,
-                        0,
-                        result.stdout.decode() + result.stderr.decode(),
-                    )
+                    if initial:
+                        self.assertTrue(
+                            {"old", "pending", "stable"}.intersection(state)
+                        )
+                    if insertion == "1":
+                        self.assertEqual(state, initial.split())
+                    self.assertIn(b"ERROR:", result.stderr)
 
     def test_linux_partitioning_tools_use_distribution_packages(self):
         source = builder.source("linux/setup-data-disk.sh").decode()
@@ -687,6 +797,79 @@ grub2-editenv() {
                 )
                 if not succeeds:
                     self.assertIn(b"ERROR:", result.stdout)
+
+    def test_mshv_installation_requests_only_boot_components(self):
+        source = builder.source("linux/setup-mshv.sh").decode()
+        self.assertNotIn("cloud-hypervisor", source)
+        self.assertNotIn("kata", source)
+        start = source.index('echo "--- installing MSHV boot components ---"')
+        end = source.index('echo "--- installed MSHV stack ---"', start)
+        mock = r"""
+set -euo pipefail
+succeeds_after=$1
+attempts=0
+dnf() {
+    [ "$*" = 'install -y mshv mshv-bootloader-lx kernel-mshv edk2-hvloader' ] || {
+        echo 'ERROR: unexpected MSHV package request' >&2
+        return 1
+    }
+    attempts=$((attempts + 1))
+    [ "$attempts" -ge "$succeeds_after" ]
+}
+sleep() { [ "$*" = 30 ]; }
+"""
+        for succeeds_after in ("1", "3", "4"):
+            with self.subTest(succeeds_after=succeeds_after):
+                result = self.execute_bash(
+                    mock
+                    + self.shell_function("linux/setup-mshv.sh", "fail")
+                    + source[start:end]
+                    + f'\ntest "$attempts" -eq {min(int(succeeds_after), 3)}\n',
+                    succeeds_after,
+                )
+                self.assertEqual(
+                    result.returncode == 0,
+                    succeeds_after != "4",
+                    (result.stdout + result.stderr).decode(),
+                )
+                if succeeds_after == "4":
+                    self.assertIn(
+                        b"could not install MSHV boot components", result.stdout
+                    )
+
+    def test_mshv_verification_does_not_require_other_runtimes(self):
+        source = builder.source("linux/verify-mshv.sh").decode()
+        self.assertNotIn("cloud-hypervisor", source)
+        self.assertNotIn("kata", source)
+        self.assertEqual(source.count("[ -e /dev/mshv ]"), 1)
+        self.assertEqual(source.count('exit "$rc"'), 1)
+        source = source.replace("[ -e /dev/mshv ]", "test_mshv_device").replace(
+            'exit "$rc"', 'return "$rc"'
+        )
+        mock = r"""
+set -euo pipefail
+device_present=$1
+test_mshv_device() { [ "$device_present" -eq 1 ]; }
+uname() { [ "$*" = -r ] && echo 6.6.148-test.mshv; }
+dmesg() { echo 'mshv: running as root partition'; }
+ls() { [ "$*" = '-l /dev/mshv /dev/mshv_diag' ]; }
+rpm() { [ "$*" = -qa ] && printf 'kernel-mshv-1\nedk2-hvloader-1\n'; }
+"""
+        for present in ("0", "1"):
+            with self.subTest(device=present):
+                result = self.execute_bash(
+                    mock + "\nverify_mshv() {\n" + source + "\n}\nverify_mshv\n",
+                    present,
+                )
+                self.assertEqual(
+                    result.returncode == 0,
+                    present == "1",
+                    (result.stdout + result.stderr).decode(),
+                )
+                self.assertIn(
+                    b"RESULT: PASS" if present == "1" else b"RESULT: FAIL",
+                    result.stdout,
+                )
 
     def test_windows_package_round_trip(self):
         config = self.configuration("windows")
@@ -1313,6 +1496,44 @@ if (-not $rejected) { throw 'Firewall creation failure was ignored' }
                 second = {p.name: p.read_bytes() for p in Path(right).iterdir()}
                 self.assertEqual(first, second)
 
+    def test_windows_zip_metadata_is_independent_of_builder_platform(self):
+        outputs: list[dict[str, bytes]] = []
+        for host_system in (0, 3):
+
+            class HostZipInfo(zipfile.ZipInfo):
+                def __init__(
+                    self,
+                    filename: str = "NoName",
+                    date_time: tuple[int, int, int, int, int, int] = (
+                        1980,
+                        1,
+                        1,
+                        0,
+                        0,
+                        0,
+                    ),
+                    *,
+                    creator_system: int = host_system,
+                ) -> None:
+                    super().__init__(filename, date_time)
+                    self.create_system = creator_system
+
+            with (
+                self.subTest(host_system=host_system),
+                tempfile.TemporaryDirectory() as temporary,
+                patch.object(builder.zipfile, "ZipInfo", HostZipInfo),
+            ):
+                builder.build_package(self.configuration("windows"), temporary)
+                outputs.append(
+                    {path.name: path.read_bytes() for path in Path(temporary).iterdir()}
+                )
+        self.assertEqual(outputs[0], outputs[1])
+        with zipfile.ZipFile(io.BytesIO(outputs[0]["sources.zip"])) as archive:
+            for entry in archive.infolist():
+                self.assertEqual(entry.create_system, 3)
+                self.assertEqual(entry.date_time, (1980, 1, 1, 0, 0, 0))
+                self.assertEqual(entry.external_attr, 0o100644 << 16)
+
     def test_generated_outputs_stay_outside_source_tree(self):
         with self.assertRaisesRegex(ValueError, "outside"):
             builder.build_package(
@@ -1461,6 +1682,24 @@ if (-not $rejected) { throw 'Firewall creation failure was ignored' }
         with self.assertRaisesRegex(ValueError, "runnerLabels must start"):
             builder.normalize_config(config)
 
+    def test_windows_paths_reject_trailing_period_aliases(self):
+        for field in ("runnerDirectory", "benchmarkScratchDirectory"):
+            for path in (
+                r"F:\runner.\bin",
+                r"F:\pool...\scratch",
+                r"F:\Windows.\runner",
+                r"F:\runner\scratch.",
+            ):
+                with self.subTest(field=field, path=path):
+                    config: dict[str, object] = dict(self.configuration("windows"))
+                    config[field] = path
+                    with self.assertRaisesRegex(ValueError, "trailing-period"):
+                        builder.normalize_config(config)
+        self.assertEqual(
+            builder.windows_path(r"F:\pool.v1\runner", "path"),
+            r"F:\pool.v1\runner",
+        )
+
     def test_windows_scratch_does_not_overlap_protected_runner_paths(self):
         for scratch, valid in (
             (r"F:\runner", False),
@@ -1476,6 +1715,29 @@ if (-not $rejected) { throw 'Firewall creation failure was ignored' }
             with self.subTest(scratch=scratch):
                 config = self.configuration("windows")
                 config["runnerDirectory"] = r"F:\runner"
+                config["benchmarkScratchDirectory"] = scratch
+                if valid:
+                    self.assertEqual(
+                        builder.normalize_config(config).get(
+                            "benchmarkScratchDirectory"
+                        ),
+                        scratch,
+                    )
+                else:
+                    with self.assertRaisesRegex(ValueError, "runner installation"):
+                        builder.normalize_config(config)
+
+    def test_windows_scratch_must_not_contain_runner_directory(self):
+        for scratch, valid in (
+            (r"F:\pool", False),
+            (r"f:\POOL", False),
+            (r"F:\pool\runner", False),
+            (r"F:\pool\runner2", True),
+            (r"F:\pool\runner\_work", True),
+        ):
+            with self.subTest(scratch=scratch):
+                config = self.configuration("windows")
+                config["runnerDirectory"] = r"F:\pool\runner"
                 config["benchmarkScratchDirectory"] = scratch
                 if valid:
                     self.assertEqual(
