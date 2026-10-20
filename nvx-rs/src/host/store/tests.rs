@@ -469,6 +469,11 @@ fn the_store_is_private_to_the_current_user() {
     assert!(error.message().ends_with("allows other users"), "{error}");
     let error = store.read_capability().unwrap_err();
     assert!(error.message().ends_with("allows other users"), "{error}");
+    // So is a lock file whose own list allows others, who could hold its lock.
+    drop(locked);
+    platform::set_access(&store.path(LOCK_NAME), "D:P(A;;FA;;;WD)").unwrap();
+    let error = store.lock(None).unwrap_err();
+    assert!(error.message().ends_with("allows other users"), "{error}");
 }
 
 #[test]

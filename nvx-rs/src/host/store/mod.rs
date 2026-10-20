@@ -21,10 +21,10 @@
 //! protected access control list that its files inherit; one that it did not create may also
 //! allow SYSTEM and the Administrators group, as one under the user's profile does, and must pass
 //! entries on to the files created in it. A file's own list decides who may open it on Windows,
-//! whatever its directory allows, so the store also refuses a record or a capability whose list
-//! allows anyone else. [`SandboxStore::create`] and [`SandboxStore::open`] refuse an existing
-//! directory that is not private, rather than change it, since others could have placed records
-//! in it, or still hold its files open. The store names its files by their paths, so the
+//! whatever its directory allows, so the store also refuses a lock, a record, or a capability
+//! whose list allows anyone else. [`SandboxStore::create`] and [`SandboxStore::open`] refuse an
+//! existing directory that is not private, rather than change it, since others could have placed
+//! records in it, or still hold its files open. The store names its files by their paths, so the
 //! directories above it must be ones that only the user, or an administrator, may change.
 //! Records are replaced atomically, so readers that hold no lock, such as an execution, see whole
 //! records. The store holds runtime records only: configuration belongs to its caller, which may
@@ -326,7 +326,8 @@ impl SandboxStore {
     ///
     /// Fails with [`ErrorKind::TimedOut`](crate::ErrorKind::TimedOut) when the deadline passes
     /// first. A lock file that is removed or replaced while this waits locks nothing, so the
-    /// lock is then taken again.
+    /// lock is then taken again. A lock file that is not private to the current user is refused,
+    /// as a record is, since others could hold its lock.
     pub fn lock(&self, deadline: Option<Instant>) -> Result<LockedStore> {
         let path = self.path(LOCK_NAME);
         let failed = |error| io_error(format!("cannot lock {}", path.display()))(error);
@@ -337,6 +338,12 @@ impl SandboxStore {
                 .truncate(false)
                 .open(&path)
                 .map_err(failed)?;
+            if let Some(problem) = platform::private_file_problem(&file).map_err(failed)? {
+                return Err(Error::io(format!(
+                    "the sandbox lock {} {problem}",
+                    path.display()
+                )));
+            }
             match deadline {
                 None => file.lock().map_err(failed)?,
                 Some(deadline) => loop {

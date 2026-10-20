@@ -745,8 +745,8 @@ fn store_dir_problem(path: &Path, user: &CurrentUser) -> io::Result<Option<Strin
     privacy_problem(&directory, user, true)
 }
 
-/// Returns why the file that `file` holds open, a record or the capability of a sandbox store,
-/// is not private to the current user, if it is not.
+/// Returns why the file that `file` holds open, the lock, a record, or the capability of a
+/// sandbox store, is not private to the current user, if it is not.
 ///
 /// A file's own access control list decides who may open it, whatever its directory allows, so
 /// a file of a store that allows anyone else could have been written by them.

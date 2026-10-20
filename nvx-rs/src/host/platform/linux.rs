@@ -333,9 +333,9 @@ pub(crate) fn store_dir_problem(uid: u32, mode: u32, euid: u32) -> Option<String
     }
 }
 
-/// Returns why the file that `file` holds open, a record or the capability of a sandbox store,
-/// is not private to the current user, if it is not: never, on Linux, where no one else may look
-/// up a file in the store's directory, which grants them no access.
+/// Returns why the file that `file` holds open, the lock, a record, or the capability of a
+/// sandbox store, is not private to the current user, if it is not: never, on Linux, where no
+/// one else may look up a file in the store's directory, which grants them no access.
 pub(crate) fn private_file_problem(_file: &File) -> io::Result<Option<String>> {
     Ok(None)
 }
