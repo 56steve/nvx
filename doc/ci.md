@@ -660,7 +660,10 @@ build, the tests, and a check with the minimum Rust version of `nvx`, after
 rustfmt. The tests check consumer-contract scenario C0: each configuration
 enables only its side of `nvx`, the guest-only build pulls in neither Tokio
 nor a dependency that only the host side declares, and the guest binary is a
-static executable.
+static executable. The guest-only configuration also checks the guest's part
+of scenario C1: the adapter's guest half and its binary serve the NVXS session
+with the adapter's own framing against a test broker, which sends them
+messages that span records, resets, disconnects, and malformed records.
 
 The development release job depends on `aci-edge-sandboxes` and `nvx-rs` and
 requires their combined Linux/Windows results to be successful; failed,
