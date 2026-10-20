@@ -242,7 +242,9 @@ impl Command {
     /// to the physical path of the child's working directory once the child has entered it.
     ///
     /// The path may hold 4095 bytes. The child records it without allocating, in an entry of
-    /// the [environment](Self::environment), without which the command fails to spawn.
+    /// the [environment](Self::environment), without which the command fails to spawn. A longer
+    /// path fails the [stage](LaunchStage::PhysicalWorkingDirectory) with `ENAMETOOLONG`, and a
+    /// working directory outside the child's root, which has no path in it, with `ENOENT`.
     pub fn export_physical_working_directory(mut self) -> Self {
         self.spec.physical_pwd = true;
         self

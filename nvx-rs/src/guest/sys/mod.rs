@@ -21,14 +21,14 @@
 //!
 //! The spawn boundary and the managed agent need a few operations that `nix` cannot provide,
 //! which reach libc through `nix`'s re-export: a spawned child, which may neither allocate nor
-//! drop an owner, fills its preallocated `PWD` entry, executes, and exits through libc; the
-//! agent's wait-status decoding keeps the real-time signals that `nix`'s `Signal` cannot
-//! represent; and its execution helper duplicates the descriptor that it inherits by number,
-//! which it cannot borrow before it knows that the descriptor is open. So do the time tools, for
-//! the calls that `nix` does not wrap: `ioperm`, `adjtimex`, `klogctl`, `getauxval`, `sigqueue`,
-//! and `_exit`; `sched_setscheduler`, which musl does not implement for one thread; and the
-//! `clock_gettime` and `getpid` system calls, which the latency probe measures without the vDSO's
-//! or libc's shortcuts. Each such call says why.
+//! drop an owner, fills its preallocated `PWD` entry with the `getcwd` system call, and executes
+//! and exits through libc; the agent's wait-status decoding keeps the real-time signals that
+//! `nix`'s `Signal` cannot represent; and its execution helper duplicates the descriptor that it
+//! inherits by number, which it cannot borrow before it knows that the descriptor is open. So do
+//! the time tools, for the calls that `nix` does not wrap: `ioperm`, `adjtimex`, `klogctl`,
+//! `getauxval`, `sigqueue`, and `_exit`; `sched_setscheduler`, which musl does not implement for
+//! one thread; and the `clock_gettime` and `getpid` system calls, which the latency probe
+//! measures without the vDSO's or libc's shortcuts. Each such call says why.
 //!
 //! The x86 instructions of the time tools are `core::arch` intrinsics, except the port
 //! instructions, which only `port` executes, as inline assembly. The constants of the kernel's

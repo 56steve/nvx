@@ -747,6 +747,29 @@ mod tests {
         std::fs::metadata("/proc/self").is_ok_and(|metadata| metadata.uid() == 0)
     }
 
+    /// A directory that only root may search while this lives, after which its owner may search
+    /// it again, so that an unprivileged test can remove its temporary directory.
+    struct Unsearchable(std::path::PathBuf);
+
+    impl Unsearchable {
+        /// Creates the directory `path` without any permissions.
+        fn new(path: std::path::PathBuf) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::create_dir(&path).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for Unsearchable {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+
     /// Spawns a launch command with its real credential calls.
     fn spawn_with_real_credentials(
         command: crate::guest::spawn::Command,
@@ -781,21 +804,14 @@ mod tests {
         system.paths.setpriv = super::super::seam::setpriv_shim(root, ":");
         let file = root.join("file");
         std::fs::write(&file, b"").unwrap();
-        let unsearchable = root.join("unsearchable");
-        std::fs::create_dir(&unsearchable).unwrap();
-        {
-            use std::os::unix::fs::PermissionsExt;
-
-            std::fs::set_permissions(&unsearchable, std::fs::Permissions::from_mode(0o000))
-                .unwrap();
-        }
+        let unsearchable = Unsearchable::new(root.join("unsearchable"));
         let marker = root.join("ran");
         let marker = marker.to_str().unwrap();
         let mut harness = Harness::with_system(true, system, 0);
         for (request_id, directory, error) in [
             (42, root.join("missing"), Errno::ENOENT),
             (43, file, Errno::ENOTDIR),
-            (44, unsearchable, Errno::EACCES),
+            (44, unsearchable.0.clone(), Errno::EACCES),
         ] {
             let directory = directory.to_str().unwrap();
             let diagnostic = super::super::diagnostics::with_description(

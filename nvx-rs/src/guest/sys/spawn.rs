@@ -4,10 +4,12 @@
 //! uses after `fork`, and [`PreparedChild::spawn`] forks it. The child branch performs no
 //! allocation, locking, formatting, or Rust cleanup: it makes direct system calls over that
 //! storage, in the order of [`LaunchStage`], and ends in `execve`, `execv`, or `_exit`. It makes
-//! them through `nix` where its wrappers neither allocate nor consume an owner, and through libc
-//! to fill the preallocated `PWD` entry, execute, and exit. A stage that fails writes its number
-//! and `errno` to the launch report, a close-on-exec pipe, and ends the child with status 125, so
-//! that the report's reader reaches end of file without a report once the program runs.
+//! them through `nix` where its wrappers neither allocate nor consume an owner, and otherwise
+//! through libc: its `syscall` fills the preallocated `PWD` entry, because its `getcwd` may walk
+//! the file system, and its `execve`, `execv`, and `_exit` end the child. A stage that fails
+//! writes its number and `errno` to the launch report, a close-on-exec pipe, and ends the child
+//! with status 125, so that the report's reader reaches end of file without a report once the
+//! program runs.
 //!
 //! Every descriptor that the child uses after it places its standard streams has a number above
 //! theirs, so that placing them replaces none of it: [`PreparedChild::new`] moves a stream source,
@@ -342,17 +344,25 @@ impl PreparedChild {
             }
         }
         if let Some(entry) = physical_pwd {
-            // `nix`'s `getcwd` allocates its result, so libc fills the entry in place.
-            // SAFETY: the entry holds the prefix and `PHYSICAL_PWD_CAPACITY` bytes after it.
-            let filled = unsafe {
-                nix::libc::getcwd(
-                    entry.add(PWD_PREFIX.len()).cast::<c_char>(),
-                    PHYSICAL_PWD_CAPACITY,
-                )
+            // `nix`'s `getcwd` allocates its result, and glibc's walks the file system, which
+            // allocates, when the kernel's path is too long or outside the root. So the system
+            // call fills the entry in place, and its failures are musl's: the kernel's `errno`,
+            // or `ENOENT` for a directory outside the root, which the kernel marks
+            // `(unreachable)`.
+            // SAFETY: the entry holds the prefix and `PHYSICAL_PWD_CAPACITY` initialized bytes
+            // after it, which the system call writes at most.
+            let (length, first) = unsafe {
+                let path = entry.add(PWD_PREFIX.len());
+                let length = nix::libc::syscall(nix::libc::SYS_getcwd, path, PHYSICAL_PWD_CAPACITY);
+                (length, path.read())
             };
-            if filled.is_null() {
-                // SAFETY: as above.
+            if length < 0 {
+                // SAFETY: the caller establishes that this is the post-fork child.
                 unsafe { fail(report, LaunchStage::PhysicalWorkingDirectory, Errno::last()) }
+            }
+            if first != b'/' {
+                // SAFETY: as above.
+                unsafe { fail(report, LaunchStage::PhysicalWorkingDirectory, Errno::ENOENT) }
             }
         }
         if let Some(cgroup) = &self.cgroup
@@ -782,6 +792,86 @@ mod tests {
         assert_eq!(
             (credentials.uid, credentials.gid),
             (Uid::from_raw(1000), Gid::from_raw(1001))
+        );
+    }
+
+    /// Returns a spec that records the physical path of the working directory that the child
+    /// inherits.
+    fn inherited_physical_pwd() -> ChildSpec {
+        let mut spec = shell("exit 0");
+        spec.environment = Some(Vec::new());
+        spec.physical_pwd = true;
+        spec
+    }
+
+    #[test]
+    fn a_physical_path_longer_than_the_entry_fails_its_stage() {
+        if crate::guest::managed_agent::isolate_process_test(
+            "NVX_SPAWN_LONG_PHYSICAL_PWD_TEST_CHILD",
+            "guest::sys::spawn::tests::a_physical_path_longer_than_the_entry_fails_its_stage",
+        ) {
+            return;
+        }
+        // The isolated process enters, one component at a time, a directory whose path is
+        // longer than `PATH_MAX`, and the child inherits it. glibc's `getcwd` would walk the file
+        // system and fail with `ERANGE`.
+        let root = tempfile::tempdir().unwrap();
+        let component = "d".repeat(250);
+        let mut directory = OwnedFd::from(std::fs::File::open(root.path()).unwrap());
+        for _ in 0..20 {
+            nix::sys::stat::mkdirat(&directory, component.as_str(), sys::Mode::S_IRWXU).unwrap();
+            directory = nix::fcntl::openat(
+                &directory,
+                component.as_str(),
+                sys::OpenFlags::O_RDONLY | sys::OpenFlags::O_DIRECTORY | sys::OpenFlags::O_CLOEXEC,
+                sys::Mode::empty(),
+            )
+            .unwrap();
+        }
+        nix::unistd::fchdir(&directory).unwrap();
+        assert_eq!(
+            run(inherited_physical_pwd()),
+            (
+                Some((
+                    LaunchStage::PhysicalWorkingDirectory.code(),
+                    Errno::ENAMETOOLONG as i32
+                )),
+                Some(ChildStatus::Exited(LAUNCH_FAILURE_STATUS))
+            )
+        );
+    }
+
+    #[test]
+    fn a_working_directory_outside_the_root_has_no_physical_path() {
+        if crate::guest::managed_agent::isolate_process_test(
+            "NVX_SPAWN_UNREACHABLE_PWD_TEST_CHILD",
+            "guest::sys::spawn::tests::a_working_directory_outside_the_root_has_no_physical_path",
+        ) {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let real_root = OwnedFd::from(std::fs::File::open("/").unwrap());
+        // The isolated process changes its root without entering it, so the working directory
+        // that the child inherits lies outside the root, where the kernel names it
+        // `(unreachable)`. Without the privilege to change its root, the test stops here.
+        match nix::unistd::chroot(root.path()) {
+            Ok(()) => {}
+            Err(Errno::EPERM) => return,
+            Err(error) => panic!("cannot change the root: {error}"),
+        }
+        let outcome = run(inherited_physical_pwd());
+        // The process leaves the root again, so that the temporary directory can be removed.
+        nix::unistd::fchdir(&real_root).unwrap();
+        nix::unistd::chroot(c".").unwrap();
+        assert_eq!(
+            outcome,
+            (
+                Some((
+                    LaunchStage::PhysicalWorkingDirectory.code(),
+                    Errno::ENOENT as i32
+                )),
+                Some(ChildStatus::Exited(LAUNCH_FAILURE_STATUS))
+            )
         );
     }
 
