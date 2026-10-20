@@ -4933,7 +4933,9 @@ class MicrovmTests(unittest.TestCase):
             interaction.return_value.close.assert_called_once_with()
             failing.close.assert_called_once_with()
 
-    def test_process_close_keeps_every_queued_chunk_when_the_transcript_write_fails(self):
+    def test_process_close_keeps_every_queued_chunk_when_the_transcript_write_fails(
+        self,
+    ):
         with tempfile.TemporaryDirectory() as temporary:
             log_path = Path(temporary) / "output.log"
             with (
