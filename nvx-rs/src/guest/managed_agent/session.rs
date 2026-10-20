@@ -1,38 +1,51 @@
-use crate::guest::sys::{Errno, FileDescriptor};
-use crate::protocol::{
-    self, APP_ERROR, OUTER_ACK, OUTER_CREDIT, OUTER_DATA, OUTER_GUEST_ATTACH, OUTER_HEADER_LEN,
-    OUTER_MAX_PAYLOAD, OUTER_RECEIVE_WINDOW, OUTER_RESET, OuterHeader,
-};
+use std::io;
 
-/// One decoded outer control record.
-pub(crate) struct Record {
-    /// Validated outer header.
-    pub(crate) header: OuterHeader,
-    /// Record payload bytes.
-    pub(crate) payload: Vec<u8>,
+use crate::guest::nvxs::{GuestConnection, GuestConnectionError};
+use crate::guest::sys::{Errno, FileDescriptor};
+use crate::protocol::nvxs::{GuestEvent, RecordError, RecordType, SessionError};
+use crate::protocol::{self, APP_ERROR, OUTER_MAX_PAYLOAD, OUTER_RECEIVE_WINDOW};
+
+/// The agent's control session: the guest's role of the shared NVXS session on the control
+/// console, and the NVXC frames that its DATA records carry.
+pub(crate) struct Session {
+    /// The guest's NVXS connection on the owned control-console descriptor.
+    connection: GuestConnection<FileDescriptor>,
+    /// Error of the connection's latest failure, which a connection that a failure ended reports
+    /// again.
+    last_error: Option<Errno>,
 }
 
-/// Sequence, identity, and credit state of one control-console attachment.
-pub(crate) struct Session {
-    /// Owned control-console descriptor.
-    descriptor: FileDescriptor,
-    /// Attached instance capability identity.
-    pub(crate) instance_id: [u8; 16],
-    /// Current nonzero reset epoch.
-    pub(crate) epoch: u64,
-    /// Next sequence sent by the guest.
-    pub(crate) guest_sequence: u64,
-    /// Next sequence expected from the host.
-    pub(crate) host_sequence: u64,
+/// Record from the broker that the session accepted.
+pub(crate) enum Event {
+    /// The broker reset the session. The agent abandons the earlier epoch's work, then
+    /// acknowledges the new epoch with [`Session::acknowledge`].
+    Reset,
+    /// The payload of a DATA record: one NVXC frame, which [`Session::accept_request`] decodes.
+    Data(Vec<u8>),
+}
+
+/// A record from the broker that ended the session, classified by the stage at which the C agent
+/// reported it.
+pub(crate) enum ReceiveFailure {
+    /// The stream failed or ended, or a record header was malformed, with the error to report.
+    Read(Errno),
+    /// A record of a type that the agent does not take in its state, with the type's code.
+    Type(u8),
+    /// A RESET that the session refused.
+    Reset,
+    /// A DATA record that the session refused.
+    Data(DataFailure),
 }
 
 /// Protocol stage that rejected an outer DATA record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DataFailureKind {
-    /// Record type or host sequence mismatch.
+    /// Host sequence mismatch.
     Sequence,
     /// Instance identity or epoch mismatch.
     Identity,
+    /// A payload beyond the receive window, which the C agent did not check.
+    Window,
     /// Malformed application frame or request metadata.
     Application,
     /// Failure to replenish host receive credit.
@@ -45,6 +58,7 @@ impl DataFailureKind {
         match self {
             Self::Sequence => "data-sequence",
             Self::Identity => "data-identity",
+            Self::Window => "data-window",
             Self::Application => "data-application",
             Self::Credit => "data-credit",
         }
@@ -72,72 +86,62 @@ impl Session {
     /// Starts unattached session state on an owned control descriptor.
     pub(crate) fn new(descriptor: FileDescriptor) -> Self {
         Self {
-            descriptor,
-            instance_id: [0; 16],
-            epoch: 0,
-            guest_sequence: 0,
-            host_sequence: 0,
+            connection: GuestConnection::new(descriptor),
+            last_error: None,
         }
     }
 
-    /// Borrows the control descriptor for polling and TTY operations.
+    /// Borrows the control descriptor for polling and TTY operations. The connection never reads
+    /// past the record in progress and holds no partial record between calls, so polling sees
+    /// every record that the session has not returned.
     pub(crate) fn descriptor(&self) -> &FileDescriptor {
-        &self.descriptor
+        self.connection.get_ref()
     }
 
     /// Sends the initial guest-attach record.
     pub(crate) fn send_attach(&mut self) -> Result<(), Errno> {
-        self.write_outer(OUTER_GUEST_ATTACH, &[0; 16], 0, 0, &[])
+        let attached = self.connection.attach();
+        attached.map_err(|error| self.error(error))
     }
 
-    /// Validates and acknowledges a host RESET record.
-    pub(crate) fn acknowledge_reset(&mut self, record: &Record) -> Result<(), Errno> {
-        if record.header.record_type != OUTER_RESET
-            || !record.payload.is_empty()
-            || record.header.epoch == 0
-        {
-            return Err(Errno::EPROTO);
+    /// Blocks until the broker's next record completes, and returns what the session accepted.
+    pub(crate) fn next_event(&mut self) -> Result<Event, ReceiveFailure> {
+        match self.connection.next_event() {
+            Ok(GuestEvent::Reset(_)) => Ok(Event::Reset),
+            Ok(GuestEvent::Data(payload)) => Ok(Event::Data(payload)),
+            Err(error) => Err(self.receive_failure(error)),
         }
-        self.instance_id = record.header.instance_id;
-        self.epoch = record.header.epoch;
-        self.guest_sequence = 0;
-        self.host_sequence = record.header.sequence.wrapping_add(1);
-        let payload = protocol::encode_ack_payload(OUTER_RECEIVE_WINDOW).map_err(protocol_error)?;
-        self.write_outer(
-            OUTER_ACK,
-            &self.instance_id,
-            self.epoch,
-            self.guest_sequence,
-            &payload,
-        )?;
-        self.guest_sequence = 1;
-        Ok(())
     }
 
-    /// Sends one outer record in the attached epoch.
-    pub(crate) fn send_record(&mut self, record_type: u8, payload: &[u8]) -> Result<(), Errno> {
-        self.write_outer(
-            record_type,
-            &self.instance_id,
-            self.epoch,
-            self.guest_sequence,
-            payload,
-        )?;
-        self.guest_sequence = self.guest_sequence.wrapping_add(1);
-        Ok(())
+    /// Acknowledges the broker's reset with NVX's receive window.
+    pub(crate) fn acknowledge(&mut self) -> Result<(), Errno> {
+        let acknowledged = self.connection.acknowledge(OUTER_RECEIVE_WINDOW);
+        acknowledged.map_err(|error| self.error(error))
     }
 
-    /// Replenishes host receive credit after consuming bytes.
-    pub(crate) fn send_credit(&mut self, bytes: usize) -> Result<(), Errno> {
-        if bytes == 0 {
-            return Ok(());
+    /// Decodes the NVXC request that a DATA payload carries, then returns the payload's bytes to
+    /// the receive window before the agent serves the request, as the C agent did.
+    pub(crate) fn accept_request<'a>(
+        &mut self,
+        payload: &'a [u8],
+    ) -> Result<protocol::AppFrame<'a>, DataFailure> {
+        // A DATA payload has at most `OUTER_MAX_PAYLOAD` bytes, so its length fits either type.
+        let status = payload.len() as i32;
+        let frame = protocol::decode_app(payload)
+            .map_err(|_| data_failure(DataFailureKind::Application, status))?;
+        if frame.request_id == 0 || frame.status != 0 {
+            return Err(data_failure(DataFailureKind::Application, status));
         }
-        let bytes = u32::try_from(bytes).map_err(|_| Errno::EOVERFLOW)?;
-        let payload = protocol::encode_credit_payload(bytes).map_err(protocol_error)?;
-        self.send_record(OUTER_CREDIT, &payload)
+        let credited = self.connection.credit(payload.len() as u32);
+        credited.map_err(|error| DataFailure {
+            kind: DataFailureKind::Credit,
+            status,
+            error: self.error(error),
+        })?;
+        Ok(frame)
     }
 
-    /// Encodes and sends one application frame.
+    /// Encodes and sends one application frame, in one DATA record.
     pub(crate) fn send_app(
         &mut self,
         kind: u8,
@@ -152,7 +156,8 @@ impl Session {
             return Err(Errno::EMSGSIZE);
         }
         let frame = protocol::encode_app(kind, request_id, status, payload);
-        self.send_record(OUTER_DATA, &frame)
+        let sent = self.connection.send(&frame);
+        sent.map_err(|error| self.error(error))
     }
 
     /// Sends one application ERROR frame with an ASCII category.
@@ -165,69 +170,92 @@ impl Session {
         self.send_app(APP_ERROR, request_id, status, category.as_bytes())
     }
 
-    /// Reads and decodes one complete outer record.
-    pub(crate) fn read_record(&mut self) -> Result<Record, Errno> {
-        let mut header = [0u8; OUTER_HEADER_LEN];
-        self.descriptor.read_exact(&mut header)?;
-        let header = protocol::decode_outer_header(&header).map_err(protocol_error)?;
-        let mut payload = vec![0; header.length];
-        self.descriptor.read_exact(&mut payload)?;
-        Ok(Record { header, payload })
+    /// Classifies a failure to receive the broker's next record by the stage at which the C agent
+    /// reported it.
+    fn receive_failure(&mut self, error: GuestConnectionError) -> ReceiveFailure {
+        let epoch = self
+            .connection
+            .session()
+            .identity()
+            .map_or(0, |identity| identity.epoch);
+        let failure = match &error {
+            GuestConnectionError::Protocol(error) => classify(error, epoch),
+            _ => None,
+        };
+        let error = self.error(error);
+        failure.unwrap_or(ReceiveFailure::Read(error))
     }
 
-    /// Validates a DATA record and advances host sequence and credit.
-    pub(crate) fn validate_data<'a>(
-        &mut self,
-        record: &'a Record,
-    ) -> Result<protocol::AppFrame<'a>, DataFailure> {
-        if record.header.record_type != OUTER_DATA || record.header.sequence != self.host_sequence {
-            return Err(data_failure(
-                DataFailureKind::Sequence,
-                record.header.sequence as i32,
-            ));
-        }
-        if record.header.epoch != self.epoch || record.header.instance_id != self.instance_id {
-            return Err(data_failure(
-                DataFailureKind::Identity,
-                record.header.epoch as i32,
-            ));
-        }
-        let frame = protocol::decode_app(&record.payload)
-            .map_err(|_| data_failure(DataFailureKind::Application, record.payload.len() as i32))?;
-        if frame.request_id == 0 || frame.status != 0 {
-            return Err(data_failure(
-                DataFailureKind::Application,
-                record.payload.len() as i32,
-            ));
-        }
-        self.host_sequence = self.host_sequence.wrapping_add(1);
-        self.send_credit(record.payload.len())
-            .map_err(|error| DataFailure {
-                kind: DataFailureKind::Credit,
-                status: record.payload.len() as i32,
-                error,
-            })?;
-        Ok(frame)
-    }
-
-    /// Encodes and writes one outer record.
-    fn write_outer(
-        &self,
-        record_type: u8,
-        instance_id: &[u8; 16],
-        epoch: u64,
-        sequence: u64,
-        payload: &[u8],
-    ) -> Result<(), Errno> {
-        let record = protocol::encode_outer(record_type, instance_id, epoch, sequence, payload)
-            .map_err(protocol_error)?;
-        self.descriptor.write_all(&record)
+    /// Converts a failure of the connection into the error that the agent reports. A connection
+    /// that an earlier failure ended reports that failure's error again, as another write to a
+    /// failed descriptor would fail again.
+    fn error(&mut self, error: GuestConnectionError) -> Errno {
+        let error = match error {
+            GuestConnectionError::Ended => return self.last_error.unwrap_or(Errno::EPROTO),
+            GuestConnectionError::Io(error) => io_error(&error),
+            // `FileDescriptor::read_exact` reports end of file as `EIO`, inside a record or not.
+            GuestConnectionError::Closed
+            | GuestConnectionError::Protocol(SessionError::Truncated { .. }) => Errno::EIO,
+            GuestConnectionError::Protocol(_) => Errno::EPROTO,
+        };
+        self.last_error = Some(error);
+        error
     }
 }
 
-/// Maps an in-memory codec error to the control protocol's `EPROTO`.
-fn protocol_error(_: protocol::ProtocolError) -> Errno {
-    Errno::EPROTO
+/// Returns the stage at which the C agent reported a record that the session refused, or `None`
+/// for one that it reported as a failure to read.
+///
+/// The C agent read each record whole, checking only its header's magic, version, flags, and
+/// length limit, then took RESET and DATA records and reported every other type. It checked a
+/// RESET's payload and epoch, then a DATA record's sequence, identity, and NVXC frame. A record
+/// with one fault thus reports the C agent's stage and status, except for the faults that only
+/// the shared session checks: a RESET without an instance ID, of an earlier epoch, or at the
+/// last sequence number, DATA before the first RESET, and DATA beyond the receive window.
+fn classify(error: &SessionError, epoch: u64) -> Option<ReceiveFailure> {
+    let data = |kind, status| Some(ReceiveFailure::Data(data_failure(kind, status)));
+    match *error {
+        SessionError::Record(ref error) => match *error {
+            RecordError::Magic(_) | RecordError::Version(_) | RecordError::Flags(_) => None,
+            RecordError::Length { length, .. } if length > OUTER_MAX_PAYLOAD => None,
+            RecordError::Type(code) => Some(ReceiveFailure::Type(code)),
+            RecordError::Length {
+                record_type: RecordType::Reset,
+                ..
+            } => Some(ReceiveFailure::Reset),
+            // The only other length that DATA does not allow is 0, which holds no NVXC frame.
+            RecordError::Length {
+                record_type: RecordType::Data,
+                length,
+            } => data(DataFailureKind::Application, length as i32),
+            RecordError::Length { record_type, .. }
+            | RecordError::BootstrapIdentity(record_type) => {
+                Some(ReceiveFailure::Type(record_type.code()))
+            }
+            RecordError::ErrorCode(_) => Some(ReceiveFailure::Type(RecordType::Error.code())),
+            RecordError::ReceiveWindow(_) => Some(ReceiveFailure::Type(RecordType::Ack.code())),
+            RecordError::Credit(_) => Some(ReceiveFailure::Type(RecordType::Credit.code())),
+        },
+        SessionError::Unexpected(record_type) => Some(ReceiveFailure::Type(record_type.code())),
+        // Only a RESET at the last sequence number leaves none for the broker's next record.
+        SessionError::MissingIdentity(_)
+        | SessionError::StaleEpoch { .. }
+        | SessionError::SequenceOverflow => Some(ReceiveFailure::Reset),
+        SessionError::Sequence { actual, .. } => data(DataFailureKind::Sequence, actual as i32),
+        SessionError::Epoch { actual, .. } => data(DataFailureKind::Identity, actual as i32),
+        // With one fault, a record of another instance carries the session's epoch, which the C
+        // agent reported.
+        SessionError::Instance { .. } => data(DataFailureKind::Identity, epoch as i32),
+        SessionError::Window { length, .. } => data(DataFailureKind::Window, length as i32),
+        SessionError::Truncated { .. }
+        | SessionError::Credit { .. }
+        | SessionError::InvalidState => None,
+    }
+}
+
+/// Returns the `errno` of an I/O failure, or `EIO` for one without, such as a write of no bytes.
+fn io_error(error: &io::Error) -> Errno {
+    error.raw_os_error().map_or(Errno::EIO, Errno::from_raw)
 }
 
 /// Constructs one typed DATA validation failure.

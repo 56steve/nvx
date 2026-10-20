@@ -40,11 +40,12 @@
 //!   it, except that a test may hand one to `FileDescriptor::from_owned`, which takes it over
 //!   whole. No descriptor thus has two owners or two buffers; a standard-library adapter such as
 //!   `BufReader` may add the one buffer of a `sys` descriptor through the `std::io::Read` that
-//!   `FileDescriptor` implements. `sys::Stdout` and `sys::DirectStdout` write standard output
-//!   directly, past the standard library's line buffer, so the programs never print with the
-//!   standard library's macros: `print!` would reorder its buffered output with theirs, and
-//!   `eprint!` would bypass the error streams that the programs' tests capture. Clippy denies
-//!   both here.
+//!   `FileDescriptor` implements, and a caller that takes `std::io::Write`, such as [`nvxs`],
+//!   writes one through the `std::io::Write` that it implements, which buffers nothing.
+//!   `sys::Stdout` and `sys::DirectStdout` write standard output directly, past the standard
+//!   library's line buffer, so the programs never print with the standard library's macros:
+//!   `print!` would reorder its buffered output with theirs, and `eprint!` would bypass the error
+//!   streams that the programs' tests capture. Clippy denies both here.
 //! - Every program fails with the shared `CommandError`, whose kind selects the program's exit
 //!   status from the shared `ExitStatus`. Every module, type, field, variant, constant, static,
 //!   and function is documented, which CI enforces with `clippy::missing_docs_in_private_items`.

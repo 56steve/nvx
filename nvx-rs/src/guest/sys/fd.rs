@@ -180,6 +180,22 @@ impl io::Read for FileDescriptor {
     }
 }
 
+/// Writes through the standard library's I/O traits, so that a caller that takes `io::Write`,
+/// such as the guest's NVXS connection, writes a descriptor that this module opened.
+///
+/// Each call is one `write` system call. An interrupted call is `ErrorKind::Interrupted`, which
+/// `write_all` retries; a write of no bytes ends `write_all` with `ErrorKind::WriteZero`. Nothing
+/// is buffered, so `flush` does nothing.
+impl io::Write for FileDescriptor {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        FileDescriptor::write(self, bytes).map_err(io::Error::from)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Gives up the descriptor to its new owner, which `crate::guest::spawn` hands to a child.
 impl From<FileDescriptor> for OwnedFd {
     fn from(descriptor: FileDescriptor) -> Self {

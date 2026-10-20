@@ -1,14 +1,13 @@
 use crate::guest::sys::Errno;
 use crate::protocol::{
     self, APP_CANCEL, APP_EXEC, APP_FEATURES, APP_MAPS, APP_PING, APP_READY, APP_STOP, APP_STOPPED,
-    GuestFeatures, INVALID_REQUEST, MAPPINGS_INCOMPLETE, OUTER_DATA, OUTER_RESET,
-    UNSUPPORTED_OPERATION,
+    GuestFeatures, INVALID_REQUEST, MAPPINGS_INCOMPLETE, UNSUPPORTED_OPERATION,
 };
 
 use super::diagnostics;
 use super::mappings::{HostMappings, MappingError};
 use super::seam::System;
-use super::session::{Record, Session};
+use super::session::{Event, ReceiveFailure, Session};
 use super::{AgentConfig, exec, tty};
 
 /// Terminal outcome of the long-lived dispatch loop.
@@ -27,43 +26,66 @@ pub(crate) fn run(
 ) -> Result<Outcome, Errno> {
     session.send_attach()?;
     loop {
-        let record = session.read_record().inspect_err(|error| {
-            diagnostics::error(system, "outer-read", *error as i32);
-        })?;
-        match record.header.record_type {
-            OUTER_RESET => session.acknowledge_reset(&record).inspect_err(|error| {
-                diagnostics::error(system, "reset-ack", *error as i32);
-            })?,
-            // As in the C agent, a DATA record that fails also reports the `data` stage, after any
-            // more specific stage. Its status is the error that ends the session, which
-            // `control-session` reports too: `EPROTO` where C's `errno` was incidental, as after
-            // a validation failure.
-            OUTER_DATA => match handle_data(system, session, config, mappings, &record) {
-                Ok(Some(outcome)) => return Ok(outcome),
-                Ok(None) => {}
-                Err(error) => {
-                    diagnostics::error(system, "data", error as i32);
-                    return Err(error);
-                }
-            },
-            record_type => {
-                diagnostics::error(system, "outer-type", i32::from(record_type));
-                return Err(Errno::EPROTO);
+        let payload = match session.next_event() {
+            Ok(Event::Reset) => {
+                session.acknowledge().inspect_err(|error| {
+                    diagnostics::error(system, "reset-ack", *error as i32);
+                })?;
+                continue;
+            }
+            Ok(Event::Data(payload)) => payload,
+            Err(failure) => return Err(report_failure(system, failure)),
+        };
+        // As in the C agent, a DATA record that fails also reports the `data` stage, after any
+        // more specific stage. Its status is the error that ends the session, which
+        // `control-session` reports too: `EPROTO` where C's `errno` was incidental, as after a
+        // validation failure.
+        match handle_data(system, session, config, mappings, &payload) {
+            Ok(Some(outcome)) => return Ok(outcome),
+            Ok(None) => {}
+            Err(error) => {
+                diagnostics::error(system, "data", error as i32);
+                return Err(error);
             }
         }
     }
 }
 
-/// Validates one DATA record and serves its application request, returning the outcome that
-/// ends the session, if any.
+/// Reports a record from the broker that ended the session at the C agent's stage, and returns
+/// the error that ends the session.
+fn report_failure(system: &mut impl System, failure: ReceiveFailure) -> Errno {
+    match failure {
+        ReceiveFailure::Read(error) => {
+            diagnostics::error(system, "outer-read", error as i32);
+            error
+        }
+        ReceiveFailure::Type(code) => {
+            diagnostics::error(system, "outer-type", i32::from(code));
+            Errno::EPROTO
+        }
+        ReceiveFailure::Reset => {
+            diagnostics::error(system, "reset-ack", Errno::EPROTO as i32);
+            Errno::EPROTO
+        }
+        ReceiveFailure::Data(failure) => {
+            diagnostics::error(system, failure.kind.stage(), failure.status);
+            let error = failure.into_error();
+            diagnostics::error(system, "data", error as i32);
+            error
+        }
+    }
+}
+
+/// Decodes the NVXC request of one DATA payload and serves it, returning the outcome that ends
+/// the session, if any.
 fn handle_data(
     system: &mut impl System,
     session: &mut Session,
     config: &AgentConfig,
     mappings: &mut HostMappings,
-    record: &Record,
+    payload: &[u8],
 ) -> Result<Option<Outcome>, Errno> {
-    let request = match session.validate_data(record) {
+    let request = match session.accept_request(payload) {
         Ok(request) => request,
         Err(failure) => {
             diagnostics::error(system, failure.kind.stage(), failure.status);
@@ -156,10 +178,11 @@ mod tests {
     use std::thread;
 
     use crate::protocol::{
-        APP_ERROR, APP_EXIT, APP_STDERR, APP_STDOUT, OUTER_ACK, OUTER_CREDIT, OUTER_GUEST_ATTACH,
-        OUTER_HEADER_LEN, OUTER_RECEIVE_WINDOW, OuterHeader, ProtocolError, Workload,
-        WorkloadEnvironment, decode_ack_payload, decode_app, decode_credit_payload,
-        decode_outer_header, encode_app, encode_exec_payload, encode_outer,
+        APP_ERROR, APP_EXIT, APP_STDERR, APP_STDOUT, OUTER_ACK, OUTER_CREDIT, OUTER_DATA,
+        OUTER_GUEST_ATTACH, OUTER_HEADER_LEN, OUTER_MAX_PAYLOAD, OUTER_RECEIVE_WINDOW, OUTER_RESET,
+        OUTER_WAIT, OuterHeader, ProtocolError, Workload, WorkloadEnvironment, decode_ack_payload,
+        decode_app, decode_credit_payload, decode_outer_header, encode_app, encode_exec_payload,
+        encode_outer,
     };
 
     use super::super::seam::{Paths, TestSystem};
@@ -182,6 +205,7 @@ mod tests {
     struct Harness {
         host: UnixStream,
         thread: thread::JoinHandle<(Result<Outcome, Errno>, TestSystem)>,
+        epoch: u64,
         host_sequence: u64,
         guest_sequence: u64,
     }
@@ -191,7 +215,14 @@ mod tests {
             Self::with_system(direct, TestSystem::new(Paths::default()), 0)
         }
 
-        fn with_system(direct: bool, mut system: TestSystem, expected_mappings: u32) -> Self {
+        fn with_system(direct: bool, system: TestSystem, expected_mappings: u32) -> Self {
+            let mut harness = Self::spawn(direct, system, expected_mappings);
+            harness.reset(1, 7);
+            harness
+        }
+
+        /// Starts the agent, which attaches and waits for the broker's first RESET.
+        fn spawn(direct: bool, mut system: TestSystem, expected_mappings: u32) -> Self {
             let (host, guest) = UnixStream::pair().unwrap();
             let descriptor = FileDescriptor::from_owned(guest.into());
             let thread = thread::spawn(move || {
@@ -215,20 +246,30 @@ mod tests {
             let mut harness = Self {
                 host,
                 thread,
-                host_sequence: 8,
-                guest_sequence: 1,
+                epoch: 0,
+                host_sequence: 0,
+                guest_sequence: 0,
             };
             let (header, payload) = harness.read_outer();
             assert_eq!(header.record_type, OUTER_GUEST_ATTACH);
             assert!(payload.is_empty());
             harness
-                .host
-                .write_all(&encode_outer(OUTER_RESET, &INSTANCE, 1, 7, &[]).unwrap())
+        }
+
+        /// Resets the session to `epoch` with a RESET at `sequence`, which the agent acknowledges.
+        fn reset(&mut self, epoch: u64, sequence: u64) {
+            self.host
+                .write_all(&encode_outer(OUTER_RESET, &INSTANCE, epoch, sequence, &[]).unwrap())
                 .unwrap();
-            let (header, payload) = harness.read_outer();
-            assert_eq!((header.record_type, header.sequence), (OUTER_ACK, 0));
+            let (header, payload) = self.read_outer();
+            assert_eq!(
+                (header.record_type, header.epoch, header.sequence),
+                (OUTER_ACK, epoch, 0)
+            );
             assert_eq!(decode_ack_payload(&payload).unwrap(), OUTER_RECEIVE_WINDOW);
-            harness
+            self.epoch = epoch;
+            self.host_sequence = sequence + 1;
+            self.guest_sequence = 1;
         }
 
         fn request(&mut self, kind: u8, payload: &[u8]) -> Response {
@@ -241,14 +282,21 @@ mod tests {
             let frame = encode_app(kind, request_id, 0, payload);
             self.host
                 .write_all(
-                    &encode_outer(OUTER_DATA, &INSTANCE, 1, self.host_sequence, &frame).unwrap(),
+                    &encode_outer(
+                        OUTER_DATA,
+                        &INSTANCE,
+                        self.epoch,
+                        self.host_sequence,
+                        &frame,
+                    )
+                    .unwrap(),
                 )
                 .unwrap();
             self.host_sequence += 1;
             let (credit, payload) = self.read_outer();
             assert_eq!(
-                (credit.record_type, credit.sequence),
-                (OUTER_CREDIT, self.guest_sequence)
+                (credit.record_type, credit.epoch, credit.sequence),
+                (OUTER_CREDIT, self.epoch, self.guest_sequence)
             );
             assert_eq!(decode_credit_payload(&payload).unwrap(), frame.len() as u32);
             self.guest_sequence += 1;
@@ -294,6 +342,15 @@ mod tests {
             self.host.write_all(record).unwrap();
             let (outcome, system) = self.thread.join().unwrap();
             assert!(outcome.is_err());
+            system.diagnostics
+        }
+
+        /// Ends the stream after `partial`, a part of a record or nothing.
+        fn close(mut self, partial: &[u8]) -> Vec<u8> {
+            self.host.write_all(partial).unwrap();
+            self.host.shutdown(std::net::Shutdown::Write).unwrap();
+            let (outcome, system) = self.thread.join().unwrap();
+            assert_eq!(outcome.err(), Some(Errno::EIO));
             system.diagnostics
         }
 
@@ -960,5 +1017,127 @@ mod tests {
         );
         assert!(system.diagnostics.is_empty());
         Ok(())
+    }
+
+    #[test]
+    fn refused_records_report_the_stage_at_which_the_c_agent_reported_them() {
+        let line = |stage: &str, status: i32| {
+            format!("NVX-MANAGED-ERROR: stage={stage} status={status}\n")
+        };
+        let eproto = Errno::EPROTO as i32;
+        let outer = |record_type, instance: &[u8; 16], epoch, sequence, payload: &[u8]| {
+            encode_outer(record_type, instance, epoch, sequence, payload).unwrap()
+        };
+        let ping = encode_app(APP_PING, 42, 0, &[]);
+        let mut bad_magic = outer(OUTER_DATA, &INSTANCE, 1, 8, &ping);
+        bad_magic[0] = b'X';
+        let mut oversized = outer(OUTER_DATA, &INSTANCE, 1, 8, &[]);
+        oversized[40..44].copy_from_slice(&(OUTER_MAX_PAYLOAD as u32 + 1).to_le_bytes());
+        let window = OUTER_RECEIVE_WINDOW.to_le_bytes();
+        let cases = [
+            // Headers that the C agent refused.
+            (bad_magic, line("outer-read", eproto)),
+            (oversized, line("outer-read", eproto)),
+            // Types that it does not take, whatever their payloads.
+            (outer(0, &INSTANCE, 1, 8, &[]), line("outer-type", 0)),
+            (outer(10, &INSTANCE, 1, 8, b"abc"), line("outer-type", 10)),
+            (
+                outer(OUTER_ACK, &INSTANCE, 1, 8, &window),
+                line("outer-type", i32::from(OUTER_ACK)),
+            ),
+            (
+                outer(OUTER_CREDIT, &INSTANCE, 1, 8, &[0; 4]),
+                line("outer-type", i32::from(OUTER_CREDIT)),
+            ),
+            (
+                outer(OUTER_WAIT, &INSTANCE, 1, 8, b"x"),
+                line("outer-type", i32::from(OUTER_WAIT)),
+            ),
+            (
+                outer(OUTER_GUEST_ATTACH, &INSTANCE, 1, 8, &[]),
+                line("outer-type", i32::from(OUTER_GUEST_ATTACH)),
+            ),
+            // RESET records with a payload or without an epoch.
+            (
+                outer(OUTER_RESET, &INSTANCE, 2, 0, b"x"),
+                line("reset-ack", eproto),
+            ),
+            (
+                outer(OUTER_RESET, &INSTANCE, 0, 0, &[]),
+                line("reset-ack", eproto),
+            ),
+            // DATA records without an NVXC frame, or of another instance.
+            (
+                outer(OUTER_DATA, &INSTANCE, 1, 8, &[]),
+                line("data-application", 0) + &line("data", eproto),
+            ),
+            (
+                outer(OUTER_DATA, &[8; 16], 1, 8, &ping),
+                line("data-identity", 1) + &line("data", eproto),
+            ),
+            // Faults that only the shared session refuses: a RESET without an instance ID, or of an
+            // epoch that does not advance the instance's.
+            (
+                outer(OUTER_RESET, &[0; 16], 2, 0, &[]),
+                line("reset-ack", eproto),
+            ),
+            (
+                outer(OUTER_RESET, &INSTANCE, 1, 0, &[]),
+                line("reset-ack", eproto),
+            ),
+        ];
+        for (record, expected) in cases {
+            let diagnostics = Harness::new(true).fail(&record);
+            let header = &record[..OUTER_HEADER_LEN];
+            assert_eq!(
+                String::from_utf8(diagnostics).unwrap(),
+                expected,
+                "{header:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn data_before_the_first_reset_is_a_type_that_the_agent_does_not_take_yet() {
+        let harness = Harness::spawn(true, TestSystem::new(Paths::default()), 0);
+        let frame = encode_app(APP_PING, 42, 0, &[]);
+        let diagnostics = harness.fail(&encode_outer(OUTER_DATA, &INSTANCE, 1, 0, &frame).unwrap());
+        assert_eq!(
+            diagnostics,
+            format!("NVX-MANAGED-ERROR: stage=outer-type status={OUTER_DATA}\n").as_bytes()
+        );
+    }
+
+    #[test]
+    fn a_stream_that_ends_reports_a_read_failure_inside_a_record_or_not() {
+        let expected = format!(
+            "NVX-MANAGED-ERROR: stage=outer-read status={}\n",
+            Errno::EIO as i32
+        );
+        let frame = encode_app(APP_PING, 42, 0, &[]);
+        let record = encode_outer(OUTER_DATA, &INSTANCE, 1, 8, &frame).unwrap();
+        for length in [0, 20, OUTER_HEADER_LEN + 1] {
+            let diagnostics = Harness::new(true).close(&record[..length]);
+            assert_eq!(diagnostics, expected.as_bytes(), "after {length} bytes");
+        }
+    }
+
+    #[test]
+    fn a_reset_between_requests_starts_a_new_epoch() {
+        let mut harness = Harness::new(true);
+        assert_eq!(
+            harness.request(APP_PING, &[]),
+            response(APP_READY, 42, 0, b"")
+        );
+        // A RESET of a later epoch may come at any sequence number.
+        for (epoch, sequence) in [(2, 0), (5, 11)] {
+            harness.reset(epoch, sequence);
+            assert_eq!(
+                harness.request(APP_PING, &[]),
+                response(APP_READY, 42, 0, b"")
+            );
+        }
+        let system = harness.stop();
+        assert!(system.diagnostics.is_empty());
     }
 }
