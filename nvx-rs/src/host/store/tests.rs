@@ -310,22 +310,110 @@ fn a_lock_file_replaced_while_waiting_locks_nothing() {
     waiter.join().unwrap();
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn the_store_is_private_to_the_current_user() {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{PermissionsExt, symlink};
 
-    let (_directory, store) = store();
+    let (directory, store) = store();
     let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
-    // An existing directory is restricted too.
-    fs::set_permissions(store.dir(), fs::Permissions::from_mode(0o755)).unwrap();
+    let set_mode = |path: &Path, mode: u32| {
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    };
+    // A directory that others may read holds no store until it is restricted to the user.
+    set_mode(store.dir(), 0o755);
+    let error = SandboxStore::open(store.dir()).unwrap_err();
+    assert!(
+        error
+            .message()
+            .ends_with("is accessible to other users (mode 755)"),
+        "{error}"
+    );
     let store = SandboxStore::create(store.dir()).unwrap();
     assert_eq!(mode(store.dir()), 0o700);
+    assert_eq!(SandboxStore::open(store.dir()).unwrap(), store);
+    // One that others may write to may hold records that they placed, and is left as it is.
+    let shared = directory.path().join("shared");
+    fs::create_dir(&shared).unwrap();
+    set_mode(&shared, 0o777);
+    for error in [
+        SandboxStore::create(&shared).unwrap_err(),
+        SandboxStore::open(&shared).unwrap_err(),
+    ] {
+        assert!(
+            error
+                .message()
+                .ends_with("is writable by other users (mode 777)"),
+            "{error}"
+        );
+    }
+    assert_eq!(mode(&shared), 0o777);
+    // A link to a store is no store.
+    let link = directory.path().join("link");
+    symlink(store.dir(), &link).unwrap();
+    for error in [
+        SandboxStore::create(&link).unwrap_err(),
+        SandboxStore::open(&link).unwrap_err(),
+    ] {
+        assert!(
+            error.message().ends_with("is not a plain directory"),
+            "{error}"
+        );
+    }
     let mut locked = store.lock(None).unwrap();
     let launch = locked.begin_launch(&runtime(), &CAPABILITY).unwrap();
     drop(launch);
     for name in [LOCK_NAME, JOURNAL_NAME, CAPABILITY_NAME, LOG_NAME] {
         assert_eq!(mode(&store.path(name)), 0o600, "{name}");
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn stores_belong_to_the_current_user() {
+    // Another user's directory is refused whatever its mode, since its owner may change it.
+    for mode in [0o40700, 0o40755] {
+        assert_eq!(
+            platform::store_dir_privacy(1001, mode, 1000),
+            Err("belongs to user 1001, not to the current user 1000".to_owned())
+        );
+    }
+    assert_eq!(platform::store_dir_privacy(1000, 0o40700, 1000), Ok(true));
+    assert_eq!(platform::store_dir_privacy(1000, 0o40755, 1000), Ok(false));
+    for mode in [0o40720, 0o40702, 0o40777] {
+        let problem = platform::store_dir_privacy(1000, mode, 1000).unwrap_err();
+        assert!(
+            problem.starts_with("is writable by other users"),
+            "{problem}"
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn the_store_is_private_to_the_current_user() {
+    let directory = tempfile::tempdir().unwrap();
+    platform::allow_everyone(directory.path()).unwrap();
+    // A directory that every user may change holds no store, nor does one created in it.
+    let error = SandboxStore::open(directory.path()).unwrap_err();
+    assert!(error.message().ends_with("allows other users"), "{error}");
+    let shared = directory.path().join("shared");
+    fs::create_dir(&shared).unwrap();
+    let error = SandboxStore::create(&shared).unwrap_err();
+    assert!(error.message().ends_with("allows other users"), "{error}");
+    // A store created there allows the current user alone, and so do its files.
+    let store = SandboxStore::create(directory.path().join("sandbox")).unwrap();
+    assert_eq!(SandboxStore::open(store.dir()).unwrap(), store);
+    assert_eq!(SandboxStore::create(store.dir()).unwrap(), store);
+    let mut locked = store.lock(None).unwrap();
+    let launch = locked.begin_launch(&runtime(), &CAPABILITY).unwrap();
+    drop(launch);
+    for name in [LOCK_NAME, JOURNAL_NAME, CAPABILITY_NAME, LOG_NAME] {
+        assert_eq!(
+            platform::file_privacy_problem(&store.path(name)).unwrap(),
+            None,
+            "{name}"
+        );
     }
 }
 
@@ -344,10 +432,10 @@ fn stores_open_only_existing_directories() {
             .contains("is not a plain directory")
     );
     // A relative directory names the same store from any later working directory.
-    let current = SandboxStore::open(".").unwrap();
-    assert!(current.dir().is_absolute());
+    let current = absolute(PathBuf::from(".")).unwrap();
+    assert!(current.is_absolute());
     assert_eq!(
-        platform::file_identity(current.dir()).unwrap(),
+        platform::file_identity(&current).unwrap(),
         platform::file_identity(&std::env::current_dir().unwrap()).unwrap()
     );
 }

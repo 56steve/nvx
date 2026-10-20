@@ -14,11 +14,17 @@
 //!   outcome.json           the VMM's outcome report of the latest launch
 //! ```
 //!
-//! The directory is private to the current user: mode 0700 on Unix, and on Windows the access
-//! control list that it inherits, which is private under a user's profile. Files have mode 0600
-//! on Unix, and records are replaced atomically, so readers that hold no lock, such as an
-//! execution, see whole records. The store holds runtime records only: configuration belongs to
-//! its caller, which may keep it in the same directory under a name of its own.
+//! The directory is private to the current user, since its records decide which process
+//! recovery signals: it belongs to the user, and no one else may access it. On Unix it has mode
+//! 0700, and its files mode 0600. On Windows, a directory that the store creates allows the user
+//! alone, through a protected access control list that its files inherit; one that it did not
+//! create may also allow SYSTEM and the Administrators group, as one under the user's profile
+//! does. [`SandboxStore::create`] refuses an existing directory that others may change, or on
+//! Windows access, and [`SandboxStore::open`] any that is not private. The store names its files
+//! by their paths, so the directories above it must be ones that only the user, or an
+//! administrator, may change. Records are replaced atomically, so readers that hold no lock, such
+//! as an execution, see whole records. The store holds runtime records only: configuration
+//! belongs to its caller, which may keep it in the same directory under a name of its own.
 //!
 //! # Records
 //!
@@ -203,34 +209,46 @@ pub struct SandboxStore {
 }
 
 impl SandboxStore {
-    /// Creates the directory `dir` if needed, whose parent must exist, restricts it to the current
+    /// Creates the directory `dir` if needed, whose parent must exist, private to the current
     /// user, and opens the store in it.
+    ///
+    /// An existing directory must belong to the user, and no one else may write to it, since
+    /// records that others placed in it would decide what recovery signals. On Unix, one that
+    /// others may only read is restricted to the user; on Windows, one that allows others is
+    /// refused, since a handle that they opened keeps its access.
     ///
     /// A relative `dir` is resolved against the current directory, so that the store's paths, and
     /// the control endpoint that a launch records, name the same files from any working directory.
     pub fn create(dir: impl Into<PathBuf>) -> Result<Self> {
         let dir = absolute(dir.into())?;
-        platform::create_private_dir(&dir).map_err(io_error(format!(
+        let problem = platform::create_store_dir(&dir).map_err(io_error(format!(
             "cannot create the sandbox store {}",
             dir.display()
         )))?;
-        Ok(Self { dir })
+        Self::private(dir, problem)
     }
 
     /// Opens the store in the existing directory `dir`, which a relative path names from the
-    /// current directory.
+    /// current directory, and which must be private to the current user, as
+    /// [`create`](Self::create) makes it.
     pub fn open(dir: impl Into<PathBuf>) -> Result<Self> {
         let dir = absolute(dir.into())?;
-        match fs::symlink_metadata(&dir) {
-            Ok(metadata) if metadata.is_dir() => Ok(Self { dir }),
-            Ok(_) => Err(Error::io(format!(
-                "the sandbox store {} is not a plain directory",
+        let problem = platform::check_store_dir(&dir).map_err(io_error(format!(
+            "cannot open the sandbox store {}",
+            dir.display()
+        )))?;
+        Self::private(dir, problem)
+    }
+
+    /// Returns the store in `dir`, unless `problem` says why `dir` is not private to the current
+    /// user.
+    fn private(dir: PathBuf, problem: Option<String>) -> Result<Self> {
+        match problem {
+            None => Ok(Self { dir }),
+            Some(problem) => Err(Error::io(format!(
+                "the sandbox store {} {problem}",
                 dir.display()
             ))),
-            Err(error) => Err(io_error(format!(
-                "cannot open the sandbox store {}",
-                dir.display()
-            ))(error)),
         }
     }
 
