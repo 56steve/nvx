@@ -182,25 +182,21 @@ impl ProcessHandle {
     /// Terminates the process with status 1, unless it has exited, and fails if this user may
     /// not terminate process `pid`.
     pub(crate) fn kill(&self, pid: u32) -> io::Result<()> {
-        if !self.terminate {
-            // A process that exited needs no termination.
-            if has_exited(&self.process)? {
-                return Ok(());
+        let result = if self.terminate {
+            // SAFETY: the handle has terminate access.
+            let terminated = unsafe { TerminateProcess(raw(&self.process), 1) } != 0;
+            if terminated {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
             }
-            return Err(io::Error::new(
+        } else {
+            Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 format!("this user may not terminate process {pid}"),
-            ));
-        }
-        // SAFETY: the handle has terminate access.
-        if unsafe { TerminateProcess(raw(&self.process), 1) } == 0 {
-            let error = io::Error::last_os_error();
-            // An exited process cannot be terminated again.
-            if !has_exited(&self.process)? {
-                return Err(error);
-            }
-        }
-        Ok(())
+            ))
+        };
+        super::unless_exited(result, || has_exited(&self.process))
     }
 }
 

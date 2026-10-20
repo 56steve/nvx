@@ -69,6 +69,22 @@ fn time_left(deadline: Option<std::time::Instant>) -> io::Result<Option<Duration
     }
 }
 
+/// Returns the outcome of ending a held process, given the `result` of signaling it: a failure
+/// stands unless `exited` shows that the process has exited, which needs no ending.
+///
+/// Hosts refuse to signal some processes that exited: Windows those that this user may not
+/// terminate or that already ended, and Linux another user's process until its parent reaps it.
+#[cfg(any(target_os = "linux", windows))]
+pub(crate) fn unless_exited(
+    result: io::Result<()>,
+    exited: impl FnOnce() -> io::Result<bool>,
+) -> io::Result<()> {
+    let Err(error) = result else {
+        return Ok(());
+    };
+    if exited()? { Ok(()) } else { Err(error) }
+}
+
 /// Parses exactly 32 hexadecimal digits, in either case, into the 16 bytes that they spell.
 pub(crate) fn parse_hex_id(digits: &str) -> Option<[u8; 16]> {
     let digits = digits.as_bytes();

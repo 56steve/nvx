@@ -790,6 +790,18 @@ mod reference_tests {
         assert_eq!(error.to_string(), "unreadable");
     }
 
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn failures_to_end_a_process_that_exited_are_not_failures() {
+        let refused = || Err(io::Error::from(io::ErrorKind::PermissionDenied));
+        platform::unless_exited(Ok(()), || panic!("a success asks nothing")).unwrap();
+        platform::unless_exited(refused(), || Ok(true)).unwrap();
+        let running = platform::unless_exited(refused(), || Ok(false));
+        assert_eq!(running.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        let unknown = platform::unless_exited(refused(), || Err(io::Error::other("unknown")));
+        assert_eq!(unknown.unwrap_err().to_string(), "unknown");
+    }
+
     /// Returns a command that runs for a minute unless it is killed.
     #[cfg(any(target_os = "linux", windows))]
     fn sleeper() -> std::process::Command {

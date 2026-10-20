@@ -140,7 +140,7 @@ impl ProcessHandle {
         };
         match pidfd.kill() {
             Err(error) if error.raw_os_error() == Some(Errno::ESRCH as i32) => Ok(()),
-            result => result,
+            result => super::unless_exited(result, || pidfd.wait_exit(Duration::ZERO)),
         }
     }
 }
