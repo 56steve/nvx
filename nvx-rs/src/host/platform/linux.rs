@@ -347,6 +347,39 @@ pub(crate) fn private_file_problem(_file: &File) -> io::Result<Option<String>> {
     Ok(None)
 }
 
+/// Gives the regular file `path` the mode `mode` if it belongs to the current user, and leaves
+/// anything else, which includes a symbolic link or a missing file, unchanged.
+///
+/// The file is opened only to locate it, which needs no permission on the file itself.
+pub(crate) fn restore_private_file_mode(path: &Path, mode: u32) -> io::Result<()> {
+    use nix::fcntl::OFlag;
+
+    let opened = OpenOptions::new()
+        .read(true)
+        .custom_flags((OFlag::O_PATH | OFlag::O_NOFOLLOW).bits())
+        .open(path);
+    let file = match opened {
+        Ok(file) => file,
+        Err(error)
+            if error.kind() == io::ErrorKind::NotFound
+                || error.raw_os_error() == Some(Errno::ELOOP as i32) =>
+        {
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() || metadata.uid() != sys::effective_ids().0 {
+        return Ok(());
+    }
+    // A descriptor that only locates the file cannot change its mode itself, but its link in
+    // /proc names exactly the file that it opened.
+    fs::set_permissions(
+        Path::new("/proc/self/fd").join(file.as_raw_fd().to_string()),
+        Permissions::from_mode(mode),
+    )
+}
+
 /// Opens the directory `path` only to locate it, which needs no permission on the directory
 /// itself, or returns `None` if it is a symbolic link or not a directory.
 fn open_plain_dir(path: &Path) -> io::Result<Option<File>> {

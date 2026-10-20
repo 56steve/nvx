@@ -47,6 +47,42 @@ pub(super) fn create_new(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
+/// Opens the lock file at `path`, creating it readable only by the current user if it does not
+/// exist.
+///
+/// On Unix, a lock and the checks of the locked file need no read access, so the file is opened
+/// only for writing. The umask may have cleared even the current user's permission to write it,
+/// whether this or another call created it, so a lock file of the current user that the user can
+/// open for writing no more is given its mode again.
+pub(super) fn open_lock(path: &Path) -> io::Result<File> {
+    let open = || {
+        private_options()
+            .read(cfg!(windows))
+            .create(true)
+            .truncate(false)
+            .open(path)
+    };
+    #[cfg(target_os = "linux")]
+    let file = match open() {
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            platform::restore_private_file_mode(path, PRIVATE_FILE_MODE)?;
+            open()?
+        }
+        opened => opened?,
+    };
+    #[cfg(not(target_os = "linux"))]
+    let file = open()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        if file.metadata()?.permissions().mode() & PRIVATE_FILE_MODE != PRIVATE_FILE_MODE {
+            file.set_permissions(fs::Permissions::from_mode(PRIVATE_FILE_MODE))?;
+        }
+    }
+    Ok(file)
+}
+
 /// Atomically replaces `path` with `contents`, readable only by the current user.
 ///
 /// The contents go to a fresh temporary file beside `path`, which is flushed to disk and then

@@ -334,14 +334,7 @@ impl SandboxStore {
         let path = self.path(LOCK_NAME);
         let failed = |error| io_error(format!("cannot lock {}", path.display()))(error);
         loop {
-            // On Unix, a lock and the checks of the locked file need no read access, which a
-            // restrictive umask may have kept from the lock file when it was created.
-            let file = files::private_options()
-                .read(cfg!(windows))
-                .create(true)
-                .truncate(false)
-                .open(&path)
-                .map_err(failed)?;
+            let file = files::open_lock(&path).map_err(failed)?;
             if let Some(problem) = platform::private_file_problem(&file).map_err(failed)? {
                 return Err(Error::io(format!(
                     "the sandbox lock {} {problem}",
