@@ -197,6 +197,40 @@ impl Spec {
             arity: Arity::Optional,
         }
     }
+
+    /// Consumes this option as `consume_optional` does, given `attached`, the value after `=` if
+    /// any, and `next`, the argument after the option if it is a positional: hands the option's
+    /// value to `receiver`, and returns how many arguments the option and its value take. `-h`
+    /// and `--help` stop the parse for the help, and messages call them `-h/--help`.
+    fn consume(
+        self,
+        attached: Option<&str>,
+        next: Option<&str>,
+        receiver: &mut dyn Receiver,
+    ) -> Result<usize, Stop> {
+        let help = self.name == "-h" || self.name == "--help";
+        let label = if help { "-h/--help" } else { self.name };
+        let mut take = |value: Option<&str>| {
+            receiver
+                .take(self.name, value)
+                .map_err(|message| Stop::Usage(format!("argument {label}: {message}")))
+        };
+        match (self.arity, attached) {
+            (Arity::Flag, Some(value)) => Err(Stop::Usage(format!(
+                "argument {label}: ignored explicit argument {}",
+                repr(value)
+            ))),
+            (Arity::Flag, None) if help => Err(Stop::Help),
+            (Arity::Flag, None) => take(None).map(|()| 1),
+            (_, Some(value)) => take(Some(value)).map(|()| 1),
+            (_, None) => match next {
+                Some(value) => take(Some(value)).map(|()| 2),
+                None => Err(Stop::Usage(format!(
+                    "argument {label}: expected one argument"
+                ))),
+            },
+        }
+    }
 }
 
 /// Receives each argument as the parser consumes it, in `argparse`'s order.
@@ -333,41 +367,11 @@ impl Parser {
                 }
                 Token::Option(name, attached) => {
                     let spec = self.options[self.option(name).unwrap_or_default()];
-                    let help = name == "-h" || name == "--help";
-                    let label = if help { "-h/--help" } else { name };
-                    let take = |receiver: &mut dyn Receiver, value: Option<&str>| {
-                        receiver
-                            .take(name, value)
-                            .map_err(|message| Stop::Usage(format!("argument {label}: {message}")))
-                    };
-                    match (spec.arity, attached) {
-                        (Arity::Flag, Some(value)) => {
-                            return Err(Stop::Usage(format!(
-                                "argument {label}: ignored explicit argument {}",
-                                repr(value)
-                            )));
-                        }
-                        (Arity::Flag, None) if help => return Err(Stop::Help),
-                        (Arity::Flag, None) => {
-                            take(receiver, None)?;
-                            index += 1;
-                        }
-                        (_, Some(value)) => {
-                            take(receiver, Some(value))?;
-                            index += 1;
-                        }
-                        (_, None) => match arguments.get(index + 1) {
-                            Some(value) if self.token(value) == Token::Positional => {
-                                take(receiver, Some(value))?;
-                                index += 2;
-                            }
-                            _ => {
-                                return Err(Stop::Usage(format!(
-                                    "argument {label}: expected one argument"
-                                )));
-                            }
-                        },
-                    }
+                    let next = arguments
+                        .get(index + 1)
+                        .map(String::as_str)
+                        .filter(|&value| self.token(value) == Token::Positional);
+                    index += spec.consume(attached, next, receiver)?;
                 }
             }
         }
@@ -475,34 +479,15 @@ impl State<'_> {
             self.extras.push(self.arguments[start].clone());
             return Ok(start + 1);
         };
-        let spec = self.parser.options[option];
-        let attached = attached.map(|offset| &self.arguments[start][offset..]);
-        let help = spec.name == "-h" || spec.name == "--help";
-        let name = if help { "-h/--help" } else { spec.name };
-        match (spec.arity, attached) {
-            (Arity::Flag, Some(value)) => Err(Stop::Usage(format!(
-                "argument {name}: ignored explicit argument {}",
-                repr(value)
-            ))),
-            (Arity::Flag, None) if help => Err(Stop::Help),
-            (Arity::Flag, None) => {
-                self.take(spec.name, None)?;
-                Ok(start + 1)
-            }
-            (_, Some(value)) => {
-                self.take(spec.name, Some(value))?;
-                Ok(start + 1)
-            }
-            (_, None) => match self.kinds.get(start + 1) {
-                Some(Kind::Positional) => {
-                    self.take(spec.name, Some(&self.arguments[start + 1]))?;
-                    Ok(start + 2)
-                }
-                _ => Err(Stop::Usage(format!(
-                    "argument {name}: expected one argument"
-                ))),
-            },
-        }
+        let arguments = self.arguments;
+        let next = (self.kinds.get(start + 1) == Some(&Kind::Positional))
+            .then(|| arguments[start + 1].as_str());
+        let consumed = self.parser.options[option].consume(
+            attached.map(|offset| &arguments[start][offset..]),
+            next,
+            self.receiver,
+        )?;
+        Ok(start + consumed)
     }
 
     /// Consumes as many positionals as the arguments from `start` provide, as
@@ -751,6 +736,18 @@ mod tests {
             split(&["--root", "-x", "sandbox"]).0,
             Err(Stop::Usage(
                 "argument --root: expected one argument".to_owned()
+            ))
+        );
+        assert_eq!(
+            split(&["--root"]).0,
+            Err(Stop::Usage(
+                "argument --root: expected one argument".to_owned()
+            ))
+        );
+        assert_eq!(
+            split(&["--help=x", "sandbox"]).0,
+            Err(Stop::Usage(
+                "argument -h/--help: ignored explicit argument 'x'".to_owned()
             ))
         );
         let required = Err(Stop::Usage(
