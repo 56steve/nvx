@@ -80,6 +80,5 @@ pub(super) fn run(path: &str) -> Result {
     let policy = compile_policy_file(Path::new(path))?;
     let rules = |rules: Vec<String>| Value::List(rules.into_iter().map(Value::Str).collect());
     let value = dumps::dict([("allow", rules(policy.allow)), ("deny", rules(policy.deny))]);
-    output::print_stdout(&dumps::dumps(&value))
-        .map_err(|error| Exit::error(output::stream_error(&error)))
+    output::print_stdout(&dumps::dumps(&value)).map_err(Exit::from_os_error)
 }

@@ -36,6 +36,7 @@ use std::ffi::OsString;
 use self::args::{Parser, Receiver, Spec, Stop, Syntax};
 use crate::host::platform;
 use crate::host::python::builtins::repr;
+use crate::host::python::fs::os_error_message;
 
 /// The name of the program in usage messages unless `--prog` names another.
 const PROGRAM: &str = "nvx-rs";
@@ -124,6 +125,13 @@ impl Exit {
         }
     }
 
+    /// Returns the error of an `OSError` that names no file, which prints `str(error)` as
+    /// [`os_error_message`] formats it, such as `[Errno 32] Broken pipe` for a write to a
+    /// standard stream whose reader has gone.
+    pub(crate) fn from_os_error(error: std::io::Error) -> Self {
+        Self::Error(os_error_message(&error, None))
+    }
+
     /// Returns the message that the end prints after `error: `, if it is an error.
     pub(crate) fn message(&self) -> Option<&str> {
         match self {
@@ -152,7 +160,7 @@ impl Exit {
                 Ok(()) => 0,
                 // Ctrl-C ends a help that waits for its reader, as `KeyboardInterrupt` ends it.
                 Err(_) if platform::interrupted() => Self::Interrupted.report(),
-                Err(error) => Self::Error(output::stream_error(&error)).report(),
+                Err(error) => Self::from_os_error(error).report(),
             },
             Self::Interrupted => {
                 output::print_stderr("Interrupted");
@@ -289,5 +297,29 @@ fn run(arguments: &[OsString]) -> Result {
         Command::Artifacts => artifacts::run(root),
         Command::EgressCompile(path) => egress::run(&path),
         Command::Sandbox(options) => sandbox::run(root, *options),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn os_errors_without_a_file_read_as_python_formats_them() {
+        let error = std::fs::metadata("definitely/missing/path").unwrap_err();
+        let expected = os_error_message(&error, None);
+        let exit = Exit::from_os_error(error);
+        let message = exit.message().unwrap();
+        assert_eq!(message, expected);
+        let label = if cfg!(windows) {
+            "[WinError 3] "
+        } else {
+            "[Errno 2] "
+        };
+        assert!(message.starts_with(label), "{message}");
+        assert!(!message.contains("os error"), "{message}");
+        assert!(!message.contains("missing"), "{message}");
+        let error = std::io::Error::other("closed");
+        assert_eq!(Exit::from_os_error(error).message(), Some("closed"));
     }
 }

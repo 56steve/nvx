@@ -133,8 +133,7 @@ fn open_lock_file(path: &PurePath) -> std::result::Result<File, OpenFailure> {
         Err(error) if is_loop(&error) => return Err(OpenFailure::Exit(not_standalone(path))),
         Err(error) => return Err(OpenFailure::Os(error)),
     };
-    let status = fs::fstat(&file)
-        .map_err(|error| OpenFailure::Exit(Exit::error(os_error_message(&error, None))))?;
+    let status = fs::fstat(&file).map_err(|error| OpenFailure::Exit(Exit::from_os_error(error)))?;
     if !status.regular || status.links != 1 || status.reparse_point {
         return Err(OpenFailure::Exit(not_standalone(path)));
     }
@@ -150,9 +149,7 @@ fn try_lock_file(file: &File) -> Result<bool> {
     match file.try_lock() {
         Ok(()) => Ok(true),
         Err(std::fs::TryLockError::WouldBlock) => Ok(false),
-        Err(std::fs::TryLockError::Error(error)) => {
-            Err(Exit::error(os_error_message(&error, None)))
-        }
+        Err(std::fs::TryLockError::Error(error)) => Err(Exit::from_os_error(error)),
     }
 }
 
@@ -354,8 +351,8 @@ impl LifecycleLock {
                     file: Some(file),
                 });
             }
-            let tombstone = read_lock_file(&file, LOCK_TOMBSTONE.len())
-                .map_err(|error| Exit::error(os_error_message(&error, None)))?;
+            let tombstone =
+                read_lock_file(&file, LOCK_TOMBSTONE.len()).map_err(Exit::from_os_error)?;
             // Deprovision leaves the mark only if lingering lock files, such as the one that this
             // handle may keep, kept it from removing the directory, which the path then still
             // names.
@@ -383,7 +380,7 @@ impl LifecycleLock {
     pub(crate) fn remove(&mut self) -> Result {
         let file = self.file.as_ref().expect("the lock is held");
         let removed = write_lock_file(file, LOCK_TOMBSTONE)
-            .map_err(|error| Exit::error(os_error_message(&error, None)))
+            .map_err(Exit::from_os_error)
             .and_then(|()| {
                 std::fs::remove_file(self.path.as_path()).map_err(|error| {
                     Exit::error(os_error_message(&error, Some(self.path.as_str())))

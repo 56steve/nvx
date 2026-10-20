@@ -233,8 +233,7 @@ fn lists_mounts(format: u64) -> bool {
 /// Returns `path.resolve()` as text.
 fn resolved(path: &std::path::Path) -> Result<String> {
     let text = crate::host::cli::sandbox::path_string(path)?;
-    let resolved = fs::resolve(&PurePath::native(&text))
-        .map_err(|error| Exit::error(os_error_message(&error, None)))?;
+    let resolved = fs::resolve(&PurePath::native(&text)).map_err(Exit::from_os_error)?;
     Ok(resolved.as_str().to_owned())
 }
 

@@ -667,7 +667,7 @@ pub(super) fn run(root: Option<&str>, options: Options) -> Result {
             )?;
             output::write_stdout(&result.stdout)
                 .and_then(|()| output::write_stderr(&result.stderr))
-                .map_err(|error| Exit::error(output::stream_error(&error)))?;
+                .map_err(Exit::from_os_error)?;
             if let Some(report) = &options.outcome_report {
                 lifecycle::write_exec_outcome(report, &result)?;
             }
@@ -713,7 +713,7 @@ pub(super) fn run(root: Option<&str>, options: Options) -> Result {
                 command.extend(["--microvm-report".to_owned(), path_text(report)]);
             }
             output::print_stdout(&format!(">> {}", format_command(&command)))
-                .map_err(|error| Exit::error(output::stream_error(&error)))?;
+                .map_err(Exit::from_os_error)?;
             if options.dry_run {
                 return Ok(());
             }
@@ -770,9 +770,7 @@ fn end_interrupted(child: &mut Child) -> Result {
 /// Returns the status of `child` if it has exited: `Popen.returncode`, which on Unix is the
 /// negated signal of a process that a signal ended.
 fn poll(child: &mut Child) -> Result<Option<i32>> {
-    let status = child
-        .try_wait()
-        .map_err(|error| Exit::error(crate::host::python::fs::os_error_message(&error, None)))?;
+    let status = child.try_wait().map_err(Exit::from_os_error)?;
     Ok(status.map(|status| {
         #[cfg(unix)]
         {

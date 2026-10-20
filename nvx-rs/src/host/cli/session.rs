@@ -29,7 +29,6 @@ use std::time::Duration;
 use super::deadline::{Deadline, RETRY_INTERVAL, sleep};
 use super::{Exit, Result, check_interrupt};
 use crate::host::platform::{self, Transport};
-use crate::host::python::fs::os_error_message;
 use crate::host::python::path::PurePath;
 use crate::host::sandbox::options::validate_exec_environment;
 use crate::host::session::{ControlSession, SessionError};
@@ -212,7 +211,7 @@ impl Session {
                             .raw_os_error()
                             .is_some_and(|code| raised_at_once(code as u32))
                     {
-                        return Err(Exit::error(os_error_message(&error, None)));
+                        return Err(Exit::from_os_error(error));
                     }
                     if deadline.passed() {
                         return Err(Exit::error(format!(
@@ -295,7 +294,7 @@ impl Session {
                 if closed || closes(&error) {
                     Exit::EndpointClosed
                 } else {
-                    Exit::error(os_error_message(&error, None))
+                    Exit::from_os_error(error)
                 }
             }
             SessionError::Reset => Exit::error("managed control session was reset"),
