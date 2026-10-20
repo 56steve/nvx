@@ -22,13 +22,16 @@
 //! The spawn boundary and the managed agent need a few operations that `nix` cannot provide,
 //! which reach libc through `nix`'s re-export: a spawned child, which may neither allocate nor
 //! drop an owner, fills its preallocated `PWD` entry with the `getcwd` system call, and executes
-//! and exits through libc; the agent's wait-status decoding keeps the real-time signals that
-//! `nix`'s `Signal` cannot represent; and its execution helper duplicates the descriptor that it
-//! inherits by number, which it cannot borrow before it knows that the descriptor is open. So do
-//! the time tools, for the calls that `nix` does not wrap: `ioperm`, `adjtimex`, `klogctl`,
-//! `getauxval`, `sigqueue`, and `_exit`; `sched_setscheduler`, which musl does not implement for
-//! one thread; and the `clock_gettime` and `getpid` system calls, which the latency probe
-//! measures without the vDSO's or libc's shortcuts. Each such call says why.
+//! and exits through libc; the agent's wait-status decoding, and the waits for one named child,
+//! keep the real-time signals that `nix`'s `Signal` cannot represent; a pidfd is opened with the
+//! `pidfd_open` system call, which neither `nix` nor musl wraps; and the agent's execution helper
+//! duplicates the descriptor that it inherits by number, which it cannot borrow before it knows
+//! that the descriptor is open. So do the time tools, for the calls that `nix` does not wrap:
+//! `ioperm`, `adjtimex`, `klogctl`, `getauxval`, `sigqueue`, and `_exit`; `sched_setscheduler`,
+//! which musl does not implement for one thread; and the `clock_gettime` and `getpid` system
+//! calls, which the latency probe measures without the vDSO's or libc's shortcuts. The tests
+//! trace a child with libc's `ptrace`, as the crate does not enable `nix`'s. Each such call says
+//! why.
 //!
 //! The x86 instructions of the time tools are `core::arch` intrinsics, except the port
 //! instructions, which only `port` executes, as inline assembly. The constants of the kernel's
@@ -91,11 +94,14 @@ pub(crate) use process::sigpipe_disposition;
 #[cfg(target_arch = "x86_64")]
 pub(crate) use process::syscall_process_id;
 pub(crate) use process::{
-    ChildStatus, DirectStdout, ForkResult, ProcessId, Stdout, current_process, detach, exec,
-    exit_immediately, fork, has_exited, ignore_interrupt_and_hangup, kill_process_group,
-    process_exists, process_name, reap_any_nonblocking, restore_sigpipe, take_inherited_descriptor,
-    try_wait, wait, with_sigpipe_ignored, write_port_diagnostic, write_standard_error,
+    ChildStatus, DirectStdout, ForkResult, ProcessId, Stdout, WaitTarget, current_process, detach,
+    exec, exit_immediately, fork, has_exited, ignore_interrupt_and_hangup, kill_process_group,
+    open_pidfd, process_exists, process_name, reap_any_nonblocking, restore_sigpipe,
+    take_inherited_descriptor, try_wait, wait, wait_named, with_sigpipe_ignored,
+    write_port_diagnostic, write_standard_error,
 };
+#[cfg(test)]
+pub(crate) use process::{continue_traced, spawn_traced_child};
 pub(crate) use scheduler::{
     AffinityGuard, IdlePriority, SchedulingPolicy, current_affinity, current_cpu, current_thread,
     pin_current_thread, promote_all_threads, scheduling_policy, set_scheduling_policy,

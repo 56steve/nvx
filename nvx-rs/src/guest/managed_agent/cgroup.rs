@@ -1,21 +1,46 @@
+use std::io;
+use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
+use std::process::ExitStatus;
 use std::time::Duration;
 
-use crate::guest::sys::{self, ChildStatus, Errno, Mode, MountFlags, OpenFlags, ProcessId};
+use crate::guest::cgroup::{ExecutionCgroup, Layout, Scope};
+use crate::guest::process::Child;
+use crate::guest::spawn::Cgroup;
+use crate::guest::sys::{self, Errno, Mode, MountFlags, ProcessId};
 
-use super::seam::{System, path_c_string};
+use super::seam::{Paths, System, path_c_string};
 
-/// Number of ten-millisecond retries after killing a cgroup.
-const SETTLE_ATTEMPTS: usize = 200;
-/// Delay between cgroup-emptiness checks.
-const SETTLE_DELAY: Duration = Duration::from_millis(10);
+/// How long settlement waits for the execution cgroup to empty: as long as the C agent's 200
+/// retries, ten milliseconds apart.
+const SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Returns the agent's cgroups in its mode. The direct agent runs in the hierarchy's root, and its
+/// workloads in `nvx-exec`, which it prepares and settles whole. The sandbox agent runs in
+/// `agent`, and its workloads in `container`, which the init agent prepares.
+fn layout(paths: &Paths, direct: bool) -> Result<Layout, Errno> {
+    let root = &paths.cgroup_root;
+    let layout = if direct {
+        Layout::new(root, root.join("nvx-exec"))
+    } else {
+        Layout::new(root.join("agent"), root.join("container"))
+    };
+    layout.map_err(|error| sys::errno_of(&error))
+}
+
+/// Returns the handle of the direct agent's execution cgroup, `nvx-exec`, in which each workload
+/// runs, one at a time.
+fn execution(paths: &Paths) -> Result<ExecutionCgroup, Errno> {
+    ExecutionCgroup::open(&layout(paths, true)?, None).map_err(|error| sys::errno_of(&error))
+}
 
 /// Mounts cgroup v2 when needed and prepares the per-execution cgroup.
 pub(crate) fn prepare(system: &mut impl System) -> Result<(), Errno> {
-    let root = system.paths().cgroup_root.clone();
+    let layout = layout(system.paths(), true)?;
+    let root = layout.agent();
     if std::fs::metadata(root.join("cgroup.procs")).is_err() {
-        mkdir(&root)?;
-        let target = path_c_string(&root)?;
+        mkdir(root)?;
+        let target = path_c_string(root)?;
         system.mount(
             Some(c"cgroup2"),
             &target,
@@ -23,105 +48,69 @@ pub(crate) fn prepare(system: &mut impl System) -> Result<(), Errno> {
             MountFlags::MS_NOSUID | MountFlags::MS_NODEV | MountFlags::MS_NOEXEC,
         )?;
     }
-    let execution = root.join("nvx-exec");
-    mkdir(&execution)?;
-    match std::fs::metadata(execution.join("pids.current")) {
-        Ok(_) => Ok(()),
-        Err(error) => match sys::errno_of(&error) {
-            Errno::ENOENT => write_path(&root.join("cgroup.subtree_control"), b"+pids"),
-            error => Err(error),
-        },
-    }
+    ExecutionCgroup::prepare(&layout, None, &[])
+        .map(drop)
+        .map_err(|error| sys::errno_of(&error))
+}
+
+/// Returns the cgroup that each direct workload joins before its program runs.
+pub(crate) fn placement(paths: &Paths) -> Result<Cgroup, Errno> {
+    execution(paths)?
+        .placement()
+        .map_err(|error| sys::errno_of(&error))
 }
 
 /// Returns whether the execution cgroup reports one or more tasks.
 pub(crate) fn has_tasks(system: &impl System) -> Result<bool, Errno> {
-    let path = system
-        .paths()
-        .cgroup_root
-        .join("nvx-exec")
-        .join("pids.current");
-    let path = path_c_string(&path)?;
-    let descriptor = sys::open(
-        &path,
-        OpenFlags::O_RDONLY | OpenFlags::O_CLOEXEC,
-        Mode::empty(),
-    )?;
-    let mut buffer = [0u8; 32];
-    let mut length = 0;
-    let result = loop {
-        match descriptor.read(&mut buffer[length..]) {
-            Ok(count) if count > 0 => {
-                length += count;
-                if length < buffer.len() {
-                    continue;
-                }
-                break Err(Errno::EOVERFLOW);
-            }
-            Ok(_) => break parse_count(&buffer[..length]),
-            Err(Errno::EINTR) => {}
-            Err(error) => break Err(error),
-        }
-    };
-    match result {
-        Ok(value) => descriptor.close().map(|()| value),
-        Err(error) => Err(error),
-    }
-}
-
-/// Parses the canonical decimal form of `pids.current`.
-fn parse_count(bytes: &[u8]) -> Result<bool, Errno> {
-    if bytes.len() < 2
-        || bytes.last() != Some(&b'\n')
-        || (bytes.first() == Some(&b'0') && bytes.len() != 2)
-        || !bytes[..bytes.len() - 1].iter().all(u8::is_ascii_digit)
-    {
-        return Err(Errno::EPROTO);
-    }
-    Ok(bytes.first() != Some(&b'0'))
+    execution(system.paths())?
+        .is_occupied(Scope::Workload)
+        .map_err(|error| sys::errno_of(&error))
 }
 
 /// Requests atomic killing of every process in the execution cgroup.
 pub(crate) fn kill(system: &mut impl System) -> Result<(), Errno> {
-    let path = system
-        .paths()
-        .cgroup_root
-        .join("nvx-exec")
-        .join("cgroup.kill");
-    let result = write_path(&path, b"1");
+    let result = execution(system.paths()).and_then(|execution| {
+        execution
+            .kill(Scope::Workload)
+            .map_err(|error| sys::errno_of(&error))
+    });
     if let Err(error) = result {
         super::diagnostics::error(system, "exec-cgroup-kill", error as i32);
     }
     result
 }
 
-/// Reaps every currently available child and records the workload's first terminal state.
-pub(crate) fn reap(child: ProcessId, status: &mut Option<ChildStatus>) {
-    while let Some(observed) = sys::reap_any_nonblocking() {
-        if observed.process == child && status.is_none() {
-            *status = Some(observed.status);
-        }
+/// Collects the status of every child that has ended, as the agent is its process's one status
+/// collector, and hands the workload's status to `child`. The direct agent is PID 1, so its
+/// children include every orphaned descendant of its workloads.
+pub(crate) fn reap(child: &mut Child) {
+    while let Some(reaped) = sys::reap_any_nonblocking() {
+        child.observe(
+            reaped.process.raw().unsigned_abs(),
+            ExitStatus::from_raw(reaped.wait_status),
+        );
     }
+}
+
+/// Collects the status of every child that has ended once the workload's status is known, when
+/// every child left is an orphaned descendant.
+fn reap_orphans() -> io::Result<()> {
+    while sys::reap_any_nonblocking().is_some() {}
+    Ok(())
 }
 
 /// Reaps orphaned descendants and returns the cgroup's current occupancy.
 pub(crate) fn verify_empty(system: &impl System) -> Result<bool, Errno> {
-    while sys::reap_any_nonblocking().is_some() {}
+    let _ = reap_orphans();
     has_tasks(system)
 }
 
 /// Kills and reaps the execution cgroup until it is empty or the deadline expires.
 pub(crate) fn settle(system: &mut impl System) -> Result<(), Errno> {
     kill(system)?;
-    for attempt in 0..=SETTLE_ATTEMPTS {
-        if !verify_empty(system)? {
-            return Ok(());
-        }
-        if attempt != SETTLE_ATTEMPTS {
-            std::thread::sleep(SETTLE_DELAY);
-        }
-    }
-    Err(Errno::ETIMEDOUT)
+    execution(system.paths())?
+        .settle(Scope::Workload, SETTLE_TIMEOUT, reap_orphans)
+        .map_err(|error| sys::errno_of(&error))
 }
 
 /// Kills the workload process group and, in direct mode, its cgroup.
@@ -134,7 +123,9 @@ pub(crate) fn terminate(system: &mut impl System, direct: bool, child: ProcessId
 
 /// Moves a sandbox launcher into the container cgroup.
 pub(crate) fn write_container_pid(system: &impl System, child: ProcessId) -> Result<(), Errno> {
-    write_path(&system.paths().container_cgroup_procs, &child.line())
+    ExecutionCgroup::open(&layout(system.paths(), false)?, None)
+        .and_then(|container| container.place(child.raw().unsigned_abs()))
+        .map_err(|error| sys::errno_of(&error))
 }
 
 /// Creates one cgroup directory with mode 0755, accepting an existing path.
@@ -144,18 +135,6 @@ fn mkdir(path: &Path) -> Result<(), Errno> {
         Ok(()) | Err(Errno::EEXIST) => Ok(()),
         Err(error) => Err(error),
     }
-}
-
-/// Writes a complete control value and reports explicit close failure.
-fn write_path(path: &Path, bytes: &[u8]) -> Result<(), Errno> {
-    let path = path_c_string(path)?;
-    let descriptor = sys::open(
-        &path,
-        OpenFlags::O_WRONLY | OpenFlags::O_CLOEXEC,
-        Mode::empty(),
-    )?;
-    descriptor.write_all(bytes)?;
-    descriptor.close()
 }
 
 #[cfg(test)]

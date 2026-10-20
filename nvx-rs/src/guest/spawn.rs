@@ -21,9 +21,10 @@
 //! the caller chooses the program, which applies its own credentials, and the identity, if any,
 //! as which the child checks its working directory. NVX's managed agent is one caller.
 //!
-//! The caller owns the child. [`Spawned::id`] names it, and the caller collects its status: this
-//! module never waits for a process. [`LaunchReport::wait`] tells whether the program started, or
-//! which stage failed and why.
+//! The caller owns the child. [`Spawned::id`] names it, and the caller collects its status, for
+//! example through a [`process::Child`](super::process::Child): this module never waits for a
+//! process. [`LaunchReport::wait`] tells whether the program started, or which stage failed and
+//! why.
 //!
 //! ```no_run
 //! use std::fs::File;
