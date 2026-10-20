@@ -170,6 +170,13 @@ mod tests {
 
     #[test]
     fn a_child_signal_wait_times_out_and_restores_the_mask() {
+        // A child that another test thread forks would end the wait early with its `SIGCHLD`.
+        if crate::guest::managed_agent::isolate_process_test(
+            "NVX_CHILD_SIGNAL_WAIT_TEST_CHILD",
+            "guest::sys::signal::tests::a_child_signal_wait_times_out_and_restores_the_mask",
+        ) {
+            return;
+        }
         let before = SigSet::thread_get_mask().unwrap();
         let wait = ChildSignalWait::new().unwrap();
         assert!(SigSet::thread_get_mask().unwrap().contains(Signal::SIGCHLD));
