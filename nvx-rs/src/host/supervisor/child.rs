@@ -44,10 +44,11 @@ struct Borrowed<'a>(std::convert::Infallible, PhantomData<&'a ()>);
 ///
 /// [`spawn`] passes the VMM these and its standard streams, and nothing else of the caller's:
 ///
-/// - On Linux, the descriptor stays close-on-exec in the caller, as Rust opens its files, and
-///   only the VMM's own process clears the flag, between its fork and its exec, so no process
-///   that another thread spawns meanwhile inherits it. The VMM opens it again as
-///   `/proc/self/fd/N`, which `proc_path` returns.
+/// - On Linux, the descriptor must be close-on-exec in the caller, as Rust opens its files, and
+///   stays so: only the VMM's own process clears the flag, between its fork and its exec, so no
+///   process that another thread spawns meanwhile inherits it. A spawn refuses a descriptor that
+///   is not close-on-exec, since any process that the caller spawns would inherit it. The VMM
+///   opens it again as `/proc/self/fd/N`, which `proc_path` returns.
 /// - On Windows, the handle joins the explicit list of handles that the VMM inherits, and is
 ///   inheritable only while the VMM is created, after which the spawn restores its earlier
 ///   inheritability. Spawns that allow handles take that window one at a time, so several may
@@ -162,9 +163,10 @@ impl VmmCommand<'_> {
 ///
 /// Record the VMM's identity right after the spawn, with
 /// [`Launch::record_process`](crate::host::store::Launch::record_process), as
-/// [`launch`](super::launch) does. Fails with [`io::ErrorKind::InvalidInput`] for a descriptor of
-/// a standard stream, 0 to 2, on Linux, and with [`io::ErrorKind::Unsupported`] for any descriptor
-/// or handle on hosts other than Linux and Windows.
+/// [`launch`](super::launch) does. Fails with [`io::ErrorKind::InvalidInput`] on Linux for a
+/// descriptor of a standard stream, 0 to 2, or one that is not close-on-exec, and with
+/// [`io::ErrorKind::Unsupported`] for any descriptor or handle on hosts other than Linux and
+/// Windows.
 pub fn spawn(
     command: &VmmCommand<'_>,
     capability: &[u8; CAPABILITY_LEN],
@@ -533,5 +535,19 @@ mod tests {
             let error = spawn_sleeper(directory.path(), vec![Inherited::from(stream)]).unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         }
+    }
+
+    #[test]
+    fn descriptors_that_are_not_close_on_exec_are_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        // As a descriptor that the caller's parent or native code left without close-on-exec,
+        // which any process that the caller spawns would inherit, and not only the VMM.
+        let (_reader, writer) = io::pipe().unwrap();
+        sys::clear_close_on_exec(&writer).unwrap();
+        let error = spawn_sleeper(directory.path(), vec![Inherited::new(&writer)]).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("close-on-exec"), "{error}");
+        // The refusal, which comes before the spawn, leaves the descriptor as it was.
+        assert!(!close_on_exec(writer.as_fd()));
     }
 }

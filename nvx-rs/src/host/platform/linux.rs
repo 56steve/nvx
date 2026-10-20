@@ -248,8 +248,11 @@ pub(crate) fn boot_id() -> io::Result<[u8; 16]> {
 /// Only the new process clears the close-on-exec flag of the descriptors in `inherit`, so no
 /// process that another thread spawns meanwhile inherits them. Fails with
 /// [`io::ErrorKind::InvalidInput`] for a descriptor of a standard stream, 0 to 2, which the
-/// command's own standard streams replace in the new process.
+/// command's own standard streams replace in the new process, and for a descriptor that is not
+/// close-on-exec in the caller, which any process that the caller spawns would inherit.
 pub(crate) fn detach(command: &mut Command, inherit: &[Inherited<'_>]) -> io::Result<()> {
+    use nix::fcntl::{FcntlArg, FdFlag, fcntl};
+
     let mut descriptors: Vec<RawFd> = Vec::with_capacity(inherit.len());
     for inherited in inherit {
         let descriptor = inherited.as_fd().as_raw_fd();
@@ -259,6 +262,16 @@ pub(crate) fn detach(command: &mut Command, inherit: &[Inherited<'_>]) -> io::Re
                 format!(
                     "descriptor {descriptor} cannot be inherited: the VMM's own standard streams \
                      replace descriptors 0 to 2"
+                ),
+            ));
+        }
+        let flags = FdFlag::from_bits_retain(fcntl(inherited.as_fd(), FcntlArg::F_GETFD)?);
+        if !flags.contains(FdFlag::FD_CLOEXEC) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "descriptor {descriptor} cannot be inherited by the VMM alone: it is not \
+                     close-on-exec, so any process that this process spawns inherits it"
                 ),
             ));
         }
