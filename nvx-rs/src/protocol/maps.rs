@@ -48,7 +48,7 @@ pub fn encode_maps_payloads(maps: &[HostMap], limit: usize) -> Result<Vec<Vec<u8
     let mut payload = Vec::new();
     let mut count = 0u32;
     for (index, map) in maps.iter().enumerate() {
-        if !acceptable(&map.source, &map.target) {
+        if !acceptable(map.source.as_bytes(), map.target.as_bytes()) {
             return Err(violation(format!(
                 "a host mapping needs a relative source and an absolute target of at most \
                  {MAX_MAP_PATH_BYTES} bytes without NUL characters or empty, `.`, or `..` \
@@ -123,45 +123,23 @@ pub struct GuestMapsPayload {
 /// table and fit the number that the kernel command line announced is for the guest agent to
 /// check.
 pub fn decode_maps_payload(payload: &[u8]) -> Result<MapsPayload, ProtocolError> {
-    let truncated = || violation("the host mapping request is truncated");
     let first = u32_at(payload, 0).ok_or_else(truncated)?;
     let count = u32_at(payload, 4).ok_or_else(truncated)?;
     let mut maps = Vec::new();
-    let mut offset = MAPS_HEADER_LEN;
-    for _ in 0..count {
-        let (Some(flags), Some(source_len), Some(target_len)) = (
-            u16_at(payload, offset),
-            u16_at(payload, offset + 2),
-            u16_at(payload, offset + 4),
-        ) else {
-            return Err(truncated());
-        };
-        offset += MAP_ENTRY_HEADER_LEN;
-        let mut text = |length: u16| -> Result<String, ProtocolError> {
-            let end = offset + usize::from(length);
-            let bytes = payload.get(offset..end).ok_or_else(truncated)?;
-            offset = end;
+    decode_maps_entries(
+        payload,
+        count,
+        &mut maps,
+        |bytes| {
             String::from_utf8(bytes.to_vec())
                 .map_err(|_| violation("a host mapping is not valid UTF-8"))
-        };
-        let source = text(source_len)?;
-        let target = text(target_len)?;
-        if flags & !MAP_READ_ONLY != 0 || !acceptable(&source, &target) {
-            return Err(violation(
-                "a host mapping has unknown flags or a source or target that the guest agent \
-                 refuses",
-            ));
-        }
-
-        maps.push(HostMap {
+        },
+        |source, target, read_only| HostMap {
             source,
             target,
-            read_only: flags & MAP_READ_ONLY != 0,
-        });
-    }
-    if offset != payload.len() {
-        return Err(violation("the host mapping request has trailing bytes"));
-    }
+            read_only,
+        },
+    )?;
     Ok(MapsPayload { first, maps })
 }
 
@@ -170,7 +148,6 @@ pub fn decode_maps_payload(payload: &[u8]) -> Result<MapsPayload, ProtocolError>
 /// [`decode_maps_payload`] remains UTF-8 for host and fake-OpenVMM callers. This decoder accepts
 /// every non-NUL Linux path byte that the guest can mount.
 pub fn decode_guest_maps_payload(payload: &[u8]) -> Result<GuestMapsPayload, ProtocolError> {
-    let truncated = || violation("the host mapping request is truncated");
     let first = u32_at(payload, 0).ok_or_else(truncated)?;
     let count = u32_at(payload, 4).ok_or_else(truncated)?;
     let capacity = usize::try_from(count)
@@ -178,6 +155,33 @@ pub fn decode_guest_maps_payload(payload: &[u8]) -> Result<GuestMapsPayload, Pro
         .filter(|count| *count <= MAX_HOST_MAPPINGS)
         .ok_or_else(|| violation("the host mapping request has too many entries"))?;
     let mut maps = Vec::with_capacity(capacity);
+    decode_maps_entries(
+        payload,
+        count,
+        &mut maps,
+        |bytes| Ok(bytes.to_vec()),
+        |source, target, read_only| GuestHostMap {
+            source,
+            target,
+            read_only,
+        },
+    )?;
+    Ok(GuestMapsPayload { first, maps })
+}
+
+/// Decodes the `count` entries that follow the header of a `MAPS` payload into `maps`, as both
+/// decoders read them: `path` converts each source and target as soon as it is read, and `entry`
+/// builds an entry from its source, its target, and whether it is read-only.
+///
+/// It refuses a truncated entry, flags other than [`MAP_READ_ONLY`], a source or target that
+/// [`acceptable`] refuses, and trailing bytes.
+fn decode_maps_entries<P: AsRef<[u8]>, M>(
+    payload: &[u8],
+    count: u32,
+    maps: &mut Vec<M>,
+    path: impl Fn(&[u8]) -> Result<P, ProtocolError>,
+    entry: impl Fn(P, P, bool) -> M,
+) -> Result<(), ProtocolError> {
     let mut offset = MAPS_HEADER_LEN;
     for _ in 0..count {
         let (Some(flags), Some(source_len), Some(target_len)) = (
@@ -190,53 +194,40 @@ pub fn decode_guest_maps_payload(payload: &[u8]) -> Result<GuestMapsPayload, Pro
         offset = offset
             .checked_add(MAP_ENTRY_HEADER_LEN)
             .ok_or_else(truncated)?;
-        let mut take = |length: u16| -> Result<Vec<u8>, ProtocolError> {
+        let mut take = |length: u16| -> Result<P, ProtocolError> {
             let end = offset
                 .checked_add(usize::from(length))
                 .ok_or_else(truncated)?;
-            let bytes = payload.get(offset..end).ok_or_else(truncated)?.to_vec();
+            let bytes = payload.get(offset..end).ok_or_else(truncated)?;
             offset = end;
-            Ok(bytes)
+            path(bytes)
         };
         let source = take(source_len)?;
         let target = take(target_len)?;
-        if flags & !MAP_READ_ONLY != 0 || !acceptable_bytes(&source, &target) {
+        if flags & !MAP_READ_ONLY != 0 || !acceptable(source.as_ref(), target.as_ref()) {
             return Err(violation(
                 "a host mapping has unknown flags or a source or target that the guest agent \
                  refuses",
             ));
         }
-        maps.push(GuestHostMap {
-            source,
-            target,
-            read_only: flags & MAP_READ_ONLY != 0,
-        });
+        maps.push(entry(source, target, flags & MAP_READ_ONLY != 0));
     }
     if offset != payload.len() {
         return Err(violation("the host mapping request has trailing bytes"));
     }
-    Ok(GuestMapsPayload { first, maps })
+    Ok(())
+}
+
+/// Returns the error of a `MAPS` payload that ends before its header or an entry does.
+fn truncated() -> ProtocolError {
+    violation("the host mapping request is truncated")
 }
 
 /// Whether the guest agent accepts the paths of a mapping: a relative `source` and an absolute
 /// `target` of at most [`MAX_MAP_PATH_BYTES`] without NUL characters, whose `/`-separated
-/// components are neither empty, `.`, nor `..`.
-fn acceptable(source: &str, target: &str) -> bool {
-    let normal = |components: &str| {
-        !components.is_empty()
-            && components
-                .split('/')
-                .all(|component| !matches!(component, "" | "." | ".."))
-    };
-    [source, target]
-        .iter()
-        .all(|path| path.len() <= MAX_MAP_PATH_BYTES && !path.contains('\0'))
-        && normal(source)
-        && target.strip_prefix('/').is_some_and(normal)
-}
-
-/// Applies the guest agent's byte-oriented source and target path rules.
-fn acceptable_bytes(source: &[u8], target: &[u8]) -> bool {
+/// components are neither empty, `.`, nor `..`. UTF-8 text follows these rules as its bytes, in
+/// which `/` and NUL occur only as themselves.
+fn acceptable(source: &[u8], target: &[u8]) -> bool {
     let normal = |components: &[u8]| {
         !components.is_empty()
             && components
@@ -245,8 +236,7 @@ fn acceptable_bytes(source: &[u8], target: &[u8]) -> bool {
     };
     [source, target]
         .iter()
-        .all(|path| !path.is_empty() && path.len() <= MAX_MAP_PATH_BYTES && !path.contains(&0))
-        && source != b"."
+        .all(|path| path.len() <= MAX_MAP_PATH_BYTES && !path.contains(&0))
         && normal(source)
         && target.strip_prefix(b"/").is_some_and(normal)
 }
