@@ -1,5 +1,6 @@
 use std::fs::{self, DirBuilder, File, OpenOptions, Permissions, TryLockError};
 use std::io::{self, Read};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -281,14 +282,20 @@ pub fn create_private_dir(path: &Path) -> io::Result<()> {
 /// is not.
 ///
 /// A new directory takes the setgid bit of its parent, and loses the bits that the umask clears,
-/// so its mode is set again, to the 0700 that OpenVMM requires of the directory of its control
-/// socket. An existing directory is never changed: others could have placed records in it, or
-/// still hold its files open, which a change of its mode would not revoke.
+/// even the current user's permission to read it, so its mode is set again, to the 0700 that
+/// OpenVMM requires of the directory of its control socket. An existing directory is never
+/// changed: others could have placed records in it, or still hold its files open, which a change
+/// of its mode would not revoke.
 pub(crate) fn create_store_dir(path: &Path) -> io::Result<Option<String>> {
     match DirBuilder::new().mode(0o700).create(path) {
         Ok(()) => {
             if let Some(directory) = open_plain_dir(path)? {
-                directory.set_permissions(Permissions::from_mode(0o700))?;
+                // A descriptor that only locates the directory cannot change its mode itself, but
+                // its link in /proc names exactly the directory that it opened.
+                fs::set_permissions(
+                    Path::new("/proc/self/fd").join(directory.as_raw_fd().to_string()),
+                    Permissions::from_mode(0o700),
+                )?;
             }
         }
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
@@ -340,11 +347,14 @@ pub(crate) fn private_file_problem(_file: &File) -> io::Result<Option<String>> {
     Ok(None)
 }
 
-/// Opens the directory `path`, or returns `None` if it is a symbolic link or not a directory.
+/// Opens the directory `path` only to locate it, which needs no permission on the directory
+/// itself, or returns `None` if it is a symbolic link or not a directory.
 fn open_plain_dir(path: &Path) -> io::Result<Option<File>> {
+    use nix::fcntl::OFlag;
+
     let opened = OpenOptions::new()
         .read(true)
-        .custom_flags((nix::fcntl::OFlag::O_DIRECTORY | nix::fcntl::OFlag::O_NOFOLLOW).bits())
+        .custom_flags((OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW).bits())
         .open(path);
     match opened {
         Ok(directory) => Ok(Some(directory)),

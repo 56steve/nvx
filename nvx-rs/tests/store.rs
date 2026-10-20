@@ -41,6 +41,9 @@ const ORCHESTRATOR_CRASH: &str = "NVX_STORE_TEST_CRASH";
 /// The boot delay, in milliseconds, of the fake OpenVMM that [`orchestrator_role`] launches
 /// instead of a VMM stand-in, if set.
 const ORCHESTRATOR_FAKE: &str = "NVX_STORE_TEST_FAKE_BOOT_DELAY_MS";
+/// The store that [`restrictive_umask_role`] creates.
+#[cfg(target_os = "linux")]
+const UMASK_STORE: &str = "NVX_STORE_TEST_UMASK_STORE";
 /// The longest wait for a recovery to become determinate.
 const RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -295,6 +298,55 @@ fn vmm_role() {
     assert_eq!(capability, CAPABILITY);
     // Bounded, so that a stand-in that a failed test leaves behind exits on its own.
     thread::sleep(Duration::from_secs(60));
+}
+
+/// A user of the store whose umask clears even the current user's permission to read the files
+/// and directories that it creates. The store sets their modes again, so that its records, its
+/// capability, and its lock still open, as their next launch and OpenVMM need. The umask belongs
+/// to the whole process, so this runs in a process of its own.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "a store user that the store tests run in a process of its own"]
+fn restrictive_umask_role() {
+    use std::os::unix::fs::PermissionsExt;
+
+    use nix::sys::stat::{Mode, umask};
+
+    let Some(directory) = env::var_os(UMASK_STORE) else {
+        return;
+    };
+    umask(Mode::S_IRUSR);
+    let store = SandboxStore::create(directory).unwrap();
+    let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+    assert_eq!(mode(store.dir()), 0o700);
+    // The second launch opens the lock file again and replaces the first launch's files.
+    for _ in 0..2 {
+        let mut locked = store.lock(None).unwrap();
+        let launch = locked.begin_launch(&runtime(), &CAPABILITY).unwrap();
+        assert_eq!(store.journal().unwrap().as_ref(), Some(launch.journal()));
+        assert_eq!(store.read_capability().unwrap(), CAPABILITY);
+        for path in [
+            store.dir().join(JOURNAL_NAME),
+            store.capability_path(),
+            store.log_path(),
+        ] {
+            assert_eq!(mode(&path), 0o600, "{}", path.display());
+        }
+        assert_eq!(launch.abandon().unwrap(), Recovery::Exited);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_restrictive_umask_leaves_the_store_usable() {
+    let directory = tempfile::tempdir().unwrap();
+    let (program, arguments) = role("restrictive_umask_role", &[]);
+    let status = Command::new(program)
+        .args(arguments)
+        .env(UMASK_STORE, directory.path().join("sandbox"))
+        .status()
+        .unwrap();
+    assert!(status.success());
 }
 
 #[test]

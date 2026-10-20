@@ -12,6 +12,10 @@ pub(super) fn io_error(context: String) -> impl FnOnce(io::Error) -> Error {
     move |error| Error::io(context).with_source(error)
 }
 
+/// Mode of the store's files on Unix: readable and writable by the current user only.
+#[cfg(unix)]
+const PRIVATE_FILE_MODE: u32 = 0o600;
+
 /// Returns options that create a file readable only by the current user (mode 0600 on Unix)
 /// and that open no link that its path names on Unix.
 pub(super) fn private_options() -> OpenOptions {
@@ -22,15 +26,25 @@ pub(super) fn private_options() -> OpenOptions {
         use std::os::unix::fs::OpenOptionsExt;
 
         options
-            .mode(0o600)
+            .mode(PRIVATE_FILE_MODE)
             .custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits());
     }
     options
 }
 
 /// Creates the file at `path`, which must not exist, readable only by the current user.
+///
+/// On Unix, the umask may clear bits of the mode that the file is created with, even the
+/// current user's permission to read it, so the mode is set again through the new file.
 pub(super) fn create_new(path: &Path) -> io::Result<File> {
-    private_options().create_new(true).open(path)
+    let file = private_options().create_new(true).open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        file.set_permissions(fs::Permissions::from_mode(PRIVATE_FILE_MODE))?;
+    }
+    Ok(file)
 }
 
 /// Atomically replaces `path` with `contents`, readable only by the current user.
