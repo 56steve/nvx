@@ -3,7 +3,7 @@ use std::fs::{self, OpenOptions};
 use std::io;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::OpenOptionsExt;
-use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
+use std::os::windows::io::{AsHandle, AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
 use std::path::Path;
 use std::time::{Duration, Instant};
 use std::{mem, ptr};
@@ -12,8 +12,9 @@ use windows_sys::Win32::Foundation::{
     ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_BROKEN_PIPE, ERROR_FILE_NOT_FOUND,
     ERROR_INVALID_PARAMETER, ERROR_IO_PENDING, ERROR_MORE_DATA, ERROR_NO_DATA,
     ERROR_OPERATION_ABORTED, ERROR_PIPE_BUSY, ERROR_PIPE_NOT_CONNECTED, ERROR_SHARING_VIOLATION,
-    ERROR_SUCCESS, FILETIME, FreeLibrary, GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE,
-    HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    ERROR_SUCCESS, FILETIME, FreeLibrary, GENERIC_READ, GENERIC_WRITE, GetHandleInformation,
+    GetLastError, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation,
+    WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::{
     ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_REVISION, ACL_SIZE_INFORMATION, AclSizeInformation,
@@ -54,6 +55,7 @@ use windows_sys::Win32::System::Threading::{
 };
 
 use super::Transport;
+use crate::host::supervisor::Inherited;
 use crate::hypervisor::Hypervisor;
 
 /// Whether this host can run NVX microVMs.
@@ -386,33 +388,92 @@ impl Drop for AttributeList {
     }
 }
 
+/// Handles of a caller that a spawn makes inheritable for as long as it needs them, and whose
+/// earlier inheritability it restores when dropped.
+struct InheritableForSpawn {
+    /// Each handle, and whether it was inheritable before.
+    handles: Vec<(HANDLE, bool)>,
+}
+
+impl InheritableForSpawn {
+    /// Makes each of `handles`, which the caller keeps open until this is dropped, inheritable.
+    ///
+    /// Fails if a handle cannot be, and then restores the handles that it changed.
+    fn new(handles: &[HANDLE]) -> io::Result<Self> {
+        let mut inheritable = Self {
+            handles: Vec::with_capacity(handles.len()),
+        };
+        for &handle in handles {
+            let mut flags = 0;
+            // SAFETY: the handle is open, and the output pointer is valid.
+            if unsafe { GetHandleInformation(handle, &mut flags) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: the handle is open.
+            if unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) }
+                == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            inheritable
+                .handles
+                .push((handle, flags & HANDLE_FLAG_INHERIT != 0));
+        }
+        Ok(inheritable)
+    }
+}
+
+impl Drop for InheritableForSpawn {
+    fn drop(&mut self) {
+        for &(handle, inheritable) in &self.handles {
+            let flags = if inheritable { HANDLE_FLAG_INHERIT } else { 0 };
+            // SAFETY: the caller keeps the handle open until this is dropped. A handle whose flag
+            // cannot be restored stays inheritable, which only widens what later spawns without a
+            // handle list may inherit.
+            unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, flags) };
+        }
+    }
+}
+
 /// Starts OpenVMM without the caller's console so it outlives the caller.
 ///
 /// `std::process::Command` lets the child inherit every inheritable handle of the caller. A
 /// caller whose own standard output is a pipe, such as a phase process whose parent collects
 /// its output, would then hand that pipe to OpenVMM, and the parent would wait for the VM to
-/// exit before seeing end-of-file. The handle list restricts inheritance to `stdio`.
+/// exit before seeing end-of-file. The handle list restricts inheritance to `stdio` and the
+/// caller's handles `inherit`, which keep their values in the child.
 ///
-/// The `stdio` handles are inheritable only from here until the caller drops them after the
-/// spawn, so a process that the caller spawns concurrently through `std::process` could inherit
-/// them in that window.
+/// A handle in the list must be inheritable while the process is created. The `stdio` handles
+/// are inheritable from here until the spawn closes them, and the handles `inherit` from here
+/// until the spawn restores their earlier inheritability, right after the process is created.
+/// A process that the caller spawns concurrently without a handle list, as `std::process` does,
+/// could inherit them in that window; a process that it spawns with one could not.
 pub(crate) fn spawn_detached(
     program: &Path,
     arguments: &[OsString],
     working_dir: &Path,
     stdio: [OwnedHandle; 3],
+    inherit: &[Inherited<'_>],
     breakaway_from_job: bool,
 ) -> io::Result<LaunchedProcess> {
     let application = wide(program);
     let mut command_line = command_line(program.as_os_str(), arguments)?;
     let directory = wide(working_dir);
-    let handles = stdio.each_ref().map(raw);
-    for handle in handles {
+    let mut handles = stdio.each_ref().map(raw).to_vec();
+    for handle in &handles {
         // SAFETY: the handle is open and owned by `stdio`.
-        if unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) } == 0 {
+        if unsafe { SetHandleInformation(*handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) } == 0 {
             return Err(io::Error::last_os_error());
         }
     }
+    for inherited in inherit {
+        let handle = inherited.as_handle().as_raw_handle() as HANDLE;
+        // A handle that the list names twice fails the spawn.
+        if !handles.contains(&handle) {
+            handles.push(handle);
+        }
+    }
+    let inheritable = InheritableForSpawn::new(&handles[stdio.len()..])?;
     let mut attributes = AttributeList::new(1)?;
     // SAFETY: the list has room for one attribute, and `handles` outlives CreateProcessW.
     if unsafe {
@@ -421,7 +482,7 @@ pub(crate) fn spawn_detached(
             0,
             PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
             handles.as_ptr().cast(),
-            mem::size_of_val(&handles),
+            mem::size_of_val(handles.as_slice()),
             ptr::null_mut(),
             ptr::null(),
         )
@@ -433,11 +494,9 @@ pub(crate) fn spawn_detached(
     let mut startup: STARTUPINFOEXW = unsafe { mem::zeroed() };
     startup.StartupInfo.cb = mem::size_of::<STARTUPINFOEXW>() as u32;
     startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
-    [
-        startup.StartupInfo.hStdInput,
-        startup.StartupInfo.hStdOutput,
-        startup.StartupInfo.hStdError,
-    ] = handles;
+    startup.StartupInfo.hStdInput = handles[0];
+    startup.StartupInfo.hStdOutput = handles[1];
+    startup.StartupInfo.hStdError = handles[2];
     startup.lpAttributeList = attributes.as_ptr();
     let mut flags = CREATE_UNICODE_ENVIRONMENT
         | EXTENDED_STARTUPINFO_PRESENT
@@ -464,9 +523,16 @@ pub(crate) fn spawn_detached(
             &mut information,
         )
     };
-    if created == 0 {
-        return Err(io::Error::last_os_error());
-    }
+    let created = if created == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    };
+    // The child holds its own copies of the handles now, so the caller's need not be
+    // inheritable any longer.
+    drop(inheritable);
+    drop(stdio);
+    created?;
     drop(owned(information.hThread));
     let process = owned(information.hProcess)
         .ok_or_else(|| io::Error::other("CreateProcessW returned no process handle"))?;
@@ -1264,6 +1330,7 @@ mod tests {
             &[OsString::from("/c"), OsString::from("ping -n 30 127.0.0.1")],
             &std::env::temp_dir(),
             [stdin.into(), stdout.into(), stderr.into()],
+            &[],
             false,
         )
         .unwrap();
@@ -1282,5 +1349,101 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// Returns whether the handle `value` of `process` refers to the object that `ours` holds, as
+    /// a handle that the process inherited from this one does, under the same value.
+    fn holds(process: &OwnedHandle, value: HANDLE, ours: &impl AsRawHandle) -> bool {
+        use windows_sys::Win32::Foundation::{
+            CompareObjectHandles, DUPLICATE_SAME_ACCESS, DuplicateHandle,
+        };
+
+        let mut copy = ptr::null_mut();
+        // SAFETY: the process handle has full access, the value is only looked up in that
+        // process, and the output pointer is valid.
+        let duplicated = unsafe {
+            DuplicateHandle(
+                raw(process),
+                value,
+                GetCurrentProcess(),
+                &mut copy,
+                0,
+                0,
+                DUPLICATE_SAME_ACCESS,
+            )
+        } != 0;
+        // A value that names no handle of the process names none of ours.
+        let Some(copy) = duplicated.then(|| owned(copy)).flatten() else {
+            return false;
+        };
+        // SAFETY: both handles are open.
+        unsafe { CompareObjectHandles(raw(&copy), ours.as_raw_handle() as HANDLE) != 0 }
+    }
+
+    /// Returns whether `handle` is inheritable.
+    fn inheritable(handle: &impl AsRawHandle) -> bool {
+        let mut flags = 0;
+        // SAFETY: the handle is open, and the output pointer is valid.
+        let read = unsafe { GetHandleInformation(handle.as_raw_handle() as HANDLE, &mut flags) };
+        assert_ne!(read, 0, "{}", io::Error::last_os_error());
+        flags & HANDLE_FLAG_INHERIT != 0
+    }
+
+    /// Makes `handle` inheritable, as native code or a parent may have left it.
+    fn make_inheritable(handle: &impl AsRawHandle) {
+        // SAFETY: the handle is open.
+        let set = unsafe {
+            SetHandleInformation(
+                handle.as_raw_handle() as HANDLE,
+                HANDLE_FLAG_INHERIT,
+                HANDLE_FLAG_INHERIT,
+            )
+        };
+        assert_ne!(set, 0, "{}", io::Error::last_os_error());
+    }
+
+    #[test]
+    fn children_inherit_the_allowed_handles_while_they_are_created() {
+        let (_allowed_reader, allowed) = io::pipe().unwrap();
+        // A handle that was inheritable before the spawn stays so.
+        let (_kept_reader, kept) = io::pipe().unwrap();
+        make_inheritable(&kept);
+        let (_other_reader, other) = io::pipe().unwrap();
+        make_inheritable(&other);
+        assert!(!inheritable(&allowed));
+        let (stdin, _stdin_writer) = io::pipe().unwrap();
+        let (_stdout_reader, stdout) = io::pipe().unwrap();
+        let stderr = stdout.try_clone().unwrap();
+        let system = std::env::var_os("SystemRoot").unwrap();
+        let ping = Path::new(&system).join("System32").join("PING.EXE");
+        // A handle that the list names twice is inherited once.
+        let inherit = [
+            Inherited::new(&allowed),
+            Inherited::new(&kept),
+            Inherited::new(&allowed),
+        ];
+        let child = spawn_detached(
+            &ping,
+            &["-n", "30", "127.0.0.1"].map(OsString::from),
+            &std::env::temp_dir(),
+            [stdin.into(), stdout.into(), stderr.into()],
+            &inherit,
+            false,
+        )
+        .unwrap();
+        let value = |handle: &io::PipeWriter| handle.as_raw_handle() as HANDLE;
+        let (allowed_held, kept_held, other_held) = (
+            holds(&child.process, value(&allowed), &allowed),
+            holds(&child.process, value(&kept), &kept),
+            holds(&child.process, value(&other), &other),
+        );
+        let (allowed_inheritable, kept_inheritable) = (inheritable(&allowed), inheritable(&kept));
+        assert!(child.terminate(Duration::from_secs(10)));
+        assert!(
+            allowed_held && kept_held,
+            "an allowed handle was not inherited"
+        );
+        assert!(!other_held, "a handle that was not allowed was inherited");
+        assert!(!allowed_inheritable && kept_inheritable);
     }
 }

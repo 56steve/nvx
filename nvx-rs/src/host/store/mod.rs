@@ -49,12 +49,15 @@
 //! 3. Once the VM is ready, [`Launch::commit`] replaces the journal with the runtime record. A
 //!    launch that fails ends with [`Launch::abandon`].
 //!
+//! [`supervisor::launch`](super::supervisor::launch) runs these steps. A caller that runs them
+//! itself does so as follows:
+//!
 //! ```no_run
 //! use std::time::{Duration, Instant};
 //!
 //! use nvx::host::launch::LaunchSpec;
-//! use nvx::host::process;
 //! use nvx::host::store::{RuntimeIdentity, SandboxStore};
+//! use nvx::host::supervisor::{self, VmmCommand};
 //! use nvx::protocol::CAPABILITY_LEN;
 //!
 //! fn launch(
@@ -67,12 +70,13 @@
 //!     locked.recover()?;
 //!     let mut launch = locked.begin_launch(runtime, capability)?;
 //!     let arguments = spec.openvmm_arguments(launch.endpoint(), &store.outcome_path())?;
+//!     let command = VmmCommand::new(&spec.openvmm, arguments, store.dir());
 //!     let log = launch.take_log()?;
-//!     let child = process::spawn(&spec.openvmm, false, &arguments, capability, log, store.dir())?;
+//!     let child = supervisor::spawn(&command, capability, log)?;
 //!     launch.record_process(&child)?;
 //!     // Wait until the VM is ready, then commit, or else abandon the launch.
 //!     launch.commit()?;
-//!     process::detach_child(child);
+//!     child.detach();
 //!     Ok(())
 //! }
 //! ```
@@ -131,8 +135,9 @@
 //!   exited once the claim is released; until then, a process of the launch may still run, and
 //!   recovery is indeterminate.
 //!
-//! The runtime record of a committed launch names its running VM, and reattaching to that VM
-//! belongs to its supervisor.
+//! The runtime record of a committed launch names its running VM, and
+//! [`supervisor::reattach`](super::supervisor::reattach) holds that VM again after its
+//! orchestrator restarts.
 
 mod files;
 mod identity;
@@ -662,7 +667,7 @@ impl Launch<'_> {
     }
 
     /// Takes the claimed log, which the caller passes to the VMM as its standard output and
-    /// error, as [`spawn`](super::process::spawn) does with its `log`, once.
+    /// error, as [`spawn`](super::supervisor::spawn) does with its `log`, once.
     ///
     /// The launch keeps no copy of the log, so the claim lasts as long as the processes that hold
     /// it.
@@ -717,10 +722,9 @@ impl Launch<'_> {
     /// nothing of it runs.
     ///
     /// A caller that still holds the VMM's [`Launched`] process releases it as usual. If the
-    /// launch never recorded that process, the caller ends it with
-    /// [`kill_child`](super::process::kill_child) first: an unrecorded VMM that serves no
-    /// endpoint yet holds the log's claim, so the launch would end as
-    /// [`Recovery::Indeterminate`].
+    /// launch never recorded that process, the caller ends it with [`Launched::kill_and_wait`]
+    /// first: an unrecorded VMM that serves no endpoint yet holds the log's claim, so the launch
+    /// would end as [`Recovery::Indeterminate`].
     pub fn abandon(mut self) -> Result<Recovery> {
         // A log that no VMM received holds no claim once it closes.
         drop(self.log.take());

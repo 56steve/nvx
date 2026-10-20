@@ -14,14 +14,17 @@
 //! - [`store`] keeps the runtime records of a sandbox in a private directory with one lock: the
 //!   runtime record of its VM, with the VM's runtime identity, and the journal of its launch,
 //!   through which an interrupted launch is recovered without signaling an unverified process.
+//! - [`supervisor`] launches a sandbox's VMM through the store's journal, passing it only the
+//!   descriptors or handles that the caller allows, stops it through the caller's graceful step,
+//!   with a bounded forced step on request, and reattaches to it after the orchestrator restarts
+//!   within the same host boot.
 //! - [`session`] speaks NVX's control protocol, `NVXC`, over [`nvxs`], which runs the host's role
 //!   of the NVXS session for it and for any other application protocol, over a platform
 //!   transport. [`platform`] holds the primitives of Linux and Windows hosts. Other hosts compile
 //!   but report NVX as unavailable.
-//! - [`process`] launches OpenVMM processes. Its verified process references name a process by
-//!   its ID, start time, and host boot, and hold it through a pidfd or a process handle, so that
-//!   waits sleep until it exits and termination reaches only it, whether or not the caller
-//!   started it.
+//! - [`process`] names processes by verified references: their ID, start time, and host boot,
+//!   through which a pidfd or a process handle holds them, so that waits sleep until a process
+//!   exits and termination reaches only it, whether or not the caller started it.
 //! - [`sandbox`] is the launch profile of `nvx.py sandbox`: a container over read-only EROFS
 //!   layers and a private ext4 scratch disk, with live shares, and the checks of its options.
 //! - `cli` (feature `cli`) is the `nvx-rs` command-line interface, which `nvx.py` runs for the
@@ -51,6 +54,7 @@ pub mod report;
 pub mod sandbox;
 pub mod session;
 pub mod store;
+pub mod supervisor;
 #[cfg(unix)]
 #[allow(unsafe_code)]
 mod sys;
