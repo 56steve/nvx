@@ -193,15 +193,7 @@ impl ControlSession {
 
     /// Waits until the guest agent acknowledges readiness.
     pub fn ping(&mut self, deadline: Instant) -> Result<(), SessionError> {
-        let request_id = request_id()?;
-        self.send_app(APP_PING, request_id, &[], Some(deadline))?;
-        let (kind, response_id, status, payload) = self.read_app(Some(deadline))?;
-        if kind != APP_READY || response_id != request_id || status != 0 || !payload.is_empty() {
-            return Err(SessionError::Protocol(
-                "the guest agent did not acknowledge readiness".to_owned(),
-            ));
-        }
-        Ok(())
+        self.acknowledged(APP_PING, APP_READY, "readiness", deadline)
     }
 
     /// Asks the guest agent which control features its image provides.
@@ -211,12 +203,7 @@ impl ControlSession {
     pub fn features(&mut self, deadline: Instant) -> Result<GuestFeatures, SessionError> {
         let request_id = request_id()?;
         self.send_app(APP_FEATURES, request_id, &[], Some(deadline))?;
-        let (kind, response_id, status, payload) = self.read_app(Some(deadline))?;
-        if response_id != request_id {
-            return Err(SessionError::Protocol(
-                "the guest agent returned a mismatched request ID".to_owned(),
-            ));
-        }
+        let (kind, status, payload) = self.read_reply(request_id, Some(deadline))?;
         match kind {
             APP_READY if status == 0 => Ok(GuestFeatures::decode(&payload)?),
             APP_ERROR if payload == UNSUPPORTED_OPERATION => Ok(GuestFeatures::NONE),
@@ -237,12 +224,7 @@ impl ControlSession {
         for payload in payloads {
             let request_id = request_id()?;
             self.send_app(APP_MAPS, request_id, &payload, Some(deadline))?;
-            let (kind, response_id, status, payload) = self.read_app(Some(deadline))?;
-            if response_id != request_id {
-                return Err(SessionError::Protocol(
-                    "the guest agent returned a mismatched request ID".to_owned(),
-                ));
-            }
+            let (kind, status, payload) = self.read_reply(request_id, Some(deadline))?;
             match kind {
                 APP_READY if status == 0 && payload.is_empty() => {}
                 APP_ERROR if payload == protocol::MAPPING_FAILED.as_bytes() => {
@@ -251,8 +233,7 @@ impl ControlSession {
                     )));
                 }
                 APP_ERROR => {
-                    let category: String =
-                        String::from_utf8_lossy(&payload).chars().take(64).collect();
+                    let category = error_category(&payload);
                     return Err(SessionError::Protocol(format!(
                         "the guest agent did not mount the host paths: {category} (status \
                          {status})"
@@ -286,12 +267,7 @@ impl ControlSession {
         request_id: u64,
         deadline: Option<Instant>,
     ) -> Result<ExecEvent, SessionError> {
-        let (kind, response_id, status, payload) = self.read_app(deadline)?;
-        if response_id != request_id {
-            return Err(SessionError::Protocol(
-                "the guest agent returned a mismatched request ID".to_owned(),
-            ));
-        }
+        let (kind, status, payload) = self.read_reply(request_id, deadline)?;
         match kind {
             APP_STDOUT => Ok(ExecEvent::Stdout(payload)),
             APP_STDERR => Ok(ExecEvent::Stderr(payload)),
@@ -299,10 +275,10 @@ impl ControlSession {
                 category: ExitCategory::parse(&payload)?,
                 status,
             }),
-            APP_ERROR => {
-                let category: String = String::from_utf8_lossy(&payload).chars().take(64).collect();
-                Ok(ExecEvent::Rejected { status, category })
-            }
+            APP_ERROR => Ok(ExecEvent::Rejected {
+                status,
+                category: error_category(&payload),
+            }),
             _ => Err(SessionError::Protocol(
                 "the guest agent returned an invalid exec response".to_owned(),
             )),
@@ -320,15 +296,7 @@ impl ControlSession {
 
     /// Asks the guest agent to shut the VM down.
     pub fn stop(&mut self, deadline: Instant) -> Result<(), SessionError> {
-        let request_id = request_id()?;
-        self.send_app(APP_STOP, request_id, &[], Some(deadline))?;
-        let (kind, response_id, status, payload) = self.read_app(Some(deadline))?;
-        if kind != APP_STOPPED || response_id != request_id || status != 0 || !payload.is_empty() {
-            return Err(SessionError::Protocol(
-                "the guest agent did not acknowledge stop".to_owned(),
-            ));
-        }
-        Ok(())
+        self.acknowledged(APP_STOP, APP_STOPPED, "stop", deadline)
     }
 
     /// Sends an application request of `kind` with `request_id` and `payload` in the next
@@ -402,6 +370,42 @@ impl ControlSession {
         ))
     }
 
+    /// Reads the next application frame, which must answer `request_id`, and returns its kind,
+    /// status, and payload.
+    fn read_reply(
+        &mut self,
+        request_id: u64,
+        deadline: Option<Instant>,
+    ) -> Result<(u8, i32, Vec<u8>), SessionError> {
+        let (kind, response_id, status, payload) = self.read_app(deadline)?;
+        if response_id != request_id {
+            return Err(SessionError::Protocol(
+                "the guest agent returned a mismatched request ID".to_owned(),
+            ));
+        }
+        Ok((kind, status, payload))
+    }
+
+    /// Sends a request of `kind` without a payload and waits until the guest agent acknowledges
+    /// `what` with an empty `reply` of status 0.
+    fn acknowledged(
+        &mut self,
+        kind: u8,
+        reply: u8,
+        what: &str,
+        deadline: Instant,
+    ) -> Result<(), SessionError> {
+        let request_id = request_id()?;
+        self.send_app(kind, request_id, &[], Some(deadline))?;
+        let (kind, response_id, status, payload) = self.read_app(Some(deadline))?;
+        if kind != reply || response_id != request_id || status != 0 || !payload.is_empty() {
+            return Err(SessionError::Protocol(format!(
+                "the guest agent did not acknowledge {what}"
+            )));
+        }
+        Ok(())
+    }
+
     /// Buffers transport bytes until one complete outer record can be returned.
     fn read_outer(
         &mut self,
@@ -452,6 +456,12 @@ fn remaining(deadline: Option<Instant>) -> Result<Option<Duration>, SessionError
             .map(Some)
             .ok_or(SessionError::TimedOut),
     }
+}
+
+/// Returns the error category that the payload of an `APP_ERROR` response names, truncated to 64
+/// characters.
+fn error_category(payload: &[u8]) -> String {
+    String::from_utf8_lossy(payload).chars().take(64).collect()
 }
 
 /// Generates a random nonzero request identifier.
@@ -779,6 +789,45 @@ mod tests {
         assert_eq!((frame.kind, frame.request_id), (APP_CANCEL, 9));
     }
 
+    /// The response kind that acknowledges a ping or a stop request.
+    fn acknowledgement(kind: u8) -> u8 {
+        if kind == APP_PING {
+            APP_READY
+        } else {
+            APP_STOPPED
+        }
+    }
+
+    #[test]
+    fn pings_and_stops_need_an_empty_acknowledgement() {
+        let (mut session, requests) =
+            attached_recording(|kind, id| encode_app(acknowledgement(kind), id, 0, &[]));
+        session.ping(deadline()).unwrap();
+        session.stop(deadline()).unwrap();
+        assert_eq!(
+            *requests.lock().unwrap(),
+            [(APP_PING, Vec::new()), (APP_STOP, Vec::new())]
+        );
+        let answers: [fn(u8, u64) -> Vec<u8>; 4] = [
+            |_, id| encode_app(APP_ERROR, id, 0, &[]),
+            |kind, id| encode_app(acknowledgement(kind), id ^ 1, 0, &[]),
+            |kind, id| encode_app(acknowledgement(kind), id, 1, &[]),
+            |kind, id| encode_app(acknowledgement(kind), id, 0, b"x"),
+        ];
+        for answer in answers {
+            let error = attached(answer).ping(deadline()).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "the guest agent did not acknowledge readiness"
+            );
+            let error = attached(answer).stop(deadline()).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "the guest agent did not acknowledge stop"
+            );
+        }
+    }
+
     #[test]
     fn features_report_what_the_guest_provides() {
         let mut session = attached(|kind, id| {
@@ -873,6 +922,35 @@ mod tests {
                 Err(SessionError::Protocol(_))
             ));
         }
+    }
+
+    #[test]
+    fn responses_to_another_request_fail_closed() {
+        let mismatched = "the guest agent returned a mismatched request ID";
+        let answer: fn(u8, u64) -> Vec<u8> = |_, id| encode_app(APP_READY, id ^ 1, 0, &[]);
+        let error = attached(answer).features(deadline()).unwrap_err();
+        assert_eq!(error.to_string(), mismatched);
+        let maps = [HostMap {
+            source: "0".to_owned(),
+            target: "/work".to_owned(),
+            read_only: true,
+        }];
+        let error = attached(answer)
+            .map_host_paths(&maps, deadline())
+            .unwrap_err();
+        assert_eq!(error.to_string(), mismatched);
+        let mut session = attached(|_, id| encode_app(APP_STDOUT, id ^ 1, 0, b"x"));
+        let workload = Workload {
+            argv: vec!["/bin/true".to_owned()],
+            timeout_ms: 0,
+            cwd: None,
+            environment: WorkloadEnvironment::Default,
+        };
+        let request_id = session.start_exec(&workload, deadline()).unwrap();
+        let error = session
+            .next_exec_event(request_id, Some(deadline()))
+            .unwrap_err();
+        assert_eq!(error.to_string(), mismatched);
     }
 
     #[test]
