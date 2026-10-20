@@ -591,16 +591,18 @@ follow the same flow with their own platform jobs:
 - `Required status check` fails unless every job that the change schedules, including
   `platform-kvm`, `performance-gate`, and `nvx-microvm-tests-kvm`, has its expected result.
 
-Each platform job runs on its backend's benchmark runner. The job targets the pool's labels
-plus `benchmark`, which exactly one runner of each pool carries, so every run measures the
-series on the same VM, and the gate compares a pull request with history from that VM. The
-pools mix VMs whose results differ by more than the run-to-run noise: over the same `dev`
+Each platform job runs on its backend's dedicated benchmark runner. The job targets the
+pool's labels plus `benchmark`, which exactly one runner of each pool carries instead of
+`general`. Every other backend job requires `general`, so it cannot occupy the
+benchmark runner. Every run therefore measures the series on the same VM without waiting for
+an unrelated build or test, and the gate compares a pull request with history from that VM.
+Platform jobs from overlapping runs still serialize on their one eligible runner. The pools
+mix VMs whose results differ by more than the run-to-run noise: over the same `dev`
 commits, the WHP runners on Emerald Rapids hosts measured about 10% slower than those on Ice
 Lake hosts, and MSHV runners in another scale set measured guest-exit teardown several times
 slower (#415). A pooled series compared each pull request with whichever runners had measured
-the base-branch window, so runner placement alone could fail the gate. The benchmark runner
-also takes other jobs of its pool, so a platform job may wait for it, and the platform jobs of
-concurrent runs measure one after another. List the benchmark runners with
+the base-branch window, so runner placement alone could fail the gate. List the benchmark
+runners with
 `gh api repos/microsoft/nvx/actions/runners --jq '.runners[] | select(any(.labels[]; .name == "benchmark")) | .name'`,
 and provision them with the benchmark switch of the
 [runner setup scripts](../scripts/setup/README.md#github-actions-runners). Before it

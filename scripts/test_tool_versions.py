@@ -1075,6 +1075,8 @@ class RunnerSetupTests(unittest.TestCase):
                 required = f"linux,{backend},virtual-machine"
                 if benchmark == "true":
                     required += ",benchmark"
+                else:
+                    required += ",general"
                 for extra, expected in (
                     ("", required),
                     ("pool", f"{required},pool"),
@@ -1127,6 +1129,8 @@ class RunnerSetupTests(unittest.TestCase):
             "KVM",
             "benchmark",
             "Benchmark",
+            "general",
+            "General",
             "pool,POOL",
             "pool,pool",
             ",pool",
@@ -1176,12 +1180,19 @@ catch {
 }
 """
         cases = (
-            ("", False, "windows,whp,virtual-machine"),
+            ("", False, "windows,whp,virtual-machine,general"),
             ("", True, "windows,whp,virtual-machine,benchmark"),
-            ("pool,fast-2", False, "windows,whp,virtual-machine,pool,fast-2"),
+            (
+                "pool,fast-2",
+                False,
+                "windows,whp,virtual-machine,general,pool,fast-2",
+            ),
             ("pool,fast-2", True, "windows,whp,virtual-machine,benchmark,pool,fast-2"),
             ("Windows", False, None),
             ("whp", False, None),
+            ("general", False, None),
+            ("benchmark", False, None),
+            ("general", True, None),
             ("benchmark", True, None),
             ("Benchmark", True, None),
             ("pool,POOL", False, None),

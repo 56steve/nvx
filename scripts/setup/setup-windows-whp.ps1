@@ -142,8 +142,14 @@ function Get-ExpectedRunnerLabels {
     if ($BenchmarkRunner) {
         $labels += "benchmark"
     }
+    else {
+        $labels += "general"
+    }
     if (-not [string]::IsNullOrEmpty($AdditionalLabels)) {
         foreach ($label in $AdditionalLabels.Split(',')) {
+            if ($label -in @("general", "benchmark")) {
+                throw "runner role label must be selected with -BenchmarkRunner: $label"
+            }
             if ($label -cnotmatch '^[A-Za-z0-9_.-]+$' -or
                 $labels -contains $label) {
                 throw "invalid or duplicate runner label: $label"

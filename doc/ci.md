@@ -2,13 +2,15 @@
 
 The GitHub Actions workflow has two microVM test layers on Azure-hosted
 self-hosted KVM, MSHV, and WHP virtual machines. Each backend has a pool of
-runners labeled by operating system, backend, and `virtual-machine`; see
+runners labeled by operating system, backend, and `virtual-machine`, plus one
+of two mutually exclusive roles; see
 [Job graph and runner capacity](#job-graph-and-runner-capacity) for their
-sizes. Jobs target the shared backend labels so any available matching runner
-can execute them. This allows the backend lanes to execute concurrently without
-binding a workload to a specific host. The platform benchmark jobs are the
-exception: each also requires the `benchmark` label, which one runner of each
-pool carries, so that every run measures its performance series on the same VM
+sizes. Every runner but one per backend carries `general`, which every
+non-benchmark backend job requires, so those jobs can use any of them without
+binding a workload to a specific host. The remaining runner carries `benchmark`
+instead of `general` and is dedicated to the platform job. This keeps unrelated
+long jobs from delaying the platform measurement and makes every run measure
+its performance series on the same VM
 (see [Benchmarks](benchmarks.md#ci-collection)). Before it measures, each
 platform job also checks that its runner is still the host that the series'
 history comes from (see
@@ -18,7 +20,7 @@ exercise OpenVMM's Linux MP-table lifecycle, TTRPC, and snapshot contracts on
 each backend. `openvmm-unit-tests` runs the OpenVMM unit and documentation
 tests once per operating system, on an MSHV runner and a WHP runner. The tests
 that need `/dev/kvm` or `/dev/mshv` are ignored, so the KVM and MSHV runners
-used to run the same 4,820 tests, and the MSHV pool has the most runners.
+used to run the same 4,820 tests; CI selects MSHV for that Linux leg.
 Failed `openvmm-vmm-tests` jobs upload Petri's `test_results` directory,
 including guest and VMM logs, screenshots, and watchdog inspection data.
 These seven-day artifacts are named
@@ -453,15 +455,33 @@ wait for its CLI job, a broken CLI does not occupy the hypervisor runners.
 `Required status check`, the development release, and performance persistence
 require both CLI jobs.
 
-The WHP pool has five runners, the KVM pool six, and the MSHV pool nine. Jobs
-wait seconds for a runner when one run is in flight, but the WHP jobs are the
-longest: the OpenVMM VMM and unit tests compile OpenVMM on Windows for about 15
-and 13 minutes before testing. A full run occupies the WHP pool for most of its
-duration, so overlapping pull requests queue there first. Each platform job
-waits for its backend's benchmark runner, which also takes other jobs of its
-pool, so the platform jobs of overlapping runs measure one after another. A
-change that adds a job or a shard needs runners to run it in parallel;
-otherwise it only queues.
+The KVM and MSHV pools have five runners each, and the WHP pool has nine. In
+each pool, one runner carries `benchmark` and runs only the platform job, and
+the others carry `general` and run all non-benchmark backend jobs. Platform
+jobs from overlapping workflow runs still measure one after another on their
+backend's single benchmark runner, but they never wait behind an unrelated
+build or test.
+
+The role split follows an October 15-20, 2026 scheduling audit, when each pool
+had five runners. Before the split, the benchmark runners spent about one third
+of their assignments on non-platform work; `azure-windows-5`, for example, ran
+102 platform jobs and 62 build or test jobs. Platform jobs queued for p50 6.3,
+p90 22.2, and at most 34.1 minutes on WHP, for p90 15.7 and at most 21.1
+minutes on KVM, and for p90 11.2 and at most 18.7 minutes on MSHV. The WHP
+platform job finished last in about a third of `dev` pushes and nearly half of
+full pull-request runs. Replaying the observed arrivals and durations with
+dedicated benchmark runners reduced WHP platform wait to about p90 3.6 and at
+most 8.4 minutes.
+
+The WHP jobs are the longest: the OpenVMM VMM and unit tests compile OpenVMM on
+Windows for about 15 and 13 minutes before testing, so overlapping runs queue
+on WHP first. Dedicating the benchmark runner takes it out of its pool's
+general capacity. In the replay, which left four general WHP runners, the WHP
+non-benchmark p90 wait rose from about three to five minutes, while the KVM and
+MSHV non-benchmark waits stayed near zero. The WHP pool has since grown to
+eight general runners, more than the five that served these jobs before the
+split. A change that adds a job or a shard needs general runners to run it in
+parallel; otherwise it only queues.
 
 ## Change classification
 

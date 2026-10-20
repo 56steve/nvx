@@ -78,7 +78,23 @@ function Get-ExtraRunnerLabels {
             throw 'Runner labels must preserve the platform and backend labels.'
         }
     }
-    return @($RunnerLabels | Select-Object -Skip $requiredLabels.Count) -join ','
+    [void](Test-BenchmarkRunner -RunnerLabels $RunnerLabels)
+    return @(
+        $RunnerLabels |
+            Select-Object -Skip $requiredLabels.Count |
+            Where-Object { $_ -notin @('general', 'benchmark') }
+    ) -join ','
+}
+
+function Test-BenchmarkRunner {
+    param([string[]]$RunnerLabels)
+    $roleLabels = @(
+        $RunnerLabels | Where-Object { $_ -in @('general', 'benchmark') }
+    )
+    if ($roleLabels -contains 'general' -and $roleLabels -contains 'benchmark') {
+        throw 'Runner labels must not contain both general and benchmark.'
+    }
+    return $roleLabels -contains 'benchmark'
 }
 
 function Set-RunnerMetadataFirewall {
@@ -267,6 +283,7 @@ try {
     $env:Path = $machinePath
 
     $extraLabels = Get-ExtraRunnerLabels -RunnerLabels @($config.runnerLabels)
+    $benchmarkRunner = Test-BenchmarkRunner -RunnerLabels @($config.runnerLabels)
     $arguments = @(
         '-RunnerOnly', '-RepositoryUrl', "https://github.com/$($config.repository)",
         '-RunnerDirectory', $config.runnerDirectory
@@ -290,9 +307,14 @@ try {
     if ($result -ne 0) { throw "Runner prerequisites failed: $result; see setup-prewarm.log." }
     if (Test-Path -LiteralPath $prerequisiteBootFile) { Remove-Item -LiteralPath $prerequisiteBootFile -Force }
     $registrationToken = Get-RegistrationToken
-    $result = Invoke-Setup -Arguments ($arguments + @(
+    $registrationArguments = $arguments + @(
         '-RunnerName', $runnerName, '-RunnerTokenStdin'
-    )) -OutputPath (Join-Path $stateRoot 'setup-registration.log') -Token $registrationToken
+    )
+    if ($benchmarkRunner) {
+        $registrationArguments += '-BenchmarkRunner'
+    }
+    $result = Invoke-Setup -Arguments $registrationArguments `
+        -OutputPath (Join-Path $stateRoot 'setup-registration.log') -Token $registrationToken
     $registrationToken = $null
     if ($result -eq 3010) {
         [IO.File]::WriteAllText($prerequisiteBootFile, $bootTime)

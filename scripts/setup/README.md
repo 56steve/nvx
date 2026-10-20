@@ -45,23 +45,49 @@ $token = $null
 ```
 
 Both scripts verify the Actions runner package against the manifest's
-checksum. Linux runner labels are `linux`, the selected backend, and
-`virtual-machine`. Windows labels are
-`windows`, `whp`, and `virtual-machine`. Runner names remain unique identities
-but are not registered as labels. Use `--extra-runner-labels LABELS` on Linux
-or `-ExtraRunnerLabels LABELS` on Windows to add comma-separated pool labels
-without removing these required labels. Labels may contain letters, digits,
-underscores, periods, and hyphens, and must not duplicate another label
-(case-insensitively). Changing a configured runner's labels requires a fresh
-registration token; check mode requires the same additional labels.
-`--benchmark-runner` on Linux and
-`-BenchmarkRunner` on Windows also register the `benchmark` label, which CI's
-platform jobs require. Exactly one runner of each backend's pool carries it, so
-that every run measures the backend's performance series on the same VM, and
-moving it to another runner changes the series; see
+checksum. Linux runner labels start with `linux`, the selected backend, and
+`virtual-machine`; Windows labels start with `windows`, `whp`, and
+`virtual-machine`. The scripts also assign exactly one runner role. By default
+they add `general`, which every non-benchmark backend job requires.
+`--benchmark-runner` on Linux and `-BenchmarkRunner` on Windows add
+`benchmark` instead, never `general`. Exactly one runner of each backend's pool
+uses that switch, so only the platform job can run there and every run measures
+the backend's performance series on the same VM. Moving the role to another
+runner changes the series; see
 [CI collection](../../doc/benchmarks.md#ci-collection). Provision the benchmark
 runner with the switch, and pass it when checking that runner: a label that was
 only added through the API is lost when provisioning replaces the registration.
+Runner names remain unique identities but are not registered as labels. Use
+`--extra-runner-labels LABELS` on Linux or `-ExtraRunnerLabels LABELS` on
+Windows to add comma-separated pool labels without removing the required
+labels. `general` and `benchmark` are reserved for the role switch. Other
+labels may contain letters, digits, underscores, periods, and hyphens, and must
+not duplicate another label case-insensitively. Changing a configured runner's
+labels requires a fresh registration token; check mode requires the same role
+and additional labels.
+
+Roll out the `general` selector to an existing fleet before merging a workflow
+that requires it:
+
+1. Add `general` to every non-benchmark runner. The labels endpoint is additive,
+   so this is harmless while existing jobs still target only the shared
+   platform labels. For each runner ID, run:
+
+   ```bash
+   gh api --method POST \
+     repos/microsoft/nvx/actions/runners/RUNNER_ID/labels \
+     -f 'labels[]=general'
+   ```
+
+   Do not add `general` to a runner that carries `benchmark`.
+2. After every general runner has the label, merge the workflow change. Reversing
+   these steps leaves non-benchmark jobs with no matching runner.
+
+A runner labeled only through the API keeps its previous labels in
+`.nvx-labels`, so check mode reports its labels as not validated, and its next
+provisioning run needs a registration token to register it again with
+`general`.
+
 Each series also names its benchmark runner's host in `data/<platform>-host.json`,
 and its platform job fails before it measures on a runner whose CPU, processors,
 memory, VM size, OS build, or benchmark disks and volumes differ from it. After

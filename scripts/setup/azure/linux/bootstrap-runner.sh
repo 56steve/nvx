@@ -18,11 +18,16 @@ if config["adminUsername"] in ("root","nvx-runner"):
 required=["linux",config["backend"],"virtual-machine"]
 if [label.lower() for label in config["runnerLabels"][:3]]!=required:
     raise SystemExit("Runner labels must preserve the platform and backend labels")
+additional=config["runnerLabels"][3:]
+roles={label.lower() for label in additional if label.lower() in ("general","benchmark")}
+if len(roles)>1:
+    raise SystemExit("Runner labels must not contain both general and benchmark")
 values=[
     config["backend"],config["adminUsername"],config["repository"],
-    ",".join(config["runnerLabels"][3:]),config["runnerDirectory"],
+    ",".join(label for label in additional if label.lower() not in ("general","benchmark")),
+    config["runnerDirectory"],
     str(config["dataDisk"]["lun"]),config["dataDisk"]["mountPoint"],
-    config["kernelMode"],
+    config["kernelMode"],str("benchmark" in roles).lower(),
 ]
 if (
     any(not isinstance(value,str) or "\n" in value or "\r" in value for value in values)
@@ -33,7 +38,7 @@ print("\n".join(values))
 PY
 )
 mapfile -t values <<<"$settings"
-[ "${#values[@]}" = 8 ] || {
+[ "${#values[@]}" = 9 ] || {
     echo "ERROR: incomplete bootstrap configuration" >&2
     exit 1
 }
@@ -45,6 +50,7 @@ runner_directory=${values[4]}
 export NVX_DATA_DISK_LUN=${values[5]}
 export NVX_DATA_DISK_MOUNT_POINT=${values[6]}
 kernel_mode=${values[7]}
+benchmark_runner=${values[8]}
 admin_uid=$(id -u "$admin_username")
 [ "$admin_uid" -ne 0 ] || {
     echo "ERROR: the runner administrator must not be root" >&2
@@ -157,10 +163,13 @@ if not token or "\n" in token or "\r" in token:
 print(token)
 PY
 )
+registration_arguments=("${setup_arguments[@]}" --runner-name "$runner_name")
+if [ "$benchmark_runner" = true ]; then
+    registration_arguments+=(--benchmark-runner)
+fi
 printf '%s\n' "$runner_token" |
     sudo -u "$admin_username" -H sh "$setup_root/setup-linux-runner.sh" \
-        "${setup_arguments[@]}" --runner-name "$runner_name" \
-        --runner-token-stdin
+        "${registration_arguments[@]}" --runner-token-stdin
 runner_token=
 
 read -r service_name <"$runner_directory/.service"
