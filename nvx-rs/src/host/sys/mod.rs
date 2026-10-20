@@ -21,7 +21,7 @@ use nix::unistd::{getegid, geteuid};
 #[cfg(feature = "cli")]
 pub(crate) use interrupt::{interrupted, watch_interrupts, write_interruptibly};
 #[cfg(target_os = "linux")]
-pub(crate) use process::{PidFd, detach};
+pub(crate) use process::{PidFd, detach, process_exists};
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) use process::{clear_close_on_exec, mark_listed_descriptors_on_spawn};
 #[cfg(target_os = "linux")]

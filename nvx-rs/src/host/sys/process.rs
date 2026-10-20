@@ -10,9 +10,9 @@ use std::time::Duration;
 use nix::fcntl::{FcntlArg, FdFlag, OFlag, fcntl, open};
 use nix::libc;
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
-use nix::sys::signal::Signal;
+use nix::sys::signal::{self, Signal};
 use nix::sys::stat::Mode;
-use nix::unistd::setsid;
+use nix::unistd::{Pid, setsid};
 
 use super::Errno;
 
@@ -82,6 +82,22 @@ impl PidFd {
             )
         })?;
         Ok(())
+    }
+}
+
+/// Returns whether a process has the ID `pid`, as signal 0 shows without signaling it.
+///
+/// Only `ESRCH` means that no process has the ID: another user's process, which refuses the
+/// signal with `EPERM`, has it too, and a process that exited keeps it until it is reaped.
+pub(crate) fn process_exists(pid: u32) -> io::Result<bool> {
+    // Signal 0 to the ID 0, or to a negative one, would test a process group instead.
+    let Some(pid) = libc::pid_t::try_from(pid).ok().filter(|&pid| pid > 0) else {
+        return Ok(false);
+    };
+    match signal::kill(Pid::from_raw(pid), None) {
+        Ok(()) | Err(Errno::EPERM) => Ok(true),
+        Err(Errno::ESRCH) => Ok(false),
+        Err(error) => Err(error.into()),
     }
 }
 

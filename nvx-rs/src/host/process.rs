@@ -179,9 +179,9 @@ impl Process {
     /// Fails with [`io::ErrorKind::PermissionDenied`] when the process that has the ID hides its
     /// identity from this user: on Windows, when this user may not query it, and on Linux, when
     /// `/proc` does not show it, as its `hidepid` mount option arranges for the processes of
-    /// other users. Linux hosts without pidfds cannot tell such a process from an exited one.
-    /// Fails with [`io::ErrorKind::InvalidInput`] for a process ID that the host never assigns,
-    /// such as 0, and with [`io::ErrorKind::Unsupported`] on hosts other than Linux and Windows.
+    /// other users. Fails with [`io::ErrorKind::InvalidInput`] for a process ID that the host
+    /// never assigns, such as 0, and with [`io::ErrorKind::Unsupported`] on hosts other than
+    /// Linux and Windows.
     pub fn open(reference: &ProcessRef) -> io::Result<Option<Self>> {
         let handle = open_reference(reference, BootId::current, platform::open_process)?;
         Ok(handle.map(|handle| Self {
@@ -266,7 +266,7 @@ fn open_reference<H>(
 }
 
 /// Waits until the process that `handle` holds exits or `deadline` passes, and returns whether
-/// it exited, polling the identity `pid` and `start_time` where the handle has no exit event.
+/// it exited, checking the identity `pid` and `start_time` where the handle has no exit event.
 fn wait_handle(
     handle: &platform::ProcessHandle,
     pid: u32,
@@ -275,20 +275,20 @@ fn wait_handle(
 ) -> io::Result<bool> {
     match handle.wait(deadline)? {
         Some(exited) => Ok(exited),
-        None => poll_exit(start_time, deadline, || platform::process_start_time(pid)),
+        // Each check verifies the identity as `Process::open` does, so that a process that
+        // `/proc` hides never counts as exited.
+        None => poll_exit(deadline, || {
+            Ok(platform::open_process(pid, start_time)?.is_some())
+        }),
     }
 }
 
-/// Checks the start time that `current` reports, at every [`POLL_INTERVAL`] until it differs
-/// from `start_time` or `deadline` passes, and returns whether it differed: the process exited,
-/// even if another one reused its ID.
-fn poll_exit(
-    start_time: u64,
-    deadline: Instant,
-    mut current: impl FnMut() -> io::Result<Option<u64>>,
-) -> io::Result<bool> {
+/// Asks `runs` whether the process still runs, at every [`POLL_INTERVAL`] until it does not or
+/// `deadline` passes, and returns whether it stopped running: it exited, even if another
+/// process reused its ID.
+fn poll_exit(deadline: Instant, mut runs: impl FnMut() -> io::Result<bool>) -> io::Result<bool> {
     loop {
-        if current()? != Some(start_time) {
+        if !runs()? {
             return Ok(true);
         }
         let now = Instant::now();
@@ -777,18 +777,16 @@ mod reference_tests {
     fn polling_checks_the_identity_until_the_deadline() {
         let later = Instant::now() + Duration::from_secs(60);
         // The process exits after two checks.
-        let mut checks = [Ok(Some(42)), Ok(Some(42)), Ok(None)].into_iter();
-        assert!(poll_exit(42, later, || checks.next().unwrap()).unwrap());
-        // Another process reused the ID, so the referenced one exited.
-        assert!(poll_exit(42, later, || Ok(Some(43))).unwrap());
+        let mut checks = [Ok(true), Ok(true), Ok(false)].into_iter();
+        assert!(poll_exit(later, || checks.next().unwrap()).unwrap());
         // The process runs past the deadline, which bounds the wait.
         let started = Instant::now();
         let deadline = started + Duration::from_millis(80);
-        assert!(!poll_exit(42, deadline, || Ok(Some(42))).unwrap());
+        assert!(!poll_exit(deadline, || Ok(true)).unwrap());
         assert!(Instant::now() >= deadline);
         assert!(started.elapsed() < Duration::from_secs(10));
         // A check that cannot determine the state ends the wait with its error, not an exit.
-        let error = poll_exit(42, later, || Err(io::Error::other("unreadable"))).unwrap_err();
+        let error = poll_exit(later, || Err(io::Error::other("unreadable"))).unwrap_err();
         assert_eq!(error.to_string(), "unreadable");
     }
 
@@ -816,18 +814,11 @@ mod reference_tests {
         let mut child = sleeper().spawn().unwrap();
         let pid = child.id();
         let start_time = platform::process_start_time(pid).unwrap().unwrap();
-        let current = || platform::process_start_time(pid);
-        let running = poll_exit(
-            start_time,
-            Instant::now() + Duration::from_millis(80),
-            current,
-        );
+        let runs =
+            || -> io::Result<bool> { Ok(platform::open_process(pid, start_time)?.is_some()) };
+        let running = poll_exit(Instant::now() + Duration::from_millis(80), runs);
         child.kill().unwrap();
-        let exited = poll_exit(
-            start_time,
-            Instant::now() + Duration::from_secs(10),
-            current,
-        );
+        let exited = poll_exit(Instant::now() + Duration::from_secs(10), runs);
         child.wait().unwrap();
         assert!(!running.unwrap());
         assert!(exited.unwrap());
@@ -970,30 +961,32 @@ mod tests {
     }
 
     #[test]
-    fn a_process_that_proc_hides_runs_while_its_pidfd_says_so() {
+    fn a_process_that_proc_hides_never_counts_as_exited() {
         let mut child = Reaped(sleeper().spawn().unwrap());
         let pid = child.0.id();
         let start_time = platform::process_start_time(pid).unwrap().unwrap();
         let pidfd = || Some(sys::PidFd::open(pid).unwrap());
-        // `/proc` hides the process, as `hidepid` hides the processes of other users.
-        let hidden = platform::check_identity(pid, start_time, pidfd(), None);
-        assert_eq!(
-            hidden.err().unwrap().kind(),
-            io::ErrorKind::PermissionDenied
-        );
-        // Without a pidfd, it cannot be told from an exited process.
-        let unheld = platform::check_identity(pid, start_time, None, None);
-        assert!(unheld.unwrap().is_none());
+        // `/proc` hides the process, as `hidepid` hides the processes of other users, while its
+        // pidfd, or without one, signal 0, shows that a process has its ID.
+        for pidfd in [pidfd(), None] {
+            let hidden = platform::check_identity(pid, start_time, pidfd, None);
+            assert_eq!(
+                hidden.err().unwrap().kind(),
+                io::ErrorKind::PermissionDenied
+            );
+        }
         // Shown, it is held.
         let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
         let shown = platform::check_identity(pid, start_time, pidfd(), Some(stat));
         assert!(shown.unwrap().is_some());
-        // Once it has exited, its pidfd says so.
+        // Once it has exited, its pidfd says so, and once it is reaped, no process has its ID.
         let held = pidfd();
         child.0.kill().unwrap();
         child.0.wait().unwrap();
         let exited = platform::check_identity(pid, start_time, held, None);
         assert!(exited.unwrap().is_none());
+        let reaped = platform::check_identity(pid, start_time, None, None);
+        assert!(reaped.unwrap().is_none());
     }
 
     #[test]

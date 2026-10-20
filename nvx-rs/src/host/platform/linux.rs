@@ -170,10 +170,11 @@ pub(crate) fn open_process(pid: u32, start_time: u64) -> io::Result<Option<Proce
 /// `stat`, its `/proc/<pid>/stat` line read after the pidfd was opened, shows that it still runs
 /// with the start time `start_time`, and `None` if it has exited.
 ///
-/// A missing line means that the process exited, unless its pidfd shows that it still runs:
-/// `/proc` then hides it from this user, as the `hidepid` mount option hides the processes of
-/// other users, and the check fails with [`io::ErrorKind::PermissionDenied`] since the process's
-/// identity cannot be read. Without a pidfd, such a process counts as exited.
+/// A missing line means that the process exited, unless a process still has the ID: its pidfd
+/// shows that it runs, or without a pidfd, signal 0 finds a process with the ID, which may be
+/// another one that reused it. `/proc` then hides that process from this user, as the `hidepid`
+/// mount option hides the processes of other users, and the check fails with
+/// [`io::ErrorKind::PermissionDenied`] since the process's identity cannot be read.
 pub(crate) fn check_identity(
     pid: u32,
     start_time: u64,
@@ -181,9 +182,11 @@ pub(crate) fn check_identity(
     stat: Option<String>,
 ) -> io::Result<Option<ProcessHandle>> {
     let Some(stat) = stat else {
-        if let Some(pidfd) = &pidfd
-            && !pidfd.wait_exit(Duration::ZERO)?
-        {
+        let held = match &pidfd {
+            Some(pidfd) => !pidfd.wait_exit(Duration::ZERO)?,
+            None => sys::process_exists(pid)?,
+        };
+        if held {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 format!(
