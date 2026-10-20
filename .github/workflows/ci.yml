@@ -12,9 +12,12 @@ on:
   push:
     branches:
       - dev
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: ci-${{ github.workflow }}-${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && format('full-{0}', github.run_id) || github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
@@ -38,8 +41,11 @@ jobs:
         with:
           persist-credentials: false
 
+      # Scheduled and manually dispatched full runs save no caches.
       - name: Check code quality
         uses: ./.github/actions/check-quality
+        with:
+          save-cache: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
 
   aci-edge-sandboxes:
     name: aci-edge-sandboxes / ${{ matrix.os }}
@@ -97,7 +103,7 @@ jobs:
           github.event.pull_request.draft == false
         ) &&
         (
-          github.event_name == 'push' ||
+          github.event_name != 'pull_request' ||
           github.event.pull_request.head.repo.full_name == github.repository
         )
       }}
@@ -178,7 +184,7 @@ jobs:
           github.event.pull_request.draft == false
         ) &&
         (
-          github.event_name == 'push' ||
+          github.event_name != 'pull_request' ||
           github.event.pull_request.head.repo.full_name == github.repository
         )
       }}
@@ -274,9 +280,9 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      # `nvx.py classify-ci-changes` selects the suites; this script only
-      # resolves the changed files and runs the full matrix whenever it
-      # cannot classify them.
+      # `nvx.py classify-ci-changes` selects the suites for pushes and pull
+      # requests; this script selects the full matrix for full-run events and
+      # whenever it cannot classify changed files.
       - name: Detect relevant changes
         id: changes
         shell: bash
@@ -298,6 +304,12 @@ jobs:
               echo "$1"
             } >> "${GITHUB_STEP_SUMMARY}"
           }
+
+          if [[ "${EVENT_NAME}" == "schedule" ||
+                "${EVENT_NAME}" == "workflow_dispatch" ]]; then
+            run_everything "The ${EVENT_NAME} event runs the full matrix without change classification."
+            exit 0
+          fi
 
           if [[ -z "${BASE_SHA}" || "${BASE_SHA}" =~ ^0+$ ]]; then
             run_everything "The comparison base is unavailable, so the safe fallback is to run the full matrix."
@@ -358,9 +370,13 @@ jobs:
         with:
           persist-credentials: false
 
+      # Full runs build the guest artifacts that miss the cache without saving
+      # them.
       - name: Build guest artifacts
         id: guest-artifacts
         uses: ./.github/actions/build-guest-artifacts
+        with:
+          save-cache: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
 
       - name: Upload guest artifacts
         uses: actions/upload-artifact@v7
@@ -414,6 +430,7 @@ jobs:
         with:
           debug-kernel: "true"
           guest-images: "false"
+          save-cache: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
 
       - name: Upload guest debug kernel
         uses: actions/upload-artifact@v7
@@ -438,7 +455,7 @@ jobs:
           github.event.pull_request.draft == false
         ) &&
         (
-          github.event_name == 'push' ||
+          github.event_name != 'pull_request' ||
           github.event.pull_request.head.repo.full_name == github.repository
         ) &&
         (
@@ -469,7 +486,7 @@ jobs:
           github.event.pull_request.draft == false
         ) &&
         (
-          github.event_name == 'push' ||
+          github.event_name != 'pull_request' ||
           github.event.pull_request.head.repo.full_name == github.repository
         ) &&
         (
@@ -500,7 +517,7 @@ jobs:
           github.event.pull_request.draft == false
         ) &&
         (
-          github.event_name == 'push' ||
+          github.event_name != 'pull_request' ||
           github.event.pull_request.head.repo.full_name == github.repository
         ) &&
         (
@@ -531,7 +548,7 @@ jobs:
           github.event.pull_request.draft == false
         ) &&
         (
-          github.event_name == 'push' ||
+          github.event_name != 'pull_request' ||
           github.event.pull_request.head.repo.full_name == github.repository
         ) &&
         needs.artifacts.result == 'success' &&
@@ -763,7 +780,7 @@ jobs:
           github.event.pull_request.draft == false
         ) &&
         (
-          github.event_name == 'push' ||
+          github.event_name != 'pull_request' ||
           github.event.pull_request.head.repo.full_name == github.repository
         ) &&
         (
@@ -968,7 +985,7 @@ jobs:
           github.event.pull_request.draft == false
         ) &&
         (
-          github.event_name == 'push' ||
+          github.event_name != 'pull_request' ||
           github.event.pull_request.head.repo.full_name == github.repository
         ) &&
         needs.artifacts.result == 'success' &&
@@ -1001,7 +1018,7 @@ jobs:
           github.event.pull_request.draft == false
         ) &&
         (
-          github.event_name == 'push' ||
+          github.event_name != 'pull_request' ||
           github.event.pull_request.head.repo.full_name == github.repository
         ) &&
         needs.artifacts.result == 'success' &&
@@ -1034,7 +1051,7 @@ jobs:
           github.event.pull_request.draft == false
         ) &&
         (
-          github.event_name == 'push' ||
+          github.event_name != 'pull_request' ||
           github.event.pull_request.head.repo.full_name == github.repository
         ) &&
         needs.artifacts.result == 'success' &&
@@ -1055,8 +1072,8 @@ jobs:
     secrets:
       OPENVMM_DEPLOY_KEY: ${{ secrets.OPENVMM_DEPLOY_KEY }}
 
-  # Pull requests run the debug kernel on KVM only; dev pushes run every
-  # backend.
+  # Pull requests run the debug kernel on KVM only; dev pushes and full runs
+  # run every backend.
   nvx-microvm-debug-kvm:
     name: NVX microVM tests / Linux / KVM / Debug kernel
     needs: [artifacts, debug-kernel, build-openvmm-linux-gnu, nvx-cli-linux, openvmm-changes]
@@ -1069,7 +1086,7 @@ jobs:
           github.event.pull_request.draft == false
         ) &&
         (
-          github.event_name == 'push' ||
+          github.event_name != 'pull_request' ||
           github.event.pull_request.head.repo.full_name == github.repository
         ) &&
         needs.artifacts.result == 'success' &&
@@ -1099,7 +1116,7 @@ jobs:
       ${{
         always() &&
         !cancelled() &&
-        github.event_name == 'push' &&
+        github.event_name != 'pull_request' &&
         needs.artifacts.result == 'success' &&
         needs.debug-kernel.result == 'success' &&
         needs.build-openvmm-linux-gnu.result == 'success' &&
@@ -1127,7 +1144,7 @@ jobs:
       ${{
         always() &&
         !cancelled() &&
-        github.event_name == 'push' &&
+        github.event_name != 'pull_request' &&
         needs.artifacts.result == 'success' &&
         needs.debug-kernel.result == 'success' &&
         needs.build-openvmm-windows-msvc.result == 'success' &&
@@ -1166,7 +1183,7 @@ jobs:
           github.event.pull_request.draft == false
         ) &&
         (
-          github.event_name == 'push' ||
+          github.event_name != 'pull_request' ||
           github.event.pull_request.head.repo.full_name == github.repository
         ) &&
         needs.artifacts.result == 'success' &&
@@ -1206,7 +1223,7 @@ jobs:
           github.event.pull_request.draft == false
         ) &&
         (
-          github.event_name == 'push' ||
+          github.event_name != 'pull_request' ||
           github.event.pull_request.head.repo.full_name == github.repository
         ) &&
         needs.artifacts.result == 'success' &&
@@ -1246,7 +1263,7 @@ jobs:
           github.event.pull_request.draft == false
         ) &&
         (
-          github.event_name == 'push' ||
+          github.event_name != 'pull_request' ||
           github.event.pull_request.head.repo.full_name == github.repository
         ) &&
         needs.artifacts.result == 'success' &&

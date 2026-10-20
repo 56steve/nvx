@@ -26,9 +26,10 @@ the branch lands in `dev`; give each one a subject that follows the
 [conventions](#commits-and-pull-requests).
 
 CI runs the jobs that need the OpenVMM deploy key or a hypervisor runner,
-including the NVX CLI tests, only for pushes and same-repository pull
-requests. A pull request from a fork runs the remaining GitHub-hosted checks,
-and a maintainer stages it on a `microsoft/nvx` branch to run the rest; see
+including the NVX CLI tests, only for pushes, scheduled and manually
+dispatched full runs, and same-repository pull requests. A pull request from a
+fork runs the remaining GitHub-hosted checks, and a maintainer stages it on a
+`microsoft/nvx` branch to run the rest; see
 [Job graph and runner capacity](ci.md#job-graph-and-runner-capacity).
 
 ## Commits and pull requests

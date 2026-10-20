@@ -224,6 +224,31 @@ def _outer_parentheses_enclose(expression: str) -> bool:
     return depth == 0 and quote is None
 
 
+def _expression_conjuncts(expression: str) -> list[str]:
+    """Split a GitHub Actions expression at its top-level && operators."""
+    expression = " ".join(expression.split())
+    if expression.startswith("${{") and expression.endswith("}}"):
+        expression = expression[3:-2].strip()
+    conjuncts: list[str] = []
+    depth = 0
+    quoted = False
+    start = 0
+    for index, character in enumerate(expression):
+        if character == "'":
+            quoted = not quoted
+        elif quoted:
+            continue
+        elif character == "(":
+            depth += 1
+        elif character == ")":
+            depth -= 1
+        elif depth == 0 and expression.startswith("&&", index):
+            conjuncts.append(expression[start:index].strip())
+            start = index + 2
+    conjuncts.append(expression[start:].strip())
+    return conjuncts
+
+
 def _write_release_fixture(
     root: Path,
 ) -> tuple[dict[str, Path], dict[str, object], str]:
@@ -595,6 +620,33 @@ class CliTests(_CheckoutArtifacts):
             args = nvx.parse_args(argv)
             for flag in flags:
                 self.assertEqual(getattr(args, flag[2:].replace("-", "_")), value)
+
+    def test_check_required_ci_accepts_every_ci_workflow_event(self):
+        base = [
+            "check-required-ci",
+            "--event-name",
+            "",
+            "--same-repository",
+            "true",
+            "--run-tests",
+            "true",
+            "--run-workloads",
+            "true",
+            "--run-openvmm-unit-tests",
+            "true",
+            "--run-openvmm-vmm-tests",
+            "true",
+        ]
+        for event_name in (
+            "pull_request",
+            "push",
+            "schedule",
+            "workflow_dispatch",
+        ):
+            argv = list(base)
+            argv[argv.index("--event-name") + 1] = event_name
+            with self.subTest(event_name=event_name):
+                self.assertEqual(nvx.parse_args(argv).event_name, event_name)
 
     def test_guest_selection_includes_azure_linux(self):
         args = nvx.parse_args(["build-initramfs", "--guest", "azurelinux"])
@@ -3741,6 +3793,14 @@ class CiConfigurationTests(unittest.TestCase):
         platforms = set(ci.REQUIRED_CI_PLATFORM_JOBS)
         workloads = artifacts | builds | platforms
         microvm = microvm_tests | debug_kernel
+        full_matrix = (
+            repository
+            | workloads
+            | openvmm_tests
+            | openvmm_artifact_tests
+            | microvm
+            | debug_kernel_push
+        )
         # Event, same repository, the change detector's outputs (tests,
         # workloads, OpenVMM unit tests, OpenVMM VMM tests), and the jobs that
         # must succeed; every other required job must be skipped.
@@ -3813,13 +3873,10 @@ class CiConfigurationTests(unittest.TestCase):
                 "push",
                 True,
                 (True, True, True, True),
-                repository
-                | workloads
-                | openvmm_tests
-                | openvmm_artifact_tests
-                | microvm
-                | debug_kernel_push,
+                full_matrix,
             ),
+            ("schedule", False, (True, True, True, True), full_matrix),
+            ("workflow_dispatch", False, (True, True, True, True), full_matrix),
         )
 
         for event_name, same_repository, flags, successful_jobs in cases:
@@ -3918,9 +3975,200 @@ class CiConfigurationTests(unittest.TestCase):
                 )
                 self.assertIn(f'--{output} "${{{environment}}}"', job)
 
+    def test_ci_full_run_triggers_and_concurrency_are_separate(self):
+        workflow = (
+            BuildConstants.REPO_ROOT / ".github" / "workflows" / "ci.yml"
+        ).read_text(encoding="utf-8")
+        header = workflow.split("\njobs:\n", 1)[0]
+
+        self.assertIn('  schedule:\n    - cron: "17 5 * * *"\n', header)
+        self.assertIn("  workflow_dispatch:\n\nconcurrency:\n", header)
+        self.assertIn(
+            "(github.event_name == 'schedule' || "
+            "github.event_name == 'workflow_dispatch') && "
+            "format('full-{0}', github.run_id) || "
+            "github.event.pull_request.number || github.ref",
+            header,
+        )
+        self.assertIn(
+            "cancel-in-progress: ${{ github.event_name == 'pull_request' }}",
+            header,
+        )
+
+    def test_ci_full_runs_short_circuit_change_detection(self):
+        workflow = (
+            BuildConstants.REPO_ROOT / ".github" / "workflows" / "ci.yml"
+        ).read_text(encoding="utf-8")
+        step = _workflow_step(workflow, "openvmm-changes", "Detect relevant changes")
+        full_run = (
+            'if [[ "${EVENT_NAME}" == "schedule" ||\n'
+            '                "${EVENT_NAME}" == "workflow_dispatch" ]]; then'
+        )
+
+        self.assertIn(full_run, step)
+        self.assertIn(
+            'run_everything "The ${EVENT_NAME} event runs the full matrix '
+            'without change classification."',
+            step,
+        )
+        self.assertLess(
+            step.index(full_run),
+            step.index('if [[ -z "${BASE_SHA}" || "${BASE_SHA}" =~ ^0+$ ]]'),
+        )
+        self.assertLess(
+            step.index(full_run),
+            step.index("python3 scripts/nvx.py classify-ci-changes"),
+        )
+
+    def test_ci_repository_jobs_run_for_every_non_pull_request_event(self):
+        workflow = (
+            BuildConstants.REPO_ROOT / ".github" / "workflows" / "ci.yml"
+        ).read_text(encoding="utf-8")
+        repository_gate = (
+            "github.event_name != 'pull_request' ||\n"
+            "          github.event.pull_request.head.repo.full_name "
+            "== github.repository"
+        )
+        gated_jobs = (
+            *ci.REQUIRED_CI_CLI_JOBS,
+            *ci.REQUIRED_CI_BUILD_JOBS,
+            *ci.REQUIRED_CI_OPENVMM_TEST_JOBS,
+            *ci.REQUIRED_CI_OPENVMM_ARTIFACT_TEST_JOBS,
+            *ci.REQUIRED_CI_MICROVM_TEST_JOBS,
+            *ci.REQUIRED_CI_MICROVM_DEBUG_JOBS,
+            *ci.REQUIRED_CI_PLATFORM_JOBS,
+        )
+        for job_name in gated_jobs:
+            with self.subTest(job=job_name):
+                self.assertIn(repository_gate, _workflow_job(workflow, job_name))
+        self.assertNotIn("github.event_name == 'push' ||", workflow)
+        for job_name in ci.REQUIRED_CI_MICROVM_DEBUG_PUSH_JOBS:
+            with self.subTest(job=job_name):
+                job = _workflow_job(workflow, job_name)
+                self.assertIn("github.event_name != 'pull_request' &&", job)
+                self.assertNotIn("github.event_name == 'push'", job)
+
+    def test_ci_full_runs_do_not_publish_persist_or_save_caches(self):
+        github = BuildConstants.REPO_ROOT / ".github"
+        workflow = (github / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        push_to_dev = (
+            "github.event_name == 'push' &&\n        github.ref == 'refs/heads/dev' &&"
+        )
+        for job_name in ("release", "performance-persist"):
+            with self.subTest(job=job_name):
+                self.assertIn(push_to_dev, _workflow_job(workflow, job_name))
+        self.assertIn(
+            "github.event_name == 'pull_request' &&",
+            _workflow_job(workflow, "performance-gate"),
+        )
+
+        # Every cache write in ci.yml, and in the actions and reusable
+        # workflows that it reaches, runs only for dev pushes or only while a
+        # save-cache input is true, which only pushes and pull requests set.
+        # setup-python saves its cache whenever it misses, so its cache input
+        # follows save-cache too.
+        save_cache = (
+            "${{ github.event_name == 'pull_request' || github.event_name == 'push' }}"
+        )
+        writes: dict[str, int] = {}
+        save_cache_actions: set[str] = set()
+        calls: list[tuple[str, str, dict[str, object]]] = []
+        visited: set[str] = set()
+        pending = ["workflows/ci.yml"]
+        while pending:
+            source = pending.pop()
+            if source in visited:
+                continue
+            visited.add(source)
+            parsed = yaml.safe_load((github / source).read_text(encoding="utf-8"))
+            if "save-cache" in parsed.get("inputs", {}):
+                save_cache_actions.add(source)
+            if "runs" in parsed:
+                entries = list(parsed["runs"]["steps"])
+            else:
+                entries = [
+                    entry
+                    for job in parsed["jobs"].values()
+                    for entry in ([job] if "uses" in job else job["steps"])
+                ]
+            for entry in entries:
+                uses = str(entry.get("uses", ""))
+                arguments = entry.get("with", {})
+                name = f"{source}: {entry.get('name', uses)}"
+                if uses.startswith("./.github/"):
+                    callee = uses.removeprefix("./.github/")
+                    if not callee.endswith(".yml"):
+                        callee = f"{callee}/action.yml"
+                    calls.append((name, callee, arguments))
+                    pending.append(callee)
+                    continue
+                with self.subTest(step=name):
+                    self.assertFalse(
+                        uses.startswith("actions/cache@"),
+                        "actions/cache saves after every miss",
+                    )
+                    if uses.startswith("actions/cache/save@"):
+                        conjuncts = _expression_conjuncts(str(entry.get("if", "")))
+                        for conjunct in conjuncts:
+                            if "||" in conjunct:
+                                self.assertTrue(
+                                    _outer_parentheses_enclose(conjunct), conjunct
+                                )
+                        self.assertTrue(
+                            "inputs.save-cache == 'true'" in conjuncts
+                            or {
+                                "github.event_name == 'push'",
+                                "github.ref == 'refs/heads/dev'",
+                            }
+                            <= set(conjuncts),
+                            conjuncts,
+                        )
+                    elif uses.startswith("actions/setup-") and "cache" in arguments:
+                        self.assertRegex(
+                            str(arguments["cache"]),
+                            r"^\$\{\{ inputs\.save-cache == 'true' && '[a-z]+' "
+                            r"\|\| '' \}\}$",
+                        )
+                    else:
+                        # Only cache writes follow save-cache, so builds still
+                        # run when an artifact misses the cache.
+                        self.assertNotIn("save-cache", str(entry))
+                        continue
+                writes[source] = writes.get(source, 0) + 1
+
+        self.assertEqual(
+            writes,
+            {
+                "workflows/ci.yml": 8,
+                "actions/build-openvmm/action.yml": 2,
+                "actions/build-guest-artifacts/action.yml": 6,
+                "actions/check-quality/action.yml": 1,
+            },
+        )
+        self.assertEqual(
+            save_cache_actions,
+            {
+                "actions/build-guest-artifacts/action.yml",
+                "actions/check-quality/action.yml",
+            },
+        )
+        save_cache_calls = [
+            (name, arguments)
+            for name, callee, arguments in calls
+            if callee in save_cache_actions
+        ]
+        self.assertEqual(len(save_cache_calls), 3)
+        for name, arguments in save_cache_calls:
+            with self.subTest(call=name):
+                self.assertEqual(arguments.get("save-cache"), save_cache)
+        # No other push-only job condition is allowed in this workflow: only
+        # its eight cache saves, the release, performance persistence, and the
+        # three save-cache arguments name the push event.
+        self.assertEqual(workflow.count("github.event_name == 'push'"), 13)
+
     def test_ci_change_classification_selects_suites_by_input(self):
-        # The pull-request outputs (tests, workloads, OpenVMM unit tests,
-        # OpenVMM VMM tests) for each class of changed path.
+        # The outputs (tests, workloads, OpenVMM unit tests, OpenVMM VMM
+        # tests) for each class of changed path.
         cases = (
             ((), (False, True, False, False)),
             (("doc/ci.md", "README.md", "DOC/Guide.MD"), (False, False, False, False)),
@@ -3976,20 +4224,30 @@ class CiConfigurationTests(unittest.TestCase):
         )
         for changed_files, flags in cases:
             with self.subTest(changed_files=changed_files):
-                pull_request = ci.classify_ci_changes("pull_request", changed_files)
-                self.assertEqual(pull_request, ci.CiChanges(*flags))
-                # Pushes keep running both OpenVMM suites with the tests.
-                run_tests, run_workloads = flags[:2]
-                self.assertEqual(
-                    ci.classify_ci_changes("push", changed_files),
-                    ci.CiChanges(run_tests, run_workloads, run_tests, run_tests),
-                )
+                for event_name in ("pull_request", "push"):
+                    with self.subTest(event_name=event_name):
+                        self.assertEqual(
+                            ci.classify_ci_changes(event_name, changed_files),
+                            ci.CiChanges(*flags),
+                        )
         self.assertEqual(
             ci.classify_ci_changes("pull_request", ["openvmm", ""]),
             ci.classify_ci_changes("pull_request", ["openvmm"]),
         )
         with self.assertRaisesRegex(ValueError, "unsupported CI event"):
             ci.classify_ci_changes("workflow_dispatch", ["openvmm"])
+
+    def test_push_classifies_each_openvmm_suite_by_its_inputs(self):
+        self.assertEqual(
+            ci.classify_ci_changes("push", ["guest/common/init"]),
+            ci.CiChanges(True, True, False, True),
+        )
+        self.assertEqual(
+            ci.classify_ci_changes(
+                "push", ["tests/runtime-adapter/src/bin/runtime-adapter-host.rs"]
+            ),
+            ci.CiChanges(True, True, False, False),
+        )
 
     def test_ci_change_classification_runs_microvm_tests_for_the_runtime_adapter(self):
         # The microVM jobs run the runtime adapter's scenarios on every backend,
@@ -4025,7 +4283,7 @@ class CiConfigurationTests(unittest.TestCase):
                 self.assertEqual(changes, ci.CiChanges(True, True, False, False))
                 self.assertEqual(
                     ci.classify_ci_changes("push", changed_files),
-                    ci.CiChanges(True, True, True, True),
+                    ci.CiChanges(True, True, False, False),
                 )
                 expected = ci.required_ci_expected_results(
                     "pull_request", same_repository=True, changes=changes
@@ -4206,11 +4464,7 @@ class CiConfigurationTests(unittest.TestCase):
         push = ci.describe_ci_changes(
             "push", changed_files, ci.classify_ci_changes("push", changed_files)
         )
-        self.assertIn(
-            "### OpenVMM unit tests: run\n"
-            "Pushes run every OpenVMM suite whenever the tests run.\n",
-            push,
-        )
+        self.assertEqual(push, summary)
         documentation = ci.describe_ci_changes(
             "pull_request",
             ["doc/ci.md"],
@@ -4377,9 +4631,7 @@ class CiConfigurationTests(unittest.TestCase):
                         expected = {
                             "run-tests": str(test_input).lower(),
                             "run-workloads": str(test_input).lower(),
-                            "run-openvmm-unit-tests": str(
-                                test_input and event == "push"
-                            ).lower(),
+                            "run-openvmm-unit-tests": "false",
                             "run-openvmm-vmm-tests": str(test_input).lower(),
                         }
                         self.assertEqual(actual, expected)
@@ -4426,6 +4678,16 @@ python3() {
             "run-openvmm-vmm-tests": "false",
         }
         cases = (
+            (
+                "schedule",
+                {"EVENT_NAME": "schedule", "GIT_CAT_FILE_STATUS": "1"},
+                everything,
+            ),
+            (
+                "workflow_dispatch",
+                {"EVENT_NAME": "workflow_dispatch", "GIT_CAT_FILE_STATUS": "1"},
+                everything,
+            ),
             ("missing base", {"BASE_SHA": ""}, everything),
             ("zero base", {"BASE_SHA": "0" * 40}, everything),
             ("missing commit", {"GIT_CAT_FILE_STATUS": "1"}, everything),
@@ -4495,6 +4757,12 @@ python3() {
                 summary = (root / "summary").read_text(encoding="utf-8")
                 if expected is everything:
                     self.assertIn("### Full matrix: run\n", summary)
+                    if name in ("schedule", "workflow_dispatch"):
+                        self.assertIn(
+                            f"The {name} event runs the full matrix without "
+                            "change classification.",
+                            summary,
+                        )
                 else:
                     self.assertNotIn("Full matrix", summary)
 
@@ -5051,7 +5319,7 @@ python3() {
                     continue
                 self.assertNotIn("restore-only", condition)
 
-    def test_ci_runs_the_debug_kernel_on_kvm_per_pull_request_and_all_on_dev(self):
+    def test_ci_runs_debug_kernel_on_kvm_for_prs_and_all_for_non_prs(self):
         workflow = (
             BuildConstants.REPO_ROOT / ".github" / "workflows" / "ci.yml"
         ).read_text(encoding="utf-8")
@@ -5092,8 +5360,7 @@ python3() {
         for job_name in ci.REQUIRED_CI_MICROVM_DEBUG_PUSH_JOBS:
             with self.subTest(job=job_name):
                 job = _workflow_job(workflow, job_name)
-                self.assertIn("github.event_name == 'push' &&", job)
-                self.assertNotIn("pull_request", job)
+                self.assertIn("github.event_name != 'pull_request' &&", job)
         for job_name in (
             *ci.REQUIRED_CI_MICROVM_DEBUG_JOBS,
             *ci.REQUIRED_CI_MICROVM_DEBUG_PUSH_JOBS,

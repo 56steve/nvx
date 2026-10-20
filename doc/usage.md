@@ -168,17 +168,17 @@ the change detector's
 `run-tests`, `run-workloads`, `run-openvmm-unit-tests`, and
 `run-openvmm-vmm-tests` outputs as `name=true` or `name=false` lines. Only
 documentation changes skip the workloads, and only test inputs run the NVX
-microVM tests. A pull request runs each OpenVMM suite only when one of that
-suite's own inputs changed, while a push runs both whenever the tests run. The
-summary file receives a Markdown explanation of each decision. CI runs the
-full matrix instead when the command fails or omits an output; see
+microVM tests. Pull requests and pushes run each OpenVMM suite only when one
+of that suite's own inputs changed. The summary file receives a Markdown
+explanation of each decision. CI runs the full matrix instead when the command
+fails or omits an output; see
 [Change classification](ci.md#change-classification).
 
 ### `check-required-ci`
 
 ```text
 python3 scripts/nvx.py check-required-ci
-    --event-name {pull_request,push}
+    --event-name {pull_request,push,schedule,workflow_dispatch}
     --same-repository {false,true}
     --run-tests VALUE
     --run-workloads VALUE
