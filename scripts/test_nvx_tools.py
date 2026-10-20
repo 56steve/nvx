@@ -18142,9 +18142,9 @@ class ReleaseTests(unittest.TestCase):
                 )
 
     def test_guest_release_inputs_reject_stale_ubuntu_artifacts(self):
-        for artifact_name in (
-            "initramfs-ubuntu.cpio.gz",
-            "ubuntu-distro.erofs",
+        for artifact_name, manifest_name in (
+            ("initramfs-ubuntu.cpio.gz", "initramfs-ubuntu.cpio.gz.packages.json"),
+            ("ubuntu-distro.erofs", "ubuntu-distro.erofs.manifest.json"),
         ):
             with (
                 self.subTest(artifact=artifact_name),
@@ -18153,19 +18153,26 @@ class ReleaseTests(unittest.TestCase):
                 root = Path(temporary)
                 paths, _kernel_inputs, _revision = _write_release_fixture(root)
                 build_dir = paths["build"]
+                recorded = json.loads(
+                    (build_dir / manifest_name).read_text(encoding="utf-8")
+                )["artifact_sha256"]
                 (build_dir / artifact_name).write_bytes(b"stale artifact")
+                current = common.sha256_file(build_dir / artifact_name)
                 with (
                     patch.object(
                         release,
                         "artifact_path",
                         side_effect=build_dir.joinpath,
                     ),
-                    self.assertRaisesRegex(
-                        common.ScriptError,
-                        "Ubuntu artifact manifest does not match",
-                    ),
+                    self.assertRaises(common.ScriptError) as raised,
                 ):
                     release._guest_release_inputs(include_azurelinux=True)
+                self.assertEqual(
+                    str(raised.exception),
+                    f"Ubuntu artifact manifest does not match {artifact_name}: "
+                    f'{manifest_name} differs in artifact_sha256 (manifest "{recorded}", '
+                    f'expected "{current}")',
+                )
 
     def test_guest_release_inputs_reject_stale_azurelinux_initramfs(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -18293,22 +18300,85 @@ class ReleaseTests(unittest.TestCase):
             root = Path(temporary)
             paths, _kernel_inputs, _revision = _write_release_fixture(root)
             build_dir = paths["build"]
-            manifest_path = build_dir / "initramfs-ubuntu.cpio.gz.packages.json"
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            manifest["input_sha256"] = "0" * 64
-            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            manifest_name = "initramfs-ubuntu.cpio.gz.packages.json"
+            recorded = json.loads(
+                (build_dir / manifest_name).read_text(encoding="utf-8")
+            )["input_sha256"]
+            guest_file = next(
+                path
+                for path in sorted(
+                    (root / UbuntuBuildConstants.GUEST_DIRECTORY).iterdir()
+                )
+                if path.is_file()
+            )
+            guest_file.write_bytes(guest_file.read_bytes() + b"\n# changed\n")
             with (
+                patch.object(BuildConstants, "REPO_ROOT", root),
+                patch.object(
+                    UbuntuBuildConstants,
+                    "PACKAGE_LOCK",
+                    root / "ubuntu" / "packages.lock.json",
+                ),
                 patch.object(
                     release,
                     "artifact_path",
                     side_effect=build_dir.joinpath,
                 ),
-                self.assertRaisesRegex(
-                    common.ScriptError,
-                    "Ubuntu artifact manifest does not match",
-                ),
+            ):
+                current = ubuntu.converter_input_sha256(ubuntu.customization_files())
+                with self.assertRaises(common.ScriptError) as raised:
+                    release._guest_release_inputs(include_azurelinux=True)
+
+        self.assertNotEqual(current, recorded)
+        self.assertEqual(
+            str(raised.exception),
+            "Ubuntu artifact manifest does not match initramfs-ubuntu.cpio.gz: "
+            f'{manifest_name} differs in input_sha256 (manifest "{recorded}", '
+            f'expected "{current}")',
+        )
+
+    def test_guest_release_inputs_name_every_mismatched_ubuntu_manifest_field(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths, _kernel_inputs, _revision = _write_release_fixture(root)
+            build_dir = paths["build"]
+            manifest_path = build_dir / "ubuntu-distro.erofs.manifest.json"
+            valid = manifest_path.read_text(encoding="utf-8")
+            with patch.object(
+                release,
+                "artifact_path",
+                side_effect=build_dir.joinpath,
             ):
                 release._guest_release_inputs(include_azurelinux=True)
+                for case, updates, removed, details in (
+                    (
+                        "two wrong fields",
+                        {"format": 2, "guest": "alpine"},
+                        (),
+                        "format (manifest 2, expected 1), "
+                        'guest (manifest "alpine", expected "ubuntu")',
+                    ),
+                    (
+                        "missing field",
+                        {},
+                        ("artifact",),
+                        'artifact (manifest missing, expected "ubuntu-distro.erofs")',
+                    ),
+                ):
+                    with self.subTest(case=case):
+                        document = json.loads(valid)
+                        document.update(updates)
+                        for field in removed:
+                            del document[field]
+                        manifest_path.write_text(json.dumps(document), encoding="utf-8")
+                        with self.assertRaises(common.ScriptError) as raised:
+                            release._guest_release_inputs(include_azurelinux=True)
+                        self.assertEqual(
+                            str(raised.exception),
+                            "Ubuntu artifact manifest does not match "
+                            "ubuntu-distro.erofs: ubuntu-distro.erofs.manifest.json "
+                            f"differs in {details}",
+                        )
 
     def test_package_rejects_tampered_source_metadata_without_replacing_output(self):
         cases: tuple[tuple[str, str, object, str], ...] = (
