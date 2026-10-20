@@ -11,6 +11,9 @@
 //! - [`instance`] supervises one VM instance in a directory of its own: it starts OpenVMM and
 //!   waits until the guest is ready, reconciles recorded state with the host, runs workloads,
 //!   and stops the VM. [`report`] reads OpenVMM's outcome report.
+//! - [`store`] keeps the runtime records of a sandbox in a private directory with one lock: the
+//!   runtime record of its VM, with the VM's runtime identity, and the journal of its launch,
+//!   through which an interrupted launch is recovered without signaling an unverified process.
 //! - [`session`] speaks the authenticated control protocol, and [`nvxs`] runs the host's role of
 //!   the NVXS session, which carries it and any other application protocol, over a platform
 //!   transport. [`platform`] holds the primitives of Linux and Windows hosts. Other hosts compile
@@ -47,6 +50,7 @@ pub(crate) mod python;
 pub mod report;
 pub mod sandbox;
 pub mod session;
+pub mod store;
 #[cfg(unix)]
 #[allow(unsafe_code)]
 mod sys;
