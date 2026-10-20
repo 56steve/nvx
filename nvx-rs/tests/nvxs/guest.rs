@@ -7,21 +7,14 @@ use std::sync::{Arc, Mutex};
 
 use nvx::guest::nvxs::{GuestConnection, GuestConnectionError};
 use nvx::protocol::nvxs::{
-    GuestEvent, GuestState, HostEvent, HostSession, Identity, RecordParser, RecordType,
-    SessionError, encode_record,
+    GuestEvent, GuestState, HostEvent, HostSession, RecordParser, RecordType, SessionError,
 };
 use nvx::protocol::{
     OUTER_HEADER_LEN, OUTER_MAX_PAYLOAD, OUTER_MIN_RECEIVE_WINDOW, OUTER_RECEIVE_WINDOW,
 };
 
-use crate::broker::{Broker, CAPABILITY, INSTANCE};
+use crate::broker::{Broker, CAPABILITY, IDENTITY, record};
 use crate::{Reassembler, framed, messages};
-
-/// Identity of the first epoch of the test broker's session.
-const IDENTITY: Identity = Identity {
-    instance_id: INSTANCE,
-    epoch: 1,
-};
 
 /// State of a [`Stream`], which the test shares with the connection.
 #[derive(Default)]
@@ -87,22 +80,6 @@ impl Write for Stream {
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
-}
-
-/// Encodes a valid record.
-fn record(record_type: RecordType, identity: Identity, sequence: u64, payload: &[u8]) -> Vec<u8> {
-    let mut output = Vec::new();
-    let (instance, epoch) = (identity.instance_id, identity.epoch);
-    encode_record(
-        record_type,
-        &instance,
-        epoch,
-        sequence,
-        payload,
-        &mut output,
-    )
-    .unwrap();
-    output
 }
 
 /// Returns the type and sequence number of each record of `bytes`.

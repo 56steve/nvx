@@ -11,39 +11,17 @@ use nvx::host::nvxs::{HostConnection, HostConnectionError};
 use nvx::host::platform::Transport;
 use nvx::protocol::nvxs::{
     ErrorCode, GuestEvent, GuestSession, HostState, Identity, RecordParser, RecordType,
-    SessionError, encode_record,
+    SessionError,
 };
 use nvx::protocol::{
     CAPABILITY_LEN, OUTER_HEADER_LEN, OUTER_MAX_PAYLOAD, OUTER_MIN_RECEIVE_WINDOW,
 };
 
-use crate::broker::{Broker, CAPABILITY, INSTANCE};
+use crate::broker::{Broker, CAPABILITY, IDENTITY, record};
 use crate::{Reassembler, framed, messages};
-
-/// Identity of the first epoch of the test broker's session.
-const IDENTITY: Identity = Identity {
-    instance_id: INSTANCE,
-    epoch: 1,
-};
 
 fn deadline() -> Instant {
     Instant::now() + Duration::from_secs(10)
-}
-
-/// Encodes a valid record.
-fn record(record_type: RecordType, identity: Identity, sequence: u64, payload: &[u8]) -> Vec<u8> {
-    let mut output = Vec::new();
-    let (instance, epoch) = (identity.instance_id, identity.epoch);
-    encode_record(
-        record_type,
-        &instance,
-        epoch,
-        sequence,
-        payload,
-        &mut output,
-    )
-    .unwrap();
-    output
 }
 
 /// The broker and a guest whose application echoes each message.
