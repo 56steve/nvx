@@ -1019,8 +1019,10 @@ verifies the manifest beside the link's target. `start` checks the binding
 from metadata alone, without reading the layer again, and refuses a layer or
 manifest that was replaced, modified, added, or removed since `provision`, and a
 configuration without a binding, as an older `nvx.py` wrote; deprovision such a
-sandbox and provision it again. Keep provisioned layers and their manifests
-read-only, and never rewrite them in place.
+sandbox and provision it again. `provision` and `start` refuse a manifest path
+that they cannot look up, as through a link loop, rather than take it for no
+manifest. Keep provisioned layers and their manifests read-only, and never
+rewrite them in place.
 
 Lifecycle transitions fail closed: `start` rejects an already-running or stale
 runtime record; `exec` and `stop` require a live OpenVMM process; and

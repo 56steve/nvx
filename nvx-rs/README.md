@@ -155,10 +155,13 @@ verification, or from `DistroBinding::import`, which a staging caller that
 verified the layer itself calls to bind it without hashing it again. `check`
 fails for a binding of another version, layer, or policy revision, a verdict
 that rejects the layer, a layer whose identity, kind, length, or times changed,
-and a manifest that appeared, disappeared, or changed. A missing or stale
-binding fails: no runtime operation registers, verifies, or hashes a layer on
-its own. Hashing belongs where layers are built, installed, or staged, and to
-diagnostics.
+and a manifest that appeared, disappeared, or changed. A binding of a layer
+without a manifest holds only while nothing is at the manifest's path: unlike
+verification, which finds a manifest as `Path.exists` does, `check` and
+`import` refuse a path whose lookup fails for another reason than a missing
+file. A missing or stale binding fails: no runtime operation registers,
+verifies, or hashes a layer on its own. Hashing belongs where layers are built,
+installed, or staged, and to diagnostics.
 
 On Linux, a seal holds `st_dev`, `st_ino`, the file type, `st_size`, and
 `st_mtime` and `st_ctime` with their nanoseconds; on Windows, the volume serial
@@ -177,13 +180,14 @@ preflight, at the path given. `provision` records the layer at its resolved
 path, as it records every path, with the binding of the layer there, under
 `distro_binding` in `config.json`. When the path given is a link to a layer of
 another name, `start` checks the manifest beside the link's target, so
-`provision` verifies the layer there as well. `start` checks the binding before
-it launches OpenVMM, and holds the checked layer until the start ends. A
-configuration without a binding, as `nvx.py` wrote, fails with `sandbox
-configuration has no distro binding`, and a stale binding with what changed,
-such as `LAYER changed after its distro binding was made: its length differs`;
-both add `deprovision the sandbox and provision it again`, since a new
-provision verifies the layer again.
+`provision` verifies the layer there as well, and it records only a binding
+that the check accepts there. `start` checks the binding before it launches
+OpenVMM, and holds the checked layer until the start ends. A configuration
+without a binding, as `nvx.py` wrote, fails with `sandbox configuration has no
+distro binding`, and a stale binding with what changed, such as `LAYER changed
+after its distro binding was made: its length differs`; both add `deprovision
+the sandbox and provision it again`, since a new provision verifies the layer
+again.
 
 ## Python parity
 

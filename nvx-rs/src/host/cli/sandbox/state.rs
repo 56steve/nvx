@@ -262,7 +262,8 @@ impl RecordedDistro {
     /// Returns the distro layer of `launch` at the path that `provision` records, `path.resolve()`
     /// of the path given, with a binding of the layer there: `binding`, which explicit
     /// verification of the layer at the path given made, if it holds at the recorded path, and
-    /// otherwise the binding that explicit verification of the layer at the recorded path makes.
+    /// otherwise the binding that explicit verification of the layer at the recorded path makes,
+    /// which must then hold there.
     ///
     /// The check of `binding` at the recorded path reads nothing, and passes unless the paths name
     /// different manifests: when the path given is a link to a layer of another name, `start`
@@ -273,7 +274,13 @@ impl RecordedDistro {
         let layer = SandboxLayer::new(distro.role(), &path, distro.uuid());
         let binding = match binding.check(&layer, DISTRO_POLICY_REVISION) {
             Ok(_) => binding,
-            Err(_) => DistroBinding::verify(&layer)?,
+            Err(_) => {
+                let binding = DistroBinding::verify(&layer)?;
+                // Verification counts a manifest path whose lookup fails as no manifest, which
+                // the check refuses: provision records no binding that every start would refuse.
+                binding.check(&layer, DISTRO_POLICY_REVISION)?;
+                binding
+            }
         };
         Ok(Self {
             path,

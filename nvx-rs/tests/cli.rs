@@ -731,6 +731,58 @@ fn symlink_file(target: &Path, link: &Path) -> bool {
 }
 
 #[test]
+fn a_distro_manifest_path_whose_lookup_fails_refuses_provision_and_start() {
+    // Verification counts a manifest path whose lookup fails as no manifest, as nvx.py did, so a
+    // run's outcome is unchanged. A binding of the manifest's absence holds only while nothing is
+    // at its path: start refuses such a path, and provision refuses to record a binding that
+    // every start would refuse.
+    let root = populated_root();
+    let manifest = root.path.join("distro.erofs.manifest.json");
+    provisioned(&root, "absent");
+    if !symlink_file(&manifest, &manifest) {
+        eprintln!("skipped: this host does not let the test create a symbolic link");
+        return;
+    }
+    let quoted = format!("'{}'", manifest.to_str().unwrap().replace('\\', "\\\\"));
+    let failed = |output: &Output| {
+        let stderr = text(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{stderr}");
+        assert!(
+            stderr.starts_with("error: [") && stderr.ends_with(&format!(": {quoted}\n")),
+            "{stderr}"
+        );
+    };
+    failed(&run(&root, &lifecycle("start", &root, "absent")));
+    let mut names: Vec<String> = fs::read_dir(root.path.join("absent"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["config.json", "lifecycle.lock"]);
+    let output = run(&root, &lifecycle("deprovision", &root, "absent"));
+    assert!(output.status.success(), "{}", text(&output.stderr));
+
+    failed(&run(&root, &provision(&root, "present", "")));
+    assert!(!root.path.join("present").exists());
+
+    let path = |name: &str| root.path.join(name).to_str().unwrap().to_owned();
+    let dry_run: Vec<String> = vec![
+        "sandbox".into(),
+        "run".into(),
+        "--layer".into(),
+        format!(
+            "distro,{},11111111-1111-1111-1111-111111111111",
+            path("distro.erofs")
+        ),
+        "--scratch".into(),
+        path("scratch.ext4"),
+        "--dry-run".into(),
+    ];
+    let output = run(&root, &dry_run);
+    assert!(output.status.success(), "{}", text(&output.stderr));
+}
+
+#[test]
 fn provision_binds_a_linked_distro_layer_where_start_checks_it() {
     // Provision records a layer at its resolved path, and start checks the binding there, with
     // the manifest beside that path: through a link to a layer of another name, the manifest

@@ -202,12 +202,14 @@ impl DistroBinding {
     /// Verifies the distro layer `layer` explicitly, and returns its binding.
     ///
     /// Without a manifest beside the layer, the layer passes without being read: the binding
-    /// records the manifest's absence. With one, the manifest must be a JSON object of format 1
-    /// that names the layer and its SHA-256 digest, with a list of packages that each have a
-    /// name, of which none is `systemd`. Verification reads the manifest and hashes the whole
-    /// layer through the files that it opened, and fails if the metadata of either changed while
-    /// it read them. The binding holds the seals that the files had, and
-    /// [`PolicyVerdict::ACCEPTED`].
+    /// records the manifest's absence. A manifest is beside the layer as `Path.exists` finds it,
+    /// for `nvx.py`'s outcomes, so a path whose lookup fails counts as none; the check of the
+    /// binding then refuses that path, as [`check`](Self::check) says. With a manifest, it must
+    /// be a JSON object of format 1 that names the layer and its SHA-256 digest, with a list of
+    /// packages that each have a name, of which none is `systemd`. Verification reads the
+    /// manifest and hashes the whole layer through the files that it opened, and fails if the
+    /// metadata of either changed while it read them. The binding holds the seals that the files
+    /// had, and [`PolicyVerdict::ACCEPTED`].
     ///
     /// Fails with [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported) for a layer of another
     /// role, a path without a name, and a manifest that it refuses, which a digest that does not
@@ -229,7 +231,8 @@ impl DistroBinding {
     /// [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported) for a layer of another role, with
     /// [`ErrorKind::Unavailable`](crate::ErrorKind::Unavailable) if the layer or its manifest is
     /// not a regular file, and with [`ErrorKind::Io`](crate::ErrorKind::Io) if either cannot be
-    /// opened or sealed.
+    /// opened or sealed, as for a manifest path whose lookup fails for another reason than a
+    /// missing file, which the import does not take for an absent manifest.
     pub fn import(layer: &SandboxLayer, verdict: PolicyVerdict) -> Result<Self> {
         import_with(layer, verdict, Access::GUARDED)
     }
@@ -242,7 +245,9 @@ impl DistroBinding {
     /// [`DISTRO_POLICY_REVISION`], and name the format and identity of `layer`. The check then
     /// opens the layer and its manifest, and compares their seals with the binding's: a
     /// replacement, a change of kind, length, or time, and a manifest that appeared, disappeared,
-    /// or changed each fail. It never reads, maps, or hashes the layer or the manifest, and never
+    /// or changed each fail. A binding of a layer without a manifest holds only while nothing is
+    /// at the manifest's path: a path whose lookup fails for another reason than a missing file
+    /// fails the check too. It never reads, maps, or hashes the layer or the manifest, and never
     /// verifies them again.
     ///
     /// Fails with [`ErrorKind::Unavailable`](crate::ErrorKind::Unavailable) for a stale binding,
@@ -361,12 +366,16 @@ impl DistroBinding {
                     )));
                 }
             }
-            None if fs::exists(manifest.as_path()) => {
-                return Err(Error::unavailable(format!(
-                    "{manifest} appeared after the distro binding of {path} was made"
-                )));
-            }
-            None => {}
+            None => match (access.open)(manifest.as_path()) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                // A manifest whose lookup fails otherwise may be present: the check fails.
+                Err(error) => return Err(os_error(&error, Some(manifest.as_str()))),
+                Ok(_) => {
+                    return Err(Error::unavailable(format!(
+                        "{manifest} appeared after the distro binding of {path} was made"
+                    )));
+                }
+            },
         }
         Ok(CheckedDistro { file })
     }
@@ -463,11 +472,7 @@ pub(crate) fn import_with(
     let path = layer.pure_path();
     let manifest = manifest_path(path)?;
     let image = seal_regular(path, access, &layer_description(layer))?;
-    let manifest = if fs::exists(manifest.as_path()) {
-        Some(seal_regular(&manifest, access, "sandbox distro manifest")?)
-    } else {
-        None
-    };
+    let manifest = seal_if_present(&manifest, access, "sandbox distro manifest")?;
     Ok(DistroBinding::new(layer, image, manifest, verdict))
 }
 
@@ -518,11 +523,26 @@ fn open_error(error: &io::Error, path: &PurePath, description: &str) -> Error {
 /// Opens and seals the regular file at `path`, which messages call `description`, through
 /// `access`, without reading it.
 fn seal_regular(path: &PurePath, access: Access<'_>, description: &str) -> Result<FileSeal> {
-    let file =
-        (access.open)(path.as_path()).map_err(|error| open_error(&error, path, description))?;
+    seal_if_present(path, access, description)?
+        .ok_or_else(|| Error::unavailable(format!("{description} not found: {path}")))
+}
+
+/// Opens and seals the regular file at `path`, which messages call `description`, through
+/// `access`, without reading it, or returns `None` if nothing is at `path`. A lookup that fails
+/// for another reason fails, rather than count as no file.
+fn seal_if_present(
+    path: &PurePath,
+    access: Access<'_>,
+    description: &str,
+) -> Result<Option<FileSeal>> {
+    let file = match (access.open)(path.as_path()) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(os_error(&error, Some(path.as_str()))),
+    };
     let seal = (access.seal)(&file).map_err(|error| os_error(&error, Some(path.as_str())))?;
     require_regular(&seal, path, description)?;
-    Ok(seal)
+    Ok(Some(seal))
 }
 
 /// Refuses a seal of a file that is not a regular file, as `require_file` refuses its path.

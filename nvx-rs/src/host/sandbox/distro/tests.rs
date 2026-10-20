@@ -608,6 +608,48 @@ fn imports_bind_a_staged_layer_without_reading_it() {
     );
 }
 
+/// Makes `path` a symbolic link to itself, whose lookup fails for another reason than a missing
+/// file, and returns whether the host allowed it: Windows lets only Developer Mode or a privilege
+/// create one.
+fn link_to_itself(path: &Path) -> bool {
+    #[cfg(unix)]
+    let linked = std::os::unix::fs::symlink(path, path);
+    #[cfg(windows)]
+    let linked = std::os::windows::fs::symlink_file(path, path);
+    linked.is_ok()
+}
+
+#[test]
+fn a_manifest_path_whose_lookup_fails_is_no_absent_manifest_for_a_binding() {
+    // Verification finds a manifest as `Path.exists` does, which counts a path whose lookup fails
+    // as none. The binding of the manifest's absence holds only while nothing is at its path, so
+    // the staged check refuses such a path, without reading anything, and so does an import.
+    let staged = Staged::new(false);
+    let layer = staged.layer();
+    let binding = verify_with(&layer, METADATA_ONLY).unwrap();
+    assert_eq!(binding.manifest(), None);
+    if !link_to_itself(&staged.manifest()) {
+        eprintln!("skipped: this host does not let the test create a symbolic link");
+        return;
+    }
+    assert_eq!(verify_with(&layer, METADATA_ONLY).unwrap(), binding);
+    for (kind, message) in [
+        failure(binding.check_with(&layer, DISTRO_POLICY_REVISION, METADATA_ONLY)),
+        failure(import_with(&layer, PolicyVerdict::ACCEPTED, METADATA_ONLY)),
+    ] {
+        assert_eq!(kind, ErrorKind::Io, "{message}");
+        assert!(
+            message.ends_with(&format!(": {}", repr(&shown(&staged.manifest())))),
+            "{message}"
+        );
+    }
+    // Once nothing is at the path, the binding holds again.
+    fs::remove_file(staged.manifest()).unwrap();
+    binding
+        .check_with(&layer, DISTRO_POLICY_REVISION, METADATA_ONLY)
+        .unwrap();
+}
+
 #[test]
 fn only_the_distro_layer_has_a_binding() {
     let staged = Staged::new(false);
