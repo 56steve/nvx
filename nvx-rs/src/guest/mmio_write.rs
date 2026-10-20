@@ -43,36 +43,30 @@ fn run(args: &[CString], memory: &CStr, err: &mut dyn Write) -> Result<(), Comma
     }
 
     let descriptor = sys::open(memory, OpenFlags::O_RDWR | OpenFlags::O_SYNC, Mode::empty())
-        .map_err(|error| {
-            perror(err, b"open /dev/mem", error);
-            CommandError::Operation
-        })?;
+        .map_err(|error| perror(err, b"open /dev/mem", error))?;
     let length = NonZeroUsize::new(page_size).expect("a valid page size is nonzero");
     let mut mapping = sys::MemoryMapping::shared_read_write(&descriptor, length, page_base)
-        .map_err(|error| {
-            perror(err, b"mmap /dev/mem", error);
-            CommandError::Operation
-        })?;
+        .map_err(|error| perror(err, b"mmap /dev/mem", error))?;
     if !mapping.write_u32(page_offset as usize, value) {
         // The boundary validation above proves this unreachable, but preserve a typed failure if
         // the mapping abstraction and validation ever diverge.
         sys::report(err, &[b"MMIO write crosses a page boundary\n"]);
         return Err(CommandError::Operation);
     }
-    mapping.unmap().map_err(|error| {
-        perror(err, b"munmap /dev/mem", error);
-        CommandError::Operation
-    })?;
-    descriptor.close().map_err(|error| {
-        perror(err, b"close /dev/mem", error);
-        CommandError::Operation
-    })?;
+    mapping
+        .unmap()
+        .map_err(|error| perror(err, b"munmap /dev/mem", error))?;
+    descriptor
+        .close()
+        .map_err(|error| perror(err, b"close /dev/mem", error))?;
     Ok(())
 }
 
-/// Reports `errno` as C's `perror(prefix)` does, with `nix`'s description.
-fn perror(err: &mut dyn Write, prefix: &[u8], errno: Errno) {
+/// Reports `errno` as C's `perror(prefix)` does, with `nix`'s description, and returns the
+/// operation failure.
+fn perror(err: &mut dyn Write, prefix: &[u8], errno: Errno) -> CommandError {
     sys::report(err, &[prefix, b": ", errno.desc().as_bytes(), b"\n"]);
+    CommandError::Operation
 }
 
 #[cfg(test)]
