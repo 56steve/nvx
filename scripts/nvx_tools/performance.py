@@ -2320,6 +2320,7 @@ def _reset_dimensions_since(
         "log",
         "--reverse",
         "--full-history",
+        "--sparse",
         "--format=%H %P",
         f"{commit}..HEAD",
         "--",
@@ -2328,6 +2329,10 @@ def _reset_dimensions_since(
     resets: set[tuple[str, int, int, str]] = set()
     for line in later:
         revision, *parents = line.split()
+        # Ignore commits on side branches that are not part of the history
+        # leading from the measurement to HEAD, even if later merged/reverted.
+        if not _on_measurement_line(top, revision, commit):
+            continue
         current = _dimension_counts(top, revision, relative)
         for parent in parents:
             # A branch that neither predates nor follows the measurement can drop rows
@@ -2340,9 +2345,9 @@ def _reset_dimensions_since(
 
 
 def _on_measurement_line(top: Path, revision: str, measured: str) -> bool:
-    """Return whether ``revision`` came before ``measured`` or was built on it."""
-    for ancestor, descendant in ((revision, measured), (measured, revision)):
-        check = subprocess.run(
+    """Return whether ``revision`` is on the path from ``measured`` to HEAD."""
+    return all(
+        subprocess.run(
             [
                 "git",
                 "-C",
@@ -2354,10 +2359,10 @@ def _on_measurement_line(top: Path, revision: str, measured: str) -> bool:
             ],
             check=False,
             capture_output=True,
-        )
-        if check.returncode == 0:
-            return True
-    return False
+        ).returncode
+        == 0
+        for ancestor, descendant in ((measured, revision), (revision, "HEAD"))
+    )
 
 
 def _without_reset_rows(
@@ -2421,6 +2426,14 @@ def persist_results(
         current = [result for result in source_results if result.metric not in excluded]
         history_path = history_dir / source_path.name
         existing = read_results(history_path) if history_path.exists() else []
+        existing_keys = {_result_identity(result) for result in existing}
+        current = [
+            result
+            for result in current
+            if _result_identity(result) not in existing_keys
+        ]
+        if git_checkout is not None:
+            current = _without_reset_rows(git_checkout, history_path, current)
         metadata = {
             (
                 result.platform,
@@ -2446,14 +2459,7 @@ def persist_results(
                     f"{expected} -> {actual}"
                 )
 
-        existing_keys = {_result_identity(result) for result in existing}
-        new_results = [
-            result
-            for result in current
-            if _result_identity(result) not in existing_keys
-        ]
-        if git_checkout is not None:
-            new_results = _without_reset_rows(git_checkout, history_path, new_results)
+        new_results = current
         if not new_results:
             print(f"No new performance rows to persist for {source_path.name}")
             continue
