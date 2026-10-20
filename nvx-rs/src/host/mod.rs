@@ -11,9 +11,10 @@
 //! - [`instance`] supervises one VM instance in a directory of its own: it starts OpenVMM and
 //!   waits until the guest is ready, reconciles recorded state with the host, runs workloads,
 //!   and stops the VM. [`report`] reads OpenVMM's outcome report.
-//! - [`session`] speaks the authenticated control protocol, [`process`] launches and terminates
-//!   OpenVMM processes, and [`platform`] holds the primitives of Linux and Windows hosts. Other
-//!   hosts compile but report NVX as unavailable.
+//! - [`session`] speaks the authenticated control protocol, and [`nvxs`] runs the host's role of
+//!   the NVXS session, which carries it and any other application protocol, over a platform
+//!   transport. [`process`] launches and terminates OpenVMM processes, and [`platform`] holds the
+//!   primitives of Linux and Windows hosts. Other hosts compile but report NVX as unavailable.
 //! - [`sandbox`] is the launch profile of `nvx.py sandbox`: a container over read-only EROFS
 //!   layers and a private ext4 scratch disk, with live shares, and the checks of its options.
 //! - `cli` (feature `cli`) is the `nvx-rs` command-line interface, which `nvx.py` runs for the
@@ -35,6 +36,7 @@ pub mod filesystem;
 pub mod instance;
 pub mod launch;
 pub mod network;
+pub mod nvxs;
 pub mod platform;
 pub mod process;
 pub(crate) mod python;
