@@ -455,31 +455,33 @@ wait for its CLI job, a broken CLI does not occupy the hypervisor runners.
 `Required status check`, the development release, and performance persistence
 require both CLI jobs.
 
-Each of the WHP, KVM, and MSHV pools has five runners: four carry `general` and
-run all non-benchmark backend jobs, while one carries `benchmark` and runs only
-the platform job. Platform jobs from overlapping workflow runs still measure
-one after another on their backend's single benchmark runner, but they never
-wait behind an unrelated build or test.
+The KVM and MSHV pools have five runners each, and the WHP pool has nine. In
+each pool, one runner carries `benchmark` and runs only the platform job, and
+the others carry `general` and run all non-benchmark backend jobs. Platform
+jobs from overlapping workflow runs still measure one after another on their
+backend's single benchmark runner, but they never wait behind an unrelated
+build or test.
 
-The role split follows an October 15-20, 2026 scheduling audit. Before the
-split, the benchmark runners spent about one third of their assignments on
-non-platform work; `azure-windows-5`, for example, ran 102 platform jobs and 62
-build or test jobs. Platform jobs queued for p50 6.3, p90 22.2, and at most
-34.1 minutes on WHP, for p90 15.7 and at most 21.1 minutes on KVM, and for p90
-11.2 and at most 18.7 minutes on MSHV. The WHP platform job finished last in
-about a third of `dev` pushes and nearly half of full pull-request runs.
-Replaying the observed arrivals and durations with dedicated benchmark runners
-reduced WHP platform wait to about p90 3.6 and at most 8.4 minutes.
+The role split follows an October 15-20, 2026 scheduling audit, when each pool
+had five runners. Before the split, the benchmark runners spent about one third
+of their assignments on non-platform work; `azure-windows-5`, for example, ran
+102 platform jobs and 62 build or test jobs. Platform jobs queued for p50 6.3,
+p90 22.2, and at most 34.1 minutes on WHP, for p90 15.7 and at most 21.1
+minutes on KVM, and for p90 11.2 and at most 18.7 minutes on MSHV. The WHP
+platform job finished last in about a third of `dev` pushes and nearly half of
+full pull-request runs. Replaying the observed arrivals and durations with
+dedicated benchmark runners reduced WHP platform wait to about p90 3.6 and at
+most 8.4 minutes.
 
-WHP has the least spare general capacity because its OpenVMM VMM and unit tests
-compile OpenVMM on Windows for about 15 and 13 minutes before testing. A full
-run occupies its four general runners for most of its duration, so overlapping
-runs queue there first. Dedicating the existing benchmark runner reduces WHP
-general capacity from five eligible runners to four; adding one `general` WHP
-runner restores the previous five-runner general capacity. In the replay, WHP
-non-benchmark p90 wait rose from about three to five minutes, while KVM and MSHV
-non-benchmark waits stayed near zero. A change that adds a job or a shard needs
-general runners to run it in parallel; otherwise it only queues.
+The WHP jobs are the longest: the OpenVMM VMM and unit tests compile OpenVMM on
+Windows for about 15 and 13 minutes before testing, so overlapping runs queue
+on WHP first. Dedicating the benchmark runner takes it out of its pool's
+general capacity. In the replay, which left four general WHP runners, the WHP
+non-benchmark p90 wait rose from about three to five minutes, while the KVM and
+MSHV non-benchmark waits stayed near zero. The WHP pool has since grown to
+eight general runners, more than the five that served these jobs before the
+split. A change that adds a job or a shard needs general runners to run it in
+parallel; otherwise it only queues.
 
 ## Change classification
 
