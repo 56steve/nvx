@@ -1317,3 +1317,56 @@ fn guest_maps_decoder_accepts_non_utf8_linux_paths() {
     let decoded = decode_guest_maps_payload(&payload).unwrap();
     assert_eq!(decoded.maps[0].source, b"0/\xff");
 }
+
+/// Both `MAPS` decoders refuse an entry with the same message, except that the host's requires
+/// each path to be UTF-8 as soon as it reads it, and the guest's bounds the number of entries
+/// before it reads any.
+#[test]
+fn maps_decoders_refuse_entries_with_the_same_messages() {
+    let valid = bytes(concat!("0000000001000000", "000001000200", "30", "2f77"));
+    let mut trailing = valid.clone();
+    trailing.push(0);
+    let mut unknown_flag = valid.clone();
+    unknown_flag[8] = 2;
+    let mut relative_target = valid.clone();
+    relative_target[15] = b'w';
+    let refused = "a host mapping has unknown flags or a source or target that the guest agent \
+                   refuses";
+    for (payload, expected) in [
+        (&valid[..7], "the host mapping request is truncated"),
+        (
+            &valid[..valid.len() - 1],
+            "the host mapping request is truncated",
+        ),
+        (&trailing[..], "the host mapping request has trailing bytes"),
+        (&unknown_flag[..], refused),
+        (&relative_target[..], refused),
+    ] {
+        assert_eq!(
+            decode_maps_payload(payload).unwrap_err().message(),
+            expected
+        );
+        assert_eq!(
+            decode_guest_maps_payload(payload).unwrap_err().message(),
+            expected
+        );
+    }
+    let not_utf8_then_truncated = bytes(concat!("0000000001000000", "000001000200", "ff"));
+    assert_eq!(
+        decode_maps_payload(&not_utf8_then_truncated)
+            .unwrap_err()
+            .message(),
+        "a host mapping is not valid UTF-8"
+    );
+    assert_eq!(
+        decode_guest_maps_payload(&not_utf8_then_truncated)
+            .unwrap_err()
+            .message(),
+        "the host mapping request is truncated"
+    );
+    let too_many = bytes("0000000001100000");
+    assert_eq!(
+        decode_guest_maps_payload(&too_many).unwrap_err().message(),
+        "the host mapping request has too many entries"
+    );
+}
