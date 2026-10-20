@@ -5080,6 +5080,17 @@ class MicrovmTests(unittest.TestCase):
         self.assertIn("NVX-SNAPSHOT-UUID-", script)
         self.assertIn("NVX-SNAPSHOT-TEMP-ID-", script)
 
+    def test_snapshot_core_checks_that_restored_processes_cannot_reach_the_ports(self):
+        # nvx-time holds the port permission only for each port transaction, so
+        # the processes that it starts on a restored VM cannot reach the ports.
+        script = microvm_tests._read_script("snapshot-core.sh")
+
+        self.assertIn(
+            'port_access="$(/sbin/nvx-time test port-access)" || fail 55', script
+        )
+        self.assertIn('echo "NVX-SNAPSHOT-PORT-ACCESS-$port_access"', script)
+        self.assertEqual(script.count("|| fail 55"), 1)
+
     def test_snapshot_core_reads_the_entropy_that_nvx_time_kept(self):
         # Restore packet v4 is consumed by nvx-time capture, which leaves the
         # entropy of an untiered restore in /run/nvx/restore-entropy.

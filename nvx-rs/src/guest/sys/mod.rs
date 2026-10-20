@@ -82,9 +82,11 @@ pub(crate) use mapping::MemoryMapping;
 #[cfg(target_arch = "x86_64")]
 pub(crate) use msr::{MsrAccess, MsrFile};
 pub(crate) use poll::{Pollable, poll, readable_or_hung_up};
+#[cfg(all(target_arch = "x86_64", test))]
+pub(crate) use port::PortBackend;
 pub(crate) use port::{PORT_DEVICE, Port};
 #[cfg(target_arch = "x86_64")]
-pub(crate) use port::{PortAccess, power_off};
+pub(crate) use port::{PortAccess, PortError, check_released, power_off, probe_port};
 #[cfg(test)]
 pub(crate) use process::sigpipe_disposition;
 #[cfg(target_arch = "x86_64")]

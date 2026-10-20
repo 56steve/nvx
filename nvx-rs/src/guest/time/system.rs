@@ -11,8 +11,9 @@ use super::events::{EventSource, ViolationCode, format_event};
 use super::state::TimeState;
 use super::{NSEC_PER_MSEC, Phase};
 use crate::guest::sys::{
-    self, ClockAdjustment, ClockDiscipline, CreatedFile, Errno, FileDescriptor, FileLock, Mode,
-    MsrAccess, MsrFile, OpenFlags, Port, PortAccess, TimeValLike, kernel,
+    self, ClockAdjustment, ClockDiscipline, CreatedFile, Errno, FileDescriptor, FileLock,
+    ForkResult, Mode, MsrAccess, MsrFile, OpenFlags, Port, PortAccess, PortError, TimeValLike,
+    kernel,
 };
 
 /// Statuses with which a fatal time-ABI failure stops the VM through the control port.
@@ -111,35 +112,12 @@ const SAMPLE_ATTEMPTS: usize = 3;
 /// and the daemon assumes when it cannot read the setting.
 pub(crate) const DEFAULT_STALL_TIMEOUT_S: i64 = 21;
 
-/// The time ABI's I/O ports, which a fake replaces in tests.
-pub(crate) trait PortIo: Sync {
-    /// Reads one byte from `port`.
-    fn inb(&self, port: Port) -> u8;
-    /// Reads four bytes from `port` with one scalar access.
-    fn inl(&self, port: Port) -> u32;
-    /// Writes one byte to `port`.
-    fn outb(&self, port: Port, value: u8);
-}
-
-impl PortIo for PortAccess {
-    fn inb(&self, port: Port) -> u8 {
-        self.read_u8(port)
-    }
-
-    fn inl(&self, port: Port) -> u32 {
-        self.read_u32(port)
-    }
-
-    fn outb(&self, port: Port, value: u8) {
-        self.write_u8(port, value);
-    }
-}
-
 /// The privileged operations of the time tools, which a fake replaces in tests, so that their
 /// retry and failure paths are testable.
 pub(crate) trait PrivilegedOps: Sync {
-    /// Returns the time ABI's ports, or why the process may not access them.
-    fn ports(&self) -> Result<&dyn PortIo, Errno>;
+    /// Takes the calling thread's permission for the time ABI's ports, for one transaction,
+    /// which [`PortAccess::release`] ends.
+    fn open_ports(&self) -> Result<PortAccess<'_>, PortError>;
     /// Opens the MSR device of `cpu`.
     fn open_msr(&self, cpu: usize, access: MsrAccess) -> Result<MsrDescriptor, Errno>;
     /// Reads the register `msr`.
@@ -168,28 +146,14 @@ pub(crate) enum MsrDescriptor {
 
 /// The production privileged operations.
 ///
-/// They request the port permission when the command starts, on the main thread, because Linux
-/// grants it per thread, and the threads and processes that the command starts later inherit it.
-pub(crate) struct RealOps {
-    /// The port permission, or why the kernel refused it.
-    ports: Result<PortAccess, Errno>,
-}
-
-impl RealOps {
-    /// Requests the port permission for the command.
-    pub(crate) fn new() -> Self {
-        Self {
-            ports: PortAccess::request(),
-        }
-    }
-}
+/// They take the port permission for each transaction, on the thread that runs it, rather than
+/// for the whole command: Linux grants it per thread, and the threads and processes that a
+/// holder starts inherit it.
+pub(crate) struct RealOps;
 
 impl PrivilegedOps for RealOps {
-    fn ports(&self) -> Result<&dyn PortIo, Errno> {
-        match &self.ports {
-            Ok(ports) => Ok(ports),
-            Err(error) => Err(*error),
-        }
+    fn open_ports(&self) -> Result<PortAccess<'_>, PortError> {
+        PortAccess::request()
     }
 
     fn open_msr(&self, cpu: usize, access: MsrAccess) -> Result<MsrDescriptor, Errno> {
@@ -294,9 +258,10 @@ impl<'a> Runtime<'a> {
         self.async_output.store(value, Ordering::Relaxed);
     }
 
-    /// Returns the time ABI's ports, or why the process may not access them.
-    pub(crate) fn ports(&self) -> Result<&dyn PortIo, Errno> {
-        self.ops.ports()
+    /// Takes the calling thread's permission for the time ABI's ports, for one transaction,
+    /// which [`PortAccess::release`] ends.
+    pub(crate) fn open_ports(&self) -> Result<PortAccess<'a>, PortError> {
+        self.ops.open_ports()
     }
 
     /// Emits one serialized violation record to every ABI destination.
@@ -330,13 +295,16 @@ impl<'a> Runtime<'a> {
         );
         self.ops
             .write_kernel_log(&[KERNEL_LOG_PRIORITY, line.as_bytes()].concat());
-        if let Ok(ports) = self.ports() {
+        if let Ok(ports) = self.open_ports() {
             if self.async_output.load(Ordering::Relaxed) {
-                ports.outb(Port::PortbData, b'\n');
+                ports.write_u8(Port::PortbData, b'\n');
             }
             for byte in line.bytes() {
-                ports.outb(Port::PortbData, byte);
+                ports.write_u8(Port::PortbData, byte);
             }
+            // A failure keeps the thread from starting anything, as `fork_process` checks, and
+            // the event goes on.
+            let _ = ports.release();
         }
         let separator: &[u8] = if self.async_output.load(Ordering::Relaxed) {
             b"\n"
@@ -392,6 +360,35 @@ pub(crate) fn clock_ns(clock: sys::Clock) -> i64 {
 /// Returns process-wide CPU time in wrapping nanoseconds.
 pub(crate) fn cpu_time_ns() -> i64 {
     clock_ns(sys::Clock::ProcessCpuTime)
+}
+
+/// Why the time tools could not start a process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SpawnError {
+    /// The calling thread may hold port permission, which the process would inherit.
+    Ports(PortError),
+    /// `fork` failed.
+    Fork(Errno),
+}
+
+impl Display for SpawnError {
+    /// Writes the diagnostic: the description of `fork`'s `errno`, or why the thread may hold
+    /// port permission, such as `ioperm revoke: Cannot allocate memory`.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Self::Ports(error) => error.fmt(formatter),
+            Self::Fork(error) => formatter.write_str(error.desc()),
+        }
+    }
+}
+
+impl std::error::Error for SpawnError {}
+
+/// Forks the process, as [`sys::fork`] does, once the calling thread holds no port permission,
+/// which the child would inherit.
+pub(crate) fn fork_process() -> Result<ForkResult, SpawnError> {
+    sys::check_released().map_err(SpawnError::Ports)?;
+    sys::fork().map_err(SpawnError::Fork)
 }
 
 /// Creates the NVX runtime directories, ignoring preexistence and failures.
@@ -517,9 +514,9 @@ pub(crate) fn suppression_restore(missing_ok: bool) -> Result<(), Vec<u8>> {
 }
 
 /// Reads a byte buffer using one scalar four-byte port access per chunk.
-pub(crate) fn portb_read(ports: &dyn PortIo, port: Port, buffer: &mut [u8]) {
+pub(crate) fn portb_read(ports: &PortAccess<'_>, port: Port, buffer: &mut [u8]) {
     for chunk in buffer.chunks_mut(size_of::<u32>()) {
-        let bytes = ports.inl(port).to_ne_bytes();
+        let bytes = ports.read_u32(port).to_ne_bytes();
         chunk.copy_from_slice(&bytes[..chunk.len()]);
     }
 }
@@ -530,10 +527,10 @@ pub(crate) fn lock_portb() -> Result<FileLock, Vec<u8>> {
 }
 
 /// Requests and decodes one host time sample, bracketed by realtime reads.
-pub(crate) fn take_sample(ports: &dyn PortIo) -> Result<TimeSample, TimeSampleError> {
+pub(crate) fn take_sample(ports: &PortAccess<'_>) -> Result<TimeSample, TimeSampleError> {
     let mut bytes = [0_u8; SAMPLE_SIZE];
     let t0 = clock_ns(sys::Clock::Realtime);
-    ports.outb(Port::PortbStatus, SELECT_TIME_SAMPLE);
+    ports.write_u8(Port::PortbStatus, SELECT_TIME_SAMPLE);
     let t1 = clock_ns(sys::Clock::Realtime);
     portb_read(ports, Port::PortbWindow, &mut bytes);
     Ok(TimeSample {
@@ -564,8 +561,8 @@ pub(crate) enum SampleResult {
 /// Why no host time sample could be selected. Its `Display` is the diagnostic.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SampleError {
-    /// The process may not access the ports.
-    Ports(Errno),
+    /// The thread could not take, or give up, the permission for the ports.
+    Ports(PortError),
     /// The port window, of this status, offers no time sample.
     NoTimeWindow(u8),
     /// A sample came from another VM generation, which a restore must handle first.
@@ -583,7 +580,7 @@ impl Display for SampleError {
     /// Writes the diagnostic, such as `time sample generation 7, expected 6`.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
-            Self::Ports(error) => write!(formatter, "ioperm: {}", error.desc()),
+            Self::Ports(error) => error.fmt(formatter),
             Self::NoTimeWindow(status) => write!(
                 formatter,
                 "portb status 0x{status:02x} has no time-sample window"
@@ -600,15 +597,28 @@ impl Display for SampleError {
 
 impl std::error::Error for SampleError {}
 
-/// Selects the lowest-uncertainty valid sample from a bounded attempt count.
+/// Selects the lowest-uncertainty valid sample from a bounded attempt count, in one port
+/// transaction, which ends before this returns.
 pub(crate) fn best_sample(
     runtime: &Runtime<'_>,
     attempts: usize,
     bound_ns: i64,
     generation: u32,
 ) -> Result<(SampleResult, BestSample), SampleError> {
-    let ports = runtime.ports().map_err(SampleError::Ports)?;
-    let status = ports.inb(Port::PortbStatus);
+    let ports = runtime.open_ports().map_err(SampleError::Ports)?;
+    let selected = select_sample(&ports, attempts, bound_ns, generation);
+    ports.release().map_err(SampleError::Ports)?;
+    selected
+}
+
+/// Selects the lowest-uncertainty valid sample through `ports`, as [`best_sample`] does.
+fn select_sample(
+    ports: &PortAccess<'_>,
+    attempts: usize,
+    bound_ns: i64,
+    generation: u32,
+) -> Result<(SampleResult, BestSample), SampleError> {
+    let status = ports.read_u8(Port::PortbStatus);
     if status & PORTB_TIME_WINDOW == 0 {
         return Err(SampleError::NoTimeWindow(status));
     }
@@ -719,12 +729,17 @@ pub(crate) mod tests {
     use std::sync::atomic::AtomicUsize;
 
     use super::*;
+    use crate::guest::sys::PortBackend;
     use crate::guest::sys::x86::msr;
 
     /// Privileged operations that record their requests and replay canned port input.
     pub(crate) struct FakeOps {
-        /// The result of the port permission.
-        pub(crate) ports: Result<(), Errno>,
+        /// The error with which the kernel refuses to grant the port permission, if any.
+        pub(crate) grant_error: Option<Errno>,
+        /// The error with which the kernel refuses to revoke the port permission, if any.
+        pub(crate) revoke_error: Option<Errno>,
+        /// Changes of the port permission, as `(first, count, enable)`, in order.
+        pub(crate) permissions: Mutex<Vec<(u16, u16, bool)>>,
         /// Values that successive port reads return.
         pub(crate) input: Mutex<VecDeque<u32>>,
         /// Port writes, in order.
@@ -743,7 +758,9 @@ pub(crate) mod tests {
         /// Returns a fake whose port reads return `input`.
         pub(crate) fn new(input: impl IntoIterator<Item = u32>) -> Self {
             Self {
-                ports: Ok(()),
+                grant_error: None,
+                revoke_error: None,
+                permissions: Mutex::new(Vec::new()),
                 input: Mutex::new(input.into_iter().collect()),
                 output: Mutex::new(Vec::new()),
                 adjustments: Mutex::new(Vec::new()),
@@ -752,25 +769,45 @@ pub(crate) mod tests {
                 console: Mutex::new(Vec::new()),
             }
         }
+
+        /// Returns the number of transactions that took the port permission, each of which
+        /// grants two ranges.
+        pub(crate) fn transactions(&self) -> usize {
+            let permissions = self.permissions.lock().unwrap();
+            permissions.iter().filter(|(.., enable)| *enable).count() / 2
+        }
     }
 
-    impl PortIo for FakeOps {
-        fn inb(&self, _: Port) -> u8 {
+    impl PortBackend for FakeOps {
+        fn set_permission(&self, first: u16, count: u16, enable: bool) -> Result<(), Errno> {
+            self.permissions
+                .lock()
+                .unwrap()
+                .push((first, count, enable));
+            let error = if enable {
+                self.grant_error
+            } else {
+                self.revoke_error
+            };
+            error.map_or(Ok(()), Err)
+        }
+
+        fn read_u8(&self, _: Port) -> u8 {
             self.input.lock().unwrap().pop_front().unwrap_or_default() as u8
         }
 
-        fn inl(&self, _: Port) -> u32 {
+        fn read_u32(&self, _: Port) -> u32 {
             self.input.lock().unwrap().pop_front().unwrap_or_default()
         }
 
-        fn outb(&self, port: Port, value: u8) {
+        fn write_u8(&self, port: Port, value: u8) {
             self.output.lock().unwrap().push((port, value));
         }
     }
 
     impl PrivilegedOps for FakeOps {
-        fn ports(&self) -> Result<&dyn PortIo, Errno> {
-            self.ports.map(|()| self as &dyn PortIo)
+        fn open_ports(&self) -> Result<PortAccess<'_>, PortError> {
+            PortAccess::with_backend(self)
         }
 
         fn open_msr(&self, _: usize, _: MsrAccess) -> Result<MsrDescriptor, Errno> {
@@ -809,8 +846,10 @@ pub(crate) mod tests {
     #[test]
     fn port_reader_uses_one_four_byte_read_per_chunk() {
         let ops = FakeOps::new([0x0403_0201, 0x0807_0605]);
+        let ports = ops.open_ports().unwrap();
         let mut bytes = [0; 7];
-        portb_read(&ops, Port::PortbData, &mut bytes);
+        portb_read(&ports, Port::PortbData, &mut bytes);
+        ports.release().unwrap();
         assert_eq!(bytes, [1, 2, 3, 4, 5, 6, 7]);
         assert!(ops.input.lock().unwrap().is_empty());
     }
@@ -818,10 +857,12 @@ pub(crate) mod tests {
     #[test]
     fn packet_without_ranges_costs_exactly_twenty_four_data_reads() {
         let ops = FakeOps::new(0..24);
+        let ports = ops.open_ports().unwrap();
         let mut header = [0; decoders::PACKET_HEADER_SIZE];
         let mut entropy = [0; decoders::PACKET_ENTROPY_SIZE];
-        portb_read(&ops, Port::PortbData, &mut header);
-        portb_read(&ops, Port::PortbData, &mut entropy);
+        portb_read(&ports, Port::PortbData, &mut header);
+        portb_read(&ports, Port::PortbData, &mut entropy);
+        ports.release().unwrap();
         assert!(ops.input.lock().unwrap().is_empty());
     }
 
@@ -840,14 +881,80 @@ pub(crate) mod tests {
     #[test]
     fn a_refused_port_permission_reaches_the_sample_diagnostic() {
         let mut ops = FakeOps::new([]);
-        ops.ports = Err(Errno::EPERM);
+        ops.grant_error = Some(Errno::EPERM);
         let runtime = Runtime::new(&ops, false);
         let error = best_sample(&runtime, 3, NSEC_PER_MSEC, 0).unwrap_err();
-        assert_eq!(error, SampleError::Ports(Errno::EPERM));
+        assert_eq!(error, SampleError::Ports(PortError::Grant(Errno::EPERM)));
         assert_eq!(
             error.to_string(),
             format!("ioperm: {}", Errno::EPERM.desc())
         );
+        assert!(ops.output.lock().unwrap().is_empty());
+        assert_eq!(sys::check_released(), Ok(()));
+    }
+
+    #[test]
+    fn a_sample_is_one_transaction_that_ends_before_it_returns() {
+        let ops = FakeOps::new([0]);
+        let runtime = Runtime::new(&ops, false);
+        let error = best_sample(&runtime, 3, NSEC_PER_MSEC, 0).unwrap_err();
+        assert_eq!(error, SampleError::NoTimeWindow(0));
+        assert_eq!(
+            *ops.permissions.lock().unwrap(),
+            [
+                (0xe9, 6, true),
+                (0x604, 2, true),
+                (0xe9, 6, false),
+                (0x604, 2, false)
+            ]
+        );
+        assert_eq!(sys::check_released(), Ok(()));
+    }
+
+    #[test]
+    fn a_failed_revocation_keeps_the_time_tools_from_starting_a_process() {
+        let mut ops = FakeOps::new([u32::from(PORTB_TIME_WINDOW)]);
+        ops.revoke_error = Some(Errno::ENOMEM);
+        let runtime = Runtime::new(&ops, false);
+        let error = best_sample(&runtime, 0, NSEC_PER_MSEC, 0).unwrap_err();
+        assert_eq!(error, SampleError::Ports(PortError::Revoke(Errno::ENOMEM)));
+        assert_eq!(
+            error.to_string(),
+            format!("ioperm revoke: {}", Errno::ENOMEM.desc())
+        );
+        // `fork_process` refuses before it forks: `fork` itself refuses with `EBUSY` in a
+        // process with more than one thread, such as the test harness.
+        let refused = fork_process().unwrap_err();
+        assert_eq!(refused, SpawnError::Ports(PortError::Revoke(Errno::ENOMEM)));
+        assert_eq!(refused.to_string(), error.to_string());
+    }
+
+    #[test]
+    fn each_event_writes_the_debug_console_in_a_transaction_of_its_own() {
+        let ops = FakeOps::new([]);
+        let runtime = Runtime::new(&ops, true);
+        runtime.repair_failure(ViolationCode::RepairSuppression, b"one");
+        runtime.repair_failure(ViolationCode::RepairSuppression, b"two");
+        assert_eq!(ops.transactions(), 2);
+        assert_eq!(sys::check_released(), Ok(()));
+        let console = ops.console.lock().unwrap().clone();
+        let port: Vec<_> = console
+            .iter()
+            .map(|&byte| (Port::PortbData, byte))
+            .collect();
+        assert_eq!(*ops.output.lock().unwrap(), port);
+    }
+
+    #[test]
+    fn an_event_skips_the_debug_console_without_the_port_permission() {
+        let mut ops = FakeOps::new([]);
+        ops.grant_error = Some(Errno::EPERM);
+        let runtime = Runtime::new(&ops, true);
+        runtime.repair_failure(ViolationCode::RepairSuppression, b"cannot restore");
+        assert!(!ops.console.lock().unwrap().is_empty());
+        assert!(!ops.kernel_log.lock().unwrap().is_empty());
+        assert!(ops.output.lock().unwrap().is_empty());
+        assert_eq!(sys::check_released(), Ok(()));
     }
 
     #[test]
