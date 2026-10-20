@@ -72,8 +72,8 @@ envelope (`version`, `phase`, and `containment`) belongs to the caller.
 
 ## Architecture
 
-- The NVX mechanics live in the [`nvx-rs` crate](../nvx-rs/README.md), library
-  `nvx`: the OpenVMM control protocol, artifact discovery, OpenVMM's command
+- The NVX mechanics live in the [`nvx` crate](../nvx-rs/README.md): the
+  OpenVMM control protocol, artifact discovery, OpenVMM's command
   line, the lowering of network and filesystem policies, process and platform
   primitives, the supervision of VM instances, and the fake OpenVMM. This crate
   re-exports it as `aci_edge_sandboxes::nvx`. It keeps the ACI Edge Sandboxes
@@ -581,7 +581,7 @@ initramfs.
 3. An `nvx/` directory in the release layout next to the current executable.
 4. The bundle staged at build time by the `bundled` feature.
 
-The `bundled` feature enables the `bundled` feature of `nvx-rs`, whose build
+The `bundled` feature enables the `bundled` feature of `nvx`, whose build
 script stages `bin/`, `guest/`, `SOURCE-MANIFEST.json`, and `SHA256SUMS` in its
 output directory, and `nvx::Artifacts::bundled` returns them. The bundle comes
 from one of two sources:
@@ -600,7 +600,7 @@ match its pinned digest. The staged directory is in Cargo's build output, so it
 serves development and tests on the build machine. To deploy, copy it next to
 your executable as `nvx/`. The build scripts of crates that depend on this one
 receive its path as `DEP_ACI_EDGE_SANDBOXES_ARTIFACTS_DIR`, which this crate's
-build script passes on from `nvx-rs`; crates that depend on `nvx-rs` directly
+build script passes on from `nvx`; crates that depend on `nvx` directly
 receive it as `DEP_NVX_ARTIFACTS_DIR`. `NVX_BUNDLE=skip` turns staging off,
 which CI uses for `--all-features` builds.
 
@@ -1006,7 +1006,7 @@ fake-OpenVMM lifecycle test.
 - `testing::MockBackend` scripts executions for consumers' unit tests.
 - The `aci-edge-sandboxes-fake-openvmm` binary (feature `testing`) emulates the OpenVMM
   control console. It runs the fake OpenVMM of `nvx::testing::fake_openvmm`, which
-  `nvx-rs` also builds as `nvx-fake-openvmm`; the binary stays in this package
+  `nvx` also builds as `nvx-fake-openvmm`; the binary stays in this package
   because `CARGO_BIN_EXE_*` names only binaries of the package under test. It lets the real OpenVMM backend run end to end on hosts
   without a hypervisor: detached launch, reconnection from a new process,
   crash recovery, interrupted-start recovery, forced stop, cancellation,
@@ -1049,12 +1049,12 @@ contract or `ContainmentBackend` routing.
 The crate is not published to a registry. A Cargo git dependency on
 `microsoft/nvx` also fetches the `openvmm` submodule, which requires access to
 `microsoft/openvmm`; vendor the crate if that access is unavailable. The crate and
-its data model depend on `nvx-rs` through relative paths, so vendor `nvx-rs/`
+its data model depend on `nvx` through relative paths, so vendor `nvx-rs/`
 beside `aci_edge_sandboxes/`.
 
 ## Breaking changes
 
-The NVX mechanics moved to [`nvx-rs`](../nvx-rs/README.md). Requests, results,
+The NVX mechanics moved to the [`nvx` crate](../nvx-rs/README.md). Requests, results,
 wire formats, error codes and messages, and on-disk sandbox state are
 unchanged; sandboxes provisioned before the move keep working. These changes
 affect Rust callers and builds:
@@ -1067,12 +1067,16 @@ affect Rust callers and builds:
   fail with `nvx::Error` instead of `aci_edge_sandboxes::Error`. Both are
   `ErrorKind::Unavailable` errors with the same messages, and `?` or `Into`
   converts them into `backend_unavailable` errors.
-- `aci_edge_sandboxes_model` depends on `nvx-rs`, without its host side, for
+- `aci_edge_sandboxes_model` depends on `nvx`, without its host side, for
   `Cidr`, `Hypervisor`, and the hostname and guest-network rules, so a consumer
   that vendors this crate or its model also vendors `nvx-rs/`.
   `aci_edge_sandboxes_model::cidr`, `aci_edge_sandboxes_model::setup::Hypervisor`,
   and `aci_edge_sandboxes_model::spec::{is_valid_hostname, is_valid_guest_network}`
   keep their paths, and `SetupConfig` keeps its JSON.
+- The package of the `nvx` crate, which was called `nvx-rs`, now has its
+  library's name; it stays in `nvx-rs/`. A crate that depends on it directly
+  declares the dependency as `nvx`, enables its features as `nvx/FEATURE`, and
+  keeps its `nvx::` paths.
 - The build variables `ACI_EDGE_SANDBOXES_BUNDLE`,
   `ACI_EDGE_SANDBOXES_BUNDLE_DIR`, and `ACI_EDGE_SANDBOXES_BUNDLE_HYPERVISOR`
   became `NVX_BUNDLE`, `NVX_BUNDLE_DIR`, and `NVX_BUNDLE_HYPERVISOR`, and the

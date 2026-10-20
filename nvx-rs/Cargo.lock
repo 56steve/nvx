@@ -148,7 +148,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "nvx-rs"
+name = "nvx"
 version = "0.1.0"
 dependencies = [
  "getrandom",

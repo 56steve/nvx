@@ -25,9 +25,9 @@
 - For changes under `aci_edge_sandboxes/`, run the commands in
   [check-aci-edge-sandboxes](./actions/check-aci-edge-sandboxes/action.yml), and for
   changes under `nvx-rs/`, those in [check-nvx-rs](./actions/check-nvx-rs/action.yml)
-  and, because `aci_edge_sandboxes` builds on `nvx-rs`, check-aci-edge-sandboxes too.
+  and, because `aci_edge_sandboxes` builds on the `nvx` crate there, check-aci-edge-sandboxes too.
   check-nvx-rs also checks the runtime adapter in `tests/runtime-adapter/`, which
-  builds on `nvx-rs`; run its steps for changes to either.
+  builds on `nvx`; run its steps for changes to either.
   They need no hypervisor. `scripts/nvx.py test-aci-edge-sandboxes` exercises both
   crates on a real hypervisor.
 - OpenVMM source changes also require the package-scoped checks prescribed by the
@@ -55,7 +55,7 @@
   environment on `PATH`, the Rust release that `rust-toolchain.toml` pins with
   the OpenVMM test targets and the `x86_64-unknown-linux-musl` target used by
   the Rust guest binaries, the minimum supported Rust versions of the
-  `aci_edge_sandboxes` and `nvx-rs` crates, cargo-nextest, and the remaining
+  `aci_edge_sandboxes` and `nvx` crates, cargo-nextest, and the remaining
   native guest build prerequisites; grants `/dev/kvm` access; pulls the pinned shell linter images;
   and stages the pinned Linux and Ubuntu Base archives in `.cache/downloads`.
   When CI has cached them for the checked-out inputs, it also restores the guest

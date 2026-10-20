@@ -20,8 +20,8 @@ are build products or caches and are not part of the tracked source tree. The
 | `ubuntu` | Pinned Ubuntu supplemental binary-package lock |
 | `azurelinux` | Checksum-pinned Azure Linux supplemental RPM lock |
 | `aci_edge_sandboxes` | Rust crate `aci_edge_sandboxes`: state-aware sandbox API with an OpenVMM backend and an opt-in native-agent backend |
-| `nvx-rs` | Rust crate `nvx-rs`, library `nvx`: the NVX mechanics that the OpenVMM backend builds on |
-| `tests/runtime-adapter` | Rust crate `runtime-adapter`: an independent adapter that CI builds against `nvx-rs` through its public API |
+| `nvx-rs` | Rust crate `nvx`: the NVX mechanics that the OpenVMM backend builds on |
+| `tests/runtime-adapter` | Rust crate `runtime-adapter`: an independent adapter that CI builds against `nvx` through its public API |
 | `openvmm` | Public OpenVMM Git submodule from `microsoft/openvmm`, tracking its `feature/microvm/dev` branch |
 | `data` | Tracked performance history and generated benchmark data |
 | `scripts/nvx_tools` | Implementation of the `nvx.py` commands |
@@ -96,8 +96,8 @@ nvx/
 |   |   `-- bin/                 aci-edge-sandboxes-fake-openvmm wrapper of the nvx fake OpenVMM
 |   |-- examples/                Runnable lifecycle examples for the OpenVMM and agent backends
 |   |-- tests/                   Mock, fake-OpenVMM, validation, real-hypervisor, and agent-library tests
-|   `-- build.rs                 Passes the bundle that nvx-rs staged on to dependents
-|-- nvx-rs/                      Rust crate `nvx-rs`, library `nvx`, for the NVX mechanics
+|   `-- build.rs                 Passes the bundle that nvx staged on to dependents
+|-- nvx-rs/                      Rust crate `nvx` for the NVX mechanics
 |   |-- src/
 |   |   |-- protocol/            Control-console codec and NVXS session shared by the host and the guest
 |   |   |-- contract.rs          Control-contract versions and release compatibility
@@ -160,7 +160,7 @@ nvx/
 |   |-- publish_development_release.py Development release publisher run by CI
 |   `-- test_*.py                Python tooling unit tests
 |-- tests/                       Tests that build on the repository's crates from outside them
-|   `-- runtime-adapter/         Rust crate `runtime-adapter`, an independent adapter of nvx-rs
+|   `-- runtime-adapter/         Rust crate `runtime-adapter`, an independent adapter of nvx
 |       |-- src/                 Its library, and its host and guest skeleton binaries
 |       `-- tests/               Consumer-contract scenario C0, the independent build
 |-- SECURITY.md                 Microsoft security vulnerability reporting policy
@@ -271,7 +271,7 @@ API, the policy honor matrix, and tests.
 
 ### `nvx-rs/`
 
-The Rust crate `nvx-rs`, whose library `nvx` holds the NVX mechanics: the
+The Rust crate `nvx` holds the NVX mechanics: the
 authenticated control protocol of the guest agent, artifact discovery and
 bundled-release staging, OpenVMM's command line, the lowering of network and
 filesystem policies, the compiler of `nvx.py`'s egress policy files, process
@@ -332,7 +332,7 @@ see [Automated environment bootstrap](setup.md#automated-environment-bootstrap).
 
 Tests that build on the repository's crates from outside them.
 `runtime-adapter/` is an independent adapter of the NVX runtime: a standalone
-crate with its own `Cargo.lock` that depends on `nvx-rs` with default features
+crate with its own `Cargo.lock` that depends on `nvx` with default features
 off and uses its public API only. Its protocol-only, host-only, and guest-only
 configurations build in CI, and its tests check that each one builds as an
 independent adapter's does. See its
@@ -367,7 +367,7 @@ independent adapter's does. See its
 | `dist/` | Staged binary and source release archives |
 | `openvmm/target/` | Rust build output produced inside the OpenVMM submodule |
 | `aci_edge_sandboxes/target/` | Rust build output of the `aci_edge_sandboxes` crate |
-| `nvx-rs/target/` | Rust build output of the `nvx-rs` crate |
+| `nvx-rs/target/` | Rust build output of the `nvx` crate |
 | `tests/runtime-adapter/target/` | Rust build output of the runtime adapter |
 | `.ruff_cache/` | Ruff's local lint cache |
 | `__pycache__/` | Python bytecode caches that may appear below Python source directories |
