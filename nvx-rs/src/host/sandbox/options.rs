@@ -22,6 +22,7 @@ use super::layer::LayerRole;
 use super::mount::{
     AGGREGATE_MOUNT_TARGET, MountKind, MountOwner, MountPolicy, POLICY_KINDS, PolicyKind,
     SandboxMount, has_forbidden_character, has_irregular_component, mount_kind, os_error,
+    targets_overlap,
 };
 use super::{SandboxLaunch, refused};
 use crate::error::Result;
@@ -335,11 +336,7 @@ pub fn validate_run_share_targets(targets: &[&str]) -> Result<()> {
             )));
         }
         for other in std::iter::once(&AGGREGATE_MOUNT_TARGET).chain(&targets[..index]) {
-            let inside = |path: &str, directory: &str| {
-                path.strip_prefix(directory)
-                    .is_some_and(|rest| rest.starts_with('/'))
-            };
-            if target == other || inside(target, other) || inside(other, target) {
+            if targets_overlap(target, other) {
                 return Err(refused(format!(
                     "--mount targets {other} and {target} overlap; a share cannot hide another"
                 )));
