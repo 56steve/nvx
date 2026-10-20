@@ -323,36 +323,6 @@ mod tests {
         .unwrap()
     }
 
-    fn direct_system() -> (tempfile::TempDir, TestSystem) {
-        let temporary = tempfile::tempdir().unwrap();
-        let root = temporary.path().join("cgroup");
-        let execution = root.join("nvx-exec");
-        std::fs::create_dir_all(&execution).unwrap();
-        std::fs::write(root.join("cgroup.procs"), b"").unwrap();
-        std::fs::write(root.join("cgroup.subtree_control"), b"").unwrap();
-        std::fs::write(execution.join("pids.current"), b"0\n").unwrap();
-        std::fs::write(execution.join("cgroup.kill"), b"").unwrap();
-        std::fs::write(execution.join("cgroup.procs"), b"").unwrap();
-        let paths = Paths {
-            cgroup_root: root,
-            ..Paths::default()
-        };
-        (temporary, TestSystem::new(paths))
-    }
-
-    fn mapping_system() -> (tempfile::TempDir, TestSystem) {
-        let temporary = tempfile::tempdir().unwrap();
-        let hostfs = temporary.path().join("hostfs");
-        std::fs::create_dir_all(hostfs.join("root/0/src")).unwrap();
-        std::fs::write(hostfs.join("root/0/notes.txt"), b"notes").unwrap();
-        std::fs::create_dir(hostfs.join("root/1")).unwrap();
-        let paths = Paths {
-            hostfs_dir: hostfs,
-            ..Paths::default()
-        };
-        (temporary, TestSystem::new(paths))
-    }
-
     fn maps_payload(first: u32, entries: &[(&[u8], &[u8], u16)], count: Option<u32>) -> Vec<u8> {
         let mut payload = Vec::new();
         payload.extend_from_slice(&first.to_le_bytes());
@@ -430,7 +400,7 @@ mod tests {
         let _process = super::super::PROCESS_TEST_LOCK.lock().unwrap();
         let payload = exec_payload(None);
         for state in ["missing", "directory", "malformed", "charged"] {
-            let (_temporary, system) = direct_system();
+            let (_temporary, system) = TestSystem::with_cgroup();
             let tasks = system.paths.cgroup_root.join("nvx-exec/pids.current");
             match state {
                 "missing" => std::fs::remove_file(&tasks).unwrap(),
@@ -472,7 +442,7 @@ mod tests {
 
     #[test]
     fn mappings_mount_in_order_and_unblock_workloads_through_dispatch() {
-        let (temporary, system) = mapping_system();
+        let (temporary, system) = TestSystem::with_host_export();
         let export = system.paths.hostfs_dir.join("root");
         let guest = temporary.path().join("guest");
         let source = guest.join("src");
@@ -549,7 +519,7 @@ mod tests {
 
     #[test]
     fn mapping_sequence_errors_are_reported_through_dispatch() {
-        let (temporary, system) = mapping_system();
+        let (temporary, system) = TestSystem::with_host_export();
         let target = temporary.path().join("guest/src");
         let target = target.as_os_str().as_bytes();
         let entry = [(b"0/src".as_slice(), target, 0)];
@@ -579,7 +549,7 @@ mod tests {
 
     #[test]
     fn a_failed_mapping_keeps_refusing_workloads_through_dispatch() {
-        let (temporary, system) = mapping_system();
+        let (temporary, system) = TestSystem::with_host_export();
         let target = temporary.path().join("guest/missing");
         let missing = maps_payload(0, &[(b"0/missing", target.as_os_str().as_bytes(), 0)], None);
         let valid = maps_payload(0, &[(b"0/src", target.as_os_str().as_bytes(), 0)], None);
@@ -603,7 +573,7 @@ mod tests {
 
     #[test]
     fn unannounced_mapping_tables_are_refused_through_dispatch() {
-        let (temporary, system) = mapping_system();
+        let (temporary, system) = TestSystem::with_host_export();
         let target = temporary.path().join("guest/src");
         let mapping = maps_payload(0, &[(b"0/src", target.as_os_str().as_bytes(), 0)], None);
         let mut harness = Harness::with_system(true, system, 0);
@@ -650,7 +620,7 @@ mod tests {
             return;
         }
         let _process = super::super::PROCESS_TEST_LOCK.lock().unwrap();
-        let (_temporary, mut system) = direct_system();
+        let (_temporary, mut system) = TestSystem::with_cgroup();
         system.fail_environment = Some(b"HOME".to_vec());
         assert_environment_failure(
             Harness::with_system(true, system, 0),
@@ -668,7 +638,7 @@ mod tests {
             return;
         }
         let _process = super::super::PROCESS_TEST_LOCK.lock().unwrap();
-        let (temporary, mut system) = direct_system();
+        let (temporary, mut system) = TestSystem::with_cgroup();
         system.fail_environment = Some(b"PWD".to_vec());
         let mut harness = Harness::with_system(true, system, 0);
         for (request_id, cwd) in [(42, None), (43, Some(temporary.path().to_str().unwrap()))] {

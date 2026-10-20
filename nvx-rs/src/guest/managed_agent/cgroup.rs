@@ -162,30 +162,13 @@ fn write_path(path: &Path, bytes: &[u8]) -> Result<(), Errno> {
 mod tests {
     use std::process::Command;
 
-    use super::super::seam::{Paths, TestSystem};
+    use super::super::seam::TestSystem;
     use super::*;
-
-    fn setup() -> (tempfile::TempDir, TestSystem) {
-        let temporary = tempfile::tempdir().unwrap();
-        let root = temporary.path().join("cgroup");
-        let execution = root.join("nvx-exec");
-        std::fs::create_dir_all(&execution).unwrap();
-        std::fs::write(root.join("cgroup.procs"), b"").unwrap();
-        std::fs::write(root.join("cgroup.subtree_control"), b"").unwrap();
-        std::fs::write(execution.join("pids.current"), b"0\n").unwrap();
-        std::fs::write(execution.join("cgroup.kill"), b"").unwrap();
-        std::fs::write(execution.join("cgroup.procs"), b"").unwrap();
-        let paths = Paths {
-            cgroup_root: root,
-            ..Paths::default()
-        };
-        (temporary, TestSystem::new(paths))
-    }
 
     #[test]
     fn task_count_requires_a_canonical_decimal() {
         let _process = super::super::PROCESS_TEST_LOCK.lock().unwrap();
-        let (_temporary, system) = setup();
+        let (_temporary, system) = TestSystem::with_cgroup();
         let tasks = system.paths.cgroup_root.join("nvx-exec/pids.current");
         for (contents, expected) in [
             (b"0\n".as_slice(), false),
@@ -224,7 +207,7 @@ mod tests {
     #[test]
     fn missing_and_unreadable_task_counts_are_errors() {
         let _process = super::super::PROCESS_TEST_LOCK.lock().unwrap();
-        let (_temporary, system) = setup();
+        let (_temporary, system) = TestSystem::with_cgroup();
         let tasks = system.paths.cgroup_root.join("nvx-exec/pids.current");
         std::fs::remove_file(&tasks).unwrap();
         assert_eq!(has_tasks(&system).unwrap_err(), Errno::ENOENT);
@@ -235,7 +218,7 @@ mod tests {
     #[test]
     fn preparation_enables_the_pids_controller_once() {
         let _process = super::super::PROCESS_TEST_LOCK.lock().unwrap();
-        let (_temporary, mut system) = setup();
+        let (_temporary, mut system) = TestSystem::with_cgroup();
         let root = system.paths.cgroup_root.clone();
         prepare(&mut system).unwrap();
         assert_eq!(
@@ -261,7 +244,7 @@ mod tests {
             return;
         }
         let _process = super::super::PROCESS_TEST_LOCK.lock().unwrap();
-        let (_temporary, mut system) = setup();
+        let (_temporary, mut system) = TestSystem::with_cgroup();
         let execution = system.paths.cgroup_root.join("nvx-exec");
         settle(&mut system).unwrap();
         assert_eq!(std::fs::read(execution.join("cgroup.kill")).unwrap(), b"1");
@@ -282,7 +265,7 @@ mod tests {
             return;
         }
         let _process = super::super::PROCESS_TEST_LOCK.lock().unwrap();
-        let (_temporary, system) = setup();
+        let (_temporary, system) = TestSystem::with_cgroup();
         let mut child = Command::new("/bin/true").spawn().unwrap();
         let process = ProcessId::from_child(&child);
         while !sys::has_exited(process).unwrap() {
@@ -302,7 +285,7 @@ mod tests {
             return;
         }
         let _process = super::super::PROCESS_TEST_LOCK.lock().unwrap();
-        let (_temporary, mut system) = setup();
+        let (_temporary, mut system) = TestSystem::with_cgroup();
         std::fs::write(
             system.paths.cgroup_root.join("nvx-exec/pids.current"),
             b"1\n",

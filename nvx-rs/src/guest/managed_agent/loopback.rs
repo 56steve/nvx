@@ -13,7 +13,7 @@ use crate::protocol::{
 };
 
 use super::launch::SpawnRequest;
-use super::seam::{Paths, TestSystem};
+use super::seam::TestSystem;
 
 struct BrokerCore {
     guest: UnixStream,
@@ -343,30 +343,11 @@ mod tests {
             return;
         }
         let _process = super::super::PROCESS_TEST_LOCK.lock().unwrap();
-        let temporary = tempfile::tempdir().unwrap();
-        let cgroup = temporary.path().join("cgroup");
-        std::fs::create_dir_all(cgroup.join("nvx-exec")).unwrap();
-        for (path, contents) in [
-            ("cgroup.procs", b"".as_slice()),
-            ("cgroup.subtree_control", b""),
-            ("nvx-exec/cgroup.procs", b""),
-            ("nvx-exec/cgroup.kill", b""),
-            ("nvx-exec/pids.current", b"0\n"),
-        ] {
-            std::fs::write(cgroup.join(path), contents).unwrap();
-        }
-        let hostfs = temporary.path().join("hostfs");
-        std::fs::create_dir_all(hostfs.join("root/0/source")).unwrap();
+        let (temporary, mut system) = TestSystem::with_cgroup();
+        system.paths.hostfs_dir = temporary.path().join("hostfs");
+        std::fs::create_dir_all(system.paths.hostfs_dir.join("root/0/source")).unwrap();
+        system.spawner = Some(spawn_unprivileged);
         let target = temporary.path().join("mapped");
-        let paths = Paths {
-            cgroup_root: cgroup,
-            hostfs_dir: hostfs,
-            ..Paths::default()
-        };
-        let system = TestSystem {
-            spawner: Some(spawn_unprivileged),
-            ..TestSystem::new(paths)
-        };
         let (broker_guest, agent) = UnixStream::pair().unwrap();
         let agent_descriptor = FileDescriptor::from_owned(agent.into());
         let agent_thread = thread::spawn(move || {
