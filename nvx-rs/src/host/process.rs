@@ -38,7 +38,7 @@ use crate::error::Error;
 use crate::protocol::CAPABILITY_LEN;
 
 /// Longest wait for a terminated OpenVMM process to exit.
-const KILL_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const KILL_TIMEOUT: Duration = Duration::from_secs(10);
 /// Interval at which process shutdown and identity are polled.
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 

@@ -22,8 +22,8 @@ use nvx::ErrorKind;
 use nvx::host::platform;
 use nvx::host::process::{self, Launched, Process};
 use nvx::host::store::{
-    ArtifactIdentity, IdentityCheck, JOURNAL_NAME, Launch, LaunchState, LockedStore, RUNTIME_NAME,
-    Recovery, RuntimeIdentity, SandboxStore,
+    ArtifactIdentity, IdentityCheck, IdentityPart, JOURNAL_NAME, Launch, LaunchState, LockedStore,
+    RUNTIME_NAME, Recovery, RuntimeIdentity, SandboxStore,
 };
 use nvx::protocol::CAPABILITY_LEN;
 
@@ -434,7 +434,7 @@ fn a_committed_launch_names_its_vm_for_another_build() {
     upgraded.initramfs = artifact('4');
     assert_eq!(
         found.check_identity(&upgraded),
-        IdentityCheck::Mismatched(vec!["initramfs"])
+        IdentityCheck::Mismatched(vec![IdentityPart::Initramfs])
     );
     // The record's verified reference holds the VMM, whichever process started it.
     let reattached = Process::open(found.process())
@@ -558,7 +558,7 @@ fn another_runtime_identity_is_mismatched() {
     let (_directory, store) = store();
     install(&store, "runtime.json", RUNTIME_NAME);
     let record = store.runtime().unwrap().unwrap();
-    let mismatched = |change: fn(&mut RuntimeIdentity), part: &'static str| {
+    let mismatched = |change: fn(&mut RuntimeIdentity), part: IdentityPart| {
         let mut current = runtime();
         change(&mut current);
         assert_eq!(
@@ -566,15 +566,30 @@ fn another_runtime_identity_is_mismatched() {
             IdentityCheck::Mismatched(vec![part])
         );
     };
-    mismatched(|runtime| runtime.openvmm = artifact('9'), "OpenVMM");
-    mismatched(|runtime| runtime.kernel = artifact('9'), "kernel");
-    mismatched(|runtime| runtime.initramfs = artifact('9'), "initramfs");
-    mismatched(|runtime| runtime.boot_contract += 1, "boot contract");
+    mismatched(
+        |runtime| runtime.openvmm = artifact('9'),
+        IdentityPart::OpenVmm,
+    );
+    mismatched(
+        |runtime| runtime.kernel = artifact('9'),
+        IdentityPart::Kernel,
+    );
+    mismatched(
+        |runtime| runtime.initramfs = artifact('9'),
+        IdentityPart::Initramfs,
+    );
+    mismatched(
+        |runtime| runtime.boot_contract += 1,
+        IdentityPart::BootContract,
+    );
     mismatched(
         |runtime| runtime.control_contract.push_str("-next"),
-        "control contract",
+        IdentityPart::ControlContract,
     );
-    mismatched(|runtime| runtime.control_session += 1, "control session");
+    mismatched(
+        |runtime| runtime.control_session += 1,
+        IdentityPart::ControlSession,
+    );
 }
 
 #[test]

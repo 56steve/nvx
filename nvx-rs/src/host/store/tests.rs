@@ -97,13 +97,33 @@ fn runtime_identities_bind_this_crates_contracts() {
     let mut other = runtime();
     other.kernel = artifact('d');
     other.control_session += 1;
-    assert_eq!(identity.differences(&other), ["kernel", "control session"]);
+    assert_eq!(
+        identity.differences(&other),
+        [IdentityPart::Kernel, IdentityPart::ControlSession]
+    );
     other = RuntimeIdentity::new(artifact('e'), artifact('b'), artifact('f'));
     other.boot_contract += 1;
     other.control_contract = "another-revision".to_owned();
     assert_eq!(
         identity.differences(&other),
-        ["OpenVMM", "initramfs", "boot contract", "control contract"]
+        [
+            IdentityPart::OpenVmm,
+            IdentityPart::Initramfs,
+            IdentityPart::BootContract,
+            IdentityPart::ControlContract
+        ]
+    );
+    let names: Vec<_> = IdentityPart::ALL.iter().map(ToString::to_string).collect();
+    assert_eq!(
+        names,
+        [
+            "OpenVMM",
+            "kernel",
+            "initramfs",
+            "boot contract",
+            "control contract",
+            "control session"
+        ]
     );
     for invalid in ["", "two words"] {
         other.control_contract = invalid.to_owned();
@@ -170,7 +190,7 @@ fn records_keep_their_json_form() {
     upgraded.openvmm = artifact('9');
     assert_eq!(
         record.check_identity(&upgraded),
-        IdentityCheck::Mismatched(vec!["OpenVMM"])
+        IdentityCheck::Mismatched(vec![IdentityPart::OpenVmm])
     );
 }
 

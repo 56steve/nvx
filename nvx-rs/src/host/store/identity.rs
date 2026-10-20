@@ -11,9 +11,35 @@ use crate::error::{Error, Result};
 /// Longest [`ArtifactIdentity`] and control contract revision, in bytes.
 pub const MAX_IDENTITY_LEN: usize = 128;
 
-/// Returns whether `text` holds 1 to [`MAX_IDENTITY_LEN`] printable ASCII characters and no space.
-pub(super) fn is_token(text: &str) -> bool {
-    (1..=MAX_IDENTITY_LEN).contains(&text.len()) && text.bytes().all(|byte| byte.is_ascii_graphic())
+/// Hexadecimal digits of a SHA-256 digest: two for each of its 32 bytes.
+const SHA256_HEX_LEN: usize = 64;
+
+/// Opaque text of 1 to [`MAX_IDENTITY_LEN`] printable ASCII characters and no space: the form of
+/// an [`ArtifactIdentity`] and of a control contract revision, which the store only compares.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct Token(String);
+
+impl Token {
+    /// Fails with [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported) unless `text`, which
+    /// `what` names, has the form of a token.
+    fn check(text: &str, what: &str) -> Result<()> {
+        if (1..=MAX_IDENTITY_LEN).contains(&text.len())
+            && text.bytes().all(|byte| byte.is_ascii_graphic())
+        {
+            Ok(())
+        } else {
+            Err(Error::unsupported(format!(
+                "{what} {text:?} must hold 1 to {MAX_IDENTITY_LEN} printable ASCII characters and \
+                 no space"
+            )))
+        }
+    }
+
+    /// Wraps `text`, which `what` names, as [`Token::check`] allows.
+    fn new(text: String, what: &str) -> Result<Self> {
+        Self::check(&text, what)?;
+        Ok(Self(text))
+    }
 }
 
 /// Identity of one runtime artifact, such as the OpenVMM executable, as the metadata of its
@@ -25,7 +51,7 @@ pub(super) fn is_token(text: &str) -> bool {
 /// launch would cost time in proportion to the artifact's size on every start.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
-pub struct ArtifactIdentity(String);
+pub struct ArtifactIdentity(Token);
 
 impl ArtifactIdentity {
     /// Wraps `identity`.
@@ -33,15 +59,7 @@ impl ArtifactIdentity {
     /// Fails with [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported) unless it holds 1 to
     /// [`MAX_IDENTITY_LEN`] printable ASCII characters and no space.
     pub fn new(identity: impl Into<String>) -> Result<Self> {
-        let identity = identity.into();
-        if is_token(&identity) {
-            Ok(Self(identity))
-        } else {
-            Err(Error::unsupported(format!(
-                "artifact identity {identity:?} must hold 1 to {MAX_IDENTITY_LEN} printable ASCII \
-                 characters and no space"
-            )))
-        }
+        Token::new(identity.into(), "artifact identity").map(Self)
     }
 
     /// Returns the identity `sha256:DIGEST` of an artifact whose SHA-256 digest is `digest`, 64
@@ -49,24 +67,24 @@ impl ArtifactIdentity {
     ///
     /// Fails with [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported) otherwise.
     pub fn sha256(digest: &str) -> Result<Self> {
-        if digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            Ok(Self(format!("sha256:{}", digest.to_ascii_lowercase())))
+        if digest.len() == SHA256_HEX_LEN && digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            Self::new(format!("sha256:{}", digest.to_ascii_lowercase()))
         } else {
             Err(Error::unsupported(format!(
-                "{digest:?} is not a SHA-256 digest of 64 hexadecimal digits"
+                "{digest:?} is not a SHA-256 digest of {SHA256_HEX_LEN} hexadecimal digits"
             )))
         }
     }
 
     /// Returns the identity's text.
     pub fn as_str(&self) -> &str {
-        &self.0
+        &self.0.0
     }
 }
 
 impl fmt::Display for ArtifactIdentity {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
+        formatter.write_str(self.as_str())
     }
 }
 
@@ -80,7 +98,55 @@ impl TryFrom<String> for ArtifactIdentity {
 
 impl From<ArtifactIdentity> for String {
     fn from(identity: ArtifactIdentity) -> Self {
-        identity.0
+        identity.0.0
+    }
+}
+
+/// A part of a [`RuntimeIdentity`], which [`RuntimeIdentity::differences`] names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum IdentityPart {
+    /// [`RuntimeIdentity::openvmm`].
+    OpenVmm,
+    /// [`RuntimeIdentity::kernel`].
+    Kernel,
+    /// [`RuntimeIdentity::initramfs`].
+    Initramfs,
+    /// [`RuntimeIdentity::boot_contract`].
+    BootContract,
+    /// [`RuntimeIdentity::control_contract`].
+    ControlContract,
+    /// [`RuntimeIdentity::control_session`].
+    ControlSession,
+}
+
+impl IdentityPart {
+    /// Every part, in the order of the fields of [`RuntimeIdentity`].
+    pub const ALL: [Self; 6] = [
+        Self::OpenVmm,
+        Self::Kernel,
+        Self::Initramfs,
+        Self::BootContract,
+        Self::ControlContract,
+        Self::ControlSession,
+    ];
+
+    /// Returns the part's name, as messages print it.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::OpenVmm => "OpenVMM",
+            Self::Kernel => "kernel",
+            Self::Initramfs => "initramfs",
+            Self::BootContract => "boot contract",
+            Self::ControlContract => "control contract",
+            Self::ControlSession => "control session",
+        }
+    }
+}
+
+impl fmt::Display for IdentityPart {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.name())
     }
 }
 
@@ -142,37 +208,27 @@ impl RuntimeIdentity {
     /// contract revision does not hold 1 to [`MAX_IDENTITY_LEN`] printable ASCII characters and
     /// no space: the one field whose type does not ensure its form.
     pub fn check(&self) -> Result<()> {
-        if is_token(&self.control_contract) {
-            Ok(())
-        } else {
-            Err(Error::unsupported(format!(
-                "control contract revision {:?} must hold 1 to {MAX_IDENTITY_LEN} printable \
-                 ASCII characters and no space",
-                self.control_contract
-            )))
-        }
+        Token::check(&self.control_contract, "control contract revision")
     }
 
-    /// Names the parts of this identity that differ from `other`, in the order of its fields.
-    pub fn differences(&self, other: &Self) -> Vec<&'static str> {
-        [
-            ("OpenVMM", self.openvmm == other.openvmm),
-            ("kernel", self.kernel == other.kernel),
-            ("initramfs", self.initramfs == other.initramfs),
-            ("boot contract", self.boot_contract == other.boot_contract),
-            (
-                "control contract",
-                self.control_contract == other.control_contract,
-            ),
-            (
-                "control session",
-                self.control_session == other.control_session,
-            ),
-        ]
-        .into_iter()
-        .filter(|(_, equal)| !equal)
-        .map(|(name, _)| name)
-        .collect()
+    /// Returns the parts of this identity that differ from `other`, in the order of its fields.
+    pub fn differences(&self, other: &Self) -> Vec<IdentityPart> {
+        IdentityPart::ALL
+            .into_iter()
+            .filter(|&part| !self.same_part(other, part))
+            .collect()
+    }
+
+    /// Returns whether this identity and `other` agree in `part`.
+    fn same_part(&self, other: &Self, part: IdentityPart) -> bool {
+        match part {
+            IdentityPart::OpenVmm => self.openvmm == other.openvmm,
+            IdentityPart::Kernel => self.kernel == other.kernel,
+            IdentityPart::Initramfs => self.initramfs == other.initramfs,
+            IdentityPart::BootContract => self.boot_contract == other.boot_contract,
+            IdentityPart::ControlContract => self.control_contract == other.control_contract,
+            IdentityPart::ControlSession => self.control_session == other.control_session,
+        }
     }
 }
 
@@ -182,7 +238,7 @@ pub enum IdentityCheck {
     /// The identities are equal: the host may reattach to the VM and keep it running.
     Matches,
     /// The identities differ in the parts that this lists, as
-    /// [`RuntimeIdentity::differences`] names them: the VM must be stopped, and only through its
-    /// verified process identity.
-    Mismatched(Vec<&'static str>),
+    /// [`RuntimeIdentity::differences`] returns them: the VM must be stopped, and only through
+    /// its verified process identity.
+    Mismatched(Vec<IdentityPart>),
 }

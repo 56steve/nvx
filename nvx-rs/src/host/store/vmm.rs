@@ -2,13 +2,10 @@
 //! references before it signals one.
 
 use std::io;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crate::host::platform;
-use crate::host::process::{BootId, Process, ProcessRef};
-
-/// Longest wait for a terminated VMM to exit.
-const TERMINATION_TIMEOUT: Duration = Duration::from_secs(10);
+use crate::host::process::{BootId, KILL_TIMEOUT, Process, ProcessRef};
 
 /// Finds the live process `pid` of the current boot and holds it, or returns `None` if it has
 /// exited.
@@ -34,10 +31,10 @@ pub(super) fn serves_launch(process: &Process, log: (u64, u64)) -> io::Result<bo
 }
 
 /// Terminates `process` through its handle, and returns whether it exited within
-/// [`TERMINATION_TIMEOUT`].
+/// [`KILL_TIMEOUT`], the wait that the termination of other OpenVMM processes allows.
 pub(super) fn terminate(process: &Process) -> io::Result<bool> {
     process.kill()?;
-    process.wait(Instant::now() + TERMINATION_TIMEOUT)
+    process.wait(Instant::now() + KILL_TIMEOUT)
 }
 
 /// Holds the process that serves a launch's control endpoint, whose ID `server_pid` returns, with

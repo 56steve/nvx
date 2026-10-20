@@ -149,7 +149,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use self::files::{io_error, remove_if_present};
-pub use self::identity::{ArtifactIdentity, IdentityCheck, MAX_IDENTITY_LEN, RuntimeIdentity};
+pub use self::identity::{
+    ArtifactIdentity, IdentityCheck, IdentityPart, MAX_IDENTITY_LEN, RuntimeIdentity,
+};
 pub use self::record::{
     LaunchId, LaunchJournal, LaunchState, LogClaim, MAX_ENDPOINT_LEN, RuntimeRecord,
 };

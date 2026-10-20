@@ -17,21 +17,27 @@ use crate::host::process::ProcessRef;
 /// Longest control endpoint, in bytes.
 pub const MAX_ENDPOINT_LEN: usize = 4096;
 
+/// Random bytes in a [`LaunchId`]: 128 bits, so that no two launches draw the same identity.
+const LAUNCH_ID_BYTES: usize = 16;
+
+/// Hexadecimal digits of a [`LaunchId`]: two for each of its bytes.
+const LAUNCH_ID_LEN: usize = 2 * LAUNCH_ID_BYTES;
+
 /// Returns `bytes` as lowercase hexadecimal digits.
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// Returns whether `text` is exactly 32 lowercase hexadecimal digits.
+/// Returns whether `text` is exactly [`LAUNCH_ID_LEN`] lowercase hexadecimal digits.
 fn is_hex_id(text: &str) -> bool {
-    text.len() == 32
+    text.len() == LAUNCH_ID_LEN
         && text
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-/// Identity of one launch: 32 lowercase hexadecimal digits that the store draws at random for
-/// every launch, and which its journal and runtime record share.
+/// Identity of one launch: 32 lowercase hexadecimal digits, the 16 random bytes that the store
+/// draws for every launch, and which its journal and runtime record share.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct LaunchId(String);
@@ -39,7 +45,7 @@ pub struct LaunchId(String);
 impl LaunchId {
     /// Draws a fresh launch identity.
     pub(super) fn generate() -> Result<Self> {
-        let mut bytes = [0u8; 16];
+        let mut bytes = [0u8; LAUNCH_ID_BYTES];
         getrandom::fill(&mut bytes)
             .map_err(|error| Error::other("cannot draw a launch identity").with_source(error))?;
         Ok(Self(hex(&bytes)))
@@ -65,7 +71,7 @@ impl TryFrom<String> for LaunchId {
             Ok(Self(text))
         } else {
             Err(format!(
-                "launch identity {text:?} is not 32 lowercase hexadecimal digits"
+                "launch identity {text:?} is not {LAUNCH_ID_LEN} lowercase hexadecimal digits"
             ))
         }
     }
