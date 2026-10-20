@@ -7623,6 +7623,14 @@ class BuildConstantsTests(unittest.TestCase):
             with self.subTest(component=component):
                 self.assertIn(location, rows[component])
 
+    def test_nvx_rs_ships_the_repository_license(self):
+        # A published crate holds only the files under its directory, so
+        # nvx-rs/ keeps a copy of the repository's license.
+        root = BuildConstants.REPO_ROOT
+        self.assertEqual(
+            (root / "nvx-rs" / "LICENSE").read_bytes(), (root / "LICENSE").read_bytes()
+        )
+
     def test_project_source_archive_excludes_the_nvx_rs_target(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

@@ -14,9 +14,10 @@ Rust.
 
 An NVX sandbox is a microVM that OpenVMM runs with the managed lifecycle: the
 guest's init starts a managed agent, which runs the workloads that the host
-sends it over an authenticated control console. The crate is not published to
-a registry, and has a `Cargo.lock` of its own; a workspace at the repository
-root would interact with the nested `openvmm/` workspace.
+sends it over an authenticated control console. The crate is published on
+crates.io as a preview, whose API can change in any release. It has a
+`Cargo.lock` of its own; a workspace at the repository root would interact with
+the nested `openvmm/` workspace.
 
 ## Layout
 

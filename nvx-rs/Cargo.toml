@@ -1,6 +1,6 @@
 [package]
 name = "nvx"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 edition = "2024"
 rust-version = "1.89"
 description = "NVX mechanics: the OpenVMM control protocol and the launch, policy lowering, and supervision of NVX microVMs"
@@ -9,9 +9,15 @@ repository = "https://github.com/microsoft/nvx"
 readme = "README.md"
 keywords = ["sandbox", "microvm", "openvmm", "virtualization"]
 categories = ["virtualization"]
-publish = false
+publish = ["crates-io"]
 # Lets the build scripts of dependents read the staged bundle as `DEP_NVX_ARTIFACTS_DIR`.
 links = "nvx"
+
+# docs.rs builds without network access, so its documentation leaves out `bundled`, whose build
+# script downloads a release.
+[package.metadata.docs.rs]
+features = ["cli", "testing", "guest"]
+targets = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
 
 [lib]
 name = "nvx"
