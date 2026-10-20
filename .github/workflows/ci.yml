@@ -450,7 +450,7 @@ jobs:
     uses: ./.github/workflows/build-openvmm-binary.yml
     with:
       display-name: Linux GNU
-      runner: '["self-hosted", "linux", "kvm", "virtual-machine"]'
+      runner: '["self-hosted", "linux", "kvm", "virtual-machine", "general"]'
       backend: kvm
       artifact: openvmm-linux-gnu
       binary: openvmm/target/release/openvmm
@@ -481,7 +481,7 @@ jobs:
     uses: ./.github/workflows/build-openvmm-binary.yml
     with:
       display-name: Linux musl
-      runner: '["self-hosted", "linux", "mshv", "virtual-machine"]'
+      runner: '["self-hosted", "linux", "mshv", "virtual-machine", "general"]'
       backend: mshv
       artifact: openvmm-linux-musl
       binary: openvmm/target/release/openvmm
@@ -512,7 +512,7 @@ jobs:
     uses: ./.github/workflows/build-openvmm-binary.yml
     with:
       display-name: Windows MSVC
-      runner: '["self-hosted", "windows", "whp", "virtual-machine"]'
+      runner: '["self-hosted", "windows", "whp", "virtual-machine", "general"]'
       backend: whp
       artifact: openvmm-windows-msvc
       binary: openvmm/target/release/openvmm.exe
@@ -548,13 +548,13 @@ jobs:
         include:
           - name: Linux / KVM
             backend: kvm
-            runner: '["self-hosted", "linux", "kvm", "virtual-machine"]'
+            runner: '["self-hosted", "linux", "kvm", "virtual-machine", "general"]'
           - name: Linux / MSHV
             backend: mshv
-            runner: '["self-hosted", "linux", "mshv", "virtual-machine"]'
+            runner: '["self-hosted", "linux", "mshv", "virtual-machine", "general"]'
           - name: Windows / WHP
             backend: whp
-            runner: '["self-hosted", "windows", "whp", "virtual-machine"]'
+            runner: '["self-hosted", "windows", "whp", "virtual-machine", "general"]'
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -778,14 +778,14 @@ jobs:
       matrix:
         # The suites run once per OS: the tests that need /dev/kvm or
         # /dev/mshv are ignored, so the KVM and MSHV runners ran the same
-        # tests. The MSHV pool has the most runners.
+        # tests.
         include:
           - name: Linux
             backend: mshv
-            runner: '["self-hosted", "linux", "mshv", "virtual-machine"]'
+            runner: '["self-hosted", "linux", "mshv", "virtual-machine", "general"]'
           - name: Windows
             backend: whp
-            runner: '["self-hosted", "windows", "whp", "virtual-machine"]'
+            runner: '["self-hosted", "windows", "whp", "virtual-machine", "general"]'
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -982,7 +982,7 @@ jobs:
     uses: ./.github/workflows/run-nvx-microvm-tests.yml
     with:
       display-name: Linux / KVM
-      runner: '["self-hosted", "linux", "kvm", "virtual-machine"]'
+      runner: '["self-hosted", "linux", "kvm", "virtual-machine", "general"]'
       backend: kvm
       openvmm-artifact: openvmm-linux-gnu
       nvx-rs-artifact: nvx-rs-linux-musl
@@ -1015,7 +1015,7 @@ jobs:
     uses: ./.github/workflows/run-nvx-microvm-tests.yml
     with:
       display-name: Linux / MSHV
-      runner: '["self-hosted", "linux", "mshv", "virtual-machine"]'
+      runner: '["self-hosted", "linux", "mshv", "virtual-machine", "general"]'
       backend: mshv
       openvmm-artifact: openvmm-linux-gnu
       nvx-rs-artifact: nvx-rs-linux-musl
@@ -1048,7 +1048,7 @@ jobs:
     uses: ./.github/workflows/run-nvx-microvm-tests.yml
     with:
       display-name: Windows / WHP
-      runner: '["self-hosted", "windows", "whp", "virtual-machine"]'
+      runner: '["self-hosted", "windows", "whp", "virtual-machine", "general"]'
       backend: whp
       openvmm-artifact: openvmm-windows-msvc
       nvx-rs-artifact: nvx-rs-windows-msvc
@@ -1084,7 +1084,7 @@ jobs:
     uses: ./.github/workflows/run-nvx-microvm-tests.yml
     with:
       display-name: Linux / KVM / Debug kernel
-      runner: '["self-hosted", "linux", "kvm", "virtual-machine"]'
+      runner: '["self-hosted", "linux", "kvm", "virtual-machine", "general"]'
       backend: kvm
       openvmm-artifact: openvmm-linux-gnu
       nvx-rs-artifact: nvx-rs-linux-musl
@@ -1112,7 +1112,7 @@ jobs:
     uses: ./.github/workflows/run-nvx-microvm-tests.yml
     with:
       display-name: Linux / MSHV / Debug kernel
-      runner: '["self-hosted", "linux", "mshv", "virtual-machine"]'
+      runner: '["self-hosted", "linux", "mshv", "virtual-machine", "general"]'
       backend: mshv
       openvmm-artifact: openvmm-linux-gnu
       nvx-rs-artifact: nvx-rs-linux-musl
@@ -1140,7 +1140,7 @@ jobs:
     uses: ./.github/workflows/run-nvx-microvm-tests.yml
     with:
       display-name: Windows / WHP / Debug kernel
-      runner: '["self-hosted", "windows", "whp", "virtual-machine"]'
+      runner: '["self-hosted", "windows", "whp", "virtual-machine", "general"]'
       backend: whp
       openvmm-artifact: openvmm-windows-msvc
       nvx-rs-artifact: nvx-rs-windows-msvc
@@ -1150,9 +1150,10 @@ jobs:
 
   # The platform jobs measure the performance series that the regression gate
   # and the history compare. Each runs on the one runner of its backend's pool
-  # that also carries the `benchmark` label, so that every workflow run
-  # measures its series on the same VM: the pools mix CPU generations and VMs
-  # whose results differ by more than the run-to-run noise (#383, #415).
+  # that carries `benchmark` instead of `general`, so that no other job can
+  # delay it and every workflow run measures its series on the same VM: the
+  # pools mix CPU generations and VMs whose results differ by more than the
+  # run-to-run noise (#383, #415).
   platform-kvm:
     name: Platform / Linux / KVM / Virtual machine
     needs: [artifacts, build-openvmm-linux-gnu, nvx-cli-linux, openvmm-changes]

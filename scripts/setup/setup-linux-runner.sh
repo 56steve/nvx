@@ -37,8 +37,8 @@ Bootstrap a Linux host for NVX GitHub Actions jobs.
 Options:
     --backend BACKEND       Virtualization backend: kvm or mshv
     --runner-name NAME      Register a runner with this unique name
-    --benchmark-runner      Also label the runner as its backend's one
-                            benchmark runner; requires --runner-name
+    --benchmark-runner      Use the backend's dedicated benchmark role instead
+                            of the general role; requires --runner-name
     --extra-runner-labels LABELS  Add labels to the required platform labels
     --repository-url URL    Runner repository URL (default: ${repository_url})
     --runner-directory PATH Runner installation path (default: ${runner_directory})
@@ -217,6 +217,11 @@ append_runner_labels() {
     while :; do
         label=${remaining%%,*}
         lowercase_label=$(printf '%s' "$label" | tr '[:upper:]' '[:lower:]')
+        case "$lowercase_label" in
+            general | benchmark)
+                die "runner role label must be selected with --benchmark-runner: $label"
+                ;;
+        esac
         case ",${seen_labels}," in
             *,"${lowercase_label}",*) die "duplicate runner label: $label" ;;
         esac
@@ -995,10 +1000,12 @@ runner_cargo_home=${runner_directory}/_work/_temp/cargo-home
 runner_sccache_dir=${runner_directory}/_work/_sccache
 runner_labels_file=${runner_directory}/.nvx-labels
 expected_runner_labels=linux,${backend},virtual-machine
-# CI's platform jobs require the benchmark label, which exactly one runner of
-# each backend's pool carries.
+# CI's platform jobs use a dedicated benchmark runner. Every other runner uses
+# the complementary general role so unrelated jobs cannot occupy that runner.
 if [ "$benchmark_runner" = true ]; then
     expected_runner_labels=${expected_runner_labels},benchmark
+else
+    expected_runner_labels=${expected_runner_labels},general
 fi
 if [ -n "$extra_runner_labels" ]; then
     append_runner_labels "$extra_runner_labels"

@@ -34,6 +34,8 @@ from pathlib import Path, PurePosixPath
 from typing import cast
 from unittest.mock import MagicMock, call, patch
 
+import yaml
+
 sys.path.insert(0, str(Path(__file__).parent))
 import nvx  # noqa: E402
 from nvx_tools import (  # noqa: E402
@@ -5201,17 +5203,17 @@ python3() {
                 (
                     "Linux / KVM",
                     "kvm",
-                    '["self-hosted", "linux", "kvm", "virtual-machine"]',
+                    '["self-hosted", "linux", "kvm", "virtual-machine", "general"]',
                 ),
                 (
                     "Linux / MSHV",
                     "mshv",
-                    '["self-hosted", "linux", "mshv", "virtual-machine"]',
+                    '["self-hosted", "linux", "mshv", "virtual-machine", "general"]',
                 ),
                 (
                     "Windows / WHP",
                     "whp",
-                    '["self-hosted", "windows", "whp", "virtual-machine"]',
+                    '["self-hosted", "windows", "whp", "virtual-machine", "general"]',
                 ),
             ],
         )
@@ -5223,12 +5225,12 @@ python3() {
                 (
                     "Linux",
                     "mshv",
-                    '["self-hosted", "linux", "mshv", "virtual-machine"]',
+                    '["self-hosted", "linux", "mshv", "virtual-machine", "general"]',
                 ),
                 (
                     "Windows",
                     "whp",
-                    '["self-hosted", "windows", "whp", "virtual-machine"]',
+                    '["self-hosted", "windows", "whp", "virtual-machine", "general"]',
                 ),
             ],
         )
@@ -5313,6 +5315,8 @@ python3() {
                     self.assertNotIn("run-platform.yml", job)
                     for labels in runners:
                         self.assertNotIn("benchmark", labels)
+                        if {"kvm", "mshv", "whp"} & set(labels):
+                            self.assertIn("general", labels)
         self.assertIn(
             "    runs-on: ${{ fromJSON(inputs.runner) }}\n", platform_workflow
         )
@@ -5320,6 +5324,55 @@ python3() {
             "    - benchmark\n",
             (github / "actionlint.yaml").read_text(encoding="utf-8"),
         )
+        self.assertIn(
+            "    - general\n",
+            (github / "actionlint.yaml").read_text(encoding="utf-8"),
+        )
+
+    def test_backend_workflow_runner_roles_are_exclusive(self):
+        workflows = BuildConstants.REPO_ROOT / ".github" / "workflows"
+        platform_jobs = {"platform-kvm", "platform-mshv", "platform-whp"}
+        observed_platform_jobs: set[str] = set()
+        observed_general_jobs: set[str] = set()
+
+        for path in sorted(workflows.glob("*.yml")):
+            parsed = yaml.safe_load(path.read_text(encoding="utf-8"))
+            for job_name, job in parsed.get("jobs", {}).items():
+                selectors: list[list[str]] = []
+                runs_on = job.get("runs-on")
+                if isinstance(runs_on, list):
+                    selectors.append(cast(list[str], runs_on))
+                runner_input = job.get("with", {}).get("runner")
+                if isinstance(runner_input, str) and runner_input.startswith("["):
+                    selectors.append(json.loads(runner_input))
+                for leg in job.get("strategy", {}).get("matrix", {}).get("include", []):
+                    runner = leg.get("runner")
+                    if isinstance(runner, str) and runner.startswith("["):
+                        selectors.append(json.loads(runner))
+
+                for labels in selectors:
+                    backends = {"kvm", "mshv", "whp"} & set(labels)
+                    if not backends:
+                        continue
+                    with self.subTest(workflow=path.name, job=job_name, labels=labels):
+                        self.assertEqual(len(backends), 1)
+                        self.assertIn("self-hosted", labels)
+                        self.assertIn("virtual-machine", labels)
+                        if path.name == "ci.yml" and job_name in platform_jobs:
+                            observed_platform_jobs.add(job_name)
+                            self.assertEqual(
+                                job.get("uses"),
+                                "./.github/workflows/run-platform.yml",
+                            )
+                            self.assertIn("benchmark", labels)
+                            self.assertNotIn("general", labels)
+                        else:
+                            observed_general_jobs.add(f"{path.name}:{job_name}")
+                            self.assertIn("general", labels)
+                            self.assertNotIn("benchmark", labels)
+
+        self.assertEqual(observed_platform_jobs, platform_jobs)
+        self.assertTrue(observed_general_jobs)
 
     def test_ci_validates_the_cli_once_per_os_after_checking_out_openvmm(self):
         # The CLI tests read OpenVMM's pinned CPU profiles from the submodule,
@@ -6027,10 +6080,9 @@ python3() {
         ):
             self.assertNotIn(cross_platform_tool, linux_setup)
 
-    def test_linux_runner_setup_adds_the_benchmark_label_on_request(self):
+    def test_linux_runner_setup_selects_exactly_one_runner_role(self):
         # Provisioning replaces a runner's registration, so the benchmark
-        # runner keeps the label that CI's platform jobs require only when
-        # the setup script registers it.
+        # runner keeps the role that CI requires only when setup registers it.
         linux_setup = (
             BuildConstants.REPO_ROOT / "scripts" / "setup" / "setup-linux-runner.sh"
         ).read_text(encoding="utf-8")
@@ -6067,8 +6119,8 @@ python3() {
             'printf "%s\\n" "$expected_runner_labels"\n'
         )
         for backend, runner_name, benchmark_runner, expected in (
-            ("kvm", "azure-kvm-1", "false", "linux,kvm,virtual-machine"),
-            ("mshv", "", "false", "linux,mshv,virtual-machine"),
+            ("kvm", "azure-kvm-1", "false", "linux,kvm,virtual-machine,general"),
+            ("mshv", "", "false", "linux,mshv,virtual-machine,general"),
             ("kvm", "azure-kvm-3", "true", "linux,kvm,virtual-machine,benchmark"),
             ("mshv", "azure-mshv-4", "true", "linux,mshv,virtual-machine,benchmark"),
             ("kvm", "", "true", None),
@@ -6095,7 +6147,7 @@ python3() {
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertEqual(result.stdout, f"{expected}\n")
 
-    def test_windows_runner_setup_adds_the_benchmark_label_on_request(self):
+    def test_windows_runner_setup_selects_exactly_one_runner_role(self):
         setup = BuildConstants.REPO_ROOT / "scripts" / "setup" / "setup-windows-whp.ps1"
         windows_setup = setup.read_text(encoding="utf-8")
         self.assertIn("    [switch]$BenchmarkRunner,\n", windows_setup)
@@ -6157,7 +6209,7 @@ Write-Output (Get-ExpectedRunnerLabels -BenchmarkRunner)
         self.assertEqual(
             result.stdout.splitlines(),
             [
-                "windows,whp,virtual-machine",
+                "windows,whp,virtual-machine,general",
                 "windows,whp,virtual-machine,benchmark",
             ],
         )

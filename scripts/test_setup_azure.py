@@ -139,6 +139,7 @@ class PackageTests(unittest.TestCase):
                 "0",
                 "/mnt/data",
                 "preinstalled",
+                "false",
             ],
         )
 
@@ -156,6 +157,27 @@ class PackageTests(unittest.TestCase):
         config = self.configuration("linux")
         config["runnerLabels"].append("isolated")
         self.assertEqual(self.execute_linux(0, config).splitlines()[3], "isolated")
+
+    def test_embedded_linux_maps_runner_roles_to_the_setup_switch(self):
+        bootstrap = builder.source("linux/bootstrap-runner.sh").decode()
+        self.assertIn("registration_arguments+=(--benchmark-runner)", bootstrap)
+        for role, benchmark in (
+            (None, "false"),
+            ("general", "false"),
+            ("benchmark", "true"),
+        ):
+            with self.subTest(role=role):
+                config = self.configuration("linux")
+                if role is not None:
+                    config["runnerLabels"].append(role)
+                values = self.execute_linux(0, config).splitlines()
+                self.assertEqual(values[3], "")
+                self.assertEqual(values[8], benchmark)
+
+        config = self.configuration("linux")
+        config["runnerLabels"].extend(("general", "benchmark"))
+        with self.assertRaisesRegex(SystemExit, "both general and benchmark"):
+            self.execute_linux(0, config)
 
     def test_embedded_linux_metadata_identity(self):
         config = self.configuration("linux")
@@ -1050,6 +1072,8 @@ rpm() { [ "$*" = -qa ] && printf 'kernel-mshv-1\nedk2-hvloader-1\n'; }
             self.skipTest("Windows PowerShell is unavailable")
         installer = builder.source("windows/install-package.ps1")
         self.assertEqual(installer.count(b"$root = 'C:\\ProgramData\\NvxBootstrap'"), 1)
+        bootstrap = builder.source("windows/bootstrap-runner.ps1")
+        self.assertIn(b"$registrationArguments += '-BenchmarkRunner'", bootstrap)
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary) / "package"
             bootstrap_root = Path(temporary) / "bootstrap"
@@ -1194,9 +1218,32 @@ $labelsDefinition = $ast.Find({
     $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
     $node.Name -eq 'Get-ExtraRunnerLabels'
 }, $true)
+$roleDefinition = $ast.Find({
+    param($node)
+    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+    $node.Name -eq 'Test-BenchmarkRunner'
+}, $true)
+. ([scriptblock]::Create($roleDefinition.Extent.Text))
 . ([scriptblock]::Create($labelsDefinition.Extent.Text))
 if ((Get-ExtraRunnerLabels -RunnerLabels @('Windows', 'WHP', 'Virtual-Machine', 'isolated')) -ne
     'isolated') { throw 'Windows bootstrap rejected valid case-insensitive runner labels' }
+if (Test-BenchmarkRunner -RunnerLabels @('windows', 'whp', 'virtual-machine')) {
+    throw 'Windows bootstrap classified a default runner as benchmark'
+}
+if (Test-BenchmarkRunner -RunnerLabels @('windows', 'whp', 'virtual-machine', 'general')) {
+    throw 'Windows bootstrap classified a general runner as benchmark'
+}
+if (-not (Test-BenchmarkRunner -RunnerLabels @(
+    'windows', 'whp', 'virtual-machine', 'benchmark'
+))) { throw 'Windows bootstrap did not classify the benchmark runner' }
+$rejected = $false
+try {
+    Get-ExtraRunnerLabels -RunnerLabels @(
+        'windows', 'whp', 'virtual-machine', 'general', 'benchmark'
+    ) | Out-Null
+}
+catch { $rejected = $true }
+if (-not $rejected) { throw 'Windows bootstrap accepted both runner roles' }
 $rejected = $false
 try { Get-ExtraRunnerLabels -RunnerLabels @('windows', 'kvm', 'virtual-machine') | Out-Null }
 catch { $rejected = $true }
@@ -2303,6 +2350,25 @@ if (-not $rejected) { throw 'Firewall creation failure was ignored' }
                 self.assertEqual(
                     builder.normalize_config(config)["runnerLabels"], labels
                 )
+
+    def test_runner_roles_are_mutually_exclusive(self):
+        for platform in ("linux", "windows"):
+            for role in (None, "general", "benchmark"):
+                with self.subTest(platform=platform, role=role):
+                    config = self.configuration(platform)
+                    if role is not None:
+                        config["runnerLabels"].append(role)
+                    self.assertEqual(
+                        builder.normalize_config(config)["runnerLabels"],
+                        config["runnerLabels"],
+                    )
+            config = self.configuration(platform)
+            config["runnerLabels"].extend(("general", "benchmark"))
+            with self.subTest(platform=platform, role="both"):
+                with self.assertRaisesRegex(
+                    ValueError, "must not contain both general and benchmark"
+                ):
+                    builder.normalize_config(config)
 
     def test_windows_drive_and_path_validation(self):
         for update in (

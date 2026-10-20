@@ -236,6 +236,11 @@ def normalize_config(config: object) -> LinuxConfig | WindowsConfig:
     ]
     if len(set(label.lower() for label in labels)) != len(labels):
         raise ValueError("runnerLabels must not contain duplicates")
+    roles = {
+        label.lower() for label in labels if label.lower() in {"general", "benchmark"}
+    }
+    if len(roles) > 1:
+        raise ValueError("runnerLabels must not contain both general and benchmark")
     disk_value = values["dataDisk"]
     if not isinstance(disk_value, dict):
         raise ValueError("dataDisk must be an object")

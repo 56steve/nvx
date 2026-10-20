@@ -42,10 +42,16 @@ scripts until the instance identity is verified.
 `runnerLabels` must start with the generic CI labels. For Linux, use
 `["linux", "<kvm|mshv>", "virtual-machine"]`; for Windows, use
 `["windows", "whp", "virtual-machine"]`. Append optional pool labels after
-these three. The adapter passes **only** those additional labels to the
-generic setup scripts, which always retain the required platform labels.
-Changing the name, backend, or labels of a registered runner requires a
-fresh registration token.
+these three. With no role label, the generic setup assigns `general`; an
+explicit `general` has the same result. Append `benchmark` instead for the one
+dedicated benchmark runner in each backend pool. The two role labels are
+mutually exclusive. The adapter removes the role from the optional labels and
+selects the generic setup's benchmark switch when needed; the setup script then
+registers exactly one role along with the required platform labels. Changing
+the name, backend, or labels of a registered runner requires a fresh
+registration token. Add `general` to existing non-benchmark runners before
+merging workflows that require it, in the order documented in the
+[runner bootstrap guide](../README.md#github-actions-runners).
 
 Linux additionally selects `backend` (`kvm` or `mshv`), `kernelMode`, and
 `dataDisk.mountPoint` below `/mnt` or `/srv`. `kernelMode: "preinstalled"`
