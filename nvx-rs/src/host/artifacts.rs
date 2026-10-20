@@ -41,12 +41,6 @@ use crate::host::sandbox::require_file;
 
 /// Name of the release manifest at the root of a release archive or repository checkout.
 pub const MANIFEST_NAME: &str = "SOURCE-MANIFEST.json";
-/// Release-layout path of the guest kernel.
-const RELEASE_KERNEL: [&str; 2] = ["guest", "vmlinux"];
-/// Release-layout path of the Alpine initramfs.
-const RELEASE_INITRD: [&str; 2] = ["guest", "initramfs.cpio.gz"];
-/// Repository-layout directory of guest artifacts.
-const REPO_BUILD_DIR: &str = "build";
 
 /// Directory staged by the build script when the `bundled` feature is enabled.
 #[cfg(feature = "bundled")]
@@ -112,30 +106,13 @@ impl Artifacts {
     /// Fails with [`ErrorKind::Unavailable`](crate::ErrorKind::Unavailable) when the release's
     /// `SOURCE-MANIFEST.json` declares an incompatible control contract.
     pub fn from_release_dir(release_dir: impl AsRef<Path>) -> Result<Self> {
-        let root = absolute(release_dir.as_ref())?;
-        check_manifest(&root.join(MANIFEST_NAME))?;
-        let join = |parts: [&str; 2]| root.join(parts[0]).join(parts[1]);
-        Ok(Self::new(
-            root.join("bin").join(openvmm_executable()),
-            join(RELEASE_KERNEL),
-            join(RELEASE_INITRD),
-        ))
+        Self::from_artifact_dir(&ArtifactDir::release(release_dir.as_ref())?)
     }
 
     /// Uses an NVX repository checkout after `nvx.py download` or a local build:
     /// `openvmm/target/release/openvmm[.exe]`, `build/vmlinux`, and `build/initramfs.cpio.gz`.
     pub fn from_repo_layout(repo_root: impl AsRef<Path>) -> Result<Self> {
-        let root = absolute(repo_root.as_ref())?;
-        check_manifest(&root.join(MANIFEST_NAME))?;
-        let build = root.join(REPO_BUILD_DIR);
-        Ok(Self::new(
-            root.join("openvmm")
-                .join("target")
-                .join("release")
-                .join(openvmm_executable()),
-            build.join(RELEASE_KERNEL[1]),
-            build.join(RELEASE_INITRD[1]),
-        ))
+        Self::from_artifact_dir(&ArtifactDir::repository(repo_root.as_ref())?)
     }
 
     /// Uses a directory in either the release or the repository layout.
@@ -145,12 +122,21 @@ impl Artifacts {
     /// `bin/openvmm[.exe]`, `guest/vmlinux`, or `guest/initramfs.cpio.gz` is a release, and any
     /// other directory is a repository checkout.
     pub fn from_dir(directory: impl AsRef<Path>) -> Result<Self> {
-        let directory = directory.as_ref();
-        if is_release_dir(directory) {
-            Self::from_release_dir(directory)
-        } else {
-            Self::from_repo_layout(directory)
-        }
+        Self::from_artifact_dir(&ArtifactDir::from_dir(directory.as_ref())?)
+    }
+
+    /// Uses the OpenVMM executable, guest kernel, and Alpine initramfs of `directory`, once its
+    /// `SOURCE-MANIFEST.json` declares the control contract that this crate speaks.
+    ///
+    /// Fails with [`ErrorKind::Unavailable`](crate::ErrorKind::Unavailable) as
+    /// [`check_manifest`] does.
+    fn from_artifact_dir(directory: &ArtifactDir) -> Result<Self> {
+        check_manifest(&directory.root().join(MANIFEST_NAME))?;
+        Ok(Self::new(
+            directory.openvmm(),
+            directory.kernel(),
+            directory.initramfs(Guest::Alpine),
+        ))
     }
 
     /// Returns the artifacts staged by the build script, if the crate was built with the
@@ -256,10 +242,11 @@ fn discover_with(
 /// Returns whether `directory` is in the release layout: whether it contains `bin/openvmm[.exe]`,
 /// `guest/vmlinux`, or `guest/initramfs.cpio.gz`.
 fn is_release_dir(directory: &Path) -> bool {
+    let guest = directory.join(RELEASE_GUEST_DIR);
     [
-        directory.join("bin").join(openvmm_executable()),
-        directory.join(RELEASE_KERNEL[0]).join(RELEASE_KERNEL[1]),
-        directory.join(RELEASE_INITRD[0]).join(RELEASE_INITRD[1]),
+        directory.join(RELEASE_BIN_DIR).join(openvmm_executable()),
+        guest.join(KERNEL_NAME),
+        guest.join(Guest::Alpine.initramfs_name()),
     ]
     .iter()
     .any(|path| path.is_file())
@@ -318,6 +305,8 @@ pub const KERNEL_NAME: &str = "vmlinux";
 pub const PACKAGE_MANIFEST_SUFFIX: &str = ".packages.json";
 /// Suffix of the manifest of a distro layer, which binds the layer's digest and packages.
 pub const DISTRO_MANIFEST_SUFFIX: &str = ".manifest.json";
+/// Repository-layout directory of guest artifacts.
+const REPO_BUILD_DIR: &str = "build";
 /// Repository-layout path of the OpenVMM build output directory.
 const REPO_OPENVMM_DIR: [&str; 3] = ["openvmm", "target", "release"];
 /// Release-layout directory of the OpenVMM executable.
@@ -708,6 +697,9 @@ mod tests {
             artifacts.initrd,
             root.join("guest").join("initramfs.cpio.gz")
         );
+        // A directory that the caller hands over, such as a `TempDir`, lives until the
+        // constructor returns, after it reads the manifest.
+        assert_eq!(Artifacts::from_release_dir(directory).unwrap(), artifacts);
     }
 
     #[test]
@@ -730,6 +722,7 @@ mod tests {
             );
         };
         expected(&Artifacts::from_dir(directory.path()).unwrap());
+        expected(&Artifacts::from_repo_layout(directory.path()).unwrap());
 
         // Build outputs do not turn a checkout into a release.
         let build = directory.path().join("build");
