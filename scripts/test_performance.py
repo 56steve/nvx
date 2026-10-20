@@ -11,7 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any, cast
 from unittest.mock import patch
@@ -453,6 +453,24 @@ def validate_attempt(source: Path, log: Path) -> int:
                 str(log),
             ]
         )
+
+
+def git_repository(path: Path) -> Callable[..., str]:
+    """Initialize a git repository at ``path`` and return a git runner for it."""
+
+    def git(*args: str) -> str:
+        return subprocess.run(
+            ["git", "-C", str(path), *args],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+    git("init", "-q")
+    git("config", "user.email", "test@example.invalid")
+    git("config", "user.name", "test")
+    git("config", "commit.gpgsign", "false")
+    return git
 
 
 class PerformanceTests(unittest.TestCase):
@@ -2688,6 +2706,141 @@ class PerformanceTests(unittest.TestCase):
                 [(row.metric, row.commit) for row in rows],
                 [("throughput", "seed"), ("throughput", measured)],
             )
+
+    def test_resolve_commit_id_records_the_commit_that_a_revision_names(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+            git = git_repository(repo)
+            git("commit", "-q", "--allow-empty", "-m", "measured")
+            head = git("rev-parse", "HEAD")
+
+            self.assertEqual(performance._resolve_commit_id("HEAD", repo), head)
+            self.assertEqual(performance._resolve_commit_id(head[:12], repo), head)
+            # A full commit ID is already immutable, so it needs no checkout.
+            self.assertEqual(performance._resolve_commit_id(head, repo / "none"), head)
+            for revision in ("missing", "--verify"):
+                with (
+                    self.subTest(revision=revision),
+                    self.assertRaisesRegex(
+                        performance.PerformanceError, "does not name a commit"
+                    ),
+                ):
+                    performance._resolve_commit_id(revision, repo)
+
+    def test_collect_clis_record_the_commit_id_of_a_symbolic_revision(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+            git = git_repository(repo)
+            git("commit", "-q", "--allow-empty", "-m", "measured")
+            head = git("rev-parse", "HEAD")
+
+            for command, collector, inputs in (
+                ("collect", "collect_results", ["--input-dir", "logs"]),
+                ("collect-openvmm", "collect_openvmm_results", ["--input", "e2e"]),
+            ):
+                args = nvx.parse_args(
+                    [
+                        "performance",
+                        command,
+                        "--platform",
+                        "linux-kvm",
+                        "--commit",
+                        "HEAD",
+                        *inputs,
+                        "--output-dir",
+                        "results",
+                    ]
+                )
+                with (
+                    self.subTest(command=command),
+                    patch.object(performance, "ROOT", repo),
+                    patch.object(performance, collector) as collect,
+                ):
+                    self.assertEqual(args.handler(args), 0)
+                    self.assertEqual(collect.call_args.args[1], head)
+
+    def test_persist_rejects_a_result_commit_that_is_not_a_commit_id(self):
+        # Results collected with --commit HEAD would compare the reset history with
+        # itself, find no reset, and refill the reset series.
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+            git = git_repository(repo)
+            history_file = repo / "data" / "linux-kvm.csv"
+            performance.write_results(
+                history_file,
+                [performance.Result("seed", "latency", "ms", "lower", 10.0)],
+            )
+            git("add", "data")
+            git("commit", "-q", "-m", "measured")
+            performance.write_results(history_file, [])
+            git("commit", "-q", "-am", "reset latency")
+            source = repo / "source"
+            performance.write_results(
+                source / "linux-kvm.csv",
+                [performance.Result("HEAD", "latency", "ms", "lower", 11.0)],
+            )
+
+            with self.assertRaisesRegex(
+                performance.PerformanceError, "HEAD is not a full commit ID"
+            ):
+                performance.persist_results(source, repo / "data", git_checkout=repo)
+            self.assertEqual(performance.read_results(history_file), [])
+
+    def test_git_checkout_of_probes_the_nearest_existing_directory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary) / "repo"
+            outside = Path(temporary) / "outside"
+            repo.mkdir()
+            outside.mkdir()
+            git_repository(repo)
+
+            self.assertEqual(
+                performance._git_checkout_of(repo / "data" / "new"), repo.resolve()
+            )
+            self.assertIsNone(performance._git_checkout_of(outside / "data"))
+
+    def test_persist_cli_checks_a_history_directory_that_does_not_exist(self):
+        # A reset can remove the history directory, and a new series has none yet;
+        # neither may skip the reset and ancestry checks.
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+            git = git_repository(repo)
+            history = repo / "data"
+            performance.write_results(
+                history / "linux-kvm.csv",
+                [performance.Result("seed", "latency", "ms", "lower", 10.0)],
+            )
+            git("add", "data")
+            git("commit", "-q", "-m", "measured")
+            measured = git("rev-parse", "HEAD")
+            git("rm", "-q", "-r", "data")
+            git("commit", "-q", "-m", "reset the series")
+            source = repo / "source"
+
+            def persist(commit: str, history_dir: Path) -> int:
+                performance.write_results(
+                    source / "linux-kvm.csv",
+                    [performance.Result(commit, "latency", "ms", "lower", 11.0)],
+                )
+                with (
+                    contextlib.redirect_stdout(io.StringIO()),
+                    contextlib.redirect_stderr(io.StringIO()),
+                ):
+                    return nvx.main(
+                        [
+                            "performance",
+                            "persist",
+                            "--source-dir",
+                            str(source),
+                            "--history-dir",
+                            str(history_dir),
+                        ]
+                    )
+
+            self.assertEqual(persist(measured, history), 0)
+            self.assertFalse((history / "linux-kvm.csv").exists())
+            self.assertEqual(persist("f" * 40, repo / "new"), 2)
+            self.assertFalse((repo / "new" / "linux-kvm.csv").exists())
 
     def test_persist_and_gate_isolate_processor_counts(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -19,8 +19,10 @@ from pathlib import Path
 from typing import cast
 
 from . import benchmark_host, host_telemetry
+from .build_constants import BuildConstants
 from .common import bytes_to_mib, positive_int, sha256_file
 
+ROOT = BuildConstants.REPO_ROOT
 LEGACY_CSV_FIELDS = ["commit", "metric", "unit", "direction", "p50"]
 CSV_FIELDS = [
     "platform",
@@ -83,6 +85,7 @@ LIFECYCLE_ATTEMPT_LOG_SCHEMA_VERSION = 1
 LIFECYCLE_ATTEMPT_STATUSES = {0: "valid", UNSTABLE_LIFECYCLE_EXIT_CODE: "unstable"}
 """Validation statuses by exit status; any other status is ``invalid``."""
 SHA256_HEX = re.compile(r"[0-9a-f]{64}")
+COMMIT_ID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 NUMBER = r"[0-9]+(?:,[0-9]{3})*(?:\.[0-9]+)?"
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 SHELL_SNAPSHOT_MEMORIES_MIB = (128, 256, 512)
@@ -2263,6 +2266,26 @@ def _git(checkout: Path, *args: str) -> str:
     return completed.stdout
 
 
+def _resolve_commit_id(revision: str, checkout: Path) -> str:
+    """Return the full ID of the commit that ``revision`` names in ``checkout``.
+
+    A symbolic revision such as ``HEAD`` names another commit by the time its
+    results are persisted, so results record the commit ID instead.
+    """
+    if COMMIT_ID.fullmatch(revision):
+        return revision
+    if not revision.startswith("-"):
+        try:
+            commit = _git(
+                checkout, "rev-parse", "--verify", "--quiet", f"{revision}^{{commit}}"
+            ).strip()
+        except PerformanceError:
+            commit = ""
+        if COMMIT_ID.fullmatch(commit):
+            return commit
+    raise PerformanceError(f"--commit {revision} does not name a commit in {checkout}")
+
+
 def _committed_results(top: Path, revision: str, relative: str) -> list[Result]:
     shown = subprocess.run(
         ["git", "-C", str(top), "show", f"{revision}:{relative}"],
@@ -2299,6 +2322,9 @@ def _reset_dimensions_since(
     A result measured at ``commit`` predates any later commit that removes the
     dimension's rows, so it must not be appended onto the reset series.
     """
+    # A mutable reference such as HEAD would compare the history with itself.
+    if not COMMIT_ID.fullmatch(commit):
+        raise PerformanceError(f"result commit {commit} is not a full commit ID")
     top = Path(_git(git_checkout, "rev-parse", "--show-toplevel").strip()).resolve()
     try:
         relative = history_path.resolve().relative_to(top).as_posix()
@@ -2388,14 +2414,25 @@ def _without_reset_rows(
 
 
 def _git_checkout_of(path: Path) -> Path | None:
-    """Return ``path`` when it lies inside a git checkout, which CI always does."""
+    """Return the nearest existing directory of ``path`` when it is in a git checkout.
+
+    ``path`` need not exist, as for a new history directory or one that a reset
+    removed; neither may skip the reset and ancestry checks. CI's history is
+    always in a checkout.
+    """
+    directory = path.resolve()
+    while not directory.is_dir():
+        if directory.parent == directory:
+            return None
+        directory = directory.parent
     probe = subprocess.run(
-        ["git", "-C", str(path), "rev-parse", "--is-inside-work-tree"],
+        ["git", "-C", str(directory), "rev-parse", "--is-inside-work-tree"],
         check=False,
         capture_output=True,
         text=True,
     )
-    return path if probe.returncode == 0 and probe.stdout.strip() == "true" else None
+    inside = probe.returncode == 0 and probe.stdout.strip() == "true"
+    return directory if inside else None
 
 
 def persist_results(
@@ -3004,7 +3041,7 @@ def command_performance(args: argparse.Namespace) -> int:
         if args.performance_command == "collect":
             collect_results(
                 args.platform,
-                args.commit,
+                _resolve_commit_id(args.commit, ROOT),
                 args.input_dir,
                 args.output_dir,
                 require_network=args.require_network,
@@ -3040,7 +3077,7 @@ def command_performance(args: argparse.Namespace) -> int:
         if args.performance_command == "collect-openvmm":
             collect_openvmm_results(
                 args.platform,
-                args.commit,
+                _resolve_commit_id(args.commit, ROOT),
                 args.input,
                 args.output_dir,
                 args.summary,
