@@ -166,22 +166,14 @@ fn create_file(path: &Path) -> Result<(), Errno> {
 mod tests {
     use std::os::unix::ffi::OsStrExt;
 
-    use super::super::seam::{Paths, TestSystem};
+    use super::super::seam::TestSystem;
     use super::*;
 
     fn setup(expected: u32) -> (tempfile::TempDir, TestSystem, HostMappings) {
-        let temporary = tempfile::tempdir().unwrap();
-        let hostfs = temporary.path().join("hostfs");
-        std::fs::create_dir_all(hostfs.join("root/0/src")).unwrap();
-        std::fs::write(hostfs.join("root/0/notes.txt"), b"notes").unwrap();
-        std::fs::create_dir(hostfs.join("root/1")).unwrap();
-        let paths = Paths {
-            hostfs_dir: hostfs,
-            ..Paths::default()
-        };
+        let (temporary, system) = TestSystem::with_host_export();
         (
             temporary,
-            TestSystem::new(paths),
+            system,
             HostMappings {
                 expected,
                 ..HostMappings::default()

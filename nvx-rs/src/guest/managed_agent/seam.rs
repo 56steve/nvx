@@ -224,6 +224,41 @@ impl TestSystem {
         }
     }
 
+    /// Returns a system whose cgroup root, in a new temporary directory that the caller keeps,
+    /// holds empty membership and controller files and an `nvx-exec` cgroup without tasks.
+    pub(crate) fn with_cgroup() -> (tempfile::TempDir, Self) {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("cgroup");
+        let execution = root.join("nvx-exec");
+        std::fs::create_dir_all(&execution).unwrap();
+        std::fs::write(root.join("cgroup.procs"), b"").unwrap();
+        std::fs::write(root.join("cgroup.subtree_control"), b"").unwrap();
+        std::fs::write(execution.join("pids.current"), b"0\n").unwrap();
+        std::fs::write(execution.join("cgroup.kill"), b"").unwrap();
+        std::fs::write(execution.join("cgroup.procs"), b"").unwrap();
+        let paths = Paths {
+            cgroup_root: root,
+            ..Paths::default()
+        };
+        (temporary, Self::new(paths))
+    }
+
+    /// Returns a system whose host-filesystem export, in a new temporary directory that the
+    /// caller keeps, holds child `0`, with the directory `src` and the file `notes.txt`, and the
+    /// empty child `1`.
+    pub(crate) fn with_host_export() -> (tempfile::TempDir, Self) {
+        let temporary = tempfile::tempdir().unwrap();
+        let hostfs = temporary.path().join("hostfs");
+        std::fs::create_dir_all(hostfs.join("root/0/src")).unwrap();
+        std::fs::write(hostfs.join("root/0/notes.txt"), b"notes").unwrap();
+        std::fs::create_dir(hostfs.join("root/1")).unwrap();
+        let paths = Paths {
+            hostfs_dir: hostfs,
+            ..Paths::default()
+        };
+        (temporary, Self::new(paths))
+    }
+
     /// Registers one owned descriptor and returns its simulated inherited argument.
     pub(crate) fn transfer_inherited_descriptor(&mut self, descriptor: FileDescriptor) -> CString {
         let argument = descriptor.argument();
