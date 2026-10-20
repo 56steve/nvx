@@ -5,6 +5,7 @@ use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::{AsHandle, AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
 use std::path::Path;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 use std::{mem, ptr};
 
@@ -388,11 +389,21 @@ impl Drop for AttributeList {
     }
 }
 
+/// Serializes the spawns that make handles of their caller inheritable, from the moment that one
+/// reads the inheritability of its handles until it restores it. Two spawns that allow the same
+/// handle would otherwise take each other's temporary inheritability for the handle's own: one
+/// could find the handle no longer inheritable when it creates its process, and fail, and then
+/// leave the handle inheritable for good.
+static INHERITANCE: Mutex<()> = Mutex::new(());
+
 /// Handles of a caller that a spawn makes inheritable for as long as it needs them, and whose
 /// earlier inheritability it restores when dropped.
 struct InheritableForSpawn {
     /// Each handle, and whether it was inheritable before.
     handles: Vec<(HANDLE, bool)>,
+    /// [`INHERITANCE`], held while any of the handles is inheritable for this spawn, and released
+    /// after their inheritability is restored.
+    _serialized: Option<MutexGuard<'static, ()>>,
 }
 
 impl InheritableForSpawn {
@@ -402,6 +413,8 @@ impl InheritableForSpawn {
     fn new(handles: &[HANDLE]) -> io::Result<Self> {
         let mut inheritable = Self {
             handles: Vec::with_capacity(handles.len()),
+            _serialized: (!handles.is_empty())
+                .then(|| INHERITANCE.lock().unwrap_or_else(PoisonError::into_inner)),
         };
         for &handle in handles {
             let mut flags = 0;
@@ -446,8 +459,10 @@ impl Drop for InheritableForSpawn {
 /// A handle in the list must be inheritable while the process is created. The `stdio` handles
 /// are inheritable from here until the spawn closes them, and the handles `inherit` from here
 /// until the spawn restores their earlier inheritability, right after the process is created.
-/// A process that the caller spawns concurrently without a handle list, as `std::process` does,
-/// could inherit them in that window; a process that it spawns with one could not.
+/// Spawns that allow handles of their caller run that part one at a time, so two that allow the
+/// same handle restore what it was before either. A process that the caller spawns concurrently
+/// without a handle list, as `std::process` does, could inherit them in that window; a process
+/// that it spawns with one could not.
 pub(crate) fn spawn_detached(
     program: &Path,
     arguments: &[OsString],
@@ -1445,5 +1460,48 @@ mod tests {
         );
         assert!(!other_held, "a handle that was not allowed was inherited");
         assert!(!allowed_inheritable && kept_inheritable);
+    }
+
+    #[test]
+    fn concurrent_spawns_that_allow_one_handle_all_inherit_it_and_restore_it() {
+        /// Threads that spawn at once.
+        const THREADS: usize = 4;
+        /// Spawns of each thread.
+        const SPAWNS: usize = 16;
+        let (_shared_reader, shared) = io::pipe().unwrap();
+        assert!(!inheritable(&shared));
+        let system = std::env::var_os("SystemRoot").unwrap();
+        let ping = Path::new(&system).join("System32").join("PING.EXE");
+        // Each spawn reads the handle's inheritability while others may have made it inheritable
+        // for their own spawns, and must neither take that for the handle's own nor find the
+        // handle no longer inheritable when it creates its process.
+        std::thread::scope(|scope| {
+            for _ in 0..THREADS {
+                scope.spawn(|| {
+                    let value = shared.as_raw_handle() as HANDLE;
+                    for _ in 0..SPAWNS {
+                        let (stdin, _stdin_writer) = io::pipe().unwrap();
+                        let (_stdout_reader, stdout) = io::pipe().unwrap();
+                        let stderr = stdout.try_clone().unwrap();
+                        let child = spawn_detached(
+                            &ping,
+                            &["-n", "30", "127.0.0.1"].map(OsString::from),
+                            &std::env::temp_dir(),
+                            [stdin.into(), stdout.into(), stderr.into()],
+                            &[Inherited::new(&shared)],
+                            false,
+                        )
+                        .unwrap();
+                        let held = holds(&child.process, value, &shared);
+                        assert!(child.terminate(Duration::from_secs(10)));
+                        assert!(held, "a spawn did not inherit the allowed handle");
+                    }
+                });
+            }
+        });
+        assert!(
+            !inheritable(&shared),
+            "the spawns left the handle inheritable"
+        );
     }
 }

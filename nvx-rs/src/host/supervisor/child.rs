@@ -50,8 +50,9 @@ struct Borrowed<'a>(std::convert::Infallible, PhantomData<&'a ()>);
 ///   `/proc/self/fd/N`, which `proc_path` returns.
 /// - On Windows, the handle joins the explicit list of handles that the VMM inherits, and is
 ///   inheritable only while the VMM is created, after which the spawn restores its earlier
-///   inheritability. A process that another thread creates in that window without such a list,
-///   as `std::process::Command` does, can inherit it too.
+///   inheritability. Spawns that allow handles take that window one at a time, so several may
+///   allow the same handle. A process that another thread creates in that window without such a
+///   list, as `std::process::Command` does, can inherit it too.
 ///
 /// Other hosts fail a spawn that passes any.
 #[derive(Debug, Clone, Copy)]
