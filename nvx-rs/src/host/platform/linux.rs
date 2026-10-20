@@ -276,31 +276,19 @@ pub fn create_private_dir(path: &Path) -> io::Result<()> {
     fs::set_permissions(path, Permissions::from_mode(0o700))
 }
 
-/// Creates the directory `path` of a sandbox store with mode 0700, or makes an existing one
-/// private to the current user, and returns why it cannot be, if it cannot.
+/// Creates the directory `path` of a sandbox store with mode 0700, or checks that an existing one
+/// is private to the current user, as [`check_store_dir`] does, and returns why it is not, if it
+/// is not.
 ///
-/// An existing directory must belong to the user, and others must not be able to write to it, as
-/// they could have placed records in it. One that others may only read or search is restricted
-/// to the user: access is checked at every lookup, so a descriptor that they opened before gains
-/// them nothing.
+/// An existing directory is never restricted: others could have placed records in it, or still
+/// hold its files open, which a change of its mode would not revoke.
 pub(crate) fn create_store_dir(path: &Path) -> io::Result<Option<String>> {
     match DirBuilder::new().mode(0o700).create(path) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
         Err(error) => return Err(error),
     }
-    let Some(directory) = open_plain_dir(path)? else {
-        return Ok(Some("is not a plain directory".to_owned()));
-    };
-    let metadata = directory.metadata()?;
-    match store_dir_privacy(metadata.uid(), metadata.mode(), sys::effective_ids().0) {
-        Ok(true) => Ok(None),
-        Ok(false) => {
-            directory.set_permissions(Permissions::from_mode(0o700))?;
-            Ok(None)
-        }
-        Err(problem) => Ok(Some(problem)),
-    }
+    check_store_dir(path)
 }
 
 /// Returns why the directory `path` cannot hold a sandbox store, if it cannot: unless it is
@@ -311,35 +299,29 @@ pub(crate) fn check_store_dir(path: &Path) -> io::Result<Option<String>> {
         return Ok(Some("is not a plain directory".to_owned()));
     };
     let metadata = directory.metadata()?;
-    Ok(
-        match store_dir_privacy(metadata.uid(), metadata.mode(), sys::effective_ids().0) {
-            Ok(true) => None,
-            Ok(false) => Some(format!(
-                "is accessible to other users (mode {:03o})",
-                metadata.mode() & 0o777
-            )),
-            Err(problem) => Some(problem),
-        },
-    )
+    Ok(store_dir_problem(
+        metadata.uid(),
+        metadata.mode(),
+        sys::effective_ids().0,
+    ))
 }
 
-/// Returns whether a directory of a sandbox store, which the user `uid` owns with the mode
-/// `mode`, is private to the user `euid`, or why it cannot become private: it must belong to
-/// that user, and no one else may write to it. One that others may read or search can become
-/// private.
-pub(crate) fn store_dir_privacy(uid: u32, mode: u32, euid: u32) -> Result<bool, String> {
+/// Returns why a directory of a sandbox store, which the user `uid` owns with the mode `mode`, is
+/// not private to the user `euid`, if it is not: it must belong to that user, and grant no access
+/// to anyone else.
+pub(crate) fn store_dir_problem(uid: u32, mode: u32, euid: u32) -> Option<String> {
     if uid != euid {
-        return Err(format!(
+        Some(format!(
             "belongs to user {uid}, not to the current user {euid}"
-        ));
-    }
-    if mode & 0o022 != 0 {
-        return Err(format!(
-            "is writable by other users (mode {:03o})",
+        ))
+    } else if mode & 0o077 != 0 {
+        Some(format!(
+            "is accessible to other users (mode {:03o})",
             mode & 0o777
-        ));
+        ))
+    } else {
+        None
     }
-    Ok(mode & 0o077 == 0)
 }
 
 /// Opens the directory `path`, or returns `None` if it is a symbolic link or not a directory.

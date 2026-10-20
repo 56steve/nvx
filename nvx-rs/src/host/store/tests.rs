@@ -320,34 +320,27 @@ fn the_store_is_private_to_the_current_user() {
     let set_mode = |path: &Path, mode: u32| {
         fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
     };
-    // A directory that others may read holds no store until it is restricted to the user.
-    set_mode(store.dir(), 0o755);
-    let error = SandboxStore::open(store.dir()).unwrap_err();
-    assert!(
-        error
-            .message()
-            .ends_with("is accessible to other users (mode 755)"),
-        "{error}"
-    );
-    let store = SandboxStore::create(store.dir()).unwrap();
-    assert_eq!(mode(store.dir()), 0o700);
-    assert_eq!(SandboxStore::open(store.dir()).unwrap(), store);
-    // One that others may write to may hold records that they placed, and is left as it is.
+    // A directory that others could access is refused, and left as it is, rather than restricted:
+    // another user could hold its files open, as this journal that anyone may write to, which a
+    // change of the directory's mode would not take back.
     let shared = directory.path().join("shared");
     fs::create_dir(&shared).unwrap();
-    set_mode(&shared, 0o777);
-    for error in [
-        SandboxStore::create(&shared).unwrap_err(),
-        SandboxStore::open(&shared).unwrap_err(),
-    ] {
-        assert!(
-            error
-                .message()
-                .ends_with("is writable by other users (mode 777)"),
-            "{error}"
-        );
+    let journal = shared.join(JOURNAL_NAME);
+    fs::write(&journal, b"{}").unwrap();
+    set_mode(&journal, 0o666);
+    let held = fs::OpenOptions::new().write(true).open(&journal).unwrap();
+    for shared_mode in [0o755, 0o777] {
+        set_mode(&shared, shared_mode);
+        for error in [
+            SandboxStore::create(&shared).unwrap_err(),
+            SandboxStore::open(&shared).unwrap_err(),
+        ] {
+            let expected = format!("is accessible to other users (mode {shared_mode:03o})");
+            assert!(error.message().ends_with(&expected), "{error}");
+        }
+        assert_eq!(mode(&shared), shared_mode);
     }
-    assert_eq!(mode(&shared), 0o777);
+    drop(held);
     // A link to a store is no store.
     let link = directory.path().join("link");
     symlink(store.dir(), &link).unwrap();
@@ -360,6 +353,10 @@ fn the_store_is_private_to_the_current_user() {
             "{error}"
         );
     }
+    // The store's own directory and files are the user's alone.
+    assert_eq!(mode(store.dir()), 0o700);
+    assert_eq!(SandboxStore::open(store.dir()).unwrap(), store);
+    assert_eq!(SandboxStore::create(store.dir()).unwrap(), store);
     let mut locked = store.lock(None).unwrap();
     let launch = locked.begin_launch(&runtime(), &CAPABILITY).unwrap();
     drop(launch);
@@ -372,18 +369,15 @@ fn the_store_is_private_to_the_current_user() {
 #[test]
 fn stores_belong_to_the_current_user() {
     // Another user's directory is refused whatever its mode, since its owner may change it.
-    for mode in [0o40700, 0o40755] {
-        assert_eq!(
-            platform::store_dir_privacy(1001, mode, 1000),
-            Err("belongs to user 1001, not to the current user 1000".to_owned())
-        );
-    }
-    assert_eq!(platform::store_dir_privacy(1000, 0o40700, 1000), Ok(true));
-    assert_eq!(platform::store_dir_privacy(1000, 0o40755, 1000), Ok(false));
-    for mode in [0o40720, 0o40702, 0o40777] {
-        let problem = platform::store_dir_privacy(1000, mode, 1000).unwrap_err();
+    assert_eq!(
+        platform::store_dir_problem(1001, 0o40700, 1000),
+        Some("belongs to user 1001, not to the current user 1000".to_owned())
+    );
+    assert_eq!(platform::store_dir_problem(1000, 0o40700, 1000), None);
+    for mode in [0o40750, 0o40705, 0o40770] {
+        let problem = platform::store_dir_problem(1000, mode, 1000).unwrap();
         assert!(
-            problem.starts_with("is writable by other users"),
+            problem.starts_with("is accessible to other users"),
             "{problem}"
         );
     }

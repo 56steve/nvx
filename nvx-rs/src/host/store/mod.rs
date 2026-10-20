@@ -19,12 +19,13 @@
 //! 0700, and its files mode 0600. On Windows, a directory that the store creates allows the user
 //! alone, through a protected access control list that its files inherit; one that it did not
 //! create may also allow SYSTEM and the Administrators group, as one under the user's profile
-//! does. [`SandboxStore::create`] refuses an existing directory that others may change, or on
-//! Windows access, and [`SandboxStore::open`] any that is not private. The store names its files
-//! by their paths, so the directories above it must be ones that only the user, or an
-//! administrator, may change. Records are replaced atomically, so readers that hold no lock, such
-//! as an execution, see whole records. The store holds runtime records only: configuration
-//! belongs to its caller, which may keep it in the same directory under a name of its own.
+//! does. [`SandboxStore::create`] and [`SandboxStore::open`] refuse an existing directory that is
+//! not private, rather than restrict it, since others could have placed records in it, or still
+//! hold its files open. The store names its files by their paths, so the directories above it
+//! must be ones that only the user, or an administrator, may change. Records are replaced
+//! atomically, so readers that hold no lock, such as an execution, see whole records. The store
+//! holds runtime records only: configuration belongs to its caller, which may keep it in the same
+//! directory under a name of its own.
 //!
 //! # Records
 //!
@@ -212,10 +213,9 @@ impl SandboxStore {
     /// Creates the directory `dir` if needed, whose parent must exist, private to the current
     /// user, and opens the store in it.
     ///
-    /// An existing directory must belong to the user, and no one else may write to it, since
-    /// records that others placed in it would decide what recovery signals. On Unix, one that
-    /// others may only read is restricted to the user; on Windows, one that allows others is
-    /// refused, since a handle that they opened keeps its access.
+    /// An existing directory must already be private, as [`open`](Self::open) requires. One that
+    /// others could access is refused rather than restricted: they could have placed records in
+    /// it, which would decide what recovery signals, or still hold its files open.
     ///
     /// A relative `dir` is resolved against the current directory, so that the store's paths, and
     /// the control endpoint that a launch records, name the same files from any working directory.
