@@ -84,12 +84,29 @@ pub fn main() -> ExitCode {
     ExitStatus::from(run(&sys::args(), &mut sys::DirectStdout)).into()
 }
 
-/// Parses and runs one benchmark that prints its result to `out`.
+/// Parses and runs one benchmark, and prints its result to `out`.
 fn run(args: &[CString], out: &mut dyn Write) -> Result<(), CommandError> {
-    match parse(args).ok_or(CommandError::Usage)? {
-        Benchmark::File(benchmark) => run_file(&benchmark, out),
-        Benchmark::Network(benchmark) => run_network(&benchmark, out),
-    }
+    let (device, operation, bytes_per_operation, measurement) =
+        match parse(args).ok_or(CommandError::Usage)? {
+            Benchmark::File(benchmark) => {
+                let operation = if benchmark.writing { "write" } else { "read" };
+                ("file", operation, BLOCK_SIZE, measure_file(&benchmark)?)
+            }
+            Benchmark::Network(benchmark) => (
+                "network",
+                "roundtrip",
+                PAYLOAD_SIZE,
+                measure_network(&benchmark)?,
+            ),
+        };
+    let line = result_line(
+        device,
+        operation,
+        measurement.operations,
+        bytes_per_operation as u64,
+        measurement.elapsed_ns,
+    );
+    out.write_all(&line).map_err(|_| CommandError::Output)
 }
 
 /// Parses a complete command line, returning `None` for the usage error.
@@ -241,17 +258,6 @@ fn start() -> Result<u64, CommandError> {
     }
 }
 
-/// Runs a file benchmark and prints its result.
-fn run_file(benchmark: &FileBenchmark<'_>, out: &mut dyn Write) -> Result<(), CommandError> {
-    let Measurement {
-        operations,
-        elapsed_ns,
-    } = measure_file(benchmark)?;
-    let operation = if benchmark.writing { "write" } else { "read" };
-    let line = result_line("file", operation, operations, BLOCK_SIZE as u64, elapsed_ns);
-    out.write_all(&line).map_err(|_| CommandError::Output)
-}
-
 /// Transfers blocks of the benchmark's file until its duration has passed.
 ///
 /// The file closes when this returns, before the caller prints the result, and a close error is
@@ -305,22 +311,6 @@ fn measure_file(benchmark: &FileBenchmark<'_>) -> Result<Measurement, CommandErr
         operations,
         elapsed_ns: ended.wrapping_sub(started),
     })
-}
-
-/// Runs a UDP echo benchmark and prints its result.
-fn run_network(benchmark: &NetworkBenchmark, out: &mut dyn Write) -> Result<(), CommandError> {
-    let Measurement {
-        operations,
-        elapsed_ns,
-    } = measure_network(benchmark)?;
-    let line = result_line(
-        "network",
-        "roundtrip",
-        operations,
-        PAYLOAD_SIZE as u64,
-        elapsed_ns,
-    );
-    out.write_all(&line).map_err(|_| CommandError::Output)
 }
 
 /// Sends payloads to the benchmark's echo server, and counts their echoes, until its duration has
