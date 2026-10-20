@@ -1075,6 +1075,17 @@ fn time_fixture(directory: &Path, name: &str, contents: impl AsRef<[u8]>) -> Pat
     path
 }
 
+/// Runs the `nvx-time` test hook `hook` on the fixture at `fixture`, with `arguments` after it,
+/// as [`run`] does.
+#[cfg(target_arch = "x86_64")]
+fn time_hook(hook: &str, fixture: &Path, arguments: &[&str]) -> (Option<i32>, Vec<u8>, Vec<u8>) {
+    let hook = [OsStr::new("test"), OsStr::new(hook), fixture.as_os_str()];
+    run(
+        "nvx-time",
+        hook.into_iter().chain(arguments.iter().map(OsStr::new)),
+    )
+}
+
 #[test]
 #[cfg(target_arch = "x86_64")]
 fn time_test_mode_decodes_packets_samples_and_arithmetic() {
@@ -1085,15 +1096,10 @@ fn time_test_mode_decodes_packets_samples_and_arithmetic() {
         time_packet(0x0d, 4, &[], 3, -13_107_200, 30_000_000_000),
     );
     assert_eq!(
-        run(
-            "nvx-time",
-            [
-                OsStr::new("test"),
-                OsStr::new("packet"),
-                packet.as_os_str(),
-                OsStr::new("2"),
-                OsStr::new("ffffffffffffffffffffffffffffffff"),
-            ]
+        time_hook(
+            "packet",
+            &packet,
+            &["2", "ffffffffffffffffffffffffffffffff"]
         ),
         (
             Some(0),
@@ -1121,15 +1127,10 @@ fn time_test_mode_decodes_packets_samples_and_arithmetic() {
             0,
         ),
     );
-    let output = run(
-        "nvx-time",
-        [
-            OsStr::new("test"),
-            OsStr::new("packet"),
-            ranges.as_os_str(),
-            OsStr::new("0"),
-            OsStr::new("ffffffffffffffffffffffffffffffff"),
-        ],
+    let output = time_hook(
+        "packet",
+        &ranges,
+        &["0", "ffffffffffffffffffffffffffffffff"],
     );
     assert_eq!(output.0, Some(0));
     assert!(
@@ -1142,15 +1143,10 @@ fn time_test_mode_decodes_packets_samples_and_arithmetic() {
         "no-ranges",
         time_packet(0x02, 0, &[], 1, 0, 0),
     );
-    let no_ranges = run(
-        "nvx-time",
-        [
-            OsStr::new("test"),
-            OsStr::new("packet"),
-            no_ranges.as_os_str(),
-            OsStr::new("0"),
-            OsStr::new("ffffffffffffffffffffffffffffffff"),
-        ],
+    let no_ranges = time_hook(
+        "packet",
+        &no_ranges,
+        &["0", "ffffffffffffffffffffffffffffffff"],
     );
     assert_eq!(no_ranges.0, Some(0));
     assert!(
@@ -1167,15 +1163,7 @@ fn time_test_mode_decodes_packets_samples_and_arithmetic() {
     sample.extend_from_slice(&TIME_UTC_NS.to_le_bytes());
     let sample = time_fixture(directory.path(), "sample", sample);
     assert_eq!(
-        run(
-            "nvx-time",
-            [
-                OsStr::new("test"),
-                OsStr::new("sample"),
-                sample.as_os_str(),
-                OsStr::new("4")
-            ]
-        ),
+        time_hook("sample", &sample, &["4"]),
         (
             Some(0),
             b"ok flags=8 generation=4 utc_ns=1790841600123456789\n".to_vec(),
@@ -1227,10 +1215,7 @@ fn time_test_mode_checks_logs_timer_state_and_status() {
         ),
     );
     assert_eq!(
-        run(
-            "nvx-time",
-            [OsStr::new("test"), OsStr::new("boot-log"), boot.as_os_str()]
-        ),
+        time_hook("boot-log", &boot, &[]),
         (Some(0), b"ok\n".to_vec(), Vec::new())
     );
     let kmsg = time_fixture(
@@ -1242,10 +1227,7 @@ fn time_test_mode_checks_logs_timer_state_and_status() {
         ),
     );
     assert_eq!(
-        run(
-            "nvx-time",
-            [OsStr::new("test"), OsStr::new("kmsg"), kmsg.as_os_str()]
-        ),
+        time_hook("kmsg", &kmsg, &[]),
         (Some(0), b"G_TSC_UNSTABLE\nnone\n".to_vec(), Vec::new())
     );
 
@@ -1264,15 +1246,7 @@ fn time_test_mode_checks_logs_timer_state_and_status() {
         ),
     );
     assert_eq!(
-        run(
-            "nvx-time",
-            [
-                OsStr::new("test"),
-                OsStr::new("timer-list"),
-                timer.as_os_str(),
-                OsStr::new("0"),
-            ]
-        ),
+        time_hook("timer-list", &timer, &["0"]),
         (Some(0), b"ok\n".to_vec(), Vec::new())
     );
 
@@ -1292,11 +1266,7 @@ fn time_test_mode_checks_logs_timer_state_and_status() {
     );
     let state = time_fixture(directory.path(), "state", state_text);
     assert_eq!(
-        run(
-            "nvx-time",
-            [OsStr::new("test"), OsStr::new("state"), state.as_os_str()]
-        )
-        .1,
+        time_hook("state", &state, &[]).1,
         concat!(
             "version=1\ngeneration=2\nboot_status=ok\nboot_cpus=8\n",
             "boot_elapsed_us=2400\nboot_cpu_us=1900\n",
@@ -1315,25 +1285,10 @@ fn time_test_mode_checks_logs_timer_state_and_status() {
         b"unknown=x\nsamples=bad\n",
     );
     assert_eq!(
-        run(
-            "nvx-time",
-            [
-                OsStr::new("test"),
-                OsStr::new("state"),
-                malformed_state.as_os_str()
-            ]
-        ),
+        time_hook("state", &malformed_state, &[]),
         (Some(0), b"error\n".to_vec(), Vec::new())
     );
-    let status = run(
-        "nvx-time",
-        [
-            OsStr::new("test"),
-            OsStr::new("status"),
-            state.as_os_str(),
-            OsStr::new("enforcing"),
-        ],
-    );
+    let status = time_hook("status", &state, &["enforcing"]);
     assert_eq!(status.0, Some(0));
     assert!(
         status
@@ -1349,10 +1304,7 @@ fn time_test_mode_preserves_boot_log_and_syslog_results() {
     let directory = tempfile::tempdir().unwrap();
     let run_log = |name: &str, mode: &str, text: &str| {
         let fixture = time_fixture(directory.path(), name, text);
-        run(
-            "nvx-time",
-            [OsStr::new("test"), OsStr::new(mode), fixture.as_os_str()],
-        )
+        time_hook(mode, &fixture, &[])
     };
     let boot = concat!(
         "Hypervisor detected: Microsoft Hyper-V\n",
@@ -1561,16 +1513,7 @@ fn run_time_packet(
     previous: &str,
 ) -> (Option<i32>, Vec<u8>, Vec<u8>) {
     let path = time_fixture(directory, name, packet);
-    run(
-        "nvx-time",
-        [
-            OsStr::new("test"),
-            OsStr::new("packet"),
-            path.as_os_str(),
-            OsStr::new(recorded),
-            OsStr::new(previous),
-        ],
-    )
+    time_hook("packet", &path, &[recorded, previous])
 }
 
 #[test]
@@ -1673,16 +1616,7 @@ fn time_test_mode_checks_packet_and_sample_boundaries() {
         };
     let good = sample_path("sample-good", 1, 8, 0, 4, TIME_UTC_NS);
     assert_eq!(
-        run(
-            "nvx-time",
-            [
-                OsStr::new("test"),
-                OsStr::new("sample"),
-                good.as_os_str(),
-                OsStr::new("4")
-            ]
-        )
-        .1,
+        time_hook("sample", &good, &["4"]).1,
         b"ok flags=8 generation=4 utc_ns=1790841600123456789\n"
     );
     for (index, path) in [
@@ -1695,15 +1629,7 @@ fn time_test_mode_checks_packet_and_sample_boundaries() {
     .iter()
     .enumerate()
     {
-        let output = run(
-            "nvx-time",
-            [
-                OsStr::new("test"),
-                OsStr::new("sample"),
-                path.as_os_str(),
-                OsStr::new("0"),
-            ],
-        );
+        let output = time_hook("sample", path, &["0"]);
         assert!(
             output.1.starts_with(b"error "),
             "sample case {index}: {:?}",
@@ -1726,16 +1652,7 @@ fn time_test_mode_covers_checks_events_records_and_workers() {
     );
     let cpuinfo = time_fixture(directory.path(), "cpuinfo", cpuinfo);
     assert_eq!(
-        run(
-            "nvx-time",
-            [
-                OsStr::new("test"),
-                OsStr::new("cpuinfo"),
-                cpuinfo.as_os_str(),
-                OsStr::new("0-1"),
-            ]
-        )
-        .1,
+        time_hook("cpuinfo", &cpuinfo, &["0-1"]).1,
         b"ok cpu0_khz=2194843 cpu1_khz=2194843\n"
     );
     let cpuinfo_text = |flags: &str, cpus: usize| {
@@ -1758,15 +1675,7 @@ fn time_test_mode_covers_checks_events_records_and_workers() {
         ("cpuinfo-missing", good_flags.to_owned(), 1),
     ] {
         let fixture = time_fixture(directory.path(), name, cpuinfo_text(&flags, cpus));
-        let output = run(
-            "nvx-time",
-            [
-                OsStr::new("test"),
-                OsStr::new("cpuinfo"),
-                fixture.as_os_str(),
-                OsStr::new("0-1"),
-            ],
-        );
+        let output = time_hook("cpuinfo", &fixture, &["0-1"]);
         assert_eq!(output.0, Some(0));
         assert!(output.2.is_empty());
         assert!(
@@ -2060,15 +1969,7 @@ fn time_test_mode_covers_remaining_events_records_and_workers() {
     ] {
         let record = time_fixture(directory.path(), name, record);
         assert_eq!(
-            run(
-                "nvx-time",
-                [
-                    OsStr::new("test"),
-                    OsStr::new("restore-record"),
-                    record.as_os_str()
-                ]
-            )
-            .1,
+            time_hook("restore-record", &record, &[]).1,
             expected.as_bytes()
         );
     }
@@ -2083,14 +1984,7 @@ fn time_test_mode_covers_remaining_events_records_and_workers() {
     {
         let record = time_fixture(directory.path(), &format!("restore-error-{index}"), record);
         assert_eq!(
-            run(
-                "nvx-time",
-                [
-                    OsStr::new("test"),
-                    OsStr::new("restore-record"),
-                    record.as_os_str()
-                ]
-            ),
+            time_hook("restore-record", &record, &[]),
             (Some(0), b"error\n".to_vec(), Vec::new()),
             "case {index}"
         );
