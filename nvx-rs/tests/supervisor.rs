@@ -32,7 +32,8 @@ const EXIT_MARKER: &str = "exit";
 const LAUNCHER_DIR: &str = "NVX_SUPERVISOR_TEST_VMM_DIR";
 /// Environment variable that asks a launcher fixture to start its VMM outside its job object.
 const LAUNCHER_BREAKAWAY: &str = "NVX_SUPERVISOR_TEST_BREAKAWAY";
-/// Prefix of the line on which a launcher fixture prints the reference of its VMM.
+/// Marker before the reference that a launcher fixture prints. Libtest's own output, the name
+/// of the fixture, precedes it on its line.
 const REFERENCE_PREFIX: &str = "vmm-reference ";
 /// Longest wait for a process that is expected to exit, or for a launcher to answer.
 const TIMEOUT: Duration = Duration::from_secs(60);
@@ -81,10 +82,19 @@ fn launcher_fixture() {
 }
 
 /// Returns the arguments that run only the fixture `name` of this test executable.
+///
+/// The fixture runs on libtest's main thread, whatever the host's processors or the inherited
+/// `RUST_TEST_THREADS`, so libtest always prints its name before the fixture's own output.
 fn fixture_arguments(name: &str) -> Vec<OsString> {
-    ["--exact", name, "--ignored", "--nocapture"]
-        .map(OsString::from)
-        .to_vec()
+    [
+        "--exact",
+        name,
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1",
+    ]
+    .map(OsString::from)
+    .to_vec()
 }
 
 /// Spawns a VMM fixture in `directory` as OpenVMM is spawned, outside the caller's job object if
@@ -184,9 +194,10 @@ impl Launcher {
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
             let mut lines = BufReader::new(output).lines();
-            let reference = lines
-                .by_ref()
-                .find_map(|line| line.ok()?.strip_prefix(REFERENCE_PREFIX).map(str::to_owned));
+            let reference = lines.by_ref().find_map(|line| {
+                let line = line.ok()?;
+                Some(line.split_once(REFERENCE_PREFIX)?.1.to_owned())
+            });
             let _ = sender.send(reference);
             // Read the rest, so that the launcher can still write its own output.
             lines.for_each(drop);
