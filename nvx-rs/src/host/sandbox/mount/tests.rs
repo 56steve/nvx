@@ -477,7 +477,29 @@ fn mount_target_validation_rejects_unsafe_and_reserved_targets() {
         message(validate_mount_target("/etc")),
         "sandbox mount target /etc is reserved"
     );
-    for target in ["/workspace", "/procfs", "/etc/app", "/opt/hostedtoolcache"] {
+    for target in ["/run", "/run/nvx"] {
+        assert_eq!(
+            message(validate_mount_target(target)),
+            format!("sandbox mount target {target} is reserved")
+        );
+    }
+    for (target, reserved) in [
+        ("/run/nvx/time", "/run/nvx/time"),
+        ("/run/nvx/time/state", "/run/nvx/time"),
+    ] {
+        assert_eq!(
+            message(validate_mount_target(target)),
+            format!("sandbox mount target {target} overlaps the reserved {reserved} tree")
+        );
+    }
+    for target in [
+        "/workspace",
+        "/procfs",
+        "/etc/app",
+        "/opt/hostedtoolcache",
+        "/run/secrets",
+        "/run/nvx/other",
+    ] {
         validate_mount_target(target).unwrap();
     }
     // The longest target fits.
