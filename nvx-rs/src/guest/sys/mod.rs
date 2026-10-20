@@ -110,6 +110,10 @@ pub(crate) use sock_diag::{
 #[cfg(test)]
 pub(crate) use sock_diag::{encode_inet_diag_done, encode_inet_diag_socket};
 pub(crate) use socket::{UdpSocket, connect_datagram};
+#[cfg(test)]
+pub(crate) use spawn::{
+    CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH, CAP_SETGID, CAP_SETUID, holds_capability,
+};
 pub(crate) use spawn::{ChildSpec, PreparedChild, REPORT_LENGTH};
 pub(crate) use terminal::{configure_raw, drain};
 pub(crate) use timer::Timer;

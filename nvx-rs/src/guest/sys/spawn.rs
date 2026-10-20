@@ -607,6 +607,36 @@ fn write_all(descriptor: &FileDescriptor, mut bytes: &[u8]) -> Result<(), Errno>
     Ok(())
 }
 
+/// Capability to bypass file read, write, and execute permission checks.
+#[cfg(test)]
+pub(crate) const CAP_DAC_OVERRIDE: u32 = 1;
+/// Capability to bypass file read permission and directory read and search permission checks.
+#[cfg(test)]
+pub(crate) const CAP_DAC_READ_SEARCH: u32 = 2;
+/// Capability to change group IDs and supplementary groups.
+#[cfg(test)]
+pub(crate) const CAP_SETGID: u32 = 6;
+/// Capability to change user IDs.
+#[cfg(test)]
+pub(crate) const CAP_SETUID: u32 = 7;
+/// Capability to change the root directory.
+#[cfg(test)]
+pub(crate) const CAP_SYS_CHROOT: u32 = 18;
+
+/// Returns whether the calling thread's effective set holds `capability`, because tests whose
+/// outcome depends on a privilege cannot infer it from the user ID: a root in a container may
+/// lack some capabilities.
+#[cfg(test)]
+pub(crate) fn holds_capability(capability: u32) -> std::io::Result<bool> {
+    let status = std::fs::read_to_string("/proc/thread-self/status")?;
+    let effective = status
+        .lines()
+        .find_map(|line| line.strip_prefix("CapEff:"))
+        .and_then(|mask| u64::from_str_radix(mask.trim(), 16).ok())
+        .ok_or_else(|| std::io::Error::other("the status has no effective capability set"))?;
+    Ok(effective & (1 << capability) != 0)
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Read;
@@ -824,7 +854,7 @@ mod tests {
         assert_eq!(status, Some(ChildStatus::Exited(LAUNCH_FAILURE_STATUS)));
         // Without the privilege to change its root, the child stops there. With it, the child
         // finds `/inside` in the new root, which has no `/bin/sh`.
-        let (stage, error) = if nix::unistd::geteuid().is_root() {
+        let (stage, error) = if holds_capability(CAP_SYS_CHROOT).unwrap() {
             (LaunchStage::Exec, Errno::ENOENT)
         } else {
             (LaunchStage::Root, Errno::EPERM)

@@ -164,7 +164,10 @@ mod tests {
 
     use super::super::seam::{Paths, TestSystem};
     use super::*;
-    use crate::guest::sys::{FileDescriptor, MountFlags};
+    use crate::guest::sys::{
+        CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH, CAP_SETGID, CAP_SETUID, FileDescriptor, MountFlags,
+        holds_capability,
+    };
 
     const INSTANCE: [u8; 16] = [7; 16];
 
@@ -749,15 +752,9 @@ mod tests {
             .ok_or_else(|| format!("{} is not UTF-8", path.display()).into())
     }
 
-    /// Returns whether the tests run as root, whose credentials the directory check would bypass.
-    fn is_root() -> bool {
-        use std::os::unix::fs::MetadataExt;
-
-        std::fs::metadata("/proc/self").is_ok_and(|metadata| metadata.uid() == 0)
-    }
-
-    /// A directory that only root may search while this lives, after which its owner may search
-    /// it again, so that an unprivileged test can remove its temporary directory.
+    /// A directory that only a process that bypasses directory permissions may search while
+    /// this lives, after which its owner may search it again, so that an unprivileged test can
+    /// remove its temporary directory.
     struct Unsearchable(std::path::PathBuf);
 
     impl Unsearchable {
@@ -810,14 +807,17 @@ mod tests {
         let _process = super::super::PROCESS_TEST_LOCK.lock()?;
         let (temporary, mut system) = TestSystem::with_cgroup();
         let root = temporary.path();
-        // As root, the child takes the workload's real identity, which must reach the
-        // directories; otherwise its credential calls are replaced, and the test's own identity
-        // meets the same refusals.
-        if is_root() {
+        // With the privilege to change credentials, the child takes the workload's real
+        // identity, which must reach the directories. Otherwise its credential calls are
+        // replaced, and the test's own identity meets the same refusals unless it may bypass
+        // directory permissions, which leaves nothing to check.
+        if holds_capability(CAP_SETUID)? && holds_capability(CAP_SETGID)? {
             use std::os::unix::fs::PermissionsExt;
 
             std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o755))?;
             system.spawner = Some(spawn_with_real_credentials);
+        } else if holds_capability(CAP_DAC_OVERRIDE)? || holds_capability(CAP_DAC_READ_SEARCH)? {
+            return Ok(());
         } else {
             system.spawner = Some(super::super::seam::spawn_as_privileged);
         }
