@@ -1048,7 +1048,7 @@ contract or `ContainmentBackend` routing.
 
 The crate is not published to a registry. A Cargo git dependency on
 `microsoft/nvx` also fetches the `openvmm` submodule, which requires access to
-`nanvix/openvmm`; vendor the crate if that access is unavailable. The crate and
+`microsoft/openvmm`; vendor the crate if that access is unavailable. The crate and
 its data model depend on `nvx-rs` through relative paths, so vendor `nvx-rs/`
 beside `aci_edge_sandboxes/`.
 

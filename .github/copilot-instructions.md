@@ -5,11 +5,12 @@
 - The integration repository is `microsoft/nvx`, and its default branch is `dev`.
   The `nanvix/nvx` repository is archived; do not create new branches or pull
   requests there. Verify configured remotes before pushing.
-- `openvmm/` is a Git submodule sourced from `nanvix/openvmm`. For OpenVMM source
-  changes, work in the nested repository and follow
-  [its instructions](../openvmm/.github/copilot-instructions.md). For an NVX pin
-  promotion, use the `nvx-openvmm-promote` skill and keep the superproject change
-  gitlink-only unless the task explicitly requires coordinated NVX changes.
+- `openvmm/` is a Git submodule that tracks the `feature/microvm/dev` branch of
+  `microsoft/openvmm`. For OpenVMM source changes, work in the nested repository
+  and follow [its instructions](../openvmm/.github/copilot-instructions.md). For
+  an NVX pin promotion, use the `nvx-openvmm-promote` skill and keep the
+  superproject change gitlink-only unless the task explicitly requires
+  coordinated NVX changes.
 - Preserve dirty state in both repositories. Do not reset, clean, switch, update,
   or synchronize the submodule over uncommitted work.
 
