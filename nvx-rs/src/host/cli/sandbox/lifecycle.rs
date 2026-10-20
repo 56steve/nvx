@@ -184,8 +184,7 @@ fn make_private(path: &PurePath) -> Result {
 /// Resolves the state directory at `path`, and creates it with `create`, as
 /// `_prepare_state_directory` does. It must be a directory and not a symbolic link.
 pub(crate) fn prepare_state_directory(path: &str, create: bool) -> Result<PurePath> {
-    let resolved = fs::resolve(&PurePath::native(path))
-        .map_err(|error| Exit::error(os_error_message(&error, None)))?;
+    let resolved = fs::resolve(&PurePath::native(path)).map_err(Exit::from_os_error)?;
     if create {
         make_directories(&resolved, 0o700)?;
         make_private(&resolved)?;
@@ -205,9 +204,7 @@ fn outcome_destination(path: &str) -> Result<PurePath> {
     let candidate = if path.is_absolute() {
         path
     } else {
-        fs::cwd()
-            .map_err(|error| Exit::error(os_error_message(&error, None)))?
-            .join(path.as_str())
+        fs::cwd().map_err(Exit::from_os_error)?.join(path.as_str())
     };
     let parent = candidate
         .parents()
@@ -222,7 +219,7 @@ fn outcome_destination(path: &str) -> Result<PurePath> {
         return Err(Exit::error("outcome report path has no filename"));
     }
     let resolved = fs::resolve(&parent)
-        .map_err(|error| Exit::error(os_error_message(&error, None)))?
+        .map_err(Exit::from_os_error)?
         .join(candidate.name());
     if fs::lexists(resolved.as_path()) {
         return Err(Exit::error(format!(
@@ -261,7 +258,7 @@ fn write_new_json(path: &str, value: &Value) -> Result {
         let text = format!("{}\n", dumps::dumps(value));
         file.write_all(text.as_bytes())
             .and_then(|()| file.sync_all())
-            .map_err(|error| Exit::error(os_error_message(&error, None)))?;
+            .map_err(Exit::from_os_error)?;
         match std::fs::hard_link(temporary.as_path(), resolved.as_path()) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Err(Exit::error(
@@ -591,8 +588,7 @@ fn launch_and_connect(
     launched: &mut Option<Launched>,
 ) -> Result {
     let arguments: Vec<std::ffi::OsString> = command[1..].iter().map(Into::into).collect();
-    let directory =
-        std::env::current_dir().map_err(|error| Exit::error(os_error_message(&error, None)))?;
+    let directory = std::env::current_dir().map_err(Exit::from_os_error)?;
     let child = process::spawn(
         std::path::Path::new(&command[0]),
         false,
@@ -611,7 +607,7 @@ fn launch_and_connect(
     let Some(start_time) = start_time else {
         let exited = child
             .wait_timeout(Duration::ZERO)
-            .map_err(|error| Exit::error(os_error_message(&error, None)))?;
+            .map_err(Exit::from_os_error)?;
         return Err(Exit::error(if exited.is_some() {
             "OpenVMM exited during startup"
         } else {
@@ -726,21 +722,17 @@ fn end_failed_start(
     };
     let status = launched
         .wait_timeout(Duration::ZERO)
-        .map_err(|error| Exit::error(os_error_message(&error, None)))?;
+        .map_err(Exit::from_os_error)?;
     if status.is_none() {
-        launched
-            .terminate()
-            .map_err(|error| Exit::error(os_error_message(&error, None)))?;
+        launched.terminate().map_err(Exit::from_os_error)?;
         let exited = launched
             .wait_timeout(Duration::from_secs(5))
-            .map_err(|error| Exit::error(os_error_message(&error, None)))?;
+            .map_err(Exit::from_os_error)?;
         if exited.is_none() {
-            launched
-                .kill()
-                .map_err(|error| Exit::error(os_error_message(&error, None)))?;
+            launched.kill().map_err(Exit::from_os_error)?;
             let killed = launched
                 .wait_timeout(Duration::from_secs(5))
-                .map_err(|error| Exit::error(os_error_message(&error, None)))?;
+                .map_err(Exit::from_os_error)?;
             if killed.is_none() {
                 let arguments: Vec<String> =
                     command.iter().map(|argument| repr(argument)).collect();
@@ -765,7 +757,7 @@ fn wait_interruptibly(launched: &mut Launched, deadline: Deadline) -> Result {
         crate::host::cli::check_interrupt()?;
         if launched
             .wait_timeout(slice)
-            .map_err(|error| Exit::error(os_error_message(&error, None)))?
+            .map_err(Exit::from_os_error)?
             .is_some()
             || deadline.passed()
         {
@@ -931,8 +923,7 @@ fn hold_directory(path: &PurePath) -> Result<((u64, u128), Option<File>)> {
             .custom_flags((nix::fcntl::OFlag::O_DIRECTORY | nix::fcntl::OFlag::O_NOFOLLOW).bits())
             .open(path.as_path())
             .map_err(|error| os_error(&error, path))?;
-        let status =
-            fs::fstat(&file).map_err(|error| Exit::error(os_error_message(&error, None)))?;
+        let status = fs::fstat(&file).map_err(Exit::from_os_error)?;
         Ok((status.identity, Some(file)))
     }
     #[cfg(not(unix))]

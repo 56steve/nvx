@@ -49,8 +49,7 @@ pub(super) fn run(root: Option<&str>) -> Result {
     paths.openvmm = located.openvmm;
     let value = serde_json::to_value(&paths)
         .map_err(|error| Exit::error(format!("cannot encode the artifact paths: {error}")))?;
-    output::print_stdout(&dumps::dumps(&json_value(&value)))
-        .map_err(|error| Exit::error(output::stream_error(&error)))
+    output::print_stdout(&dumps::dumps(&json_value(&value))).map_err(Exit::from_os_error)
 }
 
 /// The artifacts that a command runs.

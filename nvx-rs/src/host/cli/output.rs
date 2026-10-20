@@ -15,7 +15,6 @@ use std::io::{self, Write};
 use std::os::fd::AsFd;
 
 use crate::host::platform;
-use crate::host::python::fs::os_error_message;
 
 /// The line separator of this host, `os.linesep`.
 pub(crate) const LINE_SEPARATOR: &str = if cfg!(windows) { "\r\n" } else { "\n" };
@@ -68,12 +67,6 @@ fn write_all(stream: &mut impl Write, data: &[u8]) -> io::Result<()> {
     }
     stream.write_all(data)?;
     stream.flush()
-}
-
-/// Returns the message of the `OSError` that writing to a standard stream raises, such as
-/// `[Errno 32] Broken pipe`.
-pub(crate) fn stream_error(error: &io::Error) -> String {
-    os_error_message(error, None)
 }
 
 #[cfg(test)]
