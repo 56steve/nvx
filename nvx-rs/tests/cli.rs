@@ -7,8 +7,10 @@
 //! section for POSIX hosts and one for Windows. Each scenario runs here in a fresh root, with
 //! `nvx-rs --root ROOT`, and every step must exit with the recorded status, print the recorded
 //! output, and leave the recorded files, after the root, process IDs, and random identifiers are
-//! replaced with the placeholders that the script used. Now that `nvx.py sandbox` runs `nvx-rs`,
-//! the recordings are its reference: a deliberate change of behavior updates them by hand.
+//! replaced with the placeholders that the script used, and the devices, file IDs, and times that
+//! the distro binding of `config.json` records with `{int}` and `{hex32}` as well. Now that
+//! `nvx.py sandbox` runs `nvx-rs`, the recordings are its reference: a deliberate change of
+//! behavior updates them by hand.
 #![cfg(all(
     feature = "cli",
     feature = "testing",
@@ -105,11 +107,22 @@ impl Root {
             text = text.replace(&escaped, "{root_json}");
         }
         text = text.replace(raw, "{root}");
-        for prefix in ["\"pid\": ", "\"start_time\": "] {
+        // The seals of a distro binding hold the device, file ID, and times of the layer.
+        for prefix in [
+            "\"pid\": ",
+            "\"start_time\": ",
+            "\"device\": ",
+            "\"seconds\": ",
+            "\"nanoseconds\": ",
+        ] {
             text = replace_after(&text, prefix, |c| c.is_ascii_digit(), None, "{int}");
         }
         text = replace_after(&text, "openvmm-microvm-", is_hex, Some(32), "{hex32}");
-        for prefix in ["\"operation_id\": \"", "\"instance_id\": \""] {
+        for prefix in [
+            "\"operation_id\": \"",
+            "\"instance_id\": \"",
+            "\"fileId\": \"",
+        ] {
             text = replace_after(&text, prefix, is_hex, Some(32), "{hex32}");
         }
         text
@@ -437,6 +450,12 @@ fn nvx_rs_reproduces_the_recorded_scenarios() {
 
 /// Returns the arguments that provision a minimal sandbox in `state` below the root.
 fn provision(root: &Root, state: &str, command_line: &str) -> Vec<String> {
+    provision_layer(root, state, &root.path.join("distro.erofs"), command_line)
+}
+
+/// Returns the arguments that provision a minimal sandbox of the distro layer `layer` in `state`
+/// below the root.
+fn provision_layer(root: &Root, state: &str, layer: &Path, command_line: &str) -> Vec<String> {
     let path = |name: &str| root.path.join(name).to_str().unwrap().to_owned();
     vec![
         "sandbox".into(),
@@ -446,7 +465,7 @@ fn provision(root: &Root, state: &str, command_line: &str) -> Vec<String> {
         "--layer".into(),
         format!(
             "distro,{},11111111-1111-1111-1111-111111111111",
-            path("distro.erofs")
+            layer.to_str().unwrap()
         ),
         "--scratch".into(),
         path("scratch.ext4"),
@@ -560,6 +579,308 @@ fn a_sandbox_of_a_retired_layer_role_does_not_start() {
     assert!(!root.path.join("retired").join("runtime.json").exists());
     let output = run(&root, &lifecycle("deprovision", &root, "retired"));
     assert!(output.status.success(), "{}", text(&output.stderr));
+}
+
+/// What a start that fails the check of its distro binding adds to the check's message.
+const PROVISION_AGAIN: &str = "; deprovision the sandbox and provision it again";
+
+/// The SHA-256 digest of the fixture's distro layer.
+const DISTRO_SHA256: &str = "8a475efd5fd711d481a9a19de6d12b88dff0cd81cb8135ffcd5b65b062c7bf04";
+
+/// Returns a manifest of the fixture's distro layer that names it `artifact`, with its digest,
+/// and lists `packages`.
+fn distro_manifest(artifact: &str, packages: &[&str]) -> String {
+    let packages: Vec<Value> = packages.iter().map(|name| json!({"name": name})).collect();
+    json!({
+        "format": 1,
+        "artifact": artifact,
+        "artifact_sha256": DISTRO_SHA256,
+        "packages": packages,
+    })
+    .to_string()
+}
+
+/// Provisions a minimal sandbox in `state` below the root.
+fn provisioned(root: &Root, state: &str) {
+    let output = run(root, &provision(root, state, ""));
+    assert!(output.status.success(), "{}", text(&output.stderr));
+}
+
+/// Starts, stops, and deprovisions the provisioned sandbox of `state`.
+fn cycle(root: &Root, state: &str) {
+    for operation in ["start", "stop", "deprovision"] {
+        let output = run(root, &lifecycle(operation, root, state));
+        assert!(
+            output.status.success(),
+            "{operation}: {}",
+            text(&output.stderr)
+        );
+    }
+}
+
+/// Starts the sandbox of `state`, which must fail with `message` before it launches OpenVMM or
+/// writes any file, and deprovisions it.
+fn refused_start(root: &Root, state: &str, message: &str) {
+    let output = run(root, &lifecycle("start", root, state));
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output.stderr));
+    assert_eq!(text(&output.stderr), format!("error: {message}\n"));
+    let mut names: Vec<String> = fs::read_dir(root.path.join(state))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["config.json", "lifecycle.lock"]);
+    let output = run(root, &lifecycle("deprovision", root, state));
+    assert!(output.status.success(), "{}", text(&output.stderr));
+}
+
+#[test]
+fn start_refuses_a_distro_layer_that_changed_after_provision() {
+    // Start checks the binding that provision recorded against the layer's metadata alone, before
+    // it launches OpenVMM; a layer that changed needs a new provision, which verifies it again.
+    let root = populated_root();
+    let distro = root.path.join("distro.erofs");
+    let shown = distro.to_str().unwrap();
+    provisioned(&root, "appended");
+    let mut data = fs::read(&distro).unwrap();
+    data.extend_from_slice(b"more\n");
+    fs::write(&distro, &data).unwrap();
+    refused_start(
+        &root,
+        "appended",
+        &format!(
+            "{shown} changed after its distro binding was made: its length differs{PROVISION_AGAIN}"
+        ),
+    );
+    provisioned(&root, "replaced");
+    let replacement = root.path.join("distro.new");
+    fs::write(&replacement, &data).unwrap();
+    fs::rename(&replacement, &distro).unwrap();
+    refused_start(
+        &root,
+        "replaced",
+        &format!(
+            "{shown} changed after its distro binding was made: its identity differs{PROVISION_AGAIN}"
+        ),
+    );
+    // The launch's own check of its layers still finds a missing layer first, as it did before.
+    provisioned(&root, "removed");
+    fs::remove_file(&distro).unwrap();
+    refused_start(
+        &root,
+        "removed",
+        &format!("distro EROFS layer not found: {shown}"),
+    );
+    // A new provision binds the layer as it is now.
+    fs::write(&distro, &data).unwrap();
+    provisioned(&root, "again");
+    cycle(&root, "again");
+}
+
+#[test]
+fn start_refuses_a_distro_manifest_that_changed_after_provision() {
+    let root = populated_root();
+    let distro = root.path.join("distro.erofs");
+    let distro = distro.to_str().unwrap();
+    let manifest = root.path.join("distro.erofs.manifest.json");
+    let shown = manifest.to_str().unwrap();
+    // Start never reads a manifest: one that appeared after the provision fails unread.
+    provisioned(&root, "appeared");
+    fs::write(&manifest, "not JSON").unwrap();
+    refused_start(
+        &root,
+        "appeared",
+        &format!("{shown} appeared after the distro binding of {distro} was made{PROVISION_AGAIN}"),
+    );
+    // Provision verifies a manifest that sits beside the layer, and binds it.
+    let valid = distro_manifest("distro.erofs", &["busybox"]);
+    fs::write(&manifest, &valid).unwrap();
+    provisioned(&root, "intact");
+    cycle(&root, "intact");
+    provisioned(&root, "replaced");
+    let replacement = root.path.join("manifest.new");
+    fs::write(&replacement, &valid).unwrap();
+    fs::rename(&replacement, &manifest).unwrap();
+    refused_start(
+        &root,
+        "replaced",
+        &format!(
+            "{shown} changed after the distro binding of {distro} was made: its identity \
+             differs{PROVISION_AGAIN}"
+        ),
+    );
+    provisioned(&root, "removed");
+    fs::remove_file(&manifest).unwrap();
+    refused_start(
+        &root,
+        "removed",
+        &format!(
+            "{shown} disappeared after the distro binding of {distro} was made{PROVISION_AGAIN}"
+        ),
+    );
+}
+
+/// Makes `link` a symbolic link to the file `target`, and returns whether the host allowed it:
+/// Windows lets only Developer Mode or a privilege create one.
+fn symlink_file(target: &Path, link: &Path) -> bool {
+    #[cfg(unix)]
+    let linked = std::os::unix::fs::symlink(target, link);
+    #[cfg(windows)]
+    let linked = std::os::windows::fs::symlink_file(target, link);
+    linked.is_ok()
+}
+
+#[test]
+fn provision_binds_a_linked_distro_layer_where_start_checks_it() {
+    // Provision records a layer at its resolved path, and start checks the binding there, with
+    // the manifest beside that path: through a link to a layer of another name, the manifest
+    // beside the link's target. Provision verifies the layer there as well as at the path given.
+    let root = populated_root();
+    let distro = root.path.join("distro.erofs");
+    let alias = root.path.join("alias.erofs");
+    if !symlink_file(&distro, &alias) {
+        eprintln!("skipped: this host does not let the test create a symbolic link");
+        return;
+    }
+    let target_manifest = root.path.join("distro.erofs.manifest.json");
+    let alias_manifest = root.path.join("alias.erofs.manifest.json");
+    let provision_alias = |state: &str| run(&root, &provision_layer(&root, state, &alias, ""));
+    let recorded = |state: &str| -> Value {
+        let path = root.path.join(state).join("config.json");
+        serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+    };
+    let refused = |state: &str, message: &str| {
+        let output = provision_alias(state);
+        assert_eq!(output.status.code(), Some(1), "{}", text(&output.stderr));
+        assert_eq!(text(&output.stderr), format!("error: {message}\n"));
+        assert!(!root.path.join(state).exists());
+    };
+    let systemd = "systemd images are unsupported by the sandbox security profile";
+
+    // A manifest beside the target alone: provision verifies it, and start checks it.
+    fs::write(
+        &target_manifest,
+        distro_manifest("distro.erofs", &["systemd"]),
+    )
+    .unwrap();
+    refused("target-systemd", systemd);
+    fs::write(
+        &target_manifest,
+        distro_manifest("distro.erofs", &["busybox"]),
+    )
+    .unwrap();
+    let output = provision_alias("target");
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    let config = recorded("target");
+    assert_eq!(config["layers"][0]["path"], distro.to_str().unwrap());
+    assert!(config["distro_binding"]["manifest"].is_object());
+    cycle(&root, "target");
+
+    // A manifest beside the link alone: provision verifies it, as it verifies the layer at the
+    // path given, and binds the absence of one beside the target, which start checks.
+    fs::remove_file(&target_manifest).unwrap();
+    fs::write(
+        &alias_manifest,
+        distro_manifest("alias.erofs", &["systemd"]),
+    )
+    .unwrap();
+    refused("alias-systemd", systemd);
+    fs::write(
+        &alias_manifest,
+        distro_manifest("alias.erofs", &["busybox"]),
+    )
+    .unwrap();
+    let output = provision_alias("alias");
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    let config = recorded("alias");
+    assert_eq!(config["layers"][0]["path"], distro.to_str().unwrap());
+    assert!(config["distro_binding"]["manifest"].is_null());
+    cycle(&root, "alias");
+
+    // Manifests beside both: provision verifies both, and binds the target's.
+    fs::write(
+        &target_manifest,
+        distro_manifest("distro.erofs", &["busybox"]),
+    )
+    .unwrap();
+    let output = provision_alias("both");
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    assert!(recorded("both")["distro_binding"]["manifest"].is_object());
+    cycle(&root, "both");
+}
+
+/// An edit of a recorded configuration.
+type ConfigEdit = fn(&mut Value);
+
+#[test]
+fn start_refuses_a_configuration_without_a_valid_distro_binding() {
+    // nvx.py recorded no binding: a sandbox that it provisioned is provisioned again rather than
+    // migrated. A binding that does not hold refuses the start before OpenVMM starts.
+    let root = populated_root();
+    let distro = root.path.join("distro.erofs");
+    let distro = distro.to_str().unwrap();
+    let uuid = "11111111-1111-1111-1111-111111111111";
+    let other = "22222222-2222-2222-2222-222222222222";
+    let malformed = "sandbox configuration is malformed".to_owned();
+    let binding =
+        |detail: &str| format!("the distro binding of {distro} {detail}{PROVISION_AGAIN}");
+    let cases: [(&str, ConfigEdit, String); 7] = [
+        (
+            "missing",
+            |config| {
+                config.as_object_mut().unwrap().remove("distro_binding");
+            },
+            format!("sandbox configuration has no distro binding{PROVISION_AGAIN}"),
+        ),
+        (
+            "incomplete",
+            |config| {
+                config["distro_binding"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("manifest");
+            },
+            malformed.clone(),
+        ),
+        (
+            "unknown",
+            |config| config["distro_binding"]["origin"] = json!("nvx.py"),
+            malformed,
+        ),
+        (
+            "version",
+            |config| config["distro_binding"]["version"] = json!(2),
+            binding("has version 2, which this build does not check"),
+        ),
+        (
+            "identity",
+            |config| {
+                config["distro_binding"]["identity"] =
+                    json!("22222222-2222-2222-2222-222222222222");
+            },
+            binding(&format!(
+                "names the erofs layer with identity {other}, not {uuid}"
+            )),
+        ),
+        (
+            "revision",
+            |config| config["distro_binding"]["policy"]["revision"] = json!(2),
+            binding("holds a verdict of distro policy revision 2, not 1"),
+        ),
+        (
+            "rejected",
+            |config| config["distro_binding"]["policy"]["result"] = json!("rejected"),
+            binding("holds a verdict that rejects the layer"),
+        ),
+    ];
+    for (state, edit, message) in cases {
+        provisioned(&root, state);
+        let path = root.path.join(state).join("config.json");
+        let mut config: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        edit(&mut config);
+        fs::write(&path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+        refused_start(&root, state, &message);
+    }
 }
 
 #[test]

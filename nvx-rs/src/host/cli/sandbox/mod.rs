@@ -39,6 +39,7 @@ use crate::host::sandbox::{
 };
 
 pub(crate) use self::lifecycle::ProvisionConfig;
+use self::state::RecordedDistro;
 
 /// The usage and help of the parser.
 const SYNTAX: Syntax = Syntax {
@@ -609,8 +610,10 @@ pub(super) fn run(root: Option<&str>, options: Options) -> Result {
             settings,
         )?;
         launch.validated()?;
-        validate_sandbox_systemd_policy(&launch)?;
-        Some((launch, rules))
+        // `run` and `provision` verify the distro layer explicitly, at the path given;
+        // `provision` records its binding, which `start` checks without reading the layer again.
+        let binding = validate_sandbox_systemd_policy(&launch)?;
+        Some((launch, rules, binding))
     } else {
         None
     };
@@ -622,11 +625,15 @@ pub(super) fn run(root: Option<&str>, options: Options) -> Result {
             .ok_or_else(|| Exit::error(format!("sandbox {operation} requires --state-dir")))
     };
     match (operation, launch) {
-        (SandboxOperation::Provision, Some((launch, rules))) => {
+        (SandboxOperation::Provision, Some((launch, rules, binding))) => {
+            // `provision` records the layer at its resolved path, where `start` checks the
+            // binding, with the manifest beside that path.
+            let distro = RecordedDistro::new(&launch, binding)?;
             let state_dir = state_dir("provision")?;
             lifecycle::provision(
                 state_dir,
                 &launch,
+                &distro,
                 &ProvisionConfig {
                     hypervisor: hypervisor(options.hypervisor),
                     memory_mib: &options.memory_mib,
@@ -679,7 +686,7 @@ pub(super) fn run(root: Option<&str>, options: Options) -> Result {
         (SandboxOperation::Deprovision, _) => {
             lifecycle::deprovision(state_dir("deprovision")?, options.timeout)
         }
-        (SandboxOperation::Run, Some((launch, rules))) => {
+        (SandboxOperation::Run, Some((launch, rules, _))) => {
             if options.state_dir.is_some() {
                 return Err(Exit::error(
                     "one-shot sandbox execution rejects persistent --state-dir settings",

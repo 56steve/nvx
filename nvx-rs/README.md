@@ -172,6 +172,19 @@ Windows an owned handle that denies other opens for writing or deleting the
 layer, so that nothing modifies, renames, or replaces it while it is held.
 Read-only opens, such as OpenVMM's open of a sandbox's layer, share it.
 
+`nvx-rs sandbox run` and `provision` verify the distro layer in their
+preflight, at the path given. `provision` records the layer at its resolved
+path, as it records every path, with the binding of the layer there, under
+`distro_binding` in `config.json`. When the path given is a link to a layer of
+another name, `start` checks the manifest beside the link's target, so
+`provision` verifies the layer there as well. `start` checks the binding before
+it launches OpenVMM, and holds the checked layer until the start ends. A
+configuration without a binding, as `nvx.py` wrote, fails with `sandbox
+configuration has no distro binding`, and a stale binding with what changed,
+such as `LAYER changed after its distro binding was made: its length differs`;
+both add `deprovision the sandbox and provision it again`, since a new
+provision verifies the layer again.
+
 ## Python parity
 
 `nvx::host::network::policy`, `nvx::host::sandbox`, and the guest lookups of
@@ -352,12 +365,15 @@ before them.
   down and prints nothing. `deprovision` removes the state directory.
 
 The state directory and its files are those that `nvx.py` wrote before it
-delegated to `nvx-rs`, so `nvx-rs` and an older `nvx.py` can each operate a
-sandbox that the other provisioned or started:
+delegated to `nvx-rs`, except that `config.json` also records the
+[distro binding](#distro-bindings) of the sandbox. An older `nvx.py`, which
+ignores the binding, can operate a sandbox that `nvx-rs` provisioned or
+started, and `nvx-rs` one that `nvx.py` started, but `nvx-rs` refuses to start
+a sandbox that `nvx.py` provisioned, which has no binding:
 
 | File | Contents |
 | --- | --- |
-| `config.json` | The provisioned sandbox, in the lowest of formats 1 to 6 that holds it, written as `json.dumps(value, indent=2, sort_keys=True)` writes it, with mode 0600, through a temporary file |
+| `config.json` | The provisioned sandbox, in the lowest of formats 1 to 6 that holds it, with the binding of its distro layer under `distro_binding`, written as `json.dumps(value, indent=2, sort_keys=True)` writes it, with mode 0600, through a temporary file |
 | `runtime.json` | Format 1: the `pid` and `start_time` of the running OpenVMM, as Python identifies a process, and its `control_endpoint`: `STATE/control.sock`, or `//./pipe/openvmm-microvm-HEX` on Windows |
 | `control.capability` | The 32-byte capability of the running OpenVMM, with mode 0600 |
 | `control.sock` | The control endpoint on POSIX hosts |
@@ -376,9 +392,9 @@ cancels a workload, and Ctrl-C ends the session, nor workload accounts
 that lacks a required feature, or that predates the request, is stopped as a
 failed start is, and the start fails with
 `the guest image lacks control features that layered sandboxes need (...)`,
-which names the missing features. `nvx.py` does not ask; this is the one
-intended change of behavior. The guest agents of NVX advertise bits 0, 2, and 4
-in sandbox mode.
+which names the missing features. `nvx.py` does not ask; this and the check of
+the [distro binding](#distro-bindings) are the intended changes of behavior. The
+guest agents of NVX advertise bits 0, 2, and 4 in sandbox mode.
 
 #### Other differences from nvx.py
 
@@ -425,7 +441,9 @@ OpenVMM a copy of `nvx-fake-openvmm`, and from the Python functions behind
 one-shot runs, the lifecycles of sandboxes in every configuration format, and
 the refusals of the lifecycle operations. Each step records the exit status,
 standard output and error, and the state files, with the root, process IDs, and
-random identifiers as placeholders. Its `posix` and `windows` sections were
+random identifiers as placeholders, and the devices, file IDs, and times of the
+distro binding, which `config.json` has recorded since the recording, as well.
+Its `posix` and `windows` sections were
 recorded on each kind of host, where the script also played every scenario with
 `nvx-rs`, and each lifecycle with the Python implementation and `nvx-rs` taking
 turns both ways, and found no difference. `tests/cli.rs` replays the section of
