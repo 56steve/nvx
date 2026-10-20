@@ -1,9 +1,11 @@
+use std::ffi::{CStr, OsString};
 use std::io::Read;
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-use crate::guest::sys::{self, Errno, Mode, MountFlags, OpenFlags, c_string};
+use crate::guest::mappings::{Access, InvalidMapping, Mapping};
+use crate::guest::sys::{self, Errno, Mode, MountFlags};
 use crate::protocol::{self, GuestHostMap};
 
 use super::seam::{System, path_c_string};
@@ -59,6 +61,11 @@ pub(crate) fn prepare(system: &mut impl System, mappings: &mut HostMappings) -> 
 }
 
 /// Validates and applies one ordered batch of host mappings.
+///
+/// The agent keeps the table's bookkeeping: the count that the kernel command line announced,
+/// the order of the batches, and the latch after a failure. [`Mapping`] applies each entry, with
+/// the host export's mount, `hostfs_dir/root`, as the export root and the agent's own root, `/`,
+/// as the target root.
 pub(crate) fn apply_request(
     system: &mut impl System,
     mappings: &mut HostMappings,
@@ -77,12 +84,23 @@ pub(crate) fn apply_request(
     {
         return Err(MappingError::Invalid);
     }
-    for (offset, mapping) in request.maps.iter().enumerate() {
-        if let Err(error) = apply(system, mapping) {
+    let first = request.first;
+    let batch = request
+        .maps
+        .into_iter()
+        .map(mapping_of)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| MappingError::Invalid)?;
+    let export_root = system.paths().hostfs_dir.join("root");
+    for (offset, mapping) in batch.iter().enumerate() {
+        let mount = |source: Option<&CStr>, target: &CStr, flags: MountFlags| {
+            system.mount(source, target, None, flags)
+        };
+        if let Err(failure) = mapping.apply_with(&export_root, Path::new("/"), mount) {
             mappings.failed = true;
             return Err(MappingError::Mount {
-                status: error as i32,
-                entry: request.first + offset as u32,
+                status: failure.raw_os_error(),
+                entry: first + offset as u32,
             });
         }
         mappings.applied += 1;
@@ -90,76 +108,16 @@ pub(crate) fn apply_request(
     Ok(())
 }
 
-/// Creates one target and bind-mounts a validated mapping onto it.
-fn apply(system: &mut impl System, mapping: &GuestHostMap) -> Result<(), Errno> {
-    let root = system.paths().hostfs_dir.join("root");
-    let source = append_bytes(&root, &mapping.source);
-    let target = PathBuf::from(std::ffi::OsStr::from_bytes(&mapping.target));
-    let metadata = std::fs::symlink_metadata(&source).map_err(|error| sys::errno_of(&error))?;
-    if metadata.file_type().is_dir() {
-        make_directories(&target, true)?;
-    } else if metadata.file_type().is_file() {
-        make_directories(&target, false)?;
-        match std::fs::symlink_metadata(&target) {
-            Ok(existing) if existing.file_type().is_file() => {}
-            Ok(_) => return Err(Errno::EINVAL),
-            Err(error) => match sys::errno_of(&error) {
-                Errno::ENOENT => create_file(&target)?,
-                error => return Err(error),
-            },
-        }
+/// Returns the library's mapping of one decoded entry, which the decoder's path rules let
+/// through unchanged.
+fn mapping_of(entry: GuestHostMap) -> Result<Mapping, InvalidMapping> {
+    let path = |bytes: Vec<u8>| PathBuf::from(OsString::from_vec(bytes));
+    let access = if entry.read_only {
+        Access::ReadOnly
     } else {
-        return Err(Errno::EINVAL);
-    }
-    let source = path_c_string(&source)?;
-    let target = path_c_string(&target)?;
-    system.mount(Some(&source), &target, None, MountFlags::MS_BIND)?;
-    let mut flags =
-        MountFlags::MS_BIND | MountFlags::MS_REMOUNT | MountFlags::MS_NOSUID | MountFlags::MS_NODEV;
-    if mapping.read_only {
-        flags |= MountFlags::MS_RDONLY;
-    }
-    system.mount(None, &target, None, flags)
-}
-
-/// Appends arbitrary Unix bytes to a trusted root path.
-fn append_bytes(root: &Path, suffix: &[u8]) -> PathBuf {
-    let mut bytes = root.as_os_str().as_bytes().to_vec();
-    bytes.push(b'/');
-    bytes.extend_from_slice(suffix);
-    PathBuf::from(std::ffi::OsStr::from_bytes(&bytes))
-}
-
-/// Creates every missing directory component in `path`.
-fn make_directories(path: &Path, include_last: bool) -> Result<(), Errno> {
-    let bytes = path.as_os_str().as_bytes();
-    for index in 1..=bytes.len() {
-        if bytes.get(index) == Some(&b'/') || (index == bytes.len() && include_last) {
-            let directory = c_string(&bytes[..index])?;
-            match sys::create_directory(&directory, Mode::from_bits_retain(0o755)) {
-                Ok(()) | Err(Errno::EEXIST) => {}
-                Err(error) => return Err(error),
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Atomically creates one regular mapping target without following a symlink.
-///
-/// As in the C agent, the new file closes at once, and a close failure is ignored.
-fn create_file(path: &Path) -> Result<(), Errno> {
-    let path = path_c_string(path)?;
-    sys::open(
-        &path,
-        OpenFlags::O_RDONLY
-            | OpenFlags::O_CREAT
-            | OpenFlags::O_EXCL
-            | OpenFlags::O_CLOEXEC
-            | OpenFlags::O_NOFOLLOW,
-        Mode::from_bits_retain(0o644),
-    )
-    .map(|_created| ())
+        Access::ReadWrite
+    };
+    Mapping::new(path(entry.source), path(entry.target), access)
 }
 
 #[cfg(test)]
@@ -329,5 +287,106 @@ mod tests {
             Err(MappingError::Invalid)
         ));
         assert_eq!(mappings.applied, 0);
+    }
+
+    #[test]
+    fn a_failure_in_the_middle_of_a_batch_keeps_earlier_mappings_and_latches() {
+        // The second entry fails at its bind, the third mount call, or at its missing source.
+        for (fail_mount_call, source, mounted) in [
+            (Some(3), b"0/notes.txt".as_slice(), 3),
+            (None, b"0/missing".as_slice(), 2),
+        ] {
+            let (temporary, mut system, mut mappings) = setup(3);
+            system.fail_mount_call = fail_mount_call;
+            let guest = temporary.path().join("guest");
+            let [first, second, third] = ["first", "second", "third"].map(|name| guest.join(name));
+            let request = payload(
+                0,
+                &[
+                    (
+                        b"0/src",
+                        first.as_os_str().as_bytes(),
+                        protocol::MAP_READ_ONLY,
+                    ),
+                    (source, second.as_os_str().as_bytes(), 0),
+                    (b"1", third.as_os_str().as_bytes(), 0),
+                ],
+                None,
+            );
+            assert!(matches!(
+                apply_request(&mut system, &mut mappings, &request),
+                Err(MappingError::Mount { status, entry: 1 }) if status == Errno::ENOENT as i32
+            ));
+            assert_eq!((mappings.applied, mappings.failed), (1, true));
+            // The first mapping stays mounted read-only, and the third is never attempted.
+            assert_eq!(system.mounts.len(), mounted);
+            assert_eq!(
+                system.mounts[1],
+                (
+                    None,
+                    first.as_os_str().as_bytes().to_vec(),
+                    MountFlags::MS_BIND
+                        | MountFlags::MS_REMOUNT
+                        | MountFlags::MS_NOSUID
+                        | MountFlags::MS_NODEV
+                        | MountFlags::MS_RDONLY
+                )
+            );
+            assert!(first.is_dir());
+            // The latch refuses the rest of the table, wherever it continues.
+            for continued in [1, 2] {
+                let rest = payload(continued, &[(b"1", third.as_os_str().as_bytes(), 0)], None);
+                assert!(matches!(
+                    apply_request(&mut system, &mut mappings, &rest),
+                    Err(MappingError::Invalid)
+                ));
+            }
+            assert_eq!(system.mounts.len(), mounted);
+            assert_eq!(mappings.applied, 1);
+            assert!(!third.exists());
+        }
+    }
+
+    #[test]
+    fn every_entry_that_the_decoder_accepts_becomes_a_library_mapping() {
+        assert_eq!(
+            crate::guest::mappings::MAX_PATH_BYTES,
+            protocol::MAX_MAP_PATH_BYTES
+        );
+        let longest = vec![b'a'; protocol::MAX_MAP_PATH_BYTES];
+        let target = [b"/".as_slice(), &longest[1..]].concat();
+        let request = protocol::decode_guest_maps_payload(&payload(
+            0,
+            &[
+                (
+                    longest.as_slice(),
+                    target.as_slice(),
+                    protocol::MAP_READ_ONLY,
+                ),
+                (b"0/\xff", b"/\xfe", 0),
+            ],
+            None,
+        ))
+        .unwrap();
+        let converted = request
+            .maps
+            .into_iter()
+            .map(mapping_of)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let parts = |mapping: &Mapping| {
+            (
+                mapping.source().as_os_str().as_bytes().to_vec(),
+                mapping.target().as_os_str().as_bytes().to_vec(),
+                mapping.access(),
+            )
+        };
+        assert_eq!(
+            converted.iter().map(parts).collect::<Vec<_>>(),
+            [
+                (longest, target, Access::ReadOnly),
+                (b"0/\xff".to_vec(), b"/\xfe".to_vec(), Access::ReadWrite),
+            ]
+        );
     }
 }
