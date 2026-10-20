@@ -1,7 +1,8 @@
-//! The programs that run in NVX's Linux guests, which ship as `/sbin/nvx-*`.
+//! The programs that run in NVX's Linux guests, which ship as `/sbin/nvx-*`, and [`nvxs`], the
+//! guest's I/O driver of the NVXS session, which guest agents call.
 //!
-//! Each module holds one program, and the crate's binary of the same name runs its `main`. The
-//! programs keep the command lines, exit statuses, and output of the C programs that they
+//! Each other module holds one program, and the crate's binary of the same name runs its `main`.
+//! The programs keep the command lines, exit statuses, and output of the C programs that they
 //! replace, except that numeric arguments are plain decimal, with a `-` sign where `nvx-time`'s
 //! test hooks take negative numbers, or `0x`-prefixed hexadecimal where the C program also read
 //! hexadecimal, floating-point arguments plain decimal with an optional exponent, error messages
@@ -65,6 +66,7 @@ pub mod ingress;
 pub mod managed_agent;
 #[cfg(target_arch = "x86_64")]
 pub mod mmio_write;
+pub mod nvxs;
 pub mod reseed;
 #[cfg(target_arch = "x86_64")]
 pub mod time;

@@ -5,7 +5,7 @@
 //! starts a managed agent, which runs workloads that the host sends it over an authenticated
 //! control console. This crate holds everything it takes to drive one:
 //!
-//! - [`protocol`]: the codec of the control console, the `NVXS` records that OpenVMM brokers and
+//! - [`protocol`]: the codec of the control console, the `NVXS` session that OpenVMM brokers and
 //!   the `NVXC` frames of the guest agent. It has no dependencies, so the host, the guest, and
 //!   test doubles share it.
 //! - [`contract`]: the control-contract versions that this crate speaks, and the compatibility of
@@ -14,12 +14,14 @@
 //!   hostname and guest network address.
 //! - [`Hypervisor`]: the hypervisors that run the VMs.
 //! - [`host`] (feature `host`): artifact discovery, the OpenVMM command line, the lowering of
-//!   network and filesystem policies, control sessions, process and platform primitives, and the
-//!   supervision of VM instances: starting, reconciling, executing workloads, and stopping.
+//!   network and filesystem policies, the host's NVXS connection, control sessions, process and
+//!   platform primitives, and the supervision of VM instances: starting, reconciling, executing
+//!   workloads, and stopping.
 //! - `testing` (feature `testing`): a fake OpenVMM that serves the control console without
 //!   running a VM.
 //! - `guest` (feature `guest`, Linux): the programs that run in NVX guests, such as
-//!   `nvx-console-pending`. The crate's `nvx-*` guest binaries run them.
+//!   `nvx-console-pending`, and the guest's NVXS connection. The crate's `nvx-*` guest binaries
+//!   run the programs.
 //!
 //! # Example
 //!

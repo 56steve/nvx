@@ -41,8 +41,8 @@ pub const OUTER_RESET: u8 = 3;
 pub const OUTER_ACK: u8 = 4;
 /// Record that carries an application frame.
 pub const OUTER_DATA: u8 = 5;
-/// Record with which OpenVMM asks an attaching host client to wait, because another client holds
-/// the broker's single host slot.
+/// Record with which OpenVMM accepts the host client's capability and asks it to wait until the
+/// guest attaches and acknowledges the session's reset.
 pub const OUTER_WAIT: u8 = 6;
 /// Record with which OpenVMM accepts the host client. It carries the session's instance ID and
 /// epoch, which every data record repeats.

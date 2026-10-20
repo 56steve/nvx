@@ -22,21 +22,22 @@ root would interact with the nested `openvmm/` workspace.
 ```text
 nvx-rs/
 ├── src/
-│   ├── protocol/    NVXS records, NVXC frames, EXEC and MAPS payloads, guest features, and
+│   ├── protocol/    NVXS session, NVXC frames, EXEC and MAPS payloads, guest features, and
 │   │                kernel command-line tokens; no dependencies, shared by the host and the guest
 │   ├── contract.rs  control-contract versions and release-manifest compatibility
 │   ├── net/         CIDR parsing and subtraction, and hostname and guest-network forms
 │   ├── hypervisor.rs
 │   ├── error.rs     nvx::Error and its ErrorKind
 │   ├── host/        feature `host` (default): artifacts, launch, network and egress policy files,
-│   │                filesystem, session, process, platform, VM instances, outcome reports, and
-│   │                the sandbox launch profile of `nvx.py`, with the Python semantics they keep;
-│   │                with feature `cli`, the `nvx-rs` CLI
+│   │                filesystem, NVXS connection, session, process, platform, VM instances,
+│   │                outcome reports, and the sandbox launch profile of `nvx.py`, with the Python
+│   │                semantics they keep; with feature `cli`, the `nvx-rs` CLI
 │   ├── testing/     feature `testing`: the fake OpenVMM
-│   ├── guest/       feature `guest`: the programs that run in Linux guests
+│   ├── guest/       feature `guest`: the programs that run in Linux guests, and the guest's
+│   │                NVXS connection
 │   └── bin/         nvx-rs, nvx-fake-openvmm, and the guest binaries
-├── tests/           fake-OpenVMM, CLI, and guest-binary tests, and the golden fixtures that Python
-│                    recorded for the ports of its code, in fixtures/
+├── tests/           fake-OpenVMM, CLI, NVXS session, and guest-binary tests, and the golden
+│                    fixtures that Python recorded for the ports of its code, in fixtures/
 ├── build.rs         bundled-release staging
 └── artifacts.json   the NVX release that the `bundled` feature stages
 ```
@@ -44,6 +45,7 @@ nvx-rs/
 | Module | Contents |
 | --- | --- |
 | `nvx::protocol` | The codec of the control console: `NVXS` outer records, `NVXC` application frames, the `EXEC` payload that the host encodes and the guest agent decodes, the `MAPS` payloads of the host mapping table, `GuestFeatures`, and the `nvx_maps=` and `nvx_workload_account=create` tokens. Golden byte fixtures pin every record independently of the codec, which the host and the fake OpenVMM share |
+| `nvx::protocol::nvxs` | The NVXS session, independent of `NVXC` and of any other application protocol: `RecordType`, `Record`, `encode_record`, and `RecordParser`, which parses records incrementally across partial reads with buffers bounded by one record; `HostSession` and `GuestSession`, the state machines of the host's and the guest's roles, which validate every record's type, identity, and sequence number, and the guest's receive window and credits, without I/O. An application message may span DATA records, and the application's own framing reassembles it |
 | `nvx::contract` | The OpenVMM microVM ABI, broker protocol, and control-contract revision that the crate speaks, and `manifest_is_compatible` for a release's `SOURCE-MANIFEST.json` |
 | `nvx::net` | `Cidr`: IPv4 and IPv6 networks and their subtraction; `is_valid_hostname` and `is_valid_guest_network`, the forms of a VM's hostname and guest address |
 | `nvx::Hypervisor` | KVM, MSHV, or WHP, with its serde form behind the `serde` feature |
@@ -53,11 +55,13 @@ nvx-rs/
 | `nvx::host::network::policy` | Egress policy files: `compile_policy_file`, `compile_policy_bytes`, and `compile_policy` compile one to a `CompiledEgressPolicy` of native rules; see [Egress policy files](#egress-policy-files) |
 | `nvx::host::filesystem` | The `ExportPlan` of host paths through OpenVMM's aggregate virtio-fs device, the host-mapping table, the reserved guest targets, and `guest_path` and `resolve_guest_path` (also at `nvx::`) |
 | `nvx::host::instance` | `Instance`: a VM in a directory of its own. It starts OpenVMM with a fresh capability and waits until the guest is ready and has mounted the mapped paths, reconciles recorded state, recovers interrupted launches, runs workloads and pumps their output, and stops the VM with a forced fallback |
+| `nvx::host::nvxs` | `HostConnection`: the host's role of the NVXS session over a platform transport. It attaches with the launch capability, waiting while the broker asks it to, sends application bytes in as many DATA records as they take, and returns each DATA payload from the guest, with deadlines; a receive that times out keeps a partial record |
 | `nvx::host::session`, `process`, `platform`, `report` | The authenticated control session, OpenVMM processes, Linux and Windows primitives, and OpenVMM's outcome report |
 | `nvx::host::sandbox` | The launch profile of `nvx.py sandbox`, ported from the one that `scripts/nvx_tools/sandbox.py` held: `SandboxLaunch`, with the EROFS distro `SandboxLayer`, the one layer that a sandbox takes, the ext4 scratch disk, the entrypoint, arguments, hostname, workload identity, and resource limits, and its `--microvm-sandbox-block` and `--microvm-workload-identity` arguments and kernel command line, within the 1024-byte budget that OpenVMM leaves it. `mount`: `SandboxMount` live shares of host directories and files, their guest targets and the reserved ones, their access policies and owner, the aggregate of several shares, and the checks of their host paths. `options`: the checks that `nvx.py sandbox` and `nvx.py run` apply to their options: the attribution of `--mount-deny`, `--mount-allow`, and `--mount-write` to shares, the systemd policy, the targets of `nvx.py run` shares, and the managed exec environment; see [Python parity](#python-parity) |
 | `nvx::testing::fake_openvmm` | A fake OpenVMM that serves the control console and runs scripted workloads without a VM, for direct launches and for the managed and one-shot sandboxes of `nvx-rs sandbox` and `nvx.py sandbox` |
 | `nvx::host::cli` | Feature `cli`: the `nvx-rs` executable; see [The nvx-rs CLI](#the-nvx-rs-cli) |
 | `nvx::guest` | The programs that run in Linux guests; see [Guest binaries](#guest-binaries) |
+| `nvx::guest::nvxs` | `GuestConnection`: the guest's role of the NVXS session over a byte stream, such as the control console, for guest agents. It never reads past the record in progress, so a caller that polls the stream between records sees every record that it has not returned |
 
 Lowering functions take the names by which messages refer to their inputs, such
 as `EgressRules::name` and `PathList::name`, so callers' messages name their own
@@ -518,7 +522,10 @@ The tests need no hypervisor. The fake-OpenVMM test drives `Instance` end to end
 against `nvx-fake-openvmm`, the CLI test replays the
 [golden scenarios](#golden-scenarios) and checks the guest-feature
 requirement and, on Linux, Ctrl-C, and shared protocol definitions plus golden
-byte fixtures cover both sides of every record. On Linux, a loopback test drives
+byte fixtures cover both sides of every record. The NVXS test drives the
+host's and the guest's roles of the session and their connections through a
+broker that relays records as OpenVMM's does, with messages of an application
+framing of its own that span records. On Linux, a loopback test drives
 the host `ControlSession` through a broker shim into the real managed agent's
 session, dispatch, and execution engine, and `nvx.py` also lints and tests the
 guest binaries, and runs their integration tests against a build of them:
