@@ -1436,8 +1436,8 @@ fn a_process_that_this_user_may_not_query_has_an_unknown_state() {
         "the process was ended"
     );
 
-    // A sandbox whose runtime record names it cannot tell whether its VMM runs: reattach changes
-    // nothing, and signals nothing.
+    // A sandbox whose runtime record names it cannot tell whether its VMM runs: reattach keeps
+    // the record, and signals nothing.
     let (_directory, store) = sandbox();
     write_record(&store, &reference);
     let mut locked = store.lock(None).unwrap();

@@ -92,8 +92,9 @@
 //! [`Process::open`]. A record from an earlier boot names a VMM that has exited.
 //!
 //! The supervisor signals only a process that it holds through a verified identity: the child
-//! that it has not released, or a [`Process`] that matched its recorded reference. It never
-//! signals a process that reuses a recorded ID.
+//! that it has not released, a [`Process`] that matched its recorded reference, or, during the
+//! recovery of a launch that did not record its VMM, the process that recovery verified to be that
+//! VMM. It never signals a process that reuses a recorded ID.
 
 mod child;
 #[cfg(test)]
@@ -537,19 +538,26 @@ pub enum Reattached {
         recovery: Recovery,
     },
     /// Whether a VMM of the sandbox runs cannot be determined, for the reason that this gives:
-    /// an interrupted launch cannot be ended yet, or the recorded VMM cannot be examined. Nothing
-    /// is changed or signaled, and a later reattach may succeed.
+    /// an interrupted launch cannot be ended yet, or the recorded VMM cannot be examined. The
+    /// runtime record, and the journal of an interrupted launch, remain for a later reattach,
+    /// which may succeed.
+    ///
+    /// Reattach signals no process that it has not verified, but it is not free of effects:
+    /// [`LockedStore::recover`] may have terminated a verified VMM of the interrupted launch that
+    /// has not exited yet, and removes a journal that the runtime record of its committed launch
+    /// supersedes.
     Indeterminate(String),
 }
 
 /// Reattaches to the VM of the sandbox of `locked` after the orchestrator restarts within the
 /// same host boot, under the runtime identity `runtime`, which the caller would launch now.
 ///
-/// It ends an interrupted launch with [`LockedStore::recover`], reads the runtime record, holds
-/// the recorded VMM with [`Process::open`], which verifies its process ID, its start time, and
-/// the host boot, and compares the record's runtime identity with `runtime`, as
-/// [`RuntimeRecord::check_identity`] does; see [`Reattached`]. A record from an earlier boot
-/// names a VMM that has exited.
+/// It ends an interrupted launch with [`LockedStore::recover`], which signals only a VMM that it
+/// verified, reads the runtime record, holds the recorded VMM with [`Process::open`], which
+/// verifies its process ID, its start time, and the host boot, and compares the record's runtime
+/// identity with `runtime`, as [`RuntimeRecord::check_identity`] does; see [`Reattached`]. A
+/// record from an earlier boot names a VMM that has exited. Beyond that recovery, reattach
+/// signals nothing: a VM that it reports as live or mismatched keeps running.
 ///
 /// Reattach does not replay the VM's start or its mappings, restore streams that the restart
 /// lost, or resolve images: the caller's own protocol resumes through the recorded endpoint, if it
