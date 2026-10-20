@@ -101,6 +101,10 @@ pub(crate) fn check_store_dir(_path: &Path) -> io::Result<Option<String>> {
     Err(unsupported())
 }
 
+pub(crate) fn private_file_problem(_file: &File) -> io::Result<Option<String>> {
+    Err(unsupported())
+}
+
 pub(crate) fn detach(_command: &mut Command, _breakaway_from_job: bool) {}
 
 pub(crate) fn probe_hypervisor(_hypervisor: Hypervisor) -> Result<(), String> {

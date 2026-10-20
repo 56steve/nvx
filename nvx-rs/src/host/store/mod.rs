@@ -16,16 +16,19 @@
 //!
 //! The directory is private to the current user, since its records decide which process
 //! recovery signals: it belongs to the user, and no one else may access it. On Unix it has mode
-//! 0700, and its files mode 0600. On Windows, a directory that the store creates allows the user
-//! alone, through a protected access control list that its files inherit; one that it did not
-//! create may also allow SYSTEM and the Administrators group, as one under the user's profile
-//! does. [`SandboxStore::create`] and [`SandboxStore::open`] refuse an existing directory that is
-//! not private, rather than restrict it, since others could have placed records in it, or still
-//! hold its files open. The store names its files by their paths, so the directories above it
-//! must be ones that only the user, or an administrator, may change. Records are replaced
-//! atomically, so readers that hold no lock, such as an execution, see whole records. The store
-//! holds runtime records only: configuration belongs to its caller, which may keep it in the same
-//! directory under a name of its own.
+//! 0700, which OpenVMM also requires of the directory of its control socket, and its files mode
+//! 0600. On Windows, a directory that the store creates allows the user alone, through a
+//! protected access control list that its files inherit; one that it did not create may also
+//! allow SYSTEM and the Administrators group, as one under the user's profile does, and must pass
+//! entries on to the files created in it. A file's own list decides who may open it on Windows,
+//! whatever its directory allows, so the store also refuses a record or a capability whose list
+//! allows anyone else. [`SandboxStore::create`] and [`SandboxStore::open`] refuse an existing
+//! directory that is not private, rather than change it, since others could have placed records
+//! in it, or still hold its files open. The store names its files by their paths, so the
+//! directories above it must be ones that only the user, or an administrator, may change.
+//! Records are replaced atomically, so readers that hold no lock, such as an execution, see whole
+//! records. The store holds runtime records only: configuration belongs to its caller, which may
+//! keep it in the same directory under a name of its own.
 //!
 //! # Records
 //!
@@ -138,7 +141,7 @@ mod record;
 mod tests;
 mod vmm;
 
-use std::fs::{self, File, TryLockError};
+use std::fs::{File, TryLockError};
 use std::io;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
@@ -302,10 +305,13 @@ impl SandboxStore {
     /// Reads the launch capability of the sandbox's VM.
     pub fn read_capability(&self) -> Result<[u8; CAPABILITY_LEN]> {
         let path = self.capability_path();
-        let bytes = fs::read(&path).map_err(io_error(format!(
-            "cannot read the sandbox control capability {}",
-            path.display()
-        )))?;
+        let description = "sandbox control capability";
+        let Some(bytes) = files::read_private(&path, description)? else {
+            return Err(io_error(format!(
+                "cannot read the {description} {}",
+                path.display()
+            ))(io::Error::from(io::ErrorKind::NotFound)));
+        };
         match <[u8; CAPABILITY_LEN]>::try_from(bytes.as_slice()) {
             Ok(capability) if capability != [0; CAPABILITY_LEN] => Ok(capability),
             _ => Err(Error::io(format!(

@@ -280,11 +280,17 @@ pub fn create_private_dir(path: &Path) -> io::Result<()> {
 /// is private to the current user, as [`check_store_dir`] does, and returns why it is not, if it
 /// is not.
 ///
-/// An existing directory is never restricted: others could have placed records in it, or still
-/// hold its files open, which a change of its mode would not revoke.
+/// A new directory takes the setgid bit of its parent, and loses the bits that the umask clears,
+/// so its mode is set again, to the 0700 that OpenVMM requires of the directory of its control
+/// socket. An existing directory is never changed: others could have placed records in it, or
+/// still hold its files open, which a change of its mode would not revoke.
 pub(crate) fn create_store_dir(path: &Path) -> io::Result<Option<String>> {
     match DirBuilder::new().mode(0o700).create(path) {
-        Ok(()) => {}
+        Ok(()) => {
+            if let Some(directory) = open_plain_dir(path)? {
+                directory.set_permissions(Permissions::from_mode(0o700))?;
+            }
+        }
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
         Err(error) => return Err(error),
     }
@@ -292,8 +298,8 @@ pub(crate) fn create_store_dir(path: &Path) -> io::Result<Option<String>> {
 }
 
 /// Returns why the directory `path` cannot hold a sandbox store, if it cannot: unless it is
-/// private to the current user, as [`create_store_dir`] makes it, belonging to the user with no
-/// access for anyone else.
+/// private to the current user, as [`create_store_dir`] makes it, belonging to the user with mode
+/// 0700.
 pub(crate) fn check_store_dir(path: &Path) -> io::Result<Option<String>> {
     let Some(directory) = open_plain_dir(path)? else {
         return Ok(Some("is not a plain directory".to_owned()));
@@ -307,21 +313,31 @@ pub(crate) fn check_store_dir(path: &Path) -> io::Result<Option<String>> {
 }
 
 /// Returns why a directory of a sandbox store, which the user `uid` owns with the mode `mode`, is
-/// not private to the user `euid`, if it is not: it must belong to that user, and grant no access
-/// to anyone else.
+/// not private to the user `euid`, if it is not: it must belong to that user, grant no access to
+/// anyone else, and have mode 0700, which OpenVMM requires of the directory of its control
+/// socket.
 pub(crate) fn store_dir_problem(uid: u32, mode: u32, euid: u32) -> Option<String> {
+    let mode = mode & 0o7777;
     if uid != euid {
         Some(format!(
             "belongs to user {uid}, not to the current user {euid}"
         ))
     } else if mode & 0o077 != 0 {
+        Some(format!("is accessible to other users (mode {mode:03o})"))
+    } else if mode != 0o700 {
         Some(format!(
-            "is accessible to other users (mode {:03o})",
-            mode & 0o777
+            "has mode {mode:03o}, not the mode 700 that the directory of a control socket must have"
         ))
     } else {
         None
     }
+}
+
+/// Returns why the file that `file` holds open, a record or the capability of a sandbox store,
+/// is not private to the current user, if it is not: never, on Linux, where no one else may look
+/// up a file in the store's directory, which grants them no access.
+pub(crate) fn private_file_problem(_file: &File) -> io::Result<Option<String>> {
+    Ok(None)
 }
 
 /// Opens the directory `path`, or returns `None` if it is a symbolic link or not a directory.

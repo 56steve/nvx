@@ -725,7 +725,8 @@ pub(crate) fn create_store_dir(path: &Path) -> io::Result<Option<String>> {
 /// Returns why the directory `path` cannot hold a sandbox store, if it cannot: unless it is
 /// private to the current user, as [`create_store_dir`] makes it. It must belong to the user, or
 /// to SYSTEM or the Administrators group, and its access control list must allow no one else, as
-/// that of a directory under the user's profile does.
+/// that of a directory under the user's profile does. Its list must also pass entries on to the
+/// files created in it, which would otherwise take their creator's default list.
 pub(crate) fn check_store_dir(path: &Path) -> io::Result<Option<String>> {
     store_dir_problem(path, &CurrentUser::get()?)
 }
@@ -741,13 +742,26 @@ fn store_dir_problem(path: &Path, user: &CurrentUser) -> io::Result<Option<Strin
     {
         return Ok(Some("is not a plain directory".to_owned()));
     }
-    privacy_problem(&directory, user)
+    privacy_problem(&directory, user, true)
+}
+
+/// Returns why the file that `file` holds open, a record or the capability of a sandbox store,
+/// is not private to the current user, if it is not.
+///
+/// A file's own access control list decides who may open it, whatever its directory allows, so
+/// a file of a store that allows anyone else could have been written by them.
+pub(crate) fn private_file_problem(file: &fs::File) -> io::Result<Option<String>> {
+    privacy_problem(file, &CurrentUser::get()?, false)
 }
 
 /// Returns why the file or directory that `file` holds is not private to `user`, if it is not: it
 /// must belong to the user, or to SYSTEM or the Administrators group, and its access control list
-/// must allow no one else.
-fn privacy_problem(file: &fs::File, user: &CurrentUser) -> io::Result<Option<String>> {
+/// must allow no one else. A `directory` must also pass entries on to the files created in it.
+fn privacy_problem(
+    file: &fs::File,
+    user: &CurrentUser,
+    directory: bool,
+) -> io::Result<Option<String>> {
     let handle = file.as_raw_handle() as HANDLE;
     let information = OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
     let mut len = 0;
@@ -793,6 +807,7 @@ fn privacy_problem(file: &fs::File, user: &CurrentUser) -> io::Result<Option<Str
     if sized == 0 {
         return Err(io::Error::last_os_error());
     }
+    let mut inherited_by_files = false;
     for index in 0..size.AceCount {
         let mut ace = ptr::null_mut();
         // SAFETY: the index is within the list, and the output pointer is valid.
@@ -800,7 +815,11 @@ fn privacy_problem(file: &fs::File, user: &CurrentUser) -> io::Result<Option<Str
             return Err(io::Error::last_os_error());
         }
         // SAFETY: every entry starts with its header.
-        match unsafe { (*ace.cast::<ACE_HEADER>()).AceType } {
+        let header = unsafe { *ace.cast::<ACE_HEADER>() };
+        if u32::from(header.AceFlags) & OBJECT_INHERIT_ACE != 0 {
+            inherited_by_files = true;
+        }
+        match header.AceType {
             ACCESS_DENIED_ACE_TYPE => {}
             ACCESS_ALLOWED_ACE_TYPE => {
                 // SAFETY: an entry that allows access holds its identifier from `SidStart` on.
@@ -824,37 +843,33 @@ fn privacy_problem(file: &fs::File, user: &CurrentUser) -> io::Result<Option<Str
             }
         }
     }
+    // A file created without entries to inherit takes its creator's default list instead, which
+    // may allow anyone.
+    if directory && !inherited_by_files {
+        return Ok(Some(
+            "passes no access control entries on to the files created in it".to_owned(),
+        ));
+    }
     Ok(None)
 }
 
-/// Returns why the file `path` is not private to the current user, if it is not, as the files of
-/// a sandbox store must be.
+/// Replaces the access control list of the file or directory `path` with the protected list of
+/// the descriptor `sddl`, in the security descriptor definition language.
 #[cfg(test)]
-pub(crate) fn file_privacy_problem(path: &Path) -> io::Result<Option<String>> {
-    let file = OpenOptions::new()
-        .access_mode(READ_CONTROL)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(path)?;
-    privacy_problem(&file, &CurrentUser::get()?)
-}
-
-/// Lets every user change the file or directory `path`, and the files and directories created in
-/// it, as no directory of a sandbox store may.
-#[cfg(test)]
-pub(crate) fn allow_everyone(path: &Path) -> io::Result<()> {
+pub(crate) fn set_access(path: &Path, sddl: &str) -> io::Result<()> {
     use windows_sys::Win32::Foundation::LocalFree;
     use windows_sys::Win32::Security::Authorization::{
         ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
     };
-    use windows_sys::Win32::Security::SetFileSecurityW;
+    use windows_sys::Win32::Security::{PROTECTED_DACL_SECURITY_INFORMATION, SetFileSecurityW};
 
-    let everyone = wide("D:(A;OICI;FA;;;WD)");
+    let sddl = wide(sddl);
     let name = wide(path);
     let mut descriptor = ptr::null_mut();
     // SAFETY: the string is NUL-terminated, and the output pointer is valid.
     let converted = unsafe {
         ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            everyone.as_ptr(),
+            sddl.as_ptr(),
             SDDL_REVISION_1,
             &mut descriptor,
             ptr::null_mut(),
@@ -863,8 +878,9 @@ pub(crate) fn allow_everyone(path: &Path) -> io::Result<()> {
     if converted == 0 {
         return Err(io::Error::last_os_error());
     }
+    let information = DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION;
     // SAFETY: the name is NUL-terminated, and the descriptor is valid.
-    let set = unsafe { SetFileSecurityW(name.as_ptr(), DACL_SECURITY_INFORMATION, descriptor) };
+    let set = unsafe { SetFileSecurityW(name.as_ptr(), information, descriptor) };
     let result = if set == 0 {
         Err(io::Error::last_os_error())
     } else {

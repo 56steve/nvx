@@ -2,15 +2,13 @@
 //! the identities that they hold, and their reading and writing in format [`FORMAT`].
 
 use std::fmt;
-use std::fs;
-use std::io;
 use std::path::Path;
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use super::FORMAT;
-use super::files::{io_error, write_private};
+use super::files::{read_private, write_private};
 use super::identity::{IdentityCheck, RuntimeIdentity};
 use crate::error::{Error, Result};
 use crate::host::filesystem::FileIdentity;
@@ -308,19 +306,13 @@ impl Record for LaunchJournal {
 /// Reads the record at `path`, or returns `None` if the file does not exist.
 ///
 /// A record of another format fails before its fields are read, with a message that names its
-/// format: the store reads format [`FORMAT`] only, and migrates no other. Every failure to read
-/// or check the record is an [`ErrorKind::Io`](crate::ErrorKind::Io) error.
+/// format: the store reads format [`FORMAT`] only, and migrates no other. A record file that is
+/// not private to the current user fails as well, since others could have written it. Every
+/// failure to read or check the record is an [`ErrorKind::Io`](crate::ErrorKind::Io) error.
 pub(super) fn read<T: Record>(path: &Path) -> Result<Option<T>> {
     let description = T::DESCRIPTION;
-    let text = match fs::read(path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(io_error(format!(
-                "cannot read the {description} {}",
-                path.display()
-            ))(error));
-        }
+    let Some(text) = read_private(path, description)? else {
+        return Ok(None);
     };
     let malformed = || format!("the {description} {} is malformed", path.display());
     let value: serde_json::Value =

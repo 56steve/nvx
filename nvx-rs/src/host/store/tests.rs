@@ -316,7 +316,7 @@ fn the_store_is_private_to_the_current_user() {
     use std::os::unix::fs::{PermissionsExt, symlink};
 
     let (directory, store) = store();
-    let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o7777;
     let set_mode = |path: &Path, mode: u32| {
         fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
     };
@@ -363,11 +363,34 @@ fn the_store_is_private_to_the_current_user() {
     for name in [LOCK_NAME, JOURNAL_NAME, CAPABILITY_NAME, LOG_NAME] {
         assert_eq!(mode(&store.path(name)), 0o600, "{name}");
     }
+    // A new store takes the setgid bit of its parent, and drops it for the mode 0700 that OpenVMM
+    // requires of the directory of its control socket; an existing directory with another mode is
+    // refused.
+    let setgid = directory.path().join("setgid");
+    fs::create_dir(&setgid).unwrap();
+    set_mode(&setgid, 0o2700);
+    assert_eq!(mode(&setgid), 0o2700);
+    let plain = setgid.join("plain");
+    fs::create_dir(&plain).unwrap();
+    assert_eq!(mode(&plain) & 0o2000, 0o2000);
+    let nested = SandboxStore::create(setgid.join("sandbox")).unwrap();
+    assert_eq!(mode(nested.dir()), 0o700);
+    for error in [
+        SandboxStore::create(&setgid).unwrap_err(),
+        SandboxStore::open(&setgid).unwrap_err(),
+    ] {
+        assert!(
+            error.message().ends_with(
+                "has mode 2700, not the mode 700 that the directory of a control socket must have"
+            ),
+            "{error}"
+        );
+    }
 }
 
 #[cfg(target_os = "linux")]
 #[test]
-fn stores_belong_to_the_current_user() {
+fn stores_belong_to_the_current_user_with_mode_700() {
     // Another user's directory is refused whatever its mode, since its owner may change it.
     assert_eq!(
         platform::store_dir_problem(1001, 0o40700, 1000),
@@ -381,13 +404,20 @@ fn stores_belong_to_the_current_user() {
             "{problem}"
         );
     }
+    for (mode, shown) in [(0o42700, "2700"), (0o41700, "1700"), (0o40500, "500")] {
+        let problem = platform::store_dir_problem(1000, mode, 1000).unwrap();
+        assert!(
+            problem.starts_with(&format!("has mode {shown}, ")),
+            "{problem}"
+        );
+    }
 }
 
 #[cfg(windows)]
 #[test]
 fn the_store_is_private_to_the_current_user() {
     let directory = tempfile::tempdir().unwrap();
-    platform::allow_everyone(directory.path()).unwrap();
+    platform::set_access(directory.path(), "D:(A;OICI;FA;;;WD)").unwrap();
     // A directory that every user may change holds no store, nor does one created in it.
     let error = SandboxStore::open(directory.path()).unwrap_err();
     assert!(error.message().ends_with("allows other users"), "{error}");
@@ -395,6 +425,20 @@ fn the_store_is_private_to_the_current_user() {
     fs::create_dir(&shared).unwrap();
     let error = SandboxStore::create(&shared).unwrap_err();
     assert!(error.message().ends_with("allows other users"), "{error}");
+    // Nor does one that allows its owner alone, but passes nothing on to the files created in it,
+    // which would take their creator's default list.
+    platform::set_access(&shared, "D:P(A;;FA;;;OW)").unwrap();
+    for error in [
+        SandboxStore::create(&shared).unwrap_err(),
+        SandboxStore::open(&shared).unwrap_err(),
+    ] {
+        assert!(
+            error
+                .message()
+                .ends_with("passes no access control entries on to the files created in it"),
+            "{error}"
+        );
+    }
     // A store created there allows the current user alone, and so do its files.
     let store = SandboxStore::create(directory.path().join("sandbox")).unwrap();
     assert_eq!(SandboxStore::open(store.dir()).unwrap(), store);
@@ -402,13 +446,29 @@ fn the_store_is_private_to_the_current_user() {
     let mut locked = store.lock(None).unwrap();
     let launch = locked.begin_launch(&runtime(), &CAPABILITY).unwrap();
     drop(launch);
+    let problem = |name: &str| {
+        let file = fs::File::open(store.path(name)).unwrap();
+        platform::private_file_problem(&file).unwrap()
+    };
     for name in [LOCK_NAME, JOURNAL_NAME, CAPABILITY_NAME, LOG_NAME] {
+        assert_eq!(problem(name), None, "{name}");
+    }
+    // A record or a capability whose own list allows others could have been written by them,
+    // whatever the directory allows, and is refused.
+    for name in [JOURNAL_NAME, CAPABILITY_NAME] {
+        platform::set_access(&store.path(name), "D:P(A;;FA;;;WD)").unwrap();
         assert_eq!(
-            platform::file_privacy_problem(&store.path(name)).unwrap(),
-            None,
+            problem(name).as_deref(),
+            Some("allows other users"),
             "{name}"
         );
     }
+    let error = store.journal().unwrap_err();
+    assert!(error.message().ends_with("allows other users"), "{error}");
+    let error = locked.recover().unwrap_err();
+    assert!(error.message().ends_with("allows other users"), "{error}");
+    let error = store.read_capability().unwrap_err();
+    assert!(error.message().ends_with("allows other users"), "{error}");
 }
 
 #[test]

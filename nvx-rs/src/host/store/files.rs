@@ -1,10 +1,11 @@
-//! The private files of the store: their creation, atomic replacement, and removal.
+//! The private files of the store: their creation, atomic replacement, reading, and removal.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::Path;
 
 use crate::error::{Error, Result};
+use crate::host::platform;
 
 /// Builds an error mapper that keeps an I/O source under `context`.
 pub(super) fn io_error(context: String) -> impl FnOnce(io::Error) -> Error {
@@ -57,6 +58,29 @@ pub(super) fn write_private(path: &Path, contents: &[u8]) -> Result<()> {
         let _ = fs::remove_file(&temporary);
     }
     written.map_err(io_error(format!("cannot write {}", path.display())))
+}
+
+/// Reads the file at `path`, the store's `description`, or returns `None` if it does not exist.
+///
+/// A file that is not private to the current user is refused, since others could have written
+/// it: on Windows, a file's own access control list decides who may open it, whatever the store's
+/// directory allows.
+pub(super) fn read_private(path: &Path, description: &str) -> Result<Option<Vec<u8>>> {
+    let failed = || io_error(format!("cannot read the {description} {}", path.display()));
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(failed()(error)),
+    };
+    if let Some(problem) = platform::private_file_problem(&file).map_err(failed())? {
+        return Err(Error::io(format!(
+            "the {description} {} {problem}",
+            path.display()
+        )));
+    }
+    let mut contents = Vec::new();
+    file.read_to_end(&mut contents).map_err(failed())?;
+    Ok(Some(contents))
 }
 
 /// Removes the file at `path` if it exists.
