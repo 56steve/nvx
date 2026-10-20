@@ -169,7 +169,7 @@ impl GuestSession {
         let (GuestState::Active, Some(identity)) = (self.state, self.identity) else {
             return Err(SessionError::InvalidState);
         };
-        let next = next_sequence(self.send_sequence)?;
+        let next = next_sequence(self.send_sequence, RecordType::Data)?;
         let taken = encode_data(&identity, self.send_sequence, data, output)?;
         self.send_sequence = next;
         Ok(taken)
@@ -187,7 +187,7 @@ impl GuestSession {
                 bytes,
             });
         }
-        let next = next_sequence(self.send_sequence)?;
+        let next = next_sequence(self.send_sequence, RecordType::Credit)?;
         encode_record(
             RecordType::Credit,
             &identity.instance_id,
@@ -243,7 +243,7 @@ impl GuestSession {
                 actual: identity.epoch,
             });
         }
-        let next = next_sequence(record.sequence())?;
+        let next = next_sequence(record.sequence(), RecordType::Reset)?;
         self.identity = Some(identity);
         self.receive_sequence = next;
         self.send_sequence = 0;
@@ -261,7 +261,7 @@ impl GuestSession {
         };
         check_sequence(&record, self.receive_sequence)?;
         check_identity(&record, &identity)?;
-        let next = next_sequence(self.receive_sequence)?;
+        let next = next_sequence(self.receive_sequence, RecordType::Data)?;
         // A DATA payload has at most `OUTER_MAX_PAYLOAD` bytes, so its length fits a `u32`.
         let length = record.payload().len() as u32;
         if length > self.window.saturating_sub(self.outstanding) {

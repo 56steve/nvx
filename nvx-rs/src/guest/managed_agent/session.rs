@@ -211,7 +211,9 @@ impl Session {
 /// RESET's payload and epoch, then a DATA record's sequence, identity, and NVXC frame. A record
 /// with one fault thus reports the C agent's stage and status, except for the faults that only
 /// the shared session checks: a RESET without an instance ID, of an earlier epoch, or at the
-/// last sequence number, DATA before the first RESET, and DATA beyond the receive window.
+/// last sequence number, DATA at the last sequence number, which the C agent took and followed
+/// with sequence number 0 and which reports `data-sequence`, DATA before the first RESET, and DATA
+/// beyond the receive window.
 fn classify(error: &SessionError, epoch: u64) -> Option<ReceiveFailure> {
     let data = |kind, status| Some(ReceiveFailure::Data(data_failure(kind, status)));
     match *error {
@@ -240,7 +242,12 @@ fn classify(error: &SessionError, epoch: u64) -> Option<ReceiveFailure> {
         // Only a RESET at the last sequence number leaves none for the broker's next record.
         SessionError::MissingIdentity(_)
         | SessionError::StaleEpoch { .. }
-        | SessionError::SequenceOverflow => Some(ReceiveFailure::Reset),
+        | SessionError::SequenceOverflow(RecordType::Reset) => Some(ReceiveFailure::Reset),
+        // DATA at the last sequence number, which leaves none for the broker's next record, is
+        // reported as DATA out of sequence, with its sequence number.
+        SessionError::SequenceOverflow(RecordType::Data) => {
+            data(DataFailureKind::Sequence, u64::MAX as i32)
+        }
         SessionError::Sequence { actual, .. } => data(DataFailureKind::Sequence, actual as i32),
         SessionError::Epoch { actual, .. } => data(DataFailureKind::Identity, actual as i32),
         // With one fault, a record of another instance carries the session's epoch, which the C
@@ -249,6 +256,7 @@ fn classify(error: &SessionError, epoch: u64) -> Option<ReceiveFailure> {
         SessionError::Window { length, .. } => data(DataFailureKind::Window, length as i32),
         SessionError::Truncated { .. }
         | SessionError::Credit { .. }
+        | SessionError::SequenceOverflow(_)
         | SessionError::InvalidState => None,
     }
 }

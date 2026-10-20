@@ -1109,6 +1109,24 @@ mod tests {
     }
 
     #[test]
+    fn data_at_the_last_sequence_number_is_out_of_sequence() {
+        // After a RESET at the second-to-last sequence number, DATA at the last one leaves none
+        // for the broker's next record.
+        let mut harness = Harness::spawn(true, TestSystem::new(Paths::default()), 0);
+        harness.reset(1, u64::MAX - 1);
+        let frame = encode_app(APP_PING, 42, 0, &[]);
+        let record = encode_outer(OUTER_DATA, &INSTANCE, 1, u64::MAX, &frame).unwrap();
+        assert_eq!(
+            String::from_utf8(harness.fail(&record)).unwrap(),
+            format!(
+                "NVX-MANAGED-ERROR: stage=data-sequence status=-1\n\
+                 NVX-MANAGED-ERROR: stage=data status={}\n",
+                Errno::EPROTO as i32
+            )
+        );
+    }
+
+    #[test]
     fn a_stream_that_ends_reports_a_read_failure_inside_a_record_or_not() {
         let expected = format!(
             "NVX-MANAGED-ERROR: stage=outer-read status={}\n",

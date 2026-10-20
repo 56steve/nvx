@@ -135,7 +135,7 @@ impl HostSession {
         let (HostState::Attached, Some(identity)) = (self.state, self.identity) else {
             return Err(SessionError::InvalidState);
         };
-        let next = next_sequence(self.send_sequence)?;
+        let next = next_sequence(self.send_sequence, RecordType::Data)?;
         let taken = encode_data(&identity, self.send_sequence, data, output)?;
         self.send_sequence = next;
         Ok(taken)
@@ -176,7 +176,7 @@ impl HostSession {
             return Err(SessionError::Unexpected(record_type));
         }
         check_sequence(&record, self.receive_sequence)?;
-        let next = next_sequence(self.receive_sequence)?;
+        let next = next_sequence(self.receive_sequence, record_type)?;
         let event = match (record_type, self.identity) {
             (RecordType::Wait, _) => HostEvent::Wait,
             (RecordType::Ready, _) => {

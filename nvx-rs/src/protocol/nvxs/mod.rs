@@ -159,8 +159,9 @@ pub enum SessionError {
         /// Sequence number of the record.
         actual: u64,
     },
-    /// The sequence numbers of a direction ran out.
-    SequenceOverflow,
+    /// The sequence numbers of a direction ran out at a record of this type, which took or would
+    /// take the last one and leave none for the next record.
+    SequenceOverflow(RecordType),
     /// A DATA record from the broker that exceeds the guest's receive window.
     Window {
         /// Receive window that the guest advertised.
@@ -216,7 +217,10 @@ impl fmt::Display for SessionError {
                 formatter,
                 "NVXS record has sequence {actual} instead of {expected}"
             ),
-            Self::SequenceOverflow => formatter.write_str("NVXS sequence numbers ran out"),
+            Self::SequenceOverflow(record_type) => write!(
+                formatter,
+                "NVXS sequence numbers ran out at the {record_type} record"
+            ),
             Self::Window {
                 window,
                 outstanding,
@@ -264,11 +268,11 @@ fn record_identity(record: &Record) -> Option<Identity> {
     })
 }
 
-/// Returns the sequence number after `sequence`.
-fn next_sequence(sequence: u64) -> Result<u64, SessionError> {
+/// Returns the sequence number after `sequence`, which a record of `record_type` takes.
+fn next_sequence(sequence: u64, record_type: RecordType) -> Result<u64, SessionError> {
     sequence
         .checked_add(1)
-        .ok_or(SessionError::SequenceOverflow)
+        .ok_or(SessionError::SequenceOverflow(record_type))
 }
 
 /// Checks that `record` carries the sequence number `expected`.
