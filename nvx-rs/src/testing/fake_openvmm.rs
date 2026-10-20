@@ -665,22 +665,7 @@ fn sandbox_shares(
         None => {}
         Some(["/run/nvx/shares"]) if roots.is_empty() => {
             for child in values.get("--mount-child").into_iter().flatten() {
-                let invalid = || format!("invalid --mount-child {child}");
-                let (_, rest) = child.split_once(',').ok_or_else(invalid)?;
-                let (rest, file) = match rest.strip_suffix(",file") {
-                    Some(rest) => (rest, true),
-                    None => (rest, false),
-                };
-                let (host, mode) = rest.rsplit_once(',').ok_or_else(invalid)?;
-                let kind_matches = if file {
-                    Path::new(host).is_file()
-                } else {
-                    Path::new(host).is_dir()
-                };
-                if !kind_matches || !["ro", "rw"].contains(&mode) {
-                    return Err(invalid());
-                }
-                roots.push(PathBuf::from(host));
+                roots.push(mount_child_host(child, None)?);
             }
         }
         Some(_) => return Err("invalid --mount-aggregate".to_owned()),
@@ -708,24 +693,7 @@ fn mapped_children(
                 .flatten()
                 .enumerate()
             {
-                let invalid = || format!("invalid --mount-child {child}");
-                let (name, rest) = child.split_once(',').ok_or_else(invalid)?;
-                // Like OpenVMM, a child exposes a directory or, with the `file` flag, a regular
-                // file, and refuses a host path of the other kind.
-                let (rest, file) = match rest.strip_suffix(",file") {
-                    Some(rest) => (rest, true),
-                    None => (rest, false),
-                };
-                let (host, mode) = rest.rsplit_once(',').ok_or_else(invalid)?;
-                let kind_matches = if file {
-                    Path::new(host).is_file()
-                } else {
-                    Path::new(host).is_dir()
-                };
-                if name != index.to_string() || !kind_matches || !["ro", "rw"].contains(&mode) {
-                    return Err(invalid());
-                }
-                children.push(PathBuf::from(host));
+                children.push(mount_child_host(child, Some(index))?);
             }
             if children.is_empty() {
                 return Err("--mount-aggregate requires --mount-child".to_owned());
@@ -740,6 +708,34 @@ fn mapped_children(
         return Err("--mount-child requires --mount-aggregate".to_owned());
     }
     Ok(children)
+}
+
+/// Returns the host path of a `--mount-child NAME,HOST,MODE[,file]` value, or fails with
+/// `invalid --mount-child VALUE` unless its mode is `ro` or `rw` and, if `index` is given, its
+/// name is that index.
+///
+/// Like OpenVMM, a child exposes a directory or, with the `file` flag, a regular file, and refuses
+/// a host path of the other kind.
+fn mount_child_host(child: &str, index: Option<usize>) -> Result<PathBuf, String> {
+    let invalid = || format!("invalid --mount-child {child}");
+    let (name, rest) = child.split_once(',').ok_or_else(invalid)?;
+    let (rest, file) = match rest.strip_suffix(",file") {
+        Some(rest) => (rest, true),
+        None => (rest, false),
+    };
+    let (host, mode) = rest.rsplit_once(',').ok_or_else(invalid)?;
+    let kind_matches = if file {
+        Path::new(host).is_file()
+    } else {
+        Path::new(host).is_dir()
+    };
+    if index.is_some_and(|index| name != index.to_string())
+        || !kind_matches
+        || !["ro", "rw"].contains(&mode)
+    {
+        return Err(invalid());
+    }
+    Ok(PathBuf::from(host))
 }
 
 /// Summarizes the network policy of a command line as OpenVMM's outcome report does.
@@ -1541,5 +1537,35 @@ mod tests {
     fn the_current_guest_advertises_every_required_feature() {
         assert_eq!(GUEST_FEATURES, GuestFeatures::REQUIRED);
         assert!(GUEST_FEATURES.missing(GuestFeatures::REQUIRED).is_empty());
+    }
+
+    #[test]
+    fn mount_children_resolve_to_hosts_of_their_kind() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = temporary.path().to_str().unwrap().to_owned();
+        let file = temporary.path().join("file").to_str().unwrap().to_owned();
+        fs::write(&file, b"").unwrap();
+        for (value, index, host) in [
+            (format!("0,{directory},rw"), Some(0), &directory),
+            (format!("1,{file},ro,file"), Some(1), &file),
+            // Without an index, any name goes, as for the children of a sandbox's aggregate.
+            (format!("digest,{directory},ro"), None, &directory),
+        ] {
+            assert_eq!(mount_child_host(&value, index), Ok(PathBuf::from(host)));
+        }
+        for (value, index) in [
+            (format!("1,{directory},rw"), Some(0)),
+            (format!("0,{file},rw"), None),
+            (format!("0,{directory},ro,file"), None),
+            (format!("0,{directory}-missing,rw"), None),
+            (format!("0,{directory},wo"), None),
+            (format!("0,{directory}"), None),
+            ("0".to_owned(), None),
+        ] {
+            assert_eq!(
+                mount_child_host(&value, index),
+                Err(format!("invalid --mount-child {value}"))
+            );
+        }
     }
 }
