@@ -1,6 +1,7 @@
-use std::fs::{self, DirBuilder, OpenOptions, Permissions};
+use std::fs::{self, DirBuilder, File, OpenOptions, Permissions, TryLockError};
 use std::io::{self, Read};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::Command;
@@ -276,10 +277,201 @@ pub fn create_private_dir(path: &Path) -> io::Result<()> {
     fs::set_permissions(path, Permissions::from_mode(0o700))
 }
 
+/// Creates the directory `path` of a sandbox store with mode 0700, or checks that an existing one
+/// is private to the current user, as [`check_store_dir`] does, and returns why it is not, if it
+/// is not.
+///
+/// A new directory takes the setgid bit of its parent, and loses the bits that the umask clears,
+/// even the current user's permission to read it, so its mode is set again, to the 0700 that
+/// OpenVMM requires of the directory of its control socket. An existing directory is never
+/// changed: others could have placed records in it, or still hold its files open, which a change
+/// of its mode would not revoke.
+pub(crate) fn create_store_dir(path: &Path) -> io::Result<Option<String>> {
+    match DirBuilder::new().mode(0o700).create(path) {
+        Ok(()) => {
+            if let Some(directory) = open_plain_dir(path)? {
+                // A descriptor that only locates the directory cannot change its mode itself, but
+                // its link in /proc names exactly the directory that it opened.
+                fs::set_permissions(
+                    Path::new("/proc/self/fd").join(directory.as_raw_fd().to_string()),
+                    Permissions::from_mode(0o700),
+                )?;
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+    check_store_dir(path)
+}
+
+/// Returns why the directory `path` cannot hold a sandbox store, if it cannot: unless it is
+/// private to the current user, as [`create_store_dir`] makes it, belonging to the user with mode
+/// 0700.
+pub(crate) fn check_store_dir(path: &Path) -> io::Result<Option<String>> {
+    let Some(directory) = open_plain_dir(path)? else {
+        return Ok(Some("is not a plain directory".to_owned()));
+    };
+    let metadata = directory.metadata()?;
+    Ok(store_dir_problem(
+        metadata.uid(),
+        metadata.mode(),
+        sys::effective_ids().0,
+    ))
+}
+
+/// Returns why a directory of a sandbox store, which the user `uid` owns with the mode `mode`, is
+/// not private to the user `euid`, if it is not: it must belong to that user, grant no access to
+/// anyone else, and have mode 0700, which OpenVMM requires of the directory of its control
+/// socket.
+pub(crate) fn store_dir_problem(uid: u32, mode: u32, euid: u32) -> Option<String> {
+    let mode = mode & 0o7777;
+    if uid != euid {
+        Some(format!(
+            "belongs to user {uid}, not to the current user {euid}"
+        ))
+    } else if mode & 0o077 != 0 {
+        Some(format!("is accessible to other users (mode {mode:03o})"))
+    } else if mode != 0o700 {
+        Some(format!(
+            "has mode {mode:03o}, not the mode 700 that the directory of a control socket must have"
+        ))
+    } else {
+        None
+    }
+}
+
+/// Returns why the file that `file` holds open, the lock, a record, or the capability of a
+/// sandbox store, is not private to the current user, if it is not: never, on Linux, where no
+/// one else may look up a file in the store's directory, which grants them no access.
+pub(crate) fn private_file_problem(_file: &File) -> io::Result<Option<String>> {
+    Ok(None)
+}
+
+/// Gives the regular file `path` the mode `mode` if it belongs to the current user, and leaves
+/// anything else, which includes a symbolic link or a missing file, unchanged.
+///
+/// The file is opened only to locate it, which needs no permission on the file itself.
+pub(crate) fn restore_private_file_mode(path: &Path, mode: u32) -> io::Result<()> {
+    use nix::fcntl::OFlag;
+
+    let opened = OpenOptions::new()
+        .read(true)
+        .custom_flags((OFlag::O_PATH | OFlag::O_NOFOLLOW).bits())
+        .open(path);
+    let file = match opened {
+        Ok(file) => file,
+        Err(error)
+            if error.kind() == io::ErrorKind::NotFound
+                || error.raw_os_error() == Some(Errno::ELOOP as i32) =>
+        {
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() || metadata.uid() != sys::effective_ids().0 {
+        return Ok(());
+    }
+    // A descriptor that only locates the file cannot change its mode itself, but its link in
+    // /proc names exactly the file that it opened.
+    fs::set_permissions(
+        Path::new("/proc/self/fd").join(file.as_raw_fd().to_string()),
+        Permissions::from_mode(mode),
+    )
+}
+
+/// Opens the directory `path` only to locate it, which needs no permission on the directory
+/// itself, or returns `None` if it is a symbolic link or not a directory.
+fn open_plain_dir(path: &Path) -> io::Result<Option<File>> {
+    use nix::fcntl::OFlag;
+
+    let opened = OpenOptions::new()
+        .read(true)
+        .custom_flags((OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW).bits())
+        .open(path);
+    match opened {
+        Ok(directory) => Ok(Some(directory)),
+        Err(error)
+            if error.raw_os_error() == Some(Errno::ELOOP as i32)
+                || error.raw_os_error() == Some(Errno::ENOTDIR as i32) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// Returns the device and inode of a file or directory.
 pub fn file_identity(path: &Path) -> io::Result<(u64, u64)> {
     let metadata = fs::metadata(path)?;
     Ok((metadata.dev(), metadata.ino()))
+}
+
+/// Returns the device and inode of the file that `file` holds open.
+pub(crate) fn opened_file_identity(file: &File) -> io::Result<(u64, u64)> {
+    let metadata = file.metadata()?;
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+/// Claims a launch's fresh log, which `file` holds open.
+///
+/// The claim is an exclusive `flock` lock. It belongs to the open file description, which the
+/// VMM shares through the standard output and error that it inherits, and only the last close of
+/// that description releases it, so it outlives the caller while the VMM runs.
+pub(crate) fn claim_log(file: &File) -> io::Result<()> {
+    match file.try_lock() {
+        Ok(()) => Ok(()),
+        Err(TryLockError::WouldBlock) => Err(io::Error::other("another process holds the log")),
+        Err(TryLockError::Error(error)) => Err(error),
+    }
+}
+
+/// Returns whether a process still holds the claimed log at `path`, which must be the file
+/// `identity`: whether its `flock` claim is held through another open file description.
+///
+/// The open follows no link and does not wait, as it would for a FIFO, so that only the claimed
+/// file is examined.
+pub(crate) fn log_claim_held(path: &Path, identity: (u64, u64)) -> io::Result<bool> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags((nix::fcntl::OFlag::O_NOFOLLOW | nix::fcntl::OFlag::O_NONBLOCK).bits())
+        .open(path)?;
+    if opened_file_identity(&file)? != identity {
+        return Err(io::Error::other(format!(
+            "{} is not the claimed log",
+            path.display()
+        )));
+    }
+    // A lock taken here goes when the file closes, at the end of this function.
+    match file.try_lock() {
+        Ok(()) => Ok(false),
+        Err(TryLockError::WouldBlock) => Ok(true),
+        Err(TryLockError::Error(error)) => Err(error),
+    }
+}
+
+/// Returns whether the live process `pid` that started at `start_time`, which serves the control
+/// endpoint of a launch whose log is the file `log`, is that launch's VMM: whether it holds the
+/// log as its standard output.
+///
+/// The endpoint is the same socket path for every launch of a sandbox, so the log, which every
+/// launch creates afresh, tells its VMM apart. The start time is read again after the
+/// descriptor, so the answer cannot describe another process that reused the ID meanwhile.
+pub(crate) fn serves_launch(pid: u32, start_time: u64, log: (u64, u64)) -> io::Result<bool> {
+    if process_start_time(pid)? != Some(start_time) {
+        return Ok(false);
+    }
+    let held = match fs::metadata(format!("/proc/{pid}/fd/1")) {
+        Ok(metadata) => (metadata.dev(), metadata.ino()) == log,
+        Err(error)
+            if error.kind() == io::ErrorKind::NotFound
+                || error.raw_os_error() == Some(Errno::ESRCH as i32) =>
+        {
+            false
+        }
+        Err(error) => return Err(error),
+    };
+    Ok(held && process_start_time(pid)? == Some(start_time))
 }
 
 /// Returns the control endpoint OpenVMM should listen on for a sandbox.

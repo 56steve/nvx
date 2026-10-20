@@ -9,16 +9,27 @@ use std::time::{Duration, Instant};
 use std::{mem, ptr};
 
 use windows_sys::Win32::Foundation::{
-    ERROR_ACCESS_DENIED, ERROR_BROKEN_PIPE, ERROR_FILE_NOT_FOUND, ERROR_INVALID_PARAMETER,
-    ERROR_IO_PENDING, ERROR_MORE_DATA, ERROR_NO_DATA, ERROR_OPERATION_ABORTED, ERROR_PIPE_BUSY,
-    ERROR_PIPE_NOT_CONNECTED, ERROR_SUCCESS, FILETIME, FreeLibrary, GENERIC_READ, GENERIC_WRITE,
-    GetLastError, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation,
-    WAIT_OBJECT_0, WAIT_TIMEOUT,
+    ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_BROKEN_PIPE, ERROR_FILE_NOT_FOUND,
+    ERROR_INVALID_PARAMETER, ERROR_IO_PENDING, ERROR_MORE_DATA, ERROR_NO_DATA,
+    ERROR_OPERATION_ABORTED, ERROR_PIPE_BUSY, ERROR_PIPE_NOT_CONNECTED, ERROR_SHARING_VIOLATION,
+    ERROR_SUCCESS, FILETIME, FreeLibrary, GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE,
+    HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation, WAIT_OBJECT_0, WAIT_TIMEOUT,
+};
+use windows_sys::Win32::Security::{
+    ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_REVISION, ACL_SIZE_INFORMATION, AclSizeInformation,
+    AddAccessAllowedAceEx, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, EqualSid, GetAce,
+    GetAclInformation, GetKernelObjectSecurity, GetLengthSid, GetSecurityDescriptorDacl,
+    GetSecurityDescriptorOwner, GetTokenInformation, InitializeAcl, InitializeSecurityDescriptor,
+    IsWellKnownSid, OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+    SE_DACL_PROTECTED, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, SetSecurityDescriptorControl,
+    SetSecurityDescriptorDacl, SetSecurityDescriptorOwner, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    WinBuiltinAdministratorsSid, WinCreatorOwnerRightsSid, WinCreatorOwnerSid, WinLocalSystemSid,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OVERLAPPED,
-    GetFileInformationByHandle, OPEN_EXISTING, ReadFile, SECURITY_IDENTIFICATION,
-    SECURITY_SQOS_PRESENT, WriteFile,
+    BY_HANDLE_FILE_INFORMATION, CreateDirectoryW, CreateFileW, FILE_ALL_ACCESS,
+    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_OVERLAPPED, GetFileInformationByHandle, OPEN_EXISTING,
+    READ_CONTROL, ReadFile, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT, WriteFile,
 };
 #[cfg(feature = "cli")]
 use windows_sys::Win32::Storage::FileSystem::{LockFile, UnlockFile};
@@ -35,11 +46,11 @@ use windows_sys::Win32::System::Threading::GetExitCodeProcess;
 use windows_sys::Win32::System::Threading::{
     CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW,
     CREATE_UNICODE_ENVIRONMENT, CreateEventW, CreateProcessW, DeleteProcThreadAttributeList,
-    EXTENDED_STARTUPINFO_PRESENT, GetProcessTimes, INFINITE, InitializeProcThreadAttributeList,
-    LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcess, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-    PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
-    STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute,
-    WaitForSingleObject,
+    EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, GetProcessTimes, INFINITE,
+    InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcess, OpenProcessToken,
+    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess,
+    UpdateProcThreadAttribute, WaitForSingleObject,
 };
 
 use super::Transport;
@@ -590,6 +601,296 @@ pub fn create_private_dir(path: &Path) -> io::Result<()> {
     }
 }
 
+/// The `AceType` of an entry that allows access, which `winnt.h` defines.
+const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+/// The `AceType` of an entry that denies access, which `winnt.h` defines.
+const ACCESS_DENIED_ACE_TYPE: u8 = 1;
+/// The revision of an absolute security descriptor, which `winnt.h` defines.
+const SECURITY_DESCRIPTOR_REVISION: u32 = 1;
+
+/// The current user, as the token of this process names it.
+struct CurrentUser {
+    /// The token's `TOKEN_USER`, followed by the security identifier that it points to, in a
+    /// buffer aligned for both.
+    token_user: Vec<u64>,
+}
+
+impl CurrentUser {
+    /// Reads the user from the token of this process.
+    fn get() -> io::Result<Self> {
+        let mut token = ptr::null_mut();
+        // SAFETY: the pseudo-handle of the current process needs no closing, and the output
+        // pointer is valid.
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let token = owned(token).ok_or_else(io::Error::last_os_error)?;
+        let mut len = 0;
+        // SAFETY: an empty buffer asks for the length that the user's information needs.
+        unsafe { GetTokenInformation(raw(&token), TokenUser, ptr::null_mut(), 0, &mut len) };
+        let mut token_user = vec![0u64; (len as usize).div_ceil(mem::size_of::<u64>())];
+        // SAFETY: the buffer holds `len` bytes, aligned for a TOKEN_USER.
+        let read = unsafe {
+            GetTokenInformation(
+                raw(&token),
+                TokenUser,
+                token_user.as_mut_ptr().cast(),
+                len,
+                &mut len,
+            )
+        };
+        if read == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self { token_user })
+    }
+
+    /// Returns the user's security identifier, which `self` holds.
+    fn sid(&self) -> PSID {
+        // SAFETY: the buffer holds the TOKEN_USER that GetTokenInformation wrote.
+        unsafe { (*self.token_user.as_ptr().cast::<TOKEN_USER>()).User.Sid }
+    }
+
+    /// Returns whether `sid` names the user, or SYSTEM or the Administrators group, which may take
+    /// over any file anyway.
+    fn trusts(&self, sid: PSID) -> bool {
+        // SAFETY: both identifiers are valid.
+        unsafe {
+            EqualSid(sid, self.sid()) != 0
+                || IsWellKnownSid(sid, WinLocalSystemSid) != 0
+                || IsWellKnownSid(sid, WinBuiltinAdministratorsSid) != 0
+        }
+    }
+}
+
+/// Creates the directory `path` of a sandbox store, private to the current user, or checks that
+/// an existing one is, and returns why it is not, if it is not.
+///
+/// A new directory gets the user as its owner and a protected access control list that allows
+/// the user alone, which the files created in it inherit, so it is private whatever its parent
+/// allows. An existing directory must already be private, as [`check_store_dir`] checks: one
+/// that allows others is not restricted, since a handle that they opened keeps its access.
+pub(crate) fn create_store_dir(path: &Path) -> io::Result<Option<String>> {
+    let user = CurrentUser::get()?;
+    let sid = user.sid();
+    // SAFETY: the identifier is valid.
+    let sid_len = unsafe { GetLengthSid(sid) } as usize;
+    // The list holds one entry, whose identifier takes the place of its last field.
+    let acl_len = mem::size_of::<ACL>() + mem::size_of::<ACCESS_ALLOWED_ACE>()
+        - mem::size_of::<u32>()
+        + sid_len;
+    let mut acl = vec![0u32; acl_len.div_ceil(mem::size_of::<u32>())];
+    let acl_len = (acl.len() * mem::size_of::<u32>()) as u32;
+    let acl_ptr = acl.as_mut_ptr().cast::<ACL>();
+    // SAFETY: SECURITY_DESCRIPTOR is plain data for which all-zero bytes are valid.
+    let mut descriptor: SECURITY_DESCRIPTOR = unsafe { mem::zeroed() };
+    let descriptor_ptr: PSECURITY_DESCRIPTOR = (&raw mut descriptor).cast();
+    // SAFETY: the list's buffer holds `acl_len` bytes, aligned for it, and the descriptor and the
+    // identifier are valid. The descriptor points at the identifier and the list, which outlive
+    // its use below.
+    let built = unsafe {
+        InitializeAcl(acl_ptr, acl_len, ACL_REVISION) != 0
+            && AddAccessAllowedAceEx(
+                acl_ptr,
+                ACL_REVISION,
+                OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE,
+                FILE_ALL_ACCESS,
+                sid,
+            ) != 0
+            && InitializeSecurityDescriptor(descriptor_ptr, SECURITY_DESCRIPTOR_REVISION) != 0
+            && SetSecurityDescriptorOwner(descriptor_ptr, sid, 0) != 0
+            && SetSecurityDescriptorDacl(descriptor_ptr, 1, acl_ptr, 0) != 0
+            && SetSecurityDescriptorControl(descriptor_ptr, SE_DACL_PROTECTED, SE_DACL_PROTECTED)
+                != 0
+    };
+    if !built {
+        return Err(io::Error::last_os_error());
+    }
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor_ptr,
+        bInheritHandle: 0,
+    };
+    let name = wide(path);
+    // SAFETY: the name is NUL-terminated, and the attributes hold a valid descriptor.
+    if unsafe { CreateDirectoryW(name.as_ptr(), &attributes) } == 0 {
+        let error = last_error();
+        if error != ERROR_ALREADY_EXISTS {
+            return Err(io::Error::from_raw_os_error(error as i32));
+        }
+    }
+    store_dir_problem(path, &user)
+}
+
+/// Returns why the directory `path` cannot hold a sandbox store, if it cannot: unless it is
+/// private to the current user, as [`create_store_dir`] makes it. It must belong to the user, or
+/// to SYSTEM or the Administrators group, and its access control list must allow no one else, as
+/// that of a directory under the user's profile does. Its list must also pass entries on to the
+/// files created in it, which would otherwise take their creator's default list.
+pub(crate) fn check_store_dir(path: &Path) -> io::Result<Option<String>> {
+    store_dir_problem(path, &CurrentUser::get()?)
+}
+
+/// Returns why the directory `path` cannot hold a sandbox store of `user`, if it cannot.
+fn store_dir_problem(path: &Path, user: &CurrentUser) -> io::Result<Option<String>> {
+    let directory = OpenOptions::new()
+        .access_mode(READ_CONTROL)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let attributes = handle_information(directory.as_raw_handle() as HANDLE)?.dwFileAttributes;
+    if attributes & FILE_ATTRIBUTE_DIRECTORY == 0 || attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    {
+        return Ok(Some("is not a plain directory".to_owned()));
+    }
+    privacy_problem(&directory, user, true)
+}
+
+/// Returns why the file that `file` holds open, the lock, a record, or the capability of a
+/// sandbox store, is not private to the current user, if it is not.
+///
+/// A file's own access control list decides who may open it, whatever its directory allows, so
+/// a file of a store that allows anyone else could have been written by them.
+pub(crate) fn private_file_problem(file: &fs::File) -> io::Result<Option<String>> {
+    privacy_problem(file, &CurrentUser::get()?, false)
+}
+
+/// Returns why the file or directory that `file` holds is not private to `user`, if it is not: it
+/// must belong to the user, or to SYSTEM or the Administrators group, and its access control list
+/// must allow no one else. A `directory` must also pass entries on to the files created in it.
+fn privacy_problem(
+    file: &fs::File,
+    user: &CurrentUser,
+    directory: bool,
+) -> io::Result<Option<String>> {
+    let handle = file.as_raw_handle() as HANDLE;
+    let information = OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
+    let mut len = 0;
+    // SAFETY: an empty buffer asks for the length that the descriptor needs.
+    unsafe { GetKernelObjectSecurity(handle, information, ptr::null_mut(), 0, &mut len) };
+    let mut buffer = vec![0u64; (len as usize).div_ceil(mem::size_of::<u64>())];
+    let descriptor: PSECURITY_DESCRIPTOR = buffer.as_mut_ptr().cast();
+    // SAFETY: the handle has read-control access, and the buffer holds `len` bytes.
+    if unsafe { GetKernelObjectSecurity(handle, information, descriptor, len, &mut len) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut owner = ptr::null_mut();
+    let mut present = 0;
+    let mut acl = ptr::null_mut();
+    let mut defaulted = 0;
+    // SAFETY: the descriptor and the output pointers are valid. The owner and the list point
+    // into the descriptor's buffer, which outlives their use.
+    let read = unsafe {
+        GetSecurityDescriptorOwner(descriptor, &mut owner, &mut defaulted) != 0
+            && GetSecurityDescriptorDacl(descriptor, &mut present, &mut acl, &mut defaulted) != 0
+    };
+    if !read {
+        return Err(io::Error::last_os_error());
+    }
+    if owner.is_null() || !user.trusts(owner) {
+        return Ok(Some("belongs to another user".to_owned()));
+    }
+    // A missing list allows everyone.
+    if present == 0 || acl.is_null() {
+        return Ok(Some("allows every user".to_owned()));
+    }
+    // SAFETY: ACL_SIZE_INFORMATION is plain data for which all-zero bytes are valid.
+    let mut size: ACL_SIZE_INFORMATION = unsafe { mem::zeroed() };
+    // SAFETY: the list is valid, and the output holds an ACL_SIZE_INFORMATION.
+    let sized = unsafe {
+        GetAclInformation(
+            acl,
+            (&raw mut size).cast(),
+            mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+            AclSizeInformation,
+        )
+    };
+    if sized == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut inherited_by_files = false;
+    for index in 0..size.AceCount {
+        let mut ace = ptr::null_mut();
+        // SAFETY: the index is within the list, and the output pointer is valid.
+        if unsafe { GetAce(acl, index, &mut ace) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: every entry starts with its header.
+        let header = unsafe { *ace.cast::<ACE_HEADER>() };
+        if u32::from(header.AceFlags) & OBJECT_INHERIT_ACE != 0 {
+            inherited_by_files = true;
+        }
+        match header.AceType {
+            ACCESS_DENIED_ACE_TYPE => {}
+            ACCESS_ALLOWED_ACE_TYPE => {
+                // SAFETY: an entry that allows access holds its identifier from `SidStart` on.
+                let sid: PSID =
+                    unsafe { (&raw mut (*ace.cast::<ACCESS_ALLOWED_ACE>()).SidStart).cast() };
+                // The creator owner and the owner rights stand for an owner: the owner, or the
+                // creator of a file in the directory, which only those that it allows may be.
+                // SAFETY: the identifier is valid.
+                let owner_alias = unsafe {
+                    IsWellKnownSid(sid, WinCreatorOwnerSid) != 0
+                        || IsWellKnownSid(sid, WinCreatorOwnerRightsSid) != 0
+                };
+                if !owner_alias && !user.trusts(sid) {
+                    return Ok(Some("allows other users".to_owned()));
+                }
+            }
+            other => {
+                return Ok(Some(format!(
+                    "has an access control entry of type {other}, which is not checked"
+                )));
+            }
+        }
+    }
+    // A file created without entries to inherit takes its creator's default list instead, which
+    // may allow anyone.
+    if directory && !inherited_by_files {
+        return Ok(Some(
+            "passes no access control entries on to the files created in it".to_owned(),
+        ));
+    }
+    Ok(None)
+}
+
+/// Replaces the access control list of the file or directory `path` with the protected list of
+/// the descriptor `sddl`, in the security descriptor definition language.
+#[cfg(test)]
+pub(crate) fn set_access(path: &Path, sddl: &str) -> io::Result<()> {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    };
+    use windows_sys::Win32::Security::{PROTECTED_DACL_SECURITY_INFORMATION, SetFileSecurityW};
+
+    let sddl = wide(sddl);
+    let name = wide(path);
+    let mut descriptor = ptr::null_mut();
+    // SAFETY: the string is NUL-terminated, and the output pointer is valid.
+    let converted = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            ptr::null_mut(),
+        )
+    };
+    if converted == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let information = DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION;
+    // SAFETY: the name is NUL-terminated, and the descriptor is valid.
+    let set = unsafe { SetFileSecurityW(name.as_ptr(), information, descriptor) };
+    let result = if set == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    };
+    // SAFETY: the conversion allocated the descriptor, which nothing uses any more.
+    unsafe { LocalFree(descriptor) };
+    result
+}
+
 /// Returns the volume serial number and file index of a file or directory.
 ///
 /// The object is opened without access rights, which succeeds even while OpenVMM holds it open.
@@ -598,17 +899,75 @@ pub fn file_identity(path: &Path) -> io::Result<(u64, u64)> {
         .access_mode(0)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
         .open(path)?;
-    // SAFETY: BY_HANDLE_FILE_INFORMATION is plain data for which all-zero bytes are valid.
-    let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { mem::zeroed() };
-    // SAFETY: the handle is open and the output pointer is valid.
-    if unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut information) } == 0
-    {
-        return Err(io::Error::last_os_error());
-    }
+    handle_identity(file.as_raw_handle() as HANDLE)
+}
+
+/// Returns the volume serial number and file index of the file that `file` holds open.
+pub(crate) fn opened_file_identity(file: &fs::File) -> io::Result<(u64, u64)> {
+    handle_identity(file.as_raw_handle() as HANDLE)
+}
+
+/// Returns the volume serial number and file index of the file that `handle` holds open.
+fn handle_identity(handle: HANDLE) -> io::Result<(u64, u64)> {
+    let information = handle_information(handle)?;
     Ok((
         u64::from(information.dwVolumeSerialNumber),
         (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow),
     ))
+}
+
+/// Returns the information of the file that `handle` holds open.
+fn handle_information(handle: HANDLE) -> io::Result<BY_HANDLE_FILE_INFORMATION> {
+    // SAFETY: BY_HANDLE_FILE_INFORMATION is plain data for which all-zero bytes are valid.
+    let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { mem::zeroed() };
+    // SAFETY: the caller passes an open handle, and the output pointer is valid.
+    if unsafe { GetFileInformationByHandle(handle, &mut information) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(information)
+}
+
+/// Claims a launch's fresh log, which `file` holds open.
+///
+/// On Windows the claim is the open handle itself, which the VMM inherits: while any process
+/// holds the log open, an open that shares nothing fails, so the claim needs no further step.
+pub(crate) fn claim_log(_file: &fs::File) -> io::Result<()> {
+    Ok(())
+}
+
+/// Returns whether a process still holds the claimed log at `path`, which must be the file
+/// `identity`: whether any process holds it open.
+///
+/// An open without access rights takes no part in sharing checks, so the identity is checked
+/// first; an open that shares nothing then fails with a sharing violation while any process,
+/// such as a VMM that inherited the log, holds it. The identity is checked again on the
+/// exclusive handle, because a rename between the opens could have replaced the file.
+pub(crate) fn log_claim_held(path: &Path, identity: (u64, u64)) -> io::Result<bool> {
+    let replaced = || io::Error::other(format!("{} is not the claimed log", path.display()));
+    if file_identity(path)? != identity {
+        return Err(replaced());
+    }
+    let exclusive = OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path);
+    match exclusive {
+        Ok(file) if opened_file_identity(&file)? == identity => Ok(false),
+        Ok(_) => Err(replaced()),
+        Err(error) if error.raw_os_error() == Some(ERROR_SHARING_VIOLATION as i32) => Ok(true),
+        Err(error) => Err(error),
+    }
+}
+
+/// Returns whether the live process `pid` that started at `start_time`, which serves the control
+/// endpoint of a launch whose log is the file `log`, is that launch's VMM.
+///
+/// On Windows it is: the endpoint is a named pipe whose name [`control_endpoint`] draws at random
+/// for each launch, so only the VMM that the launch passed it to serves it. The objects of the
+/// process are not examined, as a query of another process's synchronous pipe could wait forever.
+pub(crate) fn serves_launch(_pid: u32, _start_time: u64, _log: (u64, u64)) -> io::Result<bool> {
+    Ok(true)
 }
 
 /// Returns a fresh named-pipe endpoint for OpenVMM to listen on.
