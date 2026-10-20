@@ -15,8 +15,11 @@
 //!   [`openvmm_arguments`](SandboxLaunch::openvmm_arguments) and
 //!   [`kernel_command_line`](SandboxLaunch::kernel_command_line).
 //! - [`options`]: the checks that `nvx.py sandbox` and `nvx.py run` apply to their options: the
-//!   attribution of access-policy paths to shares, the systemd policy, the targets of
-//!   `nvx.py run` shares, and the managed exec environment.
+//!   attribution of access-policy paths to shares, the systemd entrypoint check and the preflight
+//!   that verifies the distro layer, the targets of `nvx.py run` shares, and the managed exec
+//!   environment.
+//! - [`distro`]: the binding of the distro layer, which explicit verification makes from the
+//!   layer and its manifest, and which a launch checks from metadata alone.
 //!
 //! Values are checked as Python checked them: whitespace is what `str.isspace` accepts,
 //! integers are what `int` reads ([`Int`]), UUIDs are what `uuid.UUID` reads, host paths are
@@ -31,6 +34,7 @@
 //! is [`ErrorKind::Io`](crate::ErrorKind::Io), with Python's form of the system's error, such as
 //! `[Errno 13] Permission denied: '/path'`.
 
+pub mod distro;
 pub mod layer;
 pub mod mount;
 pub mod options;
@@ -255,6 +259,11 @@ impl SandboxLaunch {
     /// Returns the layers, in the order given.
     pub fn layers(&self) -> &[SandboxLayer] {
         &self.layers
+    }
+
+    /// Returns the distro layer, the one layer that a launch holds.
+    pub fn distro(&self) -> &SandboxLayer {
+        &self.layers[0]
     }
 
     /// Returns the scratch image.

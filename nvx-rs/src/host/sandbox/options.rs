@@ -6,7 +6,9 @@
 //!   environment, from `--environment` or `--environment-file`.
 //! - [`sandbox_mounts`]: the shares of the `--mount` options, with each `--mount-deny`,
 //!   `--mount-allow`, and `--mount-write` attributed to its share, and each share's kind.
-//! - [`validate_sandbox_systemd_policy`]: the refusal of systemd entrypoints and images.
+//! - [`validate_sandbox_entrypoint`]: the refusal of systemd entrypoints, and
+//!   [`validate_sandbox_systemd_policy`]: the preflight of `run` and `provision`, which also
+//!   verifies the distro layer and returns its [`DistroBinding`].
 //! - [`validate_run_share_targets`]: the guest targets of several `nvx.py run` shares, or of a
 //!   shared file.
 //! - [`validate_exec_environment`] and [`exec_environment_from_file`]: the environment of a
@@ -16,22 +18,17 @@ use std::fmt;
 use std::fs::File;
 use std::io::Read;
 
-use sha2::{Digest, Sha256};
-
-use super::layer::LayerRole;
+use super::distro::DistroBinding;
 use super::mount::{
     AGGREGATE_MOUNT_TARGET, MountKind, MountOwner, MountPolicy, POLICY_KINDS, PolicyKind,
-    SandboxMount, has_forbidden_character, has_irregular_component, mount_kind, os_error,
-    targets_overlap,
+    SandboxMount, has_forbidden_character, has_irregular_component, mount_kind, targets_overlap,
 };
 use super::{SandboxLaunch, refused};
 use crate::error::Result;
-use crate::host::artifacts::DISTRO_MANIFEST_SUFFIX;
 use crate::host::python::builtins::repr;
-use crate::host::python::fs;
 use crate::host::python::json::{self, Loads, Node, ReadError};
 use crate::host::python::path::{Flavor, PurePath};
-use crate::host::python::text::{PyText, decode_utf8};
+use crate::host::python::text::PyText;
 
 /// The entrypoints of systemd, which the sandbox security profile does not run.
 pub const SYSTEMD_ENTRYPOINTS: [&str; 2] = ["/usr/lib/systemd/systemd", "/lib/systemd/systemd"];
@@ -209,11 +206,8 @@ impl SandboxOptions {
         if matches!(
             operation,
             SandboxOperation::Run | SandboxOperation::Provision | SandboxOperation::Exec
-        ) && SYSTEMD_ENTRYPOINTS.contains(&self.entrypoint.as_str())
-        {
-            return Err(refused(
-                "systemd entrypoints are unsupported by the sandbox security profile",
-            ));
+        ) {
+            validate_sandbox_entrypoint(&self.entrypoint)?;
         }
         if self.outcome_report
             && !matches!(operation, SandboxOperation::Run | SandboxOperation::Exec)
@@ -346,134 +340,30 @@ pub fn validate_run_share_targets(targets: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// Refuses a launch that would run systemd: a systemd entrypoint, or a distro layer whose
-/// manifest, `LAYER.manifest.json` next to it, lists the `systemd` package.
+/// Refuses a systemd entrypoint, which the sandbox security profile does not run.
 ///
-/// A layer without a manifest passes. A manifest must be a JSON object of format 1 that names
-/// the layer and its SHA-256 digest, with a list of packages that each have a name. Fails with
-/// [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported), or
-/// [`ErrorKind::Io`](crate::ErrorKind::Io) if the layer cannot be read to compute its digest.
-pub fn validate_sandbox_systemd_policy(launch: &SandboxLaunch) -> Result<()> {
-    if SYSTEMD_ENTRYPOINTS.contains(&launch.settings().entrypoint.as_str()) {
+/// This is the cheap check of every launch, which reads nothing: it applies whether or not the
+/// distro layer has a manifest, and never reads the manifest's package list. Fails with
+/// [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported).
+pub fn validate_sandbox_entrypoint(entrypoint: &str) -> Result<()> {
+    if SYSTEMD_ENTRYPOINTS.contains(&entrypoint) {
         return Err(refused(
             "systemd entrypoints are unsupported by the sandbox security profile",
-        ));
-    }
-    let Some(distro) = launch
-        .layers()
-        .iter()
-        .find(|layer| layer.role() == LayerRole::Distro)
-    else {
-        return Ok(());
-    };
-    let path = distro.pure_path();
-    let Some(manifest) = path.with_name(&format!("{}{DISTRO_MANIFEST_SUFFIX}", path.name())) else {
-        // `with_name` raises `ValueError` for a path without a name.
-        let class = match path.flavor() {
-            Flavor::Posix => "PosixPath",
-            Flavor::Windows => "WindowsPath",
-        };
-        return Err(refused(format!(
-            "{class}({}) has an empty name",
-            repr(&path.as_str().replace('\\', "/"))
-        )));
-    };
-    if !fs::exists(manifest.as_path()) {
-        return Ok(());
-    }
-    let invalid = |detail: String| refused(format!("invalid sandbox distro manifest: {detail}"));
-    let bytes = std::fs::read(manifest.as_path())
-        .map_err(|error| invalid(fs::os_error_message(&error, Some(manifest.as_str()))))?;
-    // `read_text` decodes strictly, outside the errors that become this message, and reads with
-    // universal newlines.
-    let text = decode_utf8(&bytes)
-        .map_err(refused)?
-        .replace("\r\n", "\n")
-        .replace('\r', "\n");
-    let document = match json::read(&text, &mut Loads) {
-        Ok(document) => document,
-        Err(ReadError::Syntax { message, offset }) => {
-            return Err(invalid(json::syntax_error(&text, message, offset)));
-        }
-        Err(ReadError::Hook(error)) => return Err(refused(error.message(&text))),
-    };
-    let root = document.root();
-    if !matches!(document.node(root), Node::Object(_)) {
-        return Err(invalid("expected a JSON object".to_owned()));
-    }
-    let mismatch = || refused("sandbox distro manifest does not match its artifact");
-    if !document.get(root, "format").is_some_and(equals_one) {
-        return Err(mismatch());
-    }
-    if !document
-        .get(root, "artifact")
-        .is_some_and(|artifact| string_equals(artifact, path.name()))
-    {
-        return Err(mismatch());
-    }
-    let digest = sha256_file(path)?;
-    if !document
-        .get(root, "artifact_sha256")
-        .is_some_and(|value| string_equals(value, &digest))
-    {
-        return Err(mismatch());
-    }
-    let invalid_packages = || refused("sandbox distro manifest has invalid package metadata");
-    let Some(Node::Array(packages)) = document.get(root, "packages") else {
-        return Err(invalid_packages());
-    };
-    let mut systemd = false;
-    for &package in packages {
-        if !matches!(document.node(package), Node::Object(_)) {
-            return Err(invalid_packages());
-        }
-        let Some(Node::String(name)) = document.get(package, "name") else {
-            return Err(invalid_packages());
-        };
-        systemd |= name.as_bytes() == b"systemd";
-    }
-    if systemd {
-        return Err(refused(
-            "systemd images are unsupported by the sandbox security profile",
         ));
     }
     Ok(())
 }
 
-/// Returns whether a JSON value equals Python's `1`: the integer, a float of that value, or
-/// `true`.
-fn equals_one(value: &Node) -> bool {
-    match value {
-        Node::Integer(literal) => literal.as_ref() == "1",
-        Node::Float(float) => *float == 1.0,
-        Node::Bool(boolean) => *boolean,
-        _ => false,
-    }
-}
-
-/// Returns whether a JSON value is the string `text`.
-fn string_equals(value: &Node, text: &str) -> bool {
-    matches!(value, Node::String(string) if string.as_bytes() == text.as_bytes())
-}
-
-/// Returns the lowercase hexadecimal SHA-256 digest of the file at `path`.
-fn sha256_file(path: &PurePath) -> Result<String> {
-    let io_error = |error: std::io::Error| os_error(&error, Some(path.as_str()));
-    let mut file = File::open(path.as_path()).map_err(io_error)?;
-    let mut hasher = Sha256::new();
-    let mut buffer = vec![0; 1024 * 1024];
-    loop {
-        let read = file.read(&mut buffer).map_err(io_error)?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    Ok(hasher
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect())
+/// Refuses a launch that would run systemd, and returns the binding of its distro layer: the
+/// preflight of `nvx.py sandbox run` and `provision`.
+///
+/// It refuses a systemd entrypoint with [`validate_sandbox_entrypoint`], and then verifies the
+/// distro layer explicitly with [`DistroBinding::verify`], which refuses a layer whose manifest,
+/// `LAYER.manifest.json` next to it, lists the `systemd` package, and hashes the layer only when
+/// that manifest exists. Fails as they do.
+pub fn validate_sandbox_systemd_policy(launch: &SandboxLaunch) -> Result<DistroBinding> {
+    validate_sandbox_entrypoint(&launch.settings().entrypoint)?;
+    DistroBinding::verify(launch.distro())
 }
 
 /// Checks a managed exec environment, as `encode_exec_environment` does: at most

@@ -32,8 +32,9 @@ nvx-rs/
 │   ├── error.rs     nvx::Error and its ErrorKind
 │   ├── host/        feature `host` (default): artifacts, launch, network and egress policy files,
 │   │                filesystem, NVXS connection, session, process, platform, VM instances,
-│   │                sandbox stores, outcome reports, and the sandbox launch profile of `nvx.py`,
-│   │                with the Python semantics they keep; with feature `cli`, the `nvx-rs` CLI
+│   │                sandbox stores, outcome reports, file seals, and the sandbox launch profile
+│   │                of `nvx.py` and its distro bindings, with the Python semantics they keep;
+│   │                with feature `cli`, the `nvx-rs` CLI
 │   ├── testing/     feature `testing`: the fake OpenVMM
 │   ├── guest/       feature `guest`: the programs that run in Linux guests, the guest's NVXS
 │   │                connection, and the libraries through which a guest init or agent starts
@@ -64,8 +65,9 @@ nvx-rs/
 | `nvx::host::nvxs` | `HostConnection`: the host's role of the NVXS session over a platform transport, on which `nvx::host::session` and other host applications run their protocols. It attaches with the launch capability, waiting while the broker asks it to, sends application bytes in as many DATA records as they take, and returns each DATA payload from the guest, with deadlines; a receive that times out keeps a partial record |
 | `nvx::host::process` | Verified process references, and the launch of OpenVMM for the CLI and `nvx::host::instance`, through `nvx::host::supervisor`. A `ProcessRef` names one process by its ID, its start time, and the `BootId` of the host boot during which it started. `Process::open` checks a reference and holds its process through a pidfd on Linux or a process handle on Windows, whether or not the caller started it, so that waits sleep until the process exits and termination never reaches a process that reuses its ID. A reference from an earlier boot names an exited process, and a process whose identity this user cannot check, such as another user's, makes `Process::open` fail rather than report an exit. Linux hosts without pidfds poll the reference instead, and cannot terminate the process |
 | `nvx::host::supervisor` | The supervisor of a sandbox's VMM, beneath the CLI, `Instance`, and external orchestrators, which keep the configuration, the authorization, and the application protocol. `launch` runs the store's launch steps under the sandbox's lock: it writes the journal's marker, spawns OpenVMM with the claimed log, records its `ProcessRef` right after, and returns a `Starting` launch that the caller commits once the VMM serves its control endpoint, or abandons. A launch that fails never leaves an unrecorded VMM running. `VmmCommand::inherit` lists the descriptors (Linux) or handles (Windows) that the VMM inherits under their numbers, besides its standard streams, and it inherits nothing else of the caller's: on Linux, they must be close-on-exec, a flag that only the VMM's own process clears; on Windows, they join the VMM's explicit handle list. `Vmm::stop` runs one graceful step of the caller's and waits for the VMM's exit event until a deadline, and takes a bounded forced step through the VMM's verified identity only on request. `reattach` recovers an interrupted launch, and holds the recorded VMM again after the orchestrator restarts within the same host boot: `Live`, `Mismatched` with another runtime identity, `Exited`, or `Indeterminate` |
+| `nvx::host::seal` | `FileSeal`: what the host reports about an open file from its metadata alone, without reading it: the platform scheme, the device or volume serial number, the file ID, the kind, the length, the modification time, and on Linux the change time, with a versioned serde form. A seal detects accidental change, not tampering; see [Distro bindings](#distro-bindings) |
 | `nvx::host::session`, `platform`, `report` | The authenticated control session, which carries NVX's control protocol, `NVXC`, one frame per DATA record of a `HostConnection`; Linux and Windows primitives; and OpenVMM's outcome report |
-| `nvx::host::sandbox` | The launch profile of `nvx.py sandbox`, ported from the one that `scripts/nvx_tools/sandbox.py` held: `SandboxLaunch`, with the EROFS distro `SandboxLayer`, the one layer that a sandbox takes, the ext4 scratch disk, the entrypoint, arguments, hostname, workload identity, and resource limits, and its `--microvm-sandbox-block` and `--microvm-workload-identity` arguments and kernel command line, within the 1024-byte budget that OpenVMM leaves it. `mount`: `SandboxMount` live shares of host directories and files, their guest targets and the reserved ones, their access policies and owner, the aggregate of several shares, and the checks of their host paths. `options`: the checks that `nvx.py sandbox` and `nvx.py run` apply to their options: the attribution of `--mount-deny`, `--mount-allow`, and `--mount-write` to shares, the systemd policy, the targets of `nvx.py run` shares, and the managed exec environment; see [Python parity](#python-parity) |
+| `nvx::host::sandbox` | The launch profile of `nvx.py sandbox`, ported from the one that `scripts/nvx_tools/sandbox.py` held: `SandboxLaunch`, with the EROFS distro `SandboxLayer`, the one layer that a sandbox takes, the ext4 scratch disk, the entrypoint, arguments, hostname, workload identity, and resource limits, and its `--microvm-sandbox-block` and `--microvm-workload-identity` arguments and kernel command line, within the 1024-byte budget that OpenVMM leaves it. `mount`: `SandboxMount` live shares of host directories and files, their guest targets and the reserved ones, their access policies and owner, the aggregate of several shares, and the checks of their host paths. `options`: the checks that `nvx.py sandbox` and `nvx.py run` apply to their options: the attribution of `--mount-deny`, `--mount-allow`, and `--mount-write` to shares, the systemd entrypoint check and the explicit verification of the distro layer, the targets of `nvx.py run` shares, and the managed exec environment; see [Python parity](#python-parity). `distro`: the `DistroBinding` of a distro layer, which explicit verification makes or a staging caller imports, and its check from metadata alone, which returns the layer open; see [Distro bindings](#distro-bindings) |
 | `nvx::testing::fake_openvmm` | A fake OpenVMM that serves the control console and runs scripted workloads without a VM, for direct launches and for the managed and one-shot sandboxes of `nvx-rs sandbox` and `nvx.py sandbox` |
 | `nvx::host::cli` | Feature `cli`: the `nvx-rs` executable; see [The nvx-rs CLI](#the-nvx-rs-cli) |
 | `nvx::guest` | The programs that run in Linux guests; see [Guest binaries](#guest-binaries) |
@@ -125,6 +127,50 @@ the Python compiler's outcomes for every policy that its tests compiled,
 hand-written edge cases, and a seeded random corpus, which the tests replay
 without Python; `NVX_EGRESS_POLICY_FIXTURE` points the tests at another corpus
 in the same format. See [Python parity](#python-parity).
+
+## Distro bindings
+
+Three separate checks guard the distro layer of a sandbox, and only explicit
+verification reads it:
+
+- `options::validate_sandbox_entrypoint` refuses the entrypoints of systemd,
+  which the sandbox security profile does not run. Every launch applies it,
+  whether or not the layer has a manifest, and it reads nothing.
+- `DistroBinding::verify` verifies the layer explicitly. With a manifest,
+  `LAYER.manifest.json`, beside the layer, it reads the manifest, hashes the
+  whole layer, compares the digest with the manifest's `artifact_sha256`, and
+  then refuses a `systemd` package, in the order and with the messages of
+  `nvx.py`. A layer without a manifest passes unread. It reads each file
+  through the file that it opened, and fails if the file's metadata changed
+  meanwhile.
+- `DistroBinding::check` compares the layer and its manifest with a binding
+  from their metadata alone, and returns the layer, open, as a
+  `CheckedDistro`. It never reads, maps, or hashes either file.
+
+A `DistroBinding` ties the `FileSeal` of the layer to the seal of its
+manifest, or to the manifest's absence, to the revision and result of the
+distro policy, `DISTRO_POLICY_REVISION`, and to the layer's format and the
+identity that the guest expects of it, its EROFS UUID. It comes from explicit
+verification, or from `DistroBinding::import`, which a staging caller that
+verified the layer itself calls to bind it without hashing it again. `check`
+fails for a binding of another version, layer, or policy revision, a verdict
+that rejects the layer, a layer whose identity, kind, length, or times changed,
+and a manifest that appeared, disappeared, or changed. A missing or stale
+binding fails: no runtime operation registers, verifies, or hashes a layer on
+its own. Hashing belongs where layers are built, installed, or staged, and to
+diagnostics.
+
+On Linux, a seal holds `st_dev`, `st_ino`, the file type, `st_size`, and
+`st_mtime` and `st_ctime` with their nanoseconds; on Windows, the volume serial
+number, the 128-bit file ID, the kind, the length, and the last write time. A
+seal detects accidental change, not deliberate tampering by an account that can
+write the sealed files. Callers therefore stage layers and their manifests
+read-only, in a directory that only their own account can write, never rewrite
+them in place, and bind a replacement anew. The checked layer is a plain owned
+`File`, which no child process inherits: an owned descriptor on Linux, and on
+Windows an owned handle that denies other opens for writing or deleting the
+layer, so that nothing modifies, renames, or replaces it while it is held.
+Read-only opens, such as OpenVMM's open of a sandbox's layer, share it.
 
 ## Python parity
 
@@ -390,7 +436,7 @@ these scenarios are its reference.
 
 | Feature | Contents |
 | --- | --- |
-| `host` (default) | The `host` module. It enables `serde`, and `sha2`, which names the children of a sandbox's aggregate share |
+| `host` (default) | The `host` module. It enables `serde`, and `sha2`, which names the children of a sandbox's aggregate share and hashes distro layers in their explicit verification |
 | `bundled` | Stages a release at build time; see [Bundled artifacts](#bundled-artifacts) |
 | `testing` | The fake OpenVMM and the `nvx-fake-openvmm` binary |
 | `cli` | The `nvx-rs` CLI of `host::cli` and its `nvx-rs` binary; it enables `host`. See [The nvx-rs CLI](#the-nvx-rs-cli) |
