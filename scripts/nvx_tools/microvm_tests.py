@@ -90,6 +90,7 @@ from .time_abi import (
 )
 
 MICROVM_TEST_SCENARIOS = (
+    "command-line-limit",
     "console-exit",
     "console-snapshot",
     "cpu-profile-fallback",
@@ -163,6 +164,20 @@ MICROVM_TEST_SCRIPTS_DIR = Path(__file__).with_name("microvm_test_scripts")
 LIFECYCLE_COMPLETION_MARKER = b"NVX-LIFECYCLE-OK"
 SANDBOX_BLOCKS_COMPLETION_MARKER = b"NVX-SANDBOX-BLOCKS-OK"
 VIRTIO_NET_COMPLETION_MARKER = b"NVX-VIRTIO-NET-OK"
+# The x86 guest kernel's COMMAND_LINE_SIZE. OpenVMM requires the effective
+# kernel command line, with the tokens that it appends after the caller's, to
+# fit in it with its terminating NUL, and refuses a longer one before boot.
+KERNEL_COMMAND_LINE_SIZE = 2048
+COMMAND_LINE_LIMIT_NETWORK = "10.0.0.2/24"
+# The kernel takes a parameter whose name has a dot for a module's and passes
+# it to neither init nor its environment, so this token only takes up room.
+COMMAND_LINE_PADDING = "cmdline_limit.padding="
+COMMAND_LINE_PREFIX = b"NVX-COMMAND-LINE: "
+COMMAND_LINE_LIMIT_COMPLETION_MARKER = b"NVX-COMMAND-LINE-LIMIT-OK"
+COMMAND_LINE_LIMIT_ERROR = (
+    b"microVM kernel command line is 2048 bytes; "
+    b"the limit is 2047 bytes plus the terminating NUL"
+)
 DIRECTIONAL_NETWORK_ALLOW_MARKER = b"NVX-DIRECTIONAL-NETWORK-ALLOW-OK"
 DIRECTIONAL_NETWORK_DENY_MARKER = b"NVX-DIRECTIONAL-NETWORK-DENY-OK"
 DIRECTIONAL_NETWORK_INGRESS_READY_MARKER = b"NVX-DIRECTIONAL-INGRESS-READY"
@@ -1563,6 +1578,109 @@ def run_virtio_net(
         timeout=timeout,
         log_path=log_path,
     )
+
+
+def command_line_limit_command(
+    executable: Path,
+    kernel: Path,
+    initrd: Path,
+    backend: str,
+    memory_mib: int,
+    padding: int,
+) -> list[str]:
+    """Return the command line limit scenario's OpenVMM command, whose caller
+    tokens include a padding token with a value of ``padding`` bytes."""
+    if padding < 1:
+        raise ValueError("the command-line padding must hold at least one byte")
+    return workload_boot_command(
+        executable,
+        backend,
+        kernel,
+        initrd,
+        memory_mib,
+        f"quiet loglevel=0 {COMMAND_LINE_PADDING}{'x' * padding}",
+        network=COMMAND_LINE_LIMIT_NETWORK,
+    )
+
+
+def run_command_line_limit(
+    executable: Path,
+    kernel: Path,
+    initrd: Path,
+    backend: str,
+    *,
+    memory_mib: int,
+    timeout: float,
+    output_dir: Path,
+) -> None:
+    """Boot a kernel command line that fills the guest kernel's buffer.
+
+    OpenVMM appends its own tokens after the caller's, ending with the
+    network bootstrap, so they are the first that the guest kernel would cut
+    from a command line that does not fit. A first boot with a one-byte
+    padding token learns the effective command line from the guest. A second
+    boot pads the caller's tokens until the effective command line holds
+    KERNEL_COMMAND_LINE_SIZE - 1 bytes; the guest's /proc/cmdline must equal
+    the first one with the longer padding, and the guest must act on the last
+    token. OpenVMM must refuse a command line one byte longer before boot.
+    """
+
+    def boot(padding: int, log_name: str) -> str:
+        result = run_guest_script(
+            command_line_limit_command(
+                executable, kernel, initrd, backend, memory_mib, padding
+            ),
+            _read_script("command-line-limit.sh"),
+            COMMAND_LINE_LIMIT_COMPLETION_MARKER,
+            timeout=timeout,
+            log_path=output_dir / log_name,
+        )
+        return _single_marker_value(
+            result["text"].encode("utf-8"), COMMAND_LINE_PREFIX
+        ).decode("utf-8")
+
+    padding_token = f"{COMMAND_LINE_PADDING}x"
+    shortest = boot(1, "command-line-limit-shortest.log")
+    tokens = shortest.split(" ")
+    if tokens.count(padding_token) != 1:
+        raise RuntimeError(
+            f"the guest's kernel command line lacks the padding token: {shortest!r}"
+        )
+    padding = KERNEL_COMMAND_LINE_SIZE - len(shortest.encode("utf-8"))
+    if padding < 1:
+        raise RuntimeError(
+            f"the shortest kernel command line already holds {len(shortest)} bytes"
+        )
+    expected = " ".join(
+        f"{COMMAND_LINE_PADDING}{'x' * padding}" if token == padding_token else token
+        for token in tokens
+    )
+    longest = boot(padding, "command-line-limit.log")
+    if longest != expected or len(longest.encode("utf-8")) != (
+        KERNEL_COMMAND_LINE_SIZE - 1
+    ):
+        raise RuntimeError(
+            f"the guest received a {len(longest)}-byte kernel command line ending "
+            f"{longest[-80:]!r}, not the expected {len(expected)}-byte one ending "
+            f"{expected[-80:]!r}"
+        )
+
+    with OpenvmmProcess(
+        command_line_limit_command(
+            executable, kernel, initrd, backend, memory_mib, padding + 1
+        ),
+        output_dir / "command-line-limit-over.log",
+    ) as process:
+        result = process.wait(timeout)
+    if (
+        result.returncode == 0
+        or BOOT_MARKER in result.output
+        or COMMAND_LINE_LIMIT_ERROR not in result.output
+    ):
+        raise RuntimeError(
+            "OpenVMM did not refuse a kernel command line one byte over the guest "
+            "kernel's limit before boot"
+        )
 
 
 def _directional_network_command(
@@ -7894,6 +8012,20 @@ def run(args: argparse.Namespace) -> int:
             memory_mib=args.memory_mib,
             timeout=args.timeout,
             log_path=output_dir / "virtio-net.log",
+        )
+    if "command-line-limit" in scenarios:
+        print(
+            "Running a microVM kernel command line at the guest kernel's limit "
+            f"on OpenVMM/{args.backend}"
+        )
+        run_command_line_limit(
+            executable,
+            kernel,
+            initrd,
+            args.backend,
+            memory_mib=args.memory_mib,
+            timeout=args.timeout,
+            output_dir=output_dir,
         )
 
     report_time_abi_evidence(
