@@ -40,22 +40,17 @@ fn run(args: &[CString], out: &mut dyn Write, err: &mut dyn Write) -> Result<(),
                 b"\n",
             ],
         );
+        CommandError::Operation
     };
 
     let flags =
         OpenFlags::O_RDONLY | OpenFlags::O_CLOEXEC | OpenFlags::O_NOCTTY | OpenFlags::O_NONBLOCK;
-    let descriptor = sys::open(device, flags, Mode::empty()).map_err(|error| {
-        fail(err, b"open", error);
-        CommandError::Operation
-    })?;
-    let pending = sys::console_pending(&descriptor).map_err(|error| {
-        fail(err, b"ioctl", error);
-        CommandError::Operation
-    })?;
-    descriptor.close().map_err(|error| {
-        fail(err, b"close", error);
-        CommandError::Operation
-    })?;
+    let descriptor =
+        sys::open(device, flags, Mode::empty()).map_err(|error| fail(err, b"open", error))?;
+    let pending = sys::console_pending(&descriptor).map_err(|error| fail(err, b"ioctl", error))?;
+    descriptor
+        .close()
+        .map_err(|error| fail(err, b"close", error))?;
     if let Err(errno) = sys::print(out, format!("{pending}\n").as_bytes()) {
         let text = errno.desc().as_bytes();
         sys::report(err, &[b"nvx-console-pending: write: ", text, b"\n"]);

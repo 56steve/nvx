@@ -94,12 +94,7 @@ fn reseed(random: &CStr, seed: &[u8; SEED_BYTES], err: &mut dyn Write) -> Result
         OpenFlags::O_WRONLY | OpenFlags::O_CLOEXEC,
         Mode::empty(),
     )
-    .map_err(|errno| {
-        let path = random.to_bytes();
-        let text = errno.desc().as_bytes();
-        sys::report(err, &[b"nvx-reseed: open ", path, b": ", text, b"\n"]);
-        CommandError::Operation
-    })?;
+    .map_err(|errno| file_failure(err, b"open", random, errno.desc().as_bytes()))?;
     sys::reseed_random(&descriptor, seed).map_err(|errno| {
         let text = errno.desc().as_bytes();
         sys::report(err, &[b"nvx-reseed: random ioctl: ", text, b"\n"]);
@@ -109,38 +104,33 @@ fn reseed(random: &CStr, seed: &[u8; SEED_BYTES], err: &mut dyn Write) -> Result
 
 /// Reads exactly `bytes.len()` bytes from the file at `path`, without retrying after `EINTR`.
 fn read_seed(path: &CStr, bytes: &mut [u8], err: &mut dyn Write) -> Result<(), CommandError> {
-    let fail = |err: &mut dyn Write, operation: &[u8], reason: &[u8]| {
-        let path = path.to_bytes();
-        sys::report(
-            err,
-            &[b"nvx-reseed: ", operation, b" ", path, b": ", reason, b"\n"],
-        );
-    };
     let descriptor = sys::open(
         path,
         OpenFlags::O_RDONLY | OpenFlags::O_CLOEXEC,
         Mode::empty(),
     )
-    .map_err(|errno| {
-        fail(err, b"open", errno.desc().as_bytes());
-        CommandError::Operation
-    })?;
+    .map_err(|errno| file_failure(err, b"open", path, errno.desc().as_bytes()))?;
     let mut offset = 0;
     while offset < bytes.len() {
         let rest = &mut bytes[offset..];
         match descriptor.read(rest) {
-            Ok(0) => {
-                fail(err, b"read", b"unexpected end of file");
-                return Err(CommandError::Operation);
-            }
+            Ok(0) => return Err(file_failure(err, b"read", path, b"unexpected end of file")),
             Ok(count) => offset += count,
-            Err(errno) => {
-                fail(err, b"read", errno.desc().as_bytes());
-                return Err(CommandError::Operation);
-            }
+            Err(errno) => return Err(file_failure(err, b"read", path, errno.desc().as_bytes())),
         }
     }
     Ok(())
+}
+
+/// Reports that `operation` on the file at `path` failed for `reason`, and returns the operation
+/// failure.
+fn file_failure(err: &mut dyn Write, operation: &[u8], path: &CStr, reason: &[u8]) -> CommandError {
+    let path = path.to_bytes();
+    sys::report(
+        err,
+        &[b"nvx-reseed: ", operation, b" ", path, b": ", reason, b"\n"],
+    );
+    CommandError::Operation
 }
 
 /// Checks that `previous` is 32 hexadecimal digits that differ from `generation_id`.
