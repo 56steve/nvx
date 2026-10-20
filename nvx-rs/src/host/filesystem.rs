@@ -781,8 +781,9 @@ struct Mapped {
     directory: bool,
 }
 
-/// Returns whether `path` is `directory` or one of its descendants.
-fn within(path: &str, directory: &str) -> bool {
+/// Returns whether the guest path `path` is `directory` or one of its descendants, comparing
+/// whole components: `/run/nvx` is within `/run`, but `/runner` is not.
+pub(crate) fn within(path: &str, directory: &str) -> bool {
     path == directory
         || path
             .strip_prefix(directory)
@@ -949,6 +950,26 @@ mod tests {
         }
         assert_eq!(guest_path(Path::new("relative")), None);
         assert_eq!(guest_path(Path::new("..")), None);
+    }
+
+    /// Verifies that a guest path is within itself and its ancestors only, comparing whole
+    /// components, as the reserved targets here and the sandbox's share checks require.
+    #[test]
+    fn guest_paths_are_within_themselves_and_their_ancestors() {
+        for (path, directory) in [
+            ("/run", "/run"),
+            ("/run/nvx", "/run"),
+            ("/run/nvx/t", "/run"),
+        ] {
+            assert!(within(path, directory), "{path} {directory}");
+        }
+        for (path, directory) in [
+            ("/runner", "/run"),
+            ("/run", "/run/nvx"),
+            ("/srv/run", "/run"),
+        ] {
+            assert!(!within(path, directory), "{path} {directory}");
+        }
     }
 
     /// The layout of microsoft/nvx#281: directories that share no directory but the volume's

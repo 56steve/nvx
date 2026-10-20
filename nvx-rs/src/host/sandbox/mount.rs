@@ -20,6 +20,7 @@ use sha2::{Digest, Sha256};
 
 use super::refused;
 use crate::error::{Error, Result};
+use crate::host::filesystem::within;
 use crate::host::python::builtins::{is_space, repr};
 use crate::host::python::fs;
 use crate::host::python::path::{Flavor, PurePath};
@@ -310,11 +311,7 @@ pub fn validate_mount_target(target: &str) -> Result<()> {
         )));
     }
     for reserved in RESERVED_MOUNT_TARGETS {
-        if target == reserved
-            || target
-                .strip_prefix(reserved)
-                .is_some_and(|rest| rest.starts_with('/'))
-        {
+        if within(target, reserved) {
             return Err(refused(format!(
                 "sandbox mount target {target} overlaps the reserved {reserved} tree"
             )));
@@ -349,11 +346,7 @@ pub(crate) fn require_mount_owner_supported_on(owner: MountOwner, windows: bool)
 
 /// Returns whether two guest targets overlap: whether they are equal, or one contains the other.
 pub(crate) fn targets_overlap(left: &str, right: &str) -> bool {
-    let inside = |path: &str, directory: &str| {
-        path.strip_prefix(directory)
-            .is_some_and(|rest| rest.starts_with('/'))
-    };
-    left == right || inside(left, right) || inside(right, left)
+    within(left, right) || within(right, left)
 }
 
 /// Returns the kind of share that `host_path` requests: a file for a regular file, and
