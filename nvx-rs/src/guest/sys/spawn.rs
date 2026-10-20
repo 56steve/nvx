@@ -43,31 +43,31 @@ pub(crate) const REPORT_LENGTH: usize = 8;
 #[derive(Debug)]
 pub(crate) struct ChildSpec {
     /// Path of the program.
-    pub(crate) program: CString,
+    program: CString,
     /// Arguments, argument zero first.
-    pub(crate) arguments: Vec<CString>,
+    arguments: Vec<CString>,
     /// Exact environment, or `None` to inherit the caller's.
-    pub(crate) environment: Option<Vec<CString>>,
+    environment: Option<Vec<CString>>,
     /// Whether `PWD` receives the physical working directory.
-    pub(crate) physical_pwd: bool,
+    physical_pwd: bool,
     /// Directory that becomes the child's root.
-    pub(crate) root: Option<FileDescriptor>,
+    root: Option<FileDescriptor>,
     /// Absolute working directory, resolved in the root, or `None` to keep the current one.
-    pub(crate) directory: Option<CString>,
+    directory: Option<CString>,
     /// Effective user and group IDs with which the child enters `directory`.
-    pub(crate) credentials: Option<(u32, u32)>,
+    credentials: Option<(u32, u32)>,
     /// Sources of standard input, output, and error; `None` keeps the caller's.
-    pub(crate) streams: [Option<FileDescriptor>; 3],
+    streams: [Option<FileDescriptor>; 3],
     /// Descriptors that stay open across `exec`, at their numbers.
-    pub(crate) inherited: Vec<FileDescriptor>,
+    inherited: Vec<FileDescriptor>,
     /// Membership file of the cgroup that the child joins.
-    pub(crate) cgroup: Option<FileDescriptor>,
+    cgroup: Option<FileDescriptor>,
     /// Whether the child leads a new process group.
-    pub(crate) process_group: bool,
+    process_group: bool,
     /// Test-only outcome of the credential system calls, which the child then skips:
     /// `Some(None)` succeeds, and `Some(Some(error))` fails the first one with `error`.
     #[cfg(test)]
-    pub(crate) simulated_credentials: Option<Option<Errno>>,
+    simulated_credentials: Option<Option<Errno>>,
 }
 
 impl ChildSpec {
@@ -89,6 +89,57 @@ impl ChildSpec {
             #[cfg(test)]
             simulated_credentials: None,
         }
+    }
+
+    /// Gives the child exactly `environment` instead of the caller's.
+    pub(crate) fn set_environment(&mut self, environment: Vec<CString>) {
+        self.environment = Some(environment);
+    }
+
+    /// Makes the child record its physical working directory in `PWD`.
+    pub(crate) fn export_physical_pwd(&mut self) {
+        self.physical_pwd = true;
+    }
+
+    /// Makes the directory that `root` opens the child's root.
+    pub(crate) fn set_root(&mut self, root: FileDescriptor) {
+        self.root = Some(root);
+    }
+
+    /// Makes the absolute path `directory`, resolved in the root, the child's working directory.
+    pub(crate) fn set_directory(&mut self, directory: CString) {
+        self.directory = Some(directory);
+    }
+
+    /// Makes the child enter its working directory with the effective `uid` and `gid`.
+    pub(crate) fn set_credentials(&mut self, uid: u32, gid: u32) {
+        self.credentials = Some((uid, gid));
+    }
+
+    /// Makes `descriptor` the child's standard stream numbered `stream`: 0, 1, or 2.
+    pub(crate) fn set_stream(&mut self, stream: usize, descriptor: FileDescriptor) {
+        self.streams[stream] = Some(descriptor);
+    }
+
+    /// Keeps `descriptor` open in the child at its number.
+    pub(crate) fn inherit(&mut self, descriptor: FileDescriptor) {
+        self.inherited.push(descriptor);
+    }
+
+    /// Makes the child join the cgroup whose membership file `cgroup` opens.
+    pub(crate) fn set_cgroup(&mut self, cgroup: FileDescriptor) {
+        self.cgroup = Some(cgroup);
+    }
+
+    /// Makes the child the leader of a new process group.
+    pub(crate) fn new_process_group(&mut self) {
+        self.process_group = true;
+    }
+
+    /// Replaces the child's credential system calls, which then succeed, or fail with `failure`.
+    #[cfg(test)]
+    pub(crate) fn simulate_credentials(&mut self, failure: Option<Errno>) {
+        self.simulated_credentials = Some(failure);
     }
 }
 

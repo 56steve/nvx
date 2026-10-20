@@ -208,7 +208,7 @@ impl Command {
     /// Gives the program exactly the `NAME=value` entries of `environment`, instead of the
     /// parent's environment.
     pub fn environment(mut self, environment: Vec<CString>) -> Self {
-        self.spec.environment = Some(environment);
+        self.spec.set_environment(environment);
         self
     }
 
@@ -216,14 +216,14 @@ impl Command {
     /// directory unless [`working_directory`](Self::working_directory) names another one. Changing
     /// the root needs the privilege to `chroot`.
     pub fn root(mut self, root: impl Into<OwnedFd>) -> Self {
-        self.spec.root = Some(FileDescriptor::from_owned(root.into()));
+        self.spec.set_root(FileDescriptor::from_owned(root.into()));
         self
     }
 
     /// Makes the absolute path `directory`, which the child resolves in its root, its working
     /// directory. A relative path fails to spawn.
     pub fn working_directory(mut self, directory: CString) -> Self {
-        self.spec.directory = Some(directory);
+        self.spec.set_directory(directory);
         self
     }
 
@@ -234,7 +234,7 @@ impl Command {
     /// The check needs a [working directory](Self::working_directory), without which the command
     /// fails to spawn, and the privilege to change the child's credentials.
     pub fn check_working_directory_as(mut self, uid: u32, gid: u32) -> Self {
-        self.spec.credentials = Some((uid, gid));
+        self.spec.set_credentials(uid, gid);
         self
     }
 
@@ -246,25 +246,28 @@ impl Command {
     /// path fails the [stage](LaunchStage::PhysicalWorkingDirectory) with `ENAMETOOLONG`, and a
     /// working directory outside the child's root, which has no path in it, with `ENOENT`.
     pub fn export_physical_working_directory(mut self) -> Self {
-        self.spec.physical_pwd = true;
+        self.spec.export_physical_pwd();
         self
     }
 
     /// Makes `descriptor` the program's standard input.
     pub fn stdin(mut self, descriptor: impl Into<OwnedFd>) -> Self {
-        self.spec.streams[0] = Some(FileDescriptor::from_owned(descriptor.into()));
+        self.spec
+            .set_stream(0, FileDescriptor::from_owned(descriptor.into()));
         self
     }
 
     /// Makes `descriptor` the program's standard output.
     pub fn stdout(mut self, descriptor: impl Into<OwnedFd>) -> Self {
-        self.spec.streams[1] = Some(FileDescriptor::from_owned(descriptor.into()));
+        self.spec
+            .set_stream(1, FileDescriptor::from_owned(descriptor.into()));
         self
     }
 
     /// Makes `descriptor` the program's standard error.
     pub fn stderr(mut self, descriptor: impl Into<OwnedFd>) -> Self {
-        self.spec.streams[2] = Some(FileDescriptor::from_owned(descriptor.into()));
+        self.spec
+            .set_stream(2, FileDescriptor::from_owned(descriptor.into()));
         self
     }
 
@@ -273,21 +276,20 @@ impl Command {
     /// standard streams', fails to spawn.
     pub fn inherit(mut self, descriptor: impl Into<OwnedFd>) -> Self {
         self.spec
-            .inherited
-            .push(FileDescriptor::from_owned(descriptor.into()));
+            .inherit(FileDescriptor::from_owned(descriptor.into()));
         self
     }
 
     /// Makes the child join `cgroup` after its other stages and before its program runs, so that
     /// the program and its descendants start in it.
     pub fn cgroup(mut self, cgroup: Cgroup) -> Self {
-        self.spec.cgroup = Some(cgroup.procs);
+        self.spec.set_cgroup(cgroup.procs);
         self
     }
 
     /// Makes the child the leader of a new process group, whose ID is its process ID.
     pub fn new_process_group(mut self) -> Self {
-        self.spec.process_group = true;
+        self.spec.new_process_group();
         self
     }
 
@@ -314,7 +316,7 @@ impl Command {
     /// with `failure`, without privileges.
     #[cfg(test)]
     pub(crate) fn simulate_credentials(mut self, failure: Option<Errno>) -> Self {
-        self.spec.simulated_credentials = Some(failure);
+        self.spec.simulate_credentials(failure);
         self
     }
 }

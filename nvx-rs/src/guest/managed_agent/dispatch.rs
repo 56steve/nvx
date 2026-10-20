@@ -157,9 +157,9 @@ mod tests {
 
     use crate::protocol::{
         APP_ERROR, APP_EXIT, APP_STDERR, APP_STDOUT, OUTER_ACK, OUTER_CREDIT, OUTER_GUEST_ATTACH,
-        OUTER_HEADER_LEN, OUTER_RECEIVE_WINDOW, OuterHeader, Workload, WorkloadEnvironment,
-        decode_ack_payload, decode_app, decode_credit_payload, decode_outer_header, encode_app,
-        encode_exec_payload, encode_outer,
+        OUTER_HEADER_LEN, OUTER_RECEIVE_WINDOW, OuterHeader, ProtocolError, Workload,
+        WorkloadEnvironment, decode_ack_payload, decode_app, decode_credit_payload,
+        decode_outer_header, encode_app, encode_exec_payload, encode_outer,
     };
 
     use super::super::seam::{Paths, TestSystem};
@@ -729,15 +729,24 @@ mod tests {
         );
     }
 
-    /// Returns the payload of an `EXEC` request for `argv` in `cwd`, with the default environment.
-    fn workload_payload(argv: &[&str], cwd: Option<&str>) -> Vec<u8> {
+    /// Outcome of a test that fails with the first error that it meets.
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    /// Returns the payload of an `EXEC` request for `argv` in `cwd`, with the default environment,
+    /// or why the workload cannot be encoded.
+    fn workload_payload(argv: &[&str], cwd: Option<&str>) -> Result<Vec<u8>, ProtocolError> {
         encode_exec_payload(&Workload {
             argv: argv.iter().map(|argument| (*argument).to_owned()).collect(),
             timeout_ms: 0,
             cwd,
             environment: WorkloadEnvironment::Default,
         })
-        .unwrap()
+    }
+
+    /// Returns `path` as UTF-8, or an error that names it.
+    fn utf8(path: &std::path::Path) -> Result<&str, Box<dyn std::error::Error>> {
+        path.to_str()
+            .ok_or_else(|| format!("{} is not UTF-8", path.display()).into())
     }
 
     /// Returns whether the tests run as root, whose credentials the directory check would bypass.
@@ -753,20 +762,31 @@ mod tests {
 
     impl Unsearchable {
         /// Creates the directory `path` without any permissions.
-        fn new(path: std::path::PathBuf) -> Self {
+        fn new(path: std::path::PathBuf) -> std::io::Result<Self> {
             use std::os::unix::fs::PermissionsExt;
 
-            std::fs::create_dir(&path).unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
-            Self(path)
+            std::fs::create_dir(&path)?;
+            let unsearchable = Self(path);
+            std::fs::set_permissions(&unsearchable.0, std::fs::Permissions::from_mode(0o000))?;
+            Ok(unsearchable)
         }
     }
 
     impl Drop for Unsearchable {
         fn drop(&mut self) {
+            use std::io::Write;
             use std::os::unix::fs::PermissionsExt;
 
-            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+            if let Err(error) =
+                std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700))
+            {
+                // Logging is best effort: a test guard has no caller to report to.
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "cannot restore the permissions of {}: {error}",
+                    self.0.display()
+                );
+            }
         }
     }
 
@@ -780,14 +800,14 @@ mod tests {
     }
 
     #[test]
-    fn direct_launch_refuses_working_directories_that_the_workload_cannot_enter() {
+    fn direct_launch_refuses_working_directories_that_the_workload_cannot_enter() -> TestResult {
         if super::super::isolate_process_test(
             "NVX_DISPATCH_CWD_REFUSAL_TEST_CHILD",
             "guest::managed_agent::dispatch::tests::direct_launch_refuses_working_directories_that_the_workload_cannot_enter",
         ) {
-            return;
+            return Ok(());
         }
-        let _process = super::super::PROCESS_TEST_LOCK.lock().unwrap();
+        let _process = super::super::PROCESS_TEST_LOCK.lock()?;
         let (temporary, mut system) = TestSystem::with_cgroup();
         let root = temporary.path();
         // As root, the child takes the workload's real identity, which must reach the
@@ -796,24 +816,24 @@ mod tests {
         if is_root() {
             use std::os::unix::fs::PermissionsExt;
 
-            std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o755))?;
             system.spawner = Some(spawn_with_real_credentials);
         } else {
             system.spawner = Some(super::super::seam::spawn_as_privileged);
         }
         system.paths.setpriv = super::super::seam::setpriv_shim(root, ":");
         let file = root.join("file");
-        std::fs::write(&file, b"").unwrap();
-        let unsearchable = Unsearchable::new(root.join("unsearchable"));
+        std::fs::write(&file, b"")?;
+        let unsearchable = Unsearchable::new(root.join("unsearchable"))?;
         let marker = root.join("ran");
-        let marker = marker.to_str().unwrap();
+        let marker = utf8(&marker)?;
         let mut harness = Harness::with_system(true, system, 0);
         for (request_id, directory, error) in [
             (42, root.join("missing"), Errno::ENOENT),
             (43, file, Errno::ENOTDIR),
             (44, unsearchable.0.clone(), Errno::EACCES),
         ] {
-            let directory = directory.to_str().unwrap();
+            let directory = utf8(&directory)?;
             let diagnostic = super::super::diagnostics::with_description(
                 format!("nvx-managed-agent: cannot enter working directory {directory}: ")
                     .as_bytes(),
@@ -823,7 +843,7 @@ mod tests {
                 harness.request_all(
                     request_id,
                     APP_EXEC,
-                    &workload_payload(&["/bin/touch", marker], Some(directory)),
+                    &workload_payload(&["/bin/touch", marker], Some(directory))?,
                 ),
                 vec![
                     response(APP_STDERR, request_id, 0, &diagnostic),
@@ -836,28 +856,26 @@ mod tests {
         assert_eq!(system.spawn_calls, 3);
         assert!(system.diagnostics.is_empty());
         assert!(!std::path::Path::new(marker).exists());
+        Ok(())
     }
 
     #[test]
-    fn direct_launch_refuses_a_failed_identity_change_and_runs_nothing() {
+    fn direct_launch_refuses_a_failed_identity_change_and_runs_nothing() -> TestResult {
         if super::super::isolate_process_test(
             "NVX_DISPATCH_IDENTITY_FAILURE_TEST_CHILD",
             "guest::managed_agent::dispatch::tests::direct_launch_refuses_a_failed_identity_change_and_runs_nothing",
         ) {
-            return;
+            return Ok(());
         }
-        let _process = super::super::PROCESS_TEST_LOCK.lock().unwrap();
+        let _process = super::super::PROCESS_TEST_LOCK.lock()?;
         let (temporary, mut system) = TestSystem::with_cgroup();
         system.paths.setpriv = super::super::seam::setpriv_shim(temporary.path(), ":");
         system.spawner = Some(super::super::seam::spawn_with_failing_credentials);
         let marker = temporary.path().join("ran");
+        let payload = workload_payload(&["/bin/touch", utf8(&marker)?], None)?;
         let mut harness = Harness::with_system(true, system, 0);
         assert_eq!(
-            harness.request_all(
-                42,
-                APP_EXEC,
-                &workload_payload(&["/bin/touch", marker.to_str().unwrap()], None),
-            ),
+            harness.request_all(42, APP_EXEC, &payload),
             vec![response(
                 APP_ERROR,
                 42,
@@ -875,28 +893,29 @@ mod tests {
             .as_bytes()
         );
         assert!(!marker.exists());
+        Ok(())
     }
 
     #[test]
-    fn direct_launch_starts_the_workload_in_the_directory_that_it_checked() {
+    fn direct_launch_starts_the_workload_in_the_directory_that_it_checked() -> TestResult {
         if super::super::isolate_process_test(
             "NVX_DISPATCH_CHECKED_DIRECTORY_TEST_CHILD",
             "guest::managed_agent::dispatch::tests::direct_launch_starts_the_workload_in_the_directory_that_it_checked",
         ) {
-            return;
+            return Ok(());
         }
-        let _process = super::super::PROCESS_TEST_LOCK.lock().unwrap();
+        let _process = super::super::PROCESS_TEST_LOCK.lock()?;
         let (temporary, mut system) = TestSystem::with_cgroup();
-        let root = std::fs::canonicalize(temporary.path()).unwrap();
+        let root = std::fs::canonicalize(temporary.path())?;
         let checked = root.join("checked");
         let moved = root.join("moved");
         let first = root.join("first");
         let second = root.join("second");
         let link = root.join("link");
         for directory in [&checked, &first, &second] {
-            std::fs::create_dir(directory).unwrap();
+            std::fs::create_dir(directory)?;
         }
-        std::os::unix::fs::symlink(&first, &link).unwrap();
+        std::os::unix::fs::symlink(&first, &link)?;
         // Between the check and the workload, the stand-in `setpriv` renames the checked
         // directory and retargets the link.
         system.paths.setpriv = super::super::seam::setpriv_shim(
@@ -914,14 +933,14 @@ mod tests {
         let renamed = harness.request_all(
             42,
             APP_EXEC,
-            &workload_payload(&["/bin/sh", "-c", "pwd -P"], checked.to_str()),
+            &workload_payload(&["/bin/sh", "-c", "pwd -P"], Some(utf8(&checked)?))?,
         );
-        std::fs::remove_file(&link).unwrap();
-        std::os::unix::fs::symlink(&first, &link).unwrap();
+        std::fs::remove_file(&link)?;
+        std::os::unix::fs::symlink(&first, &link)?;
         let retargeted = harness.request_all(
             43,
             APP_EXEC,
-            &workload_payload(&["/bin/sh", "-c", "pwd -P"], link.to_str()),
+            &workload_payload(&["/bin/sh", "-c", "pwd -P"], Some(utf8(&link)?))?,
         );
         let system = harness.stop();
         let line = |path: &std::path::Path| [path.as_os_str().as_bytes(), b"\n"].concat();
@@ -940,5 +959,6 @@ mod tests {
             ]
         );
         assert!(system.diagnostics.is_empty());
+        Ok(())
     }
 }
