@@ -1,7 +1,7 @@
 name: Check aci_edge_sandboxes
 description: >-
   Format, lint, document, and test the aci_edge_sandboxes crate and its data model;
-  check-nvx-rs checks the nvx-rs crate that they build on
+  check-nvx-rs checks the nvx crate that they build on
 
 inputs:
   toolchain:

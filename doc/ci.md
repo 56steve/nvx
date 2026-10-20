@@ -498,7 +498,7 @@ participate in the decision:
 - `run-tests` is true when a test input changed: the OpenVMM pin, the guests
   and their package locks, the CLI and its modules, the workflows and actions
   that build and run the tests, the runner setup scripts, the Rust pin, the
-  `aci_edge_sandboxes` and `nvx-rs` crates, or the runtime adapter in
+  `aci_edge_sandboxes` and `nvx` crates, or the runtime adapter in
   `tests/runtime-adapter/`. It enables the NVX microVM tests.
 - `run-openvmm-unit-tests` and `run-openvmm-vmm-tests` enable the OpenVMM
   suites. A push sets both to `run-tests`. A pull request sets each only when
@@ -625,7 +625,7 @@ were compiled in, and checks that the build rejects a tampered file, a wrong
 pin, another sandbox ABI, and a link: a symbolic link on Linux and a junction
 on Windows.
 
-The required `nvx-rs` job checks the [`nvx-rs` crate](../nvx-rs/README.md),
+The required `nvx-rs` job checks the [`nvx` crate](../nvx-rs/README.md),
 which holds the NVX mechanics that the backend builds on, on the same runners
 through the [`check-nvx-rs`](../.github/actions/check-nvx-rs/action.yml)
 action. It runs rustfmt, Clippy with warnings denied for all targets and
@@ -652,13 +652,13 @@ executables.
 
 The `nvx-rs` job also checks the
 [runtime adapter](../tests/runtime-adapter/README.md) in
-`tests/runtime-adapter/`, an independent adapter that builds on `nvx-rs` with a
+`tests/runtime-adapter/`, an independent adapter that builds on `nvx` with a
 lockfile of its own, default features off, and the public API only. For each
 of its configurations, protocol-only, host-only, and, on Linux, guest-only for
 `x86_64-unknown-linux-musl`, the action runs Clippy with warnings denied, the
-build, the tests, and a check with the minimum Rust version of `nvx-rs`, after
+build, the tests, and a check with the minimum Rust version of `nvx`, after
 rustfmt. The tests check consumer-contract scenario C0: each configuration
-enables only its side of `nvx-rs`, the guest-only build pulls in neither Tokio
+enables only its side of `nvx`, the guest-only build pulls in neither Tokio
 nor a dependency that only the host side declares, and the guest binary is a
 static executable.
 

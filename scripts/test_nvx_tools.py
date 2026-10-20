@@ -3671,10 +3671,10 @@ class CiConfigurationTests(unittest.TestCase):
         )
 
     def test_nvx_rs_checks_the_runtime_adapter_in_each_configuration(self):
-        # The runtime adapter builds on nvx-rs as an independent adapter does,
-        # with a lockfile of its own and default features off. Each
+        # The runtime adapter builds on the nvx crate as an independent adapter
+        # does, with a lockfile of its own and default features off. Each
         # configuration is linted, built, tested, and checked with the minimum
-        # Rust version of nvx-rs; the guest-only one builds the static musl
+        # Rust version of nvx; the guest-only one builds the static musl
         # executable that guests run, so it needs Linux.
         root = BuildConstants.REPO_ROOT
         action = (
@@ -3683,7 +3683,7 @@ class CiConfigurationTests(unittest.TestCase):
         adapter = root / "tests" / "runtime-adapter"
         manifest = (adapter / "Cargo.toml").read_text(encoding="utf-8")
         self.assertIn(
-            'nvx-rs = { path = "../../nvx-rs", default-features = false }\n', manifest
+            'nvx = { path = "../../nvx-rs", default-features = false }\n', manifest
         )
         self.assertIn("\ndefault = []\n", manifest)
         self.assertTrue((adapter / "Cargo.lock").is_file())
@@ -7593,7 +7593,7 @@ class BuildConstantsTests(unittest.TestCase):
             )
         )
         # A new dependency is one or the other, and a shipped one needs notices.
-        self.assertEqual(set(versions) - {"nvx-rs"}, shipped | unshipped)
+        self.assertEqual(set(versions) - {"nvx"}, shipped | unshipped)
         self.assertFalse(shipped & unshipped)
         notices = (BuildConstants.REPO_ROOT / "THIRD_PARTY_NOTICES.md").read_text(
             encoding="utf-8"

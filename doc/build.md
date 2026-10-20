@@ -44,7 +44,7 @@ uses `--locked`, a fresh target directory, disabled incremental compilation,
 stable source and Cargo-home path remapping, and no linker build IDs. One
 Cargo invocation builds all nine programs, and every result must pass
 `check-static-elf`. The output's `manifest.json` binds the exact build pins,
-one digest over the `nvx-rs` crate, the shared Python build recipe, and
+one digest over the `nvx` crate, the shared Python build recipe, and
 `rust-toolchain.toml`, and each binary SHA-256.
 
 The native build keeps the Linux archive, the Ubuntu Base archive, and the

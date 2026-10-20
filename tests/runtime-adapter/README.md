@@ -2,13 +2,13 @@
 
 The runtime adapter is an independent adapter of the NVX runtime. It lives in
 this repository so that NVX's own CI builds and runs it, and it depends on
-[`nvx-rs`](../../nvx-rs/README.md) the way an adapter outside the repository
+[`nvx`](../../nvx-rs/README.md) the way an adapter outside the repository
 does:
 
 - as a path dependency with default features off;
 - with a `Cargo.lock` of its own, outside any other workspace;
 - through the public API alone, with unsafe code forbidden;
-- with the minimum supported Rust version of `nvx-rs`.
+- with the minimum supported Rust version of `nvx`.
 
 [microsoft/nvx#535](https://github.com/microsoft/nvx/issues/535) sets the
 contract that it proves: an adapter brings its own application framing over
@@ -21,9 +21,9 @@ the scenarios that run them on a hypervisor.
 
 ## Configurations
 
-Each configuration enables one side of `nvx-rs`:
+Each configuration enables one side of `nvx`:
 
-| Configuration | Cargo options | `nvx-rs` features | Binary |
+| Configuration | Cargo options | `nvx` features | Binary |
 | --- | --- | --- | --- |
 | Protocol-only | none | none | none |
 | Host-only | `--features host` | `host` | `runtime-adapter-host` |
@@ -35,11 +35,11 @@ Each configuration enables one side of `nvx-rs`:
 configuration:
 
 - The adapter is a workspace of its own with its own lockfile, and declares
-  the minimum supported Rust version of `nvx-rs`.
-- The protocol-only build depends on `nvx-rs` alone, without features. The
-  host-only build enables the host side of `nvx-rs` and not its guest side. The
+  the minimum supported Rust version of `nvx`.
+- The protocol-only build depends on `nvx` alone, without features. The
+  host-only build enables the host side of `nvx` and not its guest side. The
   guest-only build enables only the guest side, and pulls in neither Tokio nor
-  a dependency that only the host side of `nvx-rs` declares. The tests read
+  a dependency that only the host side of `nvx` declares. The tests read
   these dependency trees from `cargo tree`, which downloads the packages of the
   musl target the first time, on Windows too.
 - Each binary runs and reports the contract that it was built against, and the

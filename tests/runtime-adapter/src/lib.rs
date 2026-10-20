@@ -1,11 +1,11 @@
-//! An independent adapter of the NVX runtime. NVX's CI builds it against `nvx-rs` the way an
+//! An independent adapter of the NVX runtime. NVX's CI builds it against `nvx` the way an
 //! adapter outside the repository would: as a path dependency with default features off, with a
 //! lockfile of its own, and through the public API alone.
 //!
-//! Each configuration enables one side of `nvx-rs`:
+//! Each configuration enables one side of `nvx`:
 //!
 //! - protocol-only, without features: the control protocol, the contract versions, and the other
-//!   items that `nvx-rs` has without features;
+//!   items that `nvx` has without features;
 //! - host-only, with the `host` feature: the host API too, and the `runtime-adapter-host`
 //!   binary;
 //! - guest-only, with the `guest` feature: the guest API too, and the `runtime-adapter-guest`

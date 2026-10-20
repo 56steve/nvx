@@ -1,8 +1,9 @@
-# nvx-rs
+# nvx
 
-`nvx-rs` is the Rust crate that holds the NVX mechanics: the OpenVMM
+`nvx` is the Rust crate that holds the NVX mechanics: the OpenVMM
 control protocol, and the launch, policy lowering, and supervision of NVX
-microVMs. Its library is called `nvx`. The
+microVMs. Its package and library are both called `nvx`; the package was
+called `nvx-rs`, like the directory that holds it. The
 [`aci_edge_sandboxes` crate](../aci_edge_sandboxes/README.md) builds on it and
 re-exports it as `aci_edge_sandboxes::nvx`. The crate also holds the programs
 that run in NVX's Linux guests, and the `nvx-rs` command-line interface, the

@@ -1,6 +1,6 @@
 name: Check nvx-rs
 description: >-
-  Format, lint, document, and test the nvx-rs crate, and the runtime adapter that builds on it
+  Format, lint, document, and test the nvx crate, and the runtime adapter that builds on it
   as an independent adapter
 
 inputs:

@@ -229,7 +229,7 @@ fn discover_with(
     }
     Err(Error::unavailable(format!(
         "cannot locate the OpenVMM executable and NVX guest artifacts: set {} or {}, {}, and {}, \
-         place an NVX release in a {:?} directory next to the executable, or build the nvx-rs \
+         place an NVX release in a {:?} directory next to the executable, or build the nvx \
          crate with the bundled feature",
         Artifacts::ENV_DIR,
         Artifacts::ENV_OPENVMM,
@@ -826,7 +826,7 @@ mod tests {
         assert!(
             error
                 .message()
-                .contains("build the nvx-rs crate with the bundled feature")
+                .contains("build the nvx crate with the bundled feature")
         );
     }
 

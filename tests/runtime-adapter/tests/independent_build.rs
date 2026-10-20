@@ -1,11 +1,11 @@
-//! Consumer-contract scenario C0: the adapter builds on `nvx-rs` independently.
+//! Consumer-contract scenario C0: the adapter builds on `nvx` independently.
 //!
 //! - It is a workspace of its own, with a lockfile of its own, and declares the minimum supported
-//!   Rust version of `nvx-rs`.
-//! - Each configuration selects one side of `nvx-rs`. The protocol-only build depends on `nvx-rs`
-//!   alone, without features. The host-only build enables the host side of `nvx-rs` and not its
+//!   Rust version of `nvx`.
+//! - Each configuration selects one side of `nvx`. The protocol-only build depends on `nvx`
+//!   alone, without features. The host-only build enables the host side of `nvx` and not its
 //!   guest side. The guest-only build for `x86_64-unknown-linux-musl` enables only the guest
-//!   side, and pulls in neither Tokio nor a dependency that only the host side of `nvx-rs`
+//!   side, and pulls in neither Tokio nor a dependency that only the host side of `nvx`
 //!   declares.
 //! - Each binary runs and reports the contract that it was built against, and the guest binary
 //!   is a static executable.
@@ -104,22 +104,22 @@ fn names(tree: &[Package]) -> BTreeSet<&str> {
     tree.iter().map(|package| package.name.as_str()).collect()
 }
 
-/// Returns the features that `tree` enables in `nvx-rs`.
-fn nvx_rs_features(tree: &[Package]) -> BTreeSet<&str> {
+/// Returns the features that `tree` enables in `nvx`.
+fn nvx_features(tree: &[Package]) -> BTreeSet<&str> {
     let package = tree
         .iter()
-        .find(|package| package.name == "nvx-rs")
-        .expect("the adapter depends on nvx-rs");
+        .find(|package| package.name == "nvx")
+        .expect("the adapter depends on nvx");
     package.features.iter().map(String::as_str).collect()
 }
 
-/// Returns the names of the direct dependencies of `nvx-rs` in `tree`, including its build
+/// Returns the names of the direct dependencies of `nvx` in `tree`, including its build
 /// dependencies.
-fn nvx_rs_dependencies(tree: &[Package]) -> BTreeSet<&str> {
+fn nvx_dependencies(tree: &[Package]) -> BTreeSet<&str> {
     let start = tree
         .iter()
-        .position(|package| package.name == "nvx-rs")
-        .expect("the adapter depends on nvx-rs");
+        .position(|package| package.name == "nvx")
+        .expect("the adapter depends on nvx");
     let depth = tree[start].depth;
     tree[start + 1..]
         .iter()
@@ -141,9 +141,9 @@ fn the_adapter_is_a_workspace_of_its_own_with_its_own_lockfile() {
 }
 
 #[test]
-fn the_adapter_declares_the_minimum_rust_version_of_nvx_rs() {
+fn the_adapter_declares_the_minimum_rust_version_of_nvx() {
     let manifest = std::fs::read_to_string(directory().join("../../nvx-rs/Cargo.toml"))
-        .expect("nvx-rs has a manifest");
+        .expect("nvx has a manifest");
     let version = manifest
         .lines()
         .find_map(|line| line.strip_prefix("rust-version = "))
@@ -152,41 +152,41 @@ fn the_adapter_declares_the_minimum_rust_version_of_nvx_rs() {
 }
 
 #[test]
-fn the_protocol_only_configuration_depends_on_nvx_rs_alone_without_features() {
+fn the_protocol_only_configuration_depends_on_nvx_alone_without_features() {
     let tree = tree(&[], None);
-    assert_eq!(names(&tree), BTreeSet::from(["nvx-rs", "runtime-adapter"]));
-    assert_eq!(nvx_rs_features(&tree), BTreeSet::new());
+    assert_eq!(names(&tree), BTreeSet::from(["nvx", "runtime-adapter"]));
+    assert_eq!(nvx_features(&tree), BTreeSet::new());
 }
 
 #[test]
-fn the_host_only_configuration_enables_the_host_side_of_nvx_rs_alone() {
+fn the_host_only_configuration_enables_the_host_side_of_nvx_alone() {
     let tree = tree(&["host"], None);
-    let features = nvx_rs_features(&tree);
-    assert!(features.contains("host"), "nvx-rs features: {features:?}");
-    assert!(!features.contains("guest"), "nvx-rs features: {features:?}");
+    let features = nvx_features(&tree);
+    assert!(features.contains("host"), "nvx features: {features:?}");
+    assert!(!features.contains("guest"), "nvx features: {features:?}");
 }
 
 #[test]
 fn the_guest_only_configuration_pulls_in_no_host_or_tokio_dependency() {
     let guest = tree(&["guest"], Some(GUEST_TARGET));
-    assert_eq!(nvx_rs_features(&guest), BTreeSet::from(["guest"]));
+    assert_eq!(nvx_features(&guest), BTreeSet::from(["guest"]));
     let tokio = names(&guest)
         .into_iter()
         .filter(|name| *name == "tokio" || name.starts_with("tokio-"))
         .collect::<Vec<_>>();
     assert!(tokio.is_empty(), "the guest build pulls in {tokio:?}");
 
-    // The dependencies that the host side of nvx-rs declares and its guest side doesn't.
+    // The dependencies that the host side of nvx declares and its guest side doesn't.
     let host = tree(&["host"], Some(GUEST_TARGET));
-    let host_side = nvx_rs_dependencies(&host);
-    let guest_side = nvx_rs_dependencies(&guest);
+    let host_side = nvx_dependencies(&host);
+    let guest_side = nvx_dependencies(&guest);
     let host_only = host_side
         .difference(&guest_side)
         .copied()
         .collect::<BTreeSet<_>>();
     assert!(
         !host_only.is_empty(),
-        "the host side of nvx-rs adds no dependency"
+        "the host side of nvx adds no dependency"
     );
     let pulled = names(&guest)
         .intersection(&host_only)
