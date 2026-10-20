@@ -207,7 +207,8 @@ fn the_guest_checks_the_identity_of_each_reset() {
     // A RESET at the last sequence number leaves none for the broker's next record.
     let mut guest = attaching_guest();
     let reset = record(RecordType::Reset, IDENTITY, u64::MAX, &[]);
-    assert_eq!(guest.receive(&reset), Err(SessionError::SequenceOverflow));
+    let expected = SessionError::SequenceOverflow(RecordType::Reset);
+    assert_eq!(guest.receive(&reset), Err(expected));
     assert_eq!(guest.state(), GuestState::Failed);
 }
 
@@ -275,6 +276,20 @@ fn the_guest_checks_the_sequence_and_identity_of_data() {
         actual: 1,
     };
     assert_eq!(guest.receive(&data), Err(expected));
+
+    // After a RESET at the second-to-last sequence number, DATA at the last one leaves none for
+    // the broker's next record.
+    let mut guest = attaching_guest();
+    let reset = record(RecordType::Reset, IDENTITY, u64::MAX - 1, &[]);
+    let event = Some(GuestEvent::Reset(IDENTITY));
+    assert_eq!(guest.receive(&reset), Ok((reset.len(), event)));
+    guest
+        .acknowledge(OUTER_RECEIVE_WINDOW, &mut Vec::new())
+        .unwrap();
+    let last = record(RecordType::Data, IDENTITY, u64::MAX, b"x");
+    let expected = SessionError::SequenceOverflow(RecordType::Data);
+    assert_eq!(guest.receive(&last), Err(expected));
+    assert_eq!(guest.state(), GuestState::Failed);
 }
 
 #[test]

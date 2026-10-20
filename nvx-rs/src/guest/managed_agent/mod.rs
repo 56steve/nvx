@@ -65,7 +65,7 @@ mod loopback;
 mod mappings;
 /// Replaceable privileged-system seam.
 mod seam;
-/// Outer control-session sequencing and credit.
+/// The control session: the shared NVXS session's guest role, and the NVXC frames that it carries.
 mod session;
 /// Control-terminal setup and drain behavior.
 mod tty;

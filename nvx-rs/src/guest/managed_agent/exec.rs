@@ -6,7 +6,7 @@ use crate::guest::sys::{
 };
 use crate::protocol::{
     self, APP_CANCEL, APP_EXIT, APP_STDERR, APP_STDOUT, BUSY, CWD_FAILED, GuestExecPayload,
-    LAUNCH_FAILED, OUTER_DATA, OUTER_RESET,
+    LAUNCH_FAILED, OUTER_DATA,
 };
 
 use super::AgentConfig;
@@ -15,7 +15,7 @@ use super::diagnostics::with_description;
 use super::exec_config;
 use super::launch::{self, LaunchRequest};
 use super::seam::{System, path_c_string};
-use super::session::{DataFailureKind, Session};
+use super::session::{DataFailureKind, Event, ReceiveFailure, Session};
 use super::tty;
 
 /// Maximum bytes read from one output descriptor at a time.
@@ -365,26 +365,19 @@ fn handle_control(
     session: &mut Session,
     exec_id: u64,
 ) -> Result<ExecControl, Errno> {
-    let record = session.read_record().inspect_err(|error| {
-        super::diagnostics::error(system, "exec-outer-read", *error as i32);
-    })?;
-    if record.header.record_type == OUTER_RESET {
-        session.acknowledge_reset(&record)?;
-        return Ok(ExecControl::SessionLost);
-    }
-    if record.header.record_type != OUTER_DATA {
-        super::diagnostics::error(system, "exec-record", i32::from(record.header.record_type));
-        return Err(Errno::EPROTO);
-    }
-    let request = match session.validate_data(&record) {
+    let payload = match session.next_event() {
+        Ok(Event::Reset) => {
+            session.acknowledge()?;
+            return Ok(ExecControl::SessionLost);
+        }
+        Ok(Event::Data(payload)) => payload,
+        Err(failure) => return Err(report_control_failure(system, failure)),
+    };
+    let request = match session.accept_request(&payload) {
         Ok(request) => request,
         Err(failure) => {
             if failure.kind != DataFailureKind::Credit {
-                super::diagnostics::error(
-                    system,
-                    "exec-record",
-                    i32::from(record.header.record_type),
-                );
+                super::diagnostics::error(system, "exec-record", i32::from(OUTER_DATA));
             }
             return Err(failure.into_error());
         }
@@ -400,6 +393,27 @@ fn handle_control(
     }
     session.send_error(request.request_id, Errno::EBUSY as i32, BUSY)?;
     Ok(ExecControl::None)
+}
+
+/// Reports a control record that ended the session while a workload ran, at the C agent's stage,
+/// and returns the error that ends the session.
+fn report_control_failure(system: &mut impl System, failure: ReceiveFailure) -> Errno {
+    match failure {
+        ReceiveFailure::Read(error) => {
+            super::diagnostics::error(system, "exec-outer-read", error as i32);
+            error
+        }
+        ReceiveFailure::Type(code) => {
+            super::diagnostics::error(system, "exec-record", i32::from(code));
+            Errno::EPROTO
+        }
+        // The C agent reported a RESET that it refused only as the error that ends the session.
+        ReceiveFailure::Reset => Errno::EPROTO,
+        ReceiveFailure::Data(failure) => {
+            super::diagnostics::error(system, "exec-record", i32::from(OUTER_DATA));
+            failure.into_error()
+        }
+    }
 }
 
 /// Result of draining one nonblocking output descriptor.
