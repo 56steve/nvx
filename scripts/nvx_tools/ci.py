@@ -526,6 +526,22 @@ def validate_openvmm_test_backend(backend: str) -> None:
             )
 
 
+# MSVC's link.exe stamps every DLL and executable with the time of the link
+# and a random PDB signature unless /Brepro derives both from the image's
+# contents. Each Windows build therefore relinked every proc macro with new
+# bytes, and sccache, which hashes the files that a compilation names with
+# --extern, missed every crate that uses a proc macro directly (#693). The
+# linker appends _LINK_ to each of its command lines; RUSTFLAGS would miss the
+# proc macros of the builds that flowey runs with --target.
+MSVC_REPRODUCIBLE_LINK_OPTION = "/Brepro"
+
+
+def _link_reproducibly_with_msvc(environment: dict[str, str]) -> None:
+    options = environment.get("_LINK_", "")
+    if all(option.lstrip("/-").casefold() != "brepro" for option in options.split()):
+        environment["_LINK_"] = f"{options} {MSVC_REPRODUCIBLE_LINK_OPTION}".strip()
+
+
 def _prepare_openvmm_test_environment(
     backend: str,
     rustup: str,
@@ -550,6 +566,8 @@ def _prepare_openvmm_test_environment(
 
     environment = os.environ.copy()
     environment["RUSTUP_TOOLCHAIN"] = toolchain
+    if os.name == "nt":
+        _link_reproducibly_with_msvc(environment)
     runner_temp_value = os.environ.get("RUNNER_TEMP")
     if not installed_targets.issuperset(targets):
         if runner_temp_value:
@@ -594,16 +612,21 @@ def run_openvmm_unit_tests() -> None:
         OpenVMMBuildConstants.DIRECTORY / "Cargo.toml", "initialized OpenVMM submodule"
     )
     cargo = require_tool("cargo")
+    environment = os.environ.copy()
+    if os.name == "nt":
+        _link_reproducibly_with_msvc(environment)
 
     fuzz_crates = run_capture(
         [cargo, "xtask", "fuzz", "list", "--crates"],
         cwd=OpenVMMBuildConstants.DIRECTORY,
+        env=environment,
     )
     require_success(fuzz_crates, "OpenVMM fuzz crate query")
 
     run_checked(
         [cargo, "xflowey", "restore-packages", "--no-compat-igvm"],
         cwd=OpenVMMBuildConstants.DIRECTORY,
+        env=environment,
     )
     command = [
         cargo,
@@ -624,7 +647,7 @@ def run_openvmm_unit_tests() -> None:
     for package in excluded_packages:
         command.extend(("--exclude", package))
 
-    run_checked(command, cwd=OpenVMMBuildConstants.DIRECTORY)
+    run_checked(command, cwd=OpenVMMBuildConstants.DIRECTORY, env=environment)
     run_checked(
         [
             cargo,
@@ -635,6 +658,7 @@ def run_openvmm_unit_tests() -> None:
             "--no-fail-fast",
         ],
         cwd=OpenVMMBuildConstants.DIRECTORY,
+        env=environment,
     )
 
 

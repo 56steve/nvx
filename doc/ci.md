@@ -648,6 +648,32 @@ setup scripts and the Specula runner setup read, together; a test in
 `scripts/test_nvx_tools.py` fails while they differ. Update every self-hosted
 runner as the setup guide describes before the change merges.
 
+## Compilation cache
+
+Every self-hosted runner keeps a persistent
+[sccache](https://github.com/mozilla/sccache) cache on its local disk, in
+`_work/_sccache`, with the 10-GiB limit that the
+[runner setup scripts](../scripts/setup/README.md) configure, and Cargo
+compiles through it with incremental compilation disabled. CI builds in clean
+target directories, so each runner compiles a crate only when its own cache
+lacks it, and loses the cache when its VM is reimaged, as by an image upgrade
+of its scale set. The OpenVMM jobs that run on these runners start sccache and
+report its statistics at the end of the job through the
+[`sccache`](../.github/actions/sccache/action.yml) action.
+
+sccache keys a Rust compilation on its arguments, its `CARGO_*` environment,
+and the contents of its sources and of each library that it names with
+`--extern`. It cannot cache proc macros, build scripts, or executables, so
+every build compiles and links them again. On Linux, the linker reproduces a
+proc macro's shared library exactly, but MSVC's `link.exe` stamps every DLL
+with the time of the link and a random PDB signature. Every Windows build
+therefore missed the cache for each crate that uses a proc macro directly,
+several times per job because flowey builds `openvmm` and `pipette` in target
+directories of their own: 243 of the 1,421 cacheable compilations of a WHP
+VMM-test job, and 286 of the 1,318 of a Windows unit-test job (#693). On
+Windows, `test-openvmm` and `test-openvmm-unit` therefore append `/Brepro` to
+`_LINK_`, which makes `link.exe` derive both from the image's contents.
+
 ## Rust crates
 
 The required `aci-edge-sandboxes` job checks the [`aci_edge_sandboxes` crate](../aci_edge_sandboxes/README.md) on
