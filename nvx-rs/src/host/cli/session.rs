@@ -269,6 +269,33 @@ impl Session {
         received.map_err(|error| self.fail(error))
     }
 
+    /// Reads the next response, which must answer `request_id`, and returns its kind, status,
+    /// and payload.
+    fn reply(&mut self, request_id: u64, deadline: Deadline) -> Result<(u8, i32, Vec<u8>)> {
+        let (kind, response_id, status, payload) = self.receive(deadline)?;
+        if response_id != request_id {
+            return Err(Exit::error(
+                "managed guest returned a mismatched request ID",
+            ));
+        }
+        Ok((kind, status, payload))
+    }
+
+    /// Sends a request of `kind` without a payload and waits up to `timeout` seconds until the
+    /// guest agent acknowledges `what` with an empty `reply` of status 0.
+    fn acknowledged(&mut self, kind: u8, reply: u8, what: &str, timeout: f64) -> Result {
+        let request_id = request_id()?;
+        let deadline = Deadline::after(timeout);
+        self.send(kind, request_id, &[], deadline)?;
+        let (kind, response_id, status, payload) = self.receive(deadline)?;
+        if kind != reply || response_id != request_id || status != 0 || !payload.is_empty() {
+            return Err(Exit::error(format!(
+                "managed guest did not acknowledge {what}"
+            )));
+        }
+        Ok(())
+    }
+
     /// Closes the session after a failed transfer and returns the failure.
     fn fail(&mut self, error: SessionError) -> Exit {
         self.inner = None;
@@ -308,14 +335,7 @@ impl Session {
 
     /// Waits until the guest agent acknowledges readiness, as `ControlSession.ping` does.
     pub(crate) fn ping(&mut self, timeout: f64) -> Result {
-        let request_id = request_id()?;
-        let deadline = Deadline::after(timeout);
-        self.send(APP_PING, request_id, &[], deadline)?;
-        let (kind, response_id, status, payload) = self.receive(deadline)?;
-        if kind != APP_READY || response_id != request_id || status != 0 || !payload.is_empty() {
-            return Err(Exit::error("managed guest did not acknowledge readiness"));
-        }
-        Ok(())
+        self.acknowledged(APP_PING, APP_READY, "readiness", timeout)
     }
 
     /// Asks the guest agent which control features its image provides. An agent that predates
@@ -324,12 +344,7 @@ impl Session {
         let request_id = request_id()?;
         let deadline = Deadline::after(timeout);
         self.send(APP_FEATURES, request_id, &[], deadline)?;
-        let (kind, response_id, status, payload) = self.receive(deadline)?;
-        if response_id != request_id {
-            return Err(Exit::error(
-                "managed guest returned a mismatched request ID",
-            ));
-        }
+        let (kind, status, payload) = self.reply(request_id, deadline)?;
         match kind {
             APP_READY if status == 0 => GuestFeatures::decode(&payload)
                 .map_err(|_| Exit::error("managed guest returned an invalid features response")),
@@ -406,12 +421,7 @@ impl Session {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         loop {
-            let (kind, response_id, status, response) = self.receive(deadline)?;
-            if response_id != request_id {
-                return Err(Exit::error(
-                    "managed guest returned a mismatched request ID",
-                ));
-            }
+            let (kind, status, response) = self.reply(request_id, deadline)?;
             match kind {
                 APP_STDOUT | APP_STDERR => {
                     // The guest agent forwards at most this much output, so more breaks the
@@ -474,14 +484,7 @@ impl Session {
 
     /// Asks the guest agent to shut the VM down, as `ControlSession.stop` does.
     pub(crate) fn stop(&mut self, timeout: f64) -> Result {
-        let request_id = request_id()?;
-        let deadline = Deadline::after(timeout);
-        self.send(APP_STOP, request_id, &[], deadline)?;
-        let (kind, response_id, status, payload) = self.receive(deadline)?;
-        if kind != APP_STOPPED || response_id != request_id || status != 0 || !payload.is_empty() {
-            return Err(Exit::error("managed guest did not acknowledge stop"));
-        }
-        Ok(())
+        self.acknowledged(APP_STOP, APP_STOPPED, "stop", timeout)
     }
 }
 

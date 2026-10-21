@@ -810,6 +810,15 @@ fn protocol_violations_keep_the_messages_of_python() {
     worker.join().unwrap();
     let (mut session, worker) = session_with(|guest| {
         let (_, request_id, _) = guest.request();
+        guest.send(APP_READY, request_id ^ 1, 0, &GuestFeatures::NONE.encode());
+    });
+    assert_eq!(
+        message(session.features(5.0)),
+        "managed guest returned a mismatched request ID"
+    );
+    worker.join().unwrap();
+    let (mut session, worker) = session_with(|guest| {
+        let (_, request_id, _) = guest.request();
         guest.send(APP_READY, request_id, 0, b"");
     });
     assert_eq!(
@@ -817,6 +826,18 @@ fn protocol_violations_keep_the_messages_of_python() {
         "managed guest did not acknowledge stop"
     );
     worker.join().unwrap();
+    // An acknowledgement has status 0 and no payload.
+    for (status, payload) in [(1, &b""[..]), (0, b"x")] {
+        let (mut session, worker) = session_with(move |guest| {
+            let (_, request_id, _) = guest.request();
+            guest.send(APP_READY, request_id, status, payload);
+        });
+        assert_eq!(
+            message(session.ping(5.0)),
+            "managed guest did not acknowledge readiness"
+        );
+        worker.join().unwrap();
+    }
 }
 
 /// The endpoints of POSIX hosts: Unix-domain sockets that this process serves.
