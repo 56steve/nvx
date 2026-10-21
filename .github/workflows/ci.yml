@@ -19,6 +19,10 @@ on:
 concurrency:
   group: ci-${{ github.workflow }}-${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && format('full-{0}', github.run_id) || github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  # dev pushes wait in order instead of cancelling the run that waits. GitHub
+  # rejects queueing together with cancel-in-progress, so pull requests keep
+  # the single waiting run that a newer push replaces.
+  queue: ${{ github.event_name == 'pull_request' && 'single' || 'max' }}
 
 permissions:
   contents: read

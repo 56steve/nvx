@@ -532,6 +532,29 @@ still 13% with a warm sccache, which would take over 2 GiB of the repository's
 repositories pay for, or a self-hosted Windows runner without a hypervisor
 would cost about as much as another general WHP runner.
 
+## Run concurrency
+
+Each pull request runs in a concurrency group of its own, and a push to it
+cancels the run of the previous head, whether that run waits or runs. Pushes
+to `dev` share one group and run one at a time in the order in which they
+arrive. The group keeps up to 100 waiting runs (`queue: max`), so a merge does
+not cancel the waiting run of an earlier merge. Until October 2026 the group
+kept a single waiting run, which each newer push replaced: 12 of the 199 `dev`
+pushes from October 4 to 21 lost their run that way, five of them merged
+within four minutes on October 20. Those commits got no development release
+and no performance results, and because the detector compares a push with its
+previous commit, the run that followed classified only its own changes.
+GitHub rejects `queue: max` together with `cancel-in-progress: true`, so the
+workflow derives both settings from the event. Each scheduled or manually
+dispatched full run has a group of its own (see
+[Change classification](#change-classification)).
+
+A queued run waits for the runs ahead of it. Replaying the `dev` pushes of
+October 4 to 21 one at a time, at their measured durations and the median one
+for those that were cancelled, half would have started at once, one in ten
+would have waited at least 50 minutes, and the longest wait, on October 20,
+would have been about three hours.
+
 ## Change classification
 
 `openvmm-changes` lists the files that changed between the pull request's base
