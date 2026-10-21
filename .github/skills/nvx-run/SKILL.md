@@ -97,7 +97,8 @@ python3 scripts/nvx.py run --hypervisor "$backend"
 python scripts\nvx.py run --hypervisor whp
 ```
 
-Success requires the `ALPINE-MICROVM-BOOT-OK` marker and a responsive root shell.
+Success requires the guest's `NVX-GUEST-BOOT-OK: <guest>` marker, such as
+`NVX-GUEST-BOOT-OK: alpine` for the default guest, and a responsive root shell.
 Exercise the requested behavior, then exit cleanly inside the guest:
 
 ```sh

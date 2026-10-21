@@ -35,9 +35,11 @@ which it runs entirely, and for the egress-policy and artifact steps of
    `rust-toolchain.toml` pins, and Cargo's output on standard error, so that
    it never mixes with the output of the command.
 
-After `download`, `nvx.py` needs no Cargo: every release package ships
-`bin/nvx-rs`, or `bin/nvx-rs.exe`, which `download` installs when the
-release was built from the checkout's `nvx-rs` sources. Without `NVX_RS`, a
+Every release package ships `bin/nvx-rs`, or `bin/nvx-rs.exe`, which
+`download` installs only when the release was built from the checkout's
+`nvx-rs` sources, so that `nvx.py` then needs no Cargo. A checkout whose
+`nvx-rs` sources differ from those of its nearest release, as those of the
+latest `dev` often do, needs Cargo to build it. Without `NVX_RS`, a
 built or installed executable, or Cargo, such a command fails and names
 these choices; [rustup](https://rustup.rs) installs Cargo. `nvx.py` rebuilds
 nothing on its own once the executable exists, so run the build command again,
