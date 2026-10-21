@@ -19,7 +19,7 @@ use super::options::{
     validate_exec_environment, validate_run_share_targets, validate_sandbox_systemd_policy,
 };
 use super::*;
-use crate::host::python::golden::{Mismatches, cases, fixture, flavor, hex, text, texts};
+use crate::host::python::golden::{check_section, fixture, flavor, hex, text, texts};
 use crate::host::python::uuid::parse_uuid;
 
 /// Returns the message of a result's error, or `None` if it succeeded.
@@ -96,17 +96,14 @@ fn recorded_layer(flavor: Flavor, value: &str) -> SandboxLayer {
 #[test]
 fn identities_and_layers_parse_as_python_parses_them() {
     let fixture = fixture("sandbox.json");
-    let mut mismatches = Mismatches::new("identities");
-    for case in cases(&fixture, "identities") {
+    check_section(&fixture, "identities", |mismatches, case| {
         let actual = parse_workload_identity(text(case, "value"))
             .map(|(uid, gid)| json!([uid, gid]))
             .map_err(|error| error.to_string());
         mismatches.check(case, outcome(case, "identity"), actual);
-    }
-    mismatches.finish();
+    });
 
-    let mut mismatches = Mismatches::new("layers");
-    for case in cases(&fixture, "layers") {
+    check_section(&fixture, "layers", |mismatches, case| {
         let expected =
             outcome(case, "role").map(|_| json!([case["role"], case["path"], case["uuid"]]));
         let actual = SandboxLayer::parse_in(flavor(case), text(case, "value"))
@@ -119,51 +116,43 @@ fn identities_and_layers_parse_as_python_parses_them() {
             })
             .map_err(|error| error.to_string());
         mismatches.check(case, expected, actual);
-    }
-    mismatches.finish();
+    });
 }
 
 #[test]
 fn mount_values_targets_and_child_names_match_python() {
     let fixture = fixture("sandbox.json");
-    let mut mismatches = Mismatches::new("mount_values");
-    for case in cases(&fixture, "mount_values") {
+    check_section(&fixture, "mount_values", |mismatches, case| {
         let expected = outcome(case, "target")
             .map(|_| json!([case["target"], case["host_path"], case["access"]]));
         let actual = parse_mount_value(text(case, "value"))
             .map(|(target, host_path, access)| json!([target, host_path, access.as_str()]))
             .map_err(|error| error.to_string());
         mismatches.check(case, expected, actual);
-    }
-    mismatches.finish();
+    });
 
-    let mut mismatches = Mismatches::new("mount_targets");
-    for case in cases(&fixture, "mount_targets") {
+    check_section(&fixture, "mount_targets", |mismatches, case| {
         mismatches.check(
             case,
             case["error"].as_str().map(str::to_owned),
             error(&validate_mount_target(text(case, "target"))),
         );
-    }
-    mismatches.finish();
+    });
 
-    let mut mismatches = Mismatches::new("child_names");
-    for case in cases(&fixture, "child_names") {
+    check_section(&fixture, "child_names", |mismatches, case| {
         let index = usize::try_from(case["index"].as_u64().unwrap()).unwrap();
         mismatches.check(
             case,
             text(case, "name"),
             aggregate_child_name(index, text(case, "target")).as_str(),
         );
-    }
-    mismatches.finish();
+    });
 }
 
 #[test]
 fn mounts_lower_to_the_arguments_that_python_gives() {
     let fixture = fixture("sandbox.json");
-    let mut mismatches = Mismatches::new("mounts");
-    for case in cases(&fixture, "mounts") {
+    check_section(&fixture, "mounts", |mismatches, case| {
         let flavor = flavor(case);
         let cwd = cwd(&fixture, flavor);
         let expected = outcome(case, "mount").map(|_| {
@@ -190,15 +179,13 @@ fn mounts_lower_to_the_arguments_that_python_gives() {
             ]))
         });
         mismatches.check(case, expected, actual.map_err(|error| error.to_string()));
-    }
-    mismatches.finish();
+    });
 }
 
 #[test]
 fn launches_give_the_arguments_and_command_lines_that_python_gives() {
     let fixture = fixture("sandbox.json");
-    let mut mismatches = Mismatches::new("launches");
-    for case in cases(&fixture, "launches") {
+    check_section(&fixture, "launches", |mismatches, case| {
         let flavor = flavor(case);
         let layers = texts(case, "layers")
             .iter()
@@ -243,15 +230,13 @@ fn launches_give_the_arguments_and_command_lines_that_python_gives() {
             })
             .map_err(|error| error.to_string());
         mismatches.check(case, expected, actual);
-    }
-    mismatches.finish();
+    });
 }
 
 #[test]
 fn sandbox_option_helpers_match_nvx_py() {
     let fixture = fixture("sandbox_options.json");
-    let mut mismatches = Mismatches::new("run_share_targets");
-    for case in cases(&fixture, "run_share_targets") {
+    check_section(&fixture, "run_share_targets", |mismatches, case| {
         let targets = texts(case, "targets");
         let targets: Vec<&str> = targets.iter().map(String::as_str).collect();
         mismatches.check(
@@ -259,11 +244,9 @@ fn sandbox_option_helpers_match_nvx_py() {
             case["error"].as_str().map(str::to_owned),
             error(&validate_run_share_targets(&targets)),
         );
-    }
-    mismatches.finish();
+    });
 
-    let mut mismatches = Mismatches::new("sandbox_mounts");
-    for case in cases(&fixture, "sandbox_mounts") {
+    check_section(&fixture, "sandbox_mounts", |mismatches, case| {
         let files = texts(case, "files");
         let policy_paths: Vec<PolicyPathOption> = case["policy"]
             .as_array()
@@ -302,18 +285,15 @@ fn sandbox_option_helpers_match_nvx_py() {
         .map(|mounts| Value::Array(mounts.iter().map(mount_fields).collect()))
         .map_err(|error| error.to_string());
         mismatches.check(case, outcome(case, "result"), actual);
-    }
-    mismatches.finish();
+    });
 
-    let mut mismatches = Mismatches::new("environments");
-    for case in cases(&fixture, "environments") {
+    check_section(&fixture, "environments", |mismatches, case| {
         mismatches.check(
             case,
             case["error"].as_str().map(str::to_owned),
             error(&validate_exec_environment(&texts(case, "entries"))),
         );
-    }
-    mismatches.finish();
+    });
 }
 
 /// Returns the bytes of a document of the generator: its text, its bytes in hex, or a number
@@ -336,8 +316,7 @@ fn environment_files_and_distro_manifests_read_as_python_reads_them() {
     let path = directory.path().join("environment.json");
     let path = path.to_str().unwrap();
     let shown = PurePath::native(path).as_str().to_owned();
-    let mut mismatches = Mismatches::new("environment_files");
-    for case in cases(&fixture, "environment_files") {
+    check_section(&fixture, "environment_files", |mismatches, case| {
         std::fs::write(path, document(case)).unwrap();
         let mut options = SandboxOptions::new(SandboxOperation::Exec);
         options.environment_file = Some(path.to_owned());
@@ -350,8 +329,7 @@ fn environment_files_and_distro_manifests_read_as_python_reads_them() {
             .map(|environment| json!(environment))
             .map_err(|error| error.to_string().replace(&shown, "{path}"));
         mismatches.check(case, expected, actual);
-    }
-    mismatches.finish();
+    });
 
     let layer = directory.path().join("distro.erofs");
     std::fs::write(&layer, text(&fixture, "distro_layer")).unwrap();
@@ -370,14 +348,12 @@ fn environment_files_and_distro_manifests_read_as_python_reads_them() {
         },
     )
     .unwrap();
-    let mut mismatches = Mismatches::new("distro_manifests");
-    for case in cases(&fixture, "distro_manifests") {
+    check_section(&fixture, "distro_manifests", |mismatches, case| {
         std::fs::write(&manifest, document(&case["manifest"])).unwrap();
         mismatches.check(
             case,
             case["error"].as_str().map(str::to_owned),
             error(&validate_sandbox_systemd_policy(&launch)),
         );
-    }
-    mismatches.finish();
+    });
 }
