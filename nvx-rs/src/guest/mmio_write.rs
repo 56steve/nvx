@@ -7,14 +7,13 @@ use std::num::NonZeroUsize;
 use std::process::ExitCode;
 
 use super::parse::parse_u64;
-use super::status::{CommandError, ExitStatus};
+use super::status::{CommandError, run_main};
 use super::sys::{self, Errno, Mode, OpenFlags};
 
 /// Runs `nvx-mmio-write` with the process's arguments. It exits with 0, 1 when an operation
 /// fails, or 2 for a usage error, and prints nothing on success.
 pub fn main() -> ExitCode {
-    sys::restore_sigpipe();
-    ExitStatus::from(run(&sys::args(), c"/dev/mem", &mut io::stderr())).into()
+    run_main(|args| run(args, c"/dev/mem", &mut io::stderr()))
 }
 
 /// Validates the command, maps one physical page of `memory`, which stands for `/dev/mem`,
@@ -76,6 +75,7 @@ mod tests {
     use std::path::Path;
 
     use super::*;
+    use crate::guest::status::ExitStatus;
 
     fn page_size() -> u64 {
         sys::page_size().expect("tests need a page size") as u64

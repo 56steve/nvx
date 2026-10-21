@@ -13,7 +13,7 @@ use std::ffi::{CStr, CString};
 use std::io::{self, Write};
 use std::process::ExitCode;
 
-use super::status::{CommandError, ExitStatus};
+use super::status::{CommandError, run_main};
 use super::sys::{self, Errno, Mode, OpenFlags};
 
 /// Number of seed bytes credited to the kernel entropy pool.
@@ -29,14 +29,14 @@ const USAGE: &[u8] =
 /// Runs `nvx-reseed` with the process's arguments. It exits with 0, 1 when an operation or a
 /// check fails, or 2 for a usage error.
 pub fn main() -> ExitCode {
-    sys::restore_sigpipe();
-    ExitStatus::from(run(
-        &sys::args(),
-        c"/dev/random",
-        &mut sys::Stdout::new(),
-        &mut io::stderr(),
-    ))
-    .into()
+    run_main(|args| {
+        run(
+            args,
+            c"/dev/random",
+            &mut sys::Stdout::new(),
+            &mut io::stderr(),
+        )
+    })
 }
 
 /// Selects sampling, generation checking, or reseeding and performs that operation, with
@@ -210,6 +210,7 @@ mod tests {
     use std::path::Path;
 
     use super::*;
+    use crate::guest::status::ExitStatus;
     use crate::guest::sys::tests::Failing;
 
     /// A seed whose bytes count up from 0, so its generation ID is 000102...0f.
