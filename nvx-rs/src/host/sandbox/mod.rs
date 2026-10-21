@@ -253,13 +253,17 @@ impl SandboxLaunch {
             .as_ref()
             .is_some_and(|value| value.to_u64().is_none())
         {
-            return Err(refused(format!("--memory-max must be at most {MEMORY_MAX_LIMIT}")));
+            return Err(refused(format!(
+                "--memory-max must be at most {MEMORY_MAX_LIMIT}"
+            )));
         }
         if pids_max
             .as_ref()
             .is_some_and(|value| value.to_u32().is_none_or(|value| value > PIDS_MAX_LIMIT))
         {
-            return Err(refused(format!("--pids-max must be at most {PIDS_MAX_LIMIT}")));
+            return Err(refused(format!(
+                "--pids-max must be at most {PIDS_MAX_LIMIT}"
+            )));
         }
         mount::validate_mounts(mounts)?;
         Ok(Self {
