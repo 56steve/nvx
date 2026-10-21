@@ -5484,21 +5484,22 @@ python3() {
                 ),
             ],
         )
-        # The unit tests that need /dev/kvm or /dev/mshv are ignored, so one
-        # Linux runner covers both Linux backends.
+        # The unit tests that need /dev/kvm or /dev/mshv are ignored, so they
+        # run once per OS, and Linux needs no hypervisor runner (#697).
         self.assertEqual(
-            legs(unit_tests_job),
+            yaml.safe_load(workflow)["jobs"]["openvmm-unit-tests"]["strategy"][
+                "matrix"
+            ]["include"],
             [
-                (
-                    "Linux",
-                    "mshv",
-                    '["self-hosted", "linux", "mshv", "virtual-machine", "general"]',
-                ),
-                (
-                    "Windows",
-                    "whp",
-                    '["self-hosted", "windows", "whp", "virtual-machine", "general"]',
-                ),
+                {"name": "Linux", "runner": '["ubuntu-latest"]'},
+                {
+                    "name": "Windows",
+                    "backend": "whp",
+                    "runner": (
+                        '["self-hosted", "windows", "whp", "virtual-machine", '
+                        '"general"]'
+                    ),
+                },
             ],
         )
         self.assertIn(
@@ -5534,6 +5535,66 @@ python3() {
             1,
         )
         self.assertNotIn("test-openvmm --backend", unit_tests_job)
+
+    def test_ci_runs_the_linux_openvmm_unit_tests_on_a_github_hosted_runner(self):
+        # The Linux leg needs no hypervisor, so it runs on a GitHub-hosted
+        # runner, which has neither the self-hosted runners' validated
+        # toolchain nor their persistent sccache (#697). It installs the pinned
+        # Rust release and cargo-nextest itself, and keeps Cargo's home where
+        # the shared Cargo cache restores the registry.
+        workflow = (
+            BuildConstants.REPO_ROOT / ".github" / "workflows" / "ci.yml"
+        ).read_text(encoding="utf-8")
+        job_name = "openvmm-unit-tests"
+        job = _workflow_job(workflow, job_name)
+        self.assertIn("    runs-on: ${{ fromJSON(matrix.runner) }}\n", job)
+        self.assertIn("    timeout-minutes: 90\n", job)
+
+        for step_name, condition in (
+            ("Validate runner", "runner.environment == 'self-hosted'"),
+            ("Prepare sccache", "runner.environment == 'self-hosted'"),
+            ("Report sccache", "always() && runner.environment == 'self-hosted'"),
+        ):
+            with self.subTest(step=step_name):
+                step = _workflow_step(workflow, job_name, step_name)
+                self.assertEqual(_yaml_scalar(step, "if"), condition)
+
+        install_name = "Install the pinned Rust release and cargo-nextest"
+        install = _workflow_step(workflow, job_name, install_name)
+        self.assertEqual(
+            _yaml_scalar(install, "if"), "runner.environment == 'github-hosted'"
+        )
+        for fragment in (
+            "rust-toolchain.toml",
+            'rustup toolchain install "${toolchain}" --profile minimal'
+            " --no-self-update",
+            "s/^cargo_nextest\\.version=//p' scripts/setup/tool-versions.conf",
+            '"https://get.nexte.st/${nextest}/linux"',
+            'export CARGO_HOME="${RUNNER_TEMP}/cargo-home"',
+            'echo "CARGO_HOME=${CARGO_HOME}"',
+            'echo "CARGO_INCREMENTAL=0"',
+            'echo "${CARGO_HOME}/bin" >> "${GITHUB_PATH}"',
+            'if [[ "${rust_version}" != "rustc ${toolchain} "* ]]; then',
+            'if [[ "${nextest_version}" != "cargo-nextest ${nextest} "* ]]; then',
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, install)
+        self.assertIn(
+            "${{ format('{0}/cargo-home/registry', runner.temp) }}",
+            _workflow_step(workflow, job_name, "Restore shared Cargo cache on Linux"),
+        )
+        steps = [
+            _yaml_scalar(step, "name") for step in _workflow_steps(workflow, job_name)
+        ]
+        self.assertLess(
+            steps.index(install_name),
+            steps.index("Run OpenVMM unit tests on Linux"),
+        )
+        # The step takes its pins from inputs of the suite, so a change to
+        # either runs it.
+        for path in ("rust-toolchain.toml", "scripts/setup/tool-versions.conf"):
+            with self.subTest(path=path):
+                self.assertIsNotNone(ci.OPENVMM_UNIT_TEST_INPUT_PATHS.match(path))
 
     def test_ci_measures_each_performance_series_on_its_benchmark_runner(self):
         # Each backend's pool mixes VMs whose results differ by more than the
