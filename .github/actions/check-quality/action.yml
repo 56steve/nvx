@@ -1,6 +1,14 @@
 name: Check quality
 description: Run NVX linting, typing, and formatting checks
 
+inputs:
+  save-cache:
+    description: >-
+      Cache the pip downloads; setup-python saves the cache whenever it
+      misses, so "false" neither restores nor saves it
+    required: false
+    default: "true"
+
 runs:
   using: composite
   steps:
@@ -8,7 +16,7 @@ runs:
       uses: actions/setup-python@v6
       with:
         python-version: "3.10"
-        cache: pip
+        cache: ${{ inputs.save-cache == 'true' && 'pip' || '' }}
         cache-dependency-path: requirements-dev.txt
 
     - name: Install development tools

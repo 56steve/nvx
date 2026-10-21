@@ -888,7 +888,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     required_ci.add_argument(
         "--event-name",
-        choices=("pull_request", "push"),
+        choices=("pull_request", "push", "schedule", "workflow_dispatch"),
         required=True,
     )
     required_ci.add_argument(

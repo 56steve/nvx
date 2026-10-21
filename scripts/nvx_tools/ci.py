@@ -71,7 +71,7 @@ REQUIRED_CI_MICROVM_TEST_JOBS = (
     "nvx-microvm-tests-whp",
 )
 # The CI debug kernel runs on KVM for every pull request and on every backend
-# for dev pushes.
+# for dev pushes and full runs.
 REQUIRED_CI_MICROVM_DEBUG_JOBS = ("nvx-microvm-debug-kvm",)
 REQUIRED_CI_MICROVM_DEBUG_PUSH_JOBS = (
     "nvx-microvm-debug-mshv",
@@ -195,8 +195,8 @@ def kernel_patch_identity(patch_root: Path) -> str:
 def classify_ci_changes(event_name: str, changed_files: Sequence[str]) -> CiChanges:
     """Select the suites that a change between two commits runs.
 
-    Pull requests run each OpenVMM suite only when one of its own inputs
-    changed. Pushes keep running both whenever any test input changed.
+    Pull requests and pushes run each OpenVMM suite only when tests run and
+    one of that suite's own inputs changed.
     """
     if event_name not in ("pull_request", "push"):
         raise ValueError(f"unsupported CI event {event_name!r}")
@@ -206,8 +206,6 @@ def classify_ci_changes(event_name: str, changed_files: Sequence[str]) -> CiChan
         CI_DOCUMENTATION_PATHS.match(path) for path in files
     )
     run_tests = any(CI_TEST_INPUT_PATHS.match(path) for path in files)
-    if event_name == "push":
-        return CiChanges(run_tests, run_workloads, run_tests, run_tests)
     return CiChanges(
         run_tests=run_tests,
         run_workloads=run_workloads,
@@ -268,9 +266,7 @@ def describe_ci_changes(
             OPENVMM_VMM_TEST_INPUT_PATHS,
         ),
     ):
-        if event_name == "push":
-            reason = "Pushes run every OpenVMM suite whenever the tests run."
-        elif selected:
+        if selected:
             reason = f"Suite inputs changed: {evidence(pattern)}."
         elif changes.run_tests:
             reason = "No input of this suite changed."
@@ -286,12 +282,17 @@ def required_ci_expected_results(
     same_repository: bool,
     changes: CiChanges,
 ) -> dict[str, str]:
-    if event_name not in ("pull_request", "push"):
+    if event_name not in (
+        "pull_request",
+        "push",
+        "schedule",
+        "workflow_dispatch",
+    ):
         raise ValueError(f"unsupported CI event {event_name!r}")
 
     run_tests = changes.run_tests
     run_workloads = changes.run_workloads
-    repository_jobs_enabled = event_name == "push" or same_repository
+    repository_jobs_enabled = event_name != "pull_request" or same_repository
     expected = {
         "quality": "success",
         "aci-edge-sandboxes": "success",
@@ -362,7 +363,7 @@ def required_ci_expected_results(
         {
             job: (
                 "success"
-                if event_name == "push" and run_tests and run_workloads
+                if event_name != "pull_request" and run_tests and run_workloads
                 else "skipped"
             )
             for job in REQUIRED_CI_MICROVM_DEBUG_PUSH_JOBS

@@ -178,10 +178,10 @@ its checks pending. The one exception is `snapshot-tiers`' gate-timeout check,
 whose guest OpenVMM stops at the restore gate on purpose. The harness refuses
 a kernel whose `vmlinux-debug.config` lacks the detectors, because the guest's
 boot check of those detectors passes vacuously. To bound the cost, pull requests
-run the debug kernel on KVM only and `dev` pushes run it on every backend;
-each job takes about five minutes on its own runner, in parallel with the
-other microVM jobs. The jobs gate the required status check, the development
-release, and performance persistence. The GitHub-hosted `debug-kernel` job
+run the debug kernel on KVM only, while `dev` pushes and full runs run it on
+every backend; each job takes about five minutes on its own runner, in parallel
+with the other microVM jobs. The jobs gate the required status check, the
+development release, and performance persistence. The GitHub-hosted `debug-kernel` job
 builds the debug kernel beside the shared `artifacts` job
 (`build-guest-artifacts` with `guest-images: "false"`) and caches it under its
 own key, so a kernel rebuild delays only the debug jobs, and a failed debug
@@ -419,17 +419,20 @@ successful pushes to `dev` append their p50 values under `data/`. Metadata-only
 performance jobs use GitHub-hosted Ubuntu runners. Provisioning instructions
 are in the [runner bootstrap guide](../scripts/setup/README.md).
 
-Persistent runners accept pushes and same-repository pull requests only. Fork
-pull requests run the GitHub-hosted validation jobs but do not execute code on
-the Azure runner fleet. A maintainer must stage an external contribution on a
-trusted repository branch before running the backend matrices.
+Persistent runners accept pushes, scheduled and manually dispatched full
+runs, and same-repository pull requests only. Fork pull requests run the
+GitHub-hosted validation jobs but do not execute code on the Azure runner
+fleet. A maintainer must stage an external contribution on a trusted
+repository branch before running the backend matrices.
 
 ## Job graph and runner capacity
 
-A `dev` push or a pull request that is ready for review starts these jobs at
-once: `quality`, `aci-edge-sandboxes`, `nvx-rs`, `nvx-cli-linux`, and
-`nvx-cli-windows` on GitHub-hosted runners, and `openvmm-changes`, which classifies the change
-(see [Change classification](#change-classification)). When it finishes,
+A `dev` push, a pull request that is ready for review, or a scheduled or
+manually dispatched full run starts these jobs at once: `quality`,
+`aci-edge-sandboxes`, `nvx-rs`, `nvx-cli-linux`, and `nvx-cli-windows` on
+GitHub-hosted runners, and `openvmm-changes`, which classifies a push or pull
+request and selects every suite for a full run (see
+[Change classification](#change-classification)). When it finishes,
 `artifacts` and `debug-kernel` restore or build the guest artifacts on
 GitHub-hosted runners, the three `build-openvmm-*` producers restore or build
 OpenVMM on a KVM, an MSHV, and a WHP runner, and `openvmm-unit-tests` starts on
@@ -448,10 +451,11 @@ reads, and uses Python 3.12, the release that the self-hosted runners provide;
 the Windows job also installs the pinned Rust release with the minimal profile
 for the curl shim test and the `nvx-rs` build. Each job first builds the
 `nvx-rs` executable that `nvx.py` runs, tests with it, and hands it to the
-microVM test and platform jobs of its operating system, as described above. Fork pull requests lack the OpenVMM deploy key, so the
-CLI jobs run, like the hypervisor jobs, only for pushes and same-repository
-pull requests. Because the microVM and platform jobs of each operating system
-wait for its CLI job, a broken CLI does not occupy the hypervisor runners.
+microVM test and platform jobs of its operating system, as described above.
+Fork pull requests lack the OpenVMM deploy key, so the CLI jobs run, like the
+hypervisor jobs, only for pushes, full runs, and same-repository pull requests.
+Because the microVM and platform jobs of each operating system wait for its CLI
+job, a broken CLI does not occupy the hypervisor runners.
 `Required status check`, the development release, and performance persistence
 require both CLI jobs.
 
@@ -501,20 +505,34 @@ participate in the decision:
   `aci_edge_sandboxes` and `nvx` crates, or the runtime adapter in
   `tests/runtime-adapter/`. It enables the NVX microVM tests.
 - `run-openvmm-unit-tests` and `run-openvmm-vmm-tests` enable the OpenVMM
-  suites. A push sets both to `run-tests`. A pull request sets each only when
-  one of that suite's own inputs changed. The unit tests depend on the OpenVMM
-  pin, the Rust pin, the runner setup scripts, `ci.yml`, the actions that their
-  job uses, `nvx.py`, and the modules that `ci.py` imports. The VMM tests also
-  boot the kernel and Alpine initramfs, so they add every input of those
-  artifacts' cache keys and the `build-guest-artifacts` action.
+  suites. A push or pull request sets each only when one of that suite's own
+  inputs changed. The unit tests depend on the OpenVMM pin, the Rust pin, the
+  runner setup scripts, `ci.yml`, the actions that their job uses, `nvx.py`,
+  and the modules that `ci.py` imports. The VMM tests also boot the kernel and
+  Alpine initramfs, so they add every input of those artifacts' cache keys and
+  the `build-guest-artifacts` action.
 
-A pull request that changes neither OpenVMM suite's inputs, such as one that
-changes only the microVM tests, the benchmarks, or the Ubuntu or Azure Linux
-guests, therefore skips the two jobs that occupy the WHP runners longest,
-while the `dev` push that merges it still runs them. The detector runs the
-full matrix instead when the comparison base or a commit is unavailable, when
-the diff or the classifier fails, or when the classifier reports a suite
-twice or not at all, because a missing output would skip its jobs.
+A push or pull request that changes neither OpenVMM suite's inputs, such as
+one that changes only the microVM tests, the benchmarks, or the Ubuntu or
+Azure Linux guests, therefore skips the two jobs that occupy the WHP runners
+longest. The nightly schedule runs at 05:17 UTC, and a manual workflow
+dispatch starts the same full run. Both select the full matrix before the
+detector examines a comparison base. Each full run has a separate concurrency
+key, so it neither cancels nor queues behind a `dev` push. Full runs build,
+test, benchmark, and package, but publish and persist nothing and save no
+caches. Only `dev` pushes save the OpenVMM caches, and only pushes and pull
+requests save the guest artifact and pip caches, through the `save-cache`
+input of the
+[`build-guest-artifacts`](../.github/actions/build-guest-artifacts/action.yml)
+and [`check-quality`](../.github/actions/check-quality/action.yml) actions. A
+full run still builds the guest artifacts that miss the cache, but installs
+the Python tools without the pip cache, which `setup-python` saves whenever it
+misses.
+
+For a push or pull request, the detector runs the full matrix instead when the
+comparison base or a commit is unavailable, when the diff or the classifier
+fails, or when the classifier reports a suite twice or not at all, because a
+missing output would skip its jobs.
 `Required status check` passes the same outputs to `check-required-ci`, which
 expects every scheduled job to succeed and every other job to be skipped.
 Tests in `scripts/test_nvx_tools.py` derive each suite's inputs from the

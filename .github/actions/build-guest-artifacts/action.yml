@@ -8,6 +8,12 @@ inputs:
       and cache saves for artifacts that miss the cache
     required: false
     default: "false"
+  save-cache:
+    description: >-
+      Save the artifacts that miss the cache once they are built; "false"
+      still builds them but leaves the cache unchanged
+    required: false
+    default: "true"
   debug-kernel:
     description: Also cache or build the CI debug kernel (build/vmlinux-debug)
     required: false
@@ -165,6 +171,7 @@ runs:
     - name: Save Linux kernel (zstd)
       if: >-
         inputs.restore-only != 'true' &&
+        inputs.save-cache == 'true' &&
         inputs.guest-images == 'true' &&
         steps.cache-linux-kernel-zstd.outputs.cache-hit != 'true'
       uses: actions/cache/save@v5
@@ -204,6 +211,7 @@ runs:
     - name: Save Linux debug kernel (zstd)
       if: >-
         inputs.restore-only != 'true' &&
+        inputs.save-cache == 'true' &&
         inputs.debug-kernel == 'true' &&
         steps.cache-linux-debug-kernel-zstd.outputs.cache-hit != 'true'
       uses: actions/cache/save@v5
@@ -231,6 +239,7 @@ runs:
     - name: Save Alpine disk image (zstd)
       if: >-
         inputs.restore-only != 'true' &&
+        inputs.save-cache == 'true' &&
         inputs.guest-images == 'true' &&
         steps.cache-alpine-image-zstd.outputs.cache-hit != 'true'
       uses: actions/cache/save@v5
@@ -275,6 +284,7 @@ runs:
     - name: Save Ubuntu initramfs (zstd)
       if: >-
         inputs.restore-only != 'true' &&
+        inputs.save-cache == 'true' &&
         inputs.guest-images == 'true' &&
         steps.cache-ubuntu-initramfs-zstd.outputs.cache-hit != 'true'
       uses: actions/cache/save@v5
@@ -306,6 +316,7 @@ runs:
     - name: Save Azure Linux initramfs (zstd)
       if: >-
         inputs.restore-only != 'true' &&
+        inputs.save-cache == 'true' &&
         inputs.guest-images == 'true' &&
         steps.cache-azurelinux-initramfs-zstd.outputs.cache-hit != 'true'
       uses: actions/cache/save@v5
@@ -332,6 +343,7 @@ runs:
     - name: Save Ubuntu distro layer (zstd)
       if: >-
         inputs.restore-only != 'true' &&
+        inputs.save-cache == 'true' &&
         inputs.guest-images == 'true' &&
         steps.cache-ubuntu-distro-zstd.outputs.cache-hit != 'true'
       uses: actions/cache/save@v5
