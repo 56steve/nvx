@@ -52,7 +52,11 @@ class LinuxConfig(CommonConfig):
     dataDisk: LinuxDisk
 
 
-class WindowsConfig(CommonConfig):
+class WindowsOptionalConfig(TypedDict, total=False):
+    benchmarkRunnerName: str
+
+
+class WindowsConfig(CommonConfig, WindowsOptionalConfig):
     os: Literal["windows"]
     runnerDirectory: str
     dataDisk: WindowsDisk
@@ -92,7 +96,12 @@ COMMON_OPTIONAL = {
 }
 PLATFORM_FIELDS = {
     "linux": {"backend", "kernelMode"},
-    "windows": {"benchmarkScratchDirectory", "sshDefaultShell", "publicKeys"},
+    "windows": {
+        "benchmarkScratchDirectory",
+        "benchmarkRunnerName",
+        "sshDefaultShell",
+        "publicKeys",
+    },
 }
 WINDOWS_EXTENSION_COMMAND = (
     'powershell.exe -ExecutionPolicy Bypass -NoProfile -Command "'
@@ -374,6 +383,17 @@ def normalize_config(config: object) -> LinuxConfig | WindowsConfig:
     required_labels = ["windows", "whp", "virtual-machine"]
     if [label.lower() for label in labels[:3]] != required_labels:
         raise ValueError(f"runnerLabels must start with {', '.join(required_labels)}")
+    benchmark_name: str | None = None
+    if "benchmarkRunnerName" in values:
+        benchmark_name = text(
+            values["benchmarkRunnerName"],
+            "benchmarkRunnerName",
+            rf"{re.escape(name_prefix)}-(?:0|[1-9][0-9]{{0,15}})",
+        )
+        if "general" not in roles or int(benchmark_name.rsplit("-", 1)[1]) < offset:
+            raise ValueError(
+                "benchmarkRunnerName requires general labels and a valid VMSS instance number"
+            )
     windows_config: WindowsConfig = {
         **common,
         "os": "windows",
@@ -387,6 +407,8 @@ def normalize_config(config: object) -> LinuxConfig | WindowsConfig:
         "sshDefaultShell": default_shell,
         "publicKeys": public_keys,
     }
+    if benchmark_name is not None:
+        windows_config["benchmarkRunnerName"] = benchmark_name
     return windows_config
 
 

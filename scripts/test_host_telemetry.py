@@ -173,6 +173,66 @@ class AzureProvenanceTests(unittest.TestCase):
             ):
                 host_telemetry.azure_compute_provenance(compute)
 
+    def test_windows_runner_uses_only_the_trusted_snapshot(self):
+        safe = {
+            "vmSize": IMDS_COMPUTE["vmSize"],
+            "storageProfile": {
+                "osDisk": {
+                    "diskSizeGB": "128",
+                    "managedDisk": {"storageAccountType": "Premium_LRS"},
+                    "caching": "ReadWrite",
+                    "writeAcceleratorEnabled": "false",
+                    "diffDiskSettings": {"option": ""},
+                },
+                "dataDisks": [
+                    {
+                        "lun": "0",
+                        "diskSizeGB": "512",
+                        "managedDisk": {"storageAccountType": "Premium_LRS"},
+                        "caching": "None",
+                        "writeAcceleratorEnabled": "false",
+                        "bytesPerSecondThrottle": "",
+                        "opsPerSecondThrottle": "",
+                    }
+                ],
+                "resourceDisk": {"size": "614400"},
+            },
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            snapshot = Path(temporary) / "compute.json"
+            snapshot.write_text(json.dumps(safe), encoding="utf-8")
+            with (
+                patch.object(host_telemetry.sys, "platform", "win32"),
+                patch.object(host_telemetry, "may_be_azure_vm", return_value=True),
+                patch.object(
+                    host_telemetry, "WINDOWS_AZURE_METADATA_SNAPSHOT", snapshot
+                ),
+                patch.object(host_telemetry, "read_azure_compute_metadata") as read,
+            ):
+                expected = host_telemetry.azure_compute_provenance(safe)
+                self.assertEqual(host_telemetry.azure_vm_provenance(), expected)
+                read.assert_not_called()
+
+                snapshot.unlink()
+                host_telemetry._azure_vm_provenance.cache_clear()
+                missing = host_telemetry.azure_vm_provenance()
+                assert missing is not None
+                self.assertIn("snapshot is invalid", str(missing["error"]))
+                read.assert_not_called()
+
+                for content in (
+                    '{"vmSize": ""}',
+                    '{"vmSize": "Standard_D16ds_v5", "storageProfile": {}}',
+                    "x" * 65537,
+                ):
+                    with self.subTest(content=content[:20]):
+                        snapshot.write_text(content, encoding="utf-8")
+                        host_telemetry._azure_vm_provenance.cache_clear()
+                        invalid = host_telemetry.azure_vm_provenance()
+                        assert invalid is not None
+                        self.assertIn("snapshot is invalid", str(invalid["error"]))
+                        read.assert_not_called()
+
     def test_queries_instance_metadata_once_and_only_on_a_possible_azure_vm(self):
         with (
             patch.object(host_telemetry, "may_be_azure_vm", return_value=False),
