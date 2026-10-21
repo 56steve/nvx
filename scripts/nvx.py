@@ -85,6 +85,7 @@ from nvx_tools.guest_binaries import (
 )
 from nvx_tools.guests import GUEST_NAMES, guest_descriptor
 from nvx_tools.microvm_tests import configure_parser as configure_microvm_test_parser
+from nvx_tools.nightly_ci import configure_parser as configure_nightly_ci_parser
 from nvx_tools.performance import configure_parser as configure_performance_parser
 from nvx_tools.release import (
     collect_release_sources,
@@ -907,6 +908,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--run-openvmm-vmm-tests", choices=("false", "true"), required=True
     )
     required_ci.set_defaults(handler=command_check_required_ci)
+
+    nightly_ci = subparsers.add_parser(
+        "report-nightly-ci",
+        help="open, update, or close the report of failed nightly CI runs",
+    )
+    configure_nightly_ci_parser(nightly_ci)
 
     static_elf = subparsers.add_parser(
         "check-static-elf",

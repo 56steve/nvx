@@ -539,6 +539,60 @@ Tests in `scripts/test_nvx_tools.py` derive each suite's inputs from the
 actions that its jobs use, the modules that `ci.py` imports, and the guest
 cache keys, and fail when a pattern misses one.
 
+## Nightly failure reports
+
+GitHub notifies only one person when a scheduled run fails: whoever last
+changed the workflow's schedule or enabled the workflow again.
+[`report-nightly-ci`](usage.md#report-nightly-ci) reports a completed nightly
+run in one tracking issue instead, the nightly failure report, which a hidden
+marker in its body identifies. Only an issue that GitHub Actions or someone
+with a role in the repository opened counts, so a copy of the marker cannot
+take the report over. A failing run opens the report, or updates it when one
+is open, and a passing run closes every open report. The report shows the
+latest failing run, and a table of every failing run attempt since it
+opened, newest first, which its body also records in a hidden state comment.
+Every later failure also adds a comment with its details, which notifies the
+issue's participants, such as its assignees. Reporting an attempt again only
+refreshes the body, while a rerun's attempt counts as another failure. The
+command reports the latest nightly result, which a later run or attempt than
+the one that triggered it may hold: the newest scheduled run's latest
+completed attempt, which is the previous attempt while a rerun is in
+progress. It skips a result older than the newest run that the report
+records. A late result therefore cannot reopen, rewrite, or close the
+report. When it finds several open reports, it updates the oldest and
+closes the others as duplicates.
+
+The report links every job that failed, timed out, or was cancelled, names
+its failing step, and quotes its evidence: the step's own error annotation,
+or else the last error line of its log, or, without the log, the job's most
+specific annotation. Up to 15 lines of that log, without the echoed
+commands, follow in a collapsed block. The command reads annotations and
+logs for at most four minutes, and classifies the remaining jobs from their
+steps alone. Each job counts in one group:
+
+- Infrastructure failures: GitHub reports a lost or stopped runner, or a job
+  that no runner picked up; a setup step failed or timed out, such as
+  `Set up job`, a checkout, `Validate runner`, a download, an upload, a tool
+  installation, or a cache step; the benchmark step reports that its runner
+  is no longer the host of its series' history (see
+  [Expected benchmark hosts](benchmarks.md#expected-benchmark-hosts)); or
+  the failing step's log shows a network or download error, such as an
+  unresolved name, a reset connection, a rate limit, or a server error, or a
+  full disk, other than in a warning or a notice of a retry, which the retry
+  may have overcome. Only GitHub's runner errors count for the whole job, so
+  that a later step, such as an upload of diagnostics that fails on the
+  network, cannot hide a test failure.
+- Test and build failures: every other job that failed or timed out. Without
+  positive evidence of the infrastructure, a failure counts here, so that the
+  report never dismisses a regression; the curl and wget errors of the
+  microVM tests' guest network checks count here too.
+- Cancelled jobs: jobs that stopped because their run was cancelled.
+
+`Required status check` fails whenever another job fails, so the report
+lists it apart, unless it fails alone, for example because a job that
+should have run was skipped. A run that fails without a failing job, as when
+GitHub cannot start it, is reported with no jobs.
+
 ## Host qualification
 
 `python3 scripts/nvx.py doctor --backend <kvm|mshv|whp>` qualifies a host for

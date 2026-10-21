@@ -139,6 +139,7 @@ nvx/
 |   |   |-- managed_exec_tests.py Managed workload environment, directory, and timeout tests
 |   |   |-- microvm_test_scripts/ Guest workloads for the microVM tests
 |   |   |-- microvm_tests.py     NVX microVM correctness tests
+|   |   |-- nightly_ci.py        Nightly CI failure report
 |   |   |-- nvx_rs.py            Finds, builds, and runs nvx-rs, to which nvx.py delegates
 |   |   |-- openvmm_process.py   Foreground OpenVMM process control for tests
 |   |   |-- performance.py       CI performance collection, persistence, and gates
