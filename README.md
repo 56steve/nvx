@@ -18,17 +18,23 @@ their common `/sbin/nvx-*` paths.
 
 ## Quick Start
 
-Python 3.10 or newer is required. The commands below download the prebuilt NVX package for the
-selected platform from the cloned revision's release when available, or from its nearest released
-first-parent ancestor otherwise, so no build of the guest, OpenVMM, or
-[`nvx-rs`](doc/usage.md#nvx-rs), which `nvx.py run` runs, is required. Should the release's `nvx-rs`
-come from other sources than the checkout's, `nvx.py` builds it with Cargo, which
-[rustup](https://rustup.rs/) installs. A successful boot prints
-`NVX-GUEST-BOOT-OK: alpine` and opens a root shell. Select Ubuntu or Azure Linux userland with the
-same NVX kernel by passing `--guest ubuntu` or `--guest azurelinux`.
+Python 3.10 or newer and Git are required. The commands below download the prebuilt NVX package
+for the selected platform from the cloned revision's release when available, or from its nearest
+released first-parent ancestor otherwise, so the guest and OpenVMM need no build.
 
-Exit cleanly from the guest with `/sbin/nvx-exit 0`. See the [setup](doc/setup.md) and
-[run](doc/run.md) guides for detailed prerequisites and runtime options.
+`nvx.py run` also runs [`nvx-rs`](doc/usage.md#nvx-rs), which `download` installs only from a
+release built from the checkout's `nvx-rs` sources. Otherwise, `nvx.py` builds `nvx-rs` with
+Cargo the first time that a command needs it, so install Rust with [rustup](https://rustup.rs/).
+A clone of the latest `dev` often needs this build, because `nvx-rs` may have changed since its
+nearest release. To run without Rust, check out the tag of a
+[development release](https://github.com/microsoft/nvx/releases) before `download`.
+
+A successful boot prints `NVX-GUEST-BOOT-OK: alpine` and opens a root shell. The package also
+includes the Ubuntu and Azure Linux userlands: boot either with the same NVX kernel by adding
+`--guest ubuntu` or `--guest azurelinux` to `nvx.py run`. Exit cleanly from the guest with
+`/sbin/nvx-exit 0`. See the [setup](doc/setup.md) and [run](doc/run.md) guides for detailed
+prerequisites and runtime options. To build NVX from source instead, first
+[initialize](doc/setup.md#initialize) the `openvmm` submodule, which the clone below omits.
 
 > ℹ️ For direct OpenVMM integration without the `scripts/nvx.py` runtime harness,
 see [Run OpenVMM directly](doc/run.md#run-openvmm-directly).
@@ -72,8 +78,10 @@ python scripts\nvx.py run
 - [Run](doc/run.md) - Instructions for running NVX.
 - [Benchmark](doc/benchmarks.md) - Instructions for benchmarking NVX.
 - [Command-line reference](doc/usage.md) - Complete `scripts/nvx.py` command and option reference.
-- [Rust API](aci_edge_sandboxes/README.md) - The `aci_edge_sandboxes` crate for driving the sandbox lifecycle from Rust.
-- [NVX Rust crate](nvx-rs/README.md) - The `nvx` crate that holds the NVX mechanics: the OpenVMM control protocol and the launch, policy lowering, and supervision of NVX microVMs.
+- [Rust API](aci_edge_sandboxes/README.md) - The `aci_edge_sandboxes` crate for driving the sandbox
+  lifecycle from Rust.
+- [NVX Rust crate](nvx-rs/README.md) - The `nvx` crate that holds the NVX mechanics: the OpenVMM
+  control protocol and the launch, policy lowering, and supervision of NVX microVMs.
 
 ### Development
 
@@ -88,7 +96,7 @@ python scripts\nvx.py run
 - [Copilot-driven adversarial testing](doc/adversarial-testing.md) - Bounded adaptive stress and
   containment campaigns.
 - [Package and source delivery](doc/distribution.md) - Instructions for packaging and distributing
-	NVX.
+  NVX.
 - [Contributing](doc/contribute.md) - Guidelines for contributing to NVX.
 - [OpenVMM upstream roadmap](doc/openvmm-upstream-roadmap.md) - Plan for upstreaming the OpenVMM
   fork's microVM commits.

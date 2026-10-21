@@ -2,10 +2,12 @@
 
 ## Initialize
 
-Clone with submodules, or initialize after cloning:
+Building from source and `nvx.py verify` need the `openvmm` submodule, which the
+[Quick Start](../README.md#quick-start) clone omits because its prebuilt package
+does not need it. Clone with submodules, or initialize after cloning:
 
 ```bash
-git clone --recurse-submodules <umbrella-repository-url> nvx
+git clone --recurse-submodules https://github.com/microsoft/nvx.git nvx
 cd nvx
 python3 scripts/nvx.py verify
 ```
@@ -14,7 +16,7 @@ On Windows PowerShell, use `python` in place of `python3` if that is the
 installed launcher:
 
 ```powershell
-git clone --recurse-submodules <umbrella-repository-url> nvx
+git clone --recurse-submodules https://github.com/microsoft/nvx.git nvx
 Set-Location nvx
 python scripts\nvx.py verify
 ```
