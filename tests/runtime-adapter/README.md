@@ -36,7 +36,7 @@ length, a little-endian `u32`, then the message's kind:
 | --- | --- | --- |
 | 1 | `Ping`: asks the guest to answer with `Pong` | none |
 | 2 | `Pong`: the guest's answer to `Ping` | none |
-| 3 | `Echo`: bytes that the guest sends back in an `Echo` of its own | at most 256 KiB |
+| 3 | `Echo`: bytes that the guest sends back in an `Echo` of its own | at most 256 KiB, what four of the session's largest records carry |
 | 4 | `Stop`: asks the guest to stop serving | none |
 | 5 | `Stopped`: the guest's confirmation of `Stop`, its last message | none |
 

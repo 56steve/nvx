@@ -287,7 +287,7 @@ fn decode(decoder: &mut Decoder, mut bytes: &[u8]) -> Vec<Message> {
     messages
 }
 
-/// Returns an echo of the longest body, which spans five records.
+/// Returns an echo of the longest body: with its header, the message spans five records.
 fn longest() -> Message {
     Message::Echo((0..=u8::MAX).cycle().take(MAX_BODY).collect())
 }

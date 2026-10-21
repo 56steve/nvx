@@ -13,11 +13,14 @@
 
 use std::fmt;
 
+use nvx::protocol::OUTER_MAX_PAYLOAD;
+
 /// Bytes of a message's header: the body's length, then the message's kind.
 pub const HEADER_LEN: usize = 5;
 
-/// Most bytes of a message's body, which is more than four of the session's records carry.
-pub const MAX_BODY: usize = 256 * 1024;
+/// Most bytes of a message's body: as many as four of the session's largest records carry, so that
+/// the longest message, with its header, spans five records.
+pub const MAX_BODY: usize = 4 * OUTER_MAX_PAYLOAD;
 
 /// A message of the adapter's framing.
 #[derive(Clone, Debug, PartialEq, Eq)]
