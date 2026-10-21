@@ -29,7 +29,9 @@
 //! A handle holds the directories of its cgroups open, from when it was
 //! [opened](ExecutionCgroup::open), and each operation opens the interface files that it uses in
 //! them anew. So a handle stays valid whatever controllers its cgroup gains, and reaches its own
-//! cgroups alone, even once the caller removes one and prepares another at its path.
+//! cgroups alone, even once the caller removes one and prepares another at its path. A removal,
+//! which only a path names, takes its turn with the process's other removals and preparations,
+//! so it never reaches such a cgroup either.
 //!
 //! ```no_run
 //! use std::time::Duration;
@@ -57,7 +59,7 @@
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use super::spawn::Cgroup;
@@ -75,6 +77,19 @@ const PIDS_CURRENT: &str = "pids.current";
 const COUNT_CAPACITY: usize = 32;
 /// The interval between two checks of a settling cgroup.
 const SETTLE_INTERVAL: Duration = Duration::from_millis(10);
+
+/// The turns of the process's removals of execution cgroups, and of its preparations of
+/// execution cgroups of their own, which take them one at a time: see
+/// [`ExecutionCgroup::remove`].
+static TURNS: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+thread_local! {
+    /// What the next turn on this thread runs once it found its cgroup, before it acts on the
+    /// cgroup's path: the pause in which a test races it.
+    static PAUSE: std::cell::Cell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::Cell::new(None) };
+}
 
 /// The cgroups that a guest init or agent uses: its own, and the workload cgroup in which or
 /// below which its executions run.
@@ -202,7 +217,9 @@ impl ExecutionCgroup {
     /// before anything changes. A failure once the execution's own cgroup exists, such as a value
     /// that the kernel refuses, removes that cgroup again, so that its name can be prepared anew;
     /// the workload cgroup stays, with the controllers that it enabled, as the executions share
-    /// it.
+    /// it. The preparation of a cgroup of the execution's own takes its turn with the process's
+    /// removals, as [`remove`](Self::remove) describes, so that the handle holds the cgroup that
+    /// it created, and a failure removes that cgroup alone.
     pub fn prepare(
         layout: &Layout,
         name: Option<&str>,
@@ -219,8 +236,12 @@ impl ExecutionCgroup {
         let files = || std::iter::once(PIDS_CURRENT).chain(resources.iter().map(|(file, _)| *file));
         create(&layout.workload, false)?;
         provide(&layout.workload, above_workload, files())?;
+        // In its turn, no removal of the process removes the new cgroup, so its path names it.
+        let _turn = name.map(|_| turn());
         if name.is_some() {
             create(&path, true)?;
+            #[cfg(test)]
+            pause();
         }
         let prepared = Self::open(layout, name).and_then(|execution| {
             execution.configure(files(), resources)?;
@@ -341,12 +362,19 @@ impl ExecutionCgroup {
     /// Removes the execution's own cgroup unless it is gone already, and fails with `EBUSY`
     /// while a process, a zombie included, or a cgroup is left in it, so that a removal never
     /// hides a status that the caller has yet to collect. An execution that runs in the workload
-    /// cgroup itself leaves it in place, and a cgroup that the caller prepared at the path of a
-    /// removed one stays.
+    /// cgroup itself leaves it in place.
+    ///
+    /// The removal names the cgroup by its path, which no other cgroup takes while the cgroup
+    /// exists, as cgroup v2 never renames one. So the process's removals take turns, with its
+    /// preparations of cgroups of the executions' own: in its turn, a removal finds its cgroup
+    /// still there before it removes the cgroup at its path, and a cgroup that the caller
+    /// prepared at the path of a removed one stays, even when clones of one handle remove the
+    /// cgroup at once.
     pub fn remove(&self) -> io::Result<()> {
         if !self.own {
             return Ok(());
         }
+        let _turn = turn();
         match self.is_occupied(Scope::Execution) {
             Ok(false) => {}
             Ok(true) => return Err(Errno::EBUSY.into()),
@@ -355,6 +383,8 @@ impl ExecutionCgroup {
             }
             Err(error) => return Err(error),
         }
+        #[cfg(test)]
+        pause();
         match fs::remove_dir(&self.path) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
             result => result,
@@ -374,6 +404,20 @@ impl ExecutionCgroup {
             (Scope::Workload, Some(workload)) => workload,
             _ => &self.directories.execution,
         }
+    }
+}
+
+/// Waits for the process's turn to remove an execution's own cgroup, or to prepare one, which
+/// lasts until the guard drops.
+fn turn() -> MutexGuard<'static, ()> {
+    TURNS.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Runs the pause that a test set for this thread's next turn, if any.
+#[cfg(test)]
+fn pause() {
+    if let Some(pause) = PAUSE.take() {
+        pause();
     }
 }
 
@@ -1162,5 +1206,95 @@ mod tests {
             .unwrap();
         assert_eq!(sibling.status().unwrap().signal(), Some(nix::libc::SIGKILL));
         second.remove().unwrap();
+    }
+
+    /// Runs `racer` on another thread once this thread's next turn pauses, and lets the turn go
+    /// on once `racer` has returned, or after half a second, as it does when the turn holds the
+    /// racer off. Joining the thread returns what `racer` returned, or `None` if no turn paused.
+    fn race<T: Send + 'static>(
+        racer: impl FnOnce() -> T + Send + 'static,
+    ) -> std::thread::JoinHandle<Option<T>> {
+        let (go, start) = std::sync::mpsc::channel();
+        let (finished, done) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            start.recv().ok()?;
+            let result = racer();
+            let _ = finished.send(());
+            Some(result)
+        });
+        PAUSE.set(Some(Box::new(move || {
+            go.send(()).unwrap();
+            let _ = done.recv_timeout(Duration::from_millis(500));
+        })));
+        thread
+    }
+
+    /// Returns what the racer of `thread` returned, once no turn of this thread is left to pause.
+    fn finish<T>(thread: std::thread::JoinHandle<Option<T>>) -> T {
+        drop(PAUSE.take());
+        thread.join().unwrap().expect("the turn paused")
+    }
+
+    #[test]
+    fn a_removal_leaves_a_cgroup_prepared_at_its_path_by_a_concurrent_one() {
+        // The test changes the real hierarchy, which needs root; elsewhere it does nothing.
+        let Some(workload) = RealWorkload::new("removals") else {
+            return;
+        };
+        let layout = workload.0.clone();
+        let first = ExecutionCgroup::prepare(&layout, Some("exec"), &[]).unwrap();
+        let delayed = first.clone();
+        // Once the delayed clone found the cgroup empty, the racer removes it through the other
+        // clone and prepares another of the same name, unless the delayed removal holds it off.
+        let racer = race({
+            let layout = layout.clone();
+            move || {
+                first.remove().unwrap();
+                ExecutionCgroup::prepare(&layout, Some("exec"), &[]).unwrap()
+            }
+        });
+        delayed.remove().unwrap();
+        let replacement = finish(racer);
+        assert!(replacement.path().is_dir());
+        assert!(!replacement.is_occupied(Scope::Execution).unwrap());
+        replacement.remove().unwrap();
+        assert!(!replacement.path().exists());
+    }
+
+    #[test]
+    fn a_failed_preparation_removes_its_own_cgroup_alone() {
+        // The test changes the real hierarchy, which needs root; elsewhere it does nothing.
+        let Some(workload) = RealWorkload::new("preparations") else {
+            return;
+        };
+        let layout = workload.0.clone();
+        // A first preparation gives the workload cgroup's children the `pids` controller.
+        ExecutionCgroup::prepare(&layout, Some("first"), &[])
+            .unwrap()
+            .remove()
+            .unwrap();
+        // Once the preparation created its cgroup, the racer opens that cgroup, removes it, and
+        // prepares another of the same name, unless the preparation holds it off. The preparation
+        // then fails, as the kernel refuses its value, and removes its cgroup again.
+        let racer = race({
+            let layout = layout.clone();
+            move || {
+                let opened = ExecutionCgroup::open(&layout, Some("exec")).unwrap();
+                opened.remove().unwrap();
+                ExecutionCgroup::prepare(&layout, Some("exec"), &[]).unwrap()
+            }
+        });
+        assert_eq!(
+            error(ExecutionCgroup::prepare(
+                &layout,
+                Some("exec"),
+                &[("pids.max", "-1")]
+            )),
+            Some(Errno::EINVAL as i32)
+        );
+        let replacement = finish(racer);
+        assert!(replacement.path().is_dir());
+        assert!(!replacement.is_occupied(Scope::Execution).unwrap());
+        replacement.remove().unwrap();
     }
 }
