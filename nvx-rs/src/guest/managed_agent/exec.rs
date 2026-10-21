@@ -85,7 +85,7 @@ pub(crate) fn run(
     }
     if launch_failed {
         cgroup::terminate(system, config.direct, child.process());
-        let _ = child.wait();
+        wait_ended(system, &mut child);
         unlink_barrier(system);
         return session.send_error(request_id, 125, LAUNCH_FAILED);
     }
@@ -122,7 +122,7 @@ pub(crate) fn run(
                 Ok(control) => control,
                 Err(error) => {
                     cgroup::terminate(system, config.direct, child.process());
-                    let _ = child.wait();
+                    wait_ended(system, &mut child);
                     return Err(error);
                 }
             };
@@ -173,8 +173,13 @@ pub(crate) fn run(
             timed_out = true;
             cgroup::terminate(system, config.direct, child.process());
         }
-        if (timed_out || output_limited || cancelled || session_lost) && child.status().is_none() {
-            let _ = child.wait();
+        // The outcome is the cause for which the agent ended the workload, so a status that it
+        // cannot collect only ends the loop, which would otherwise wait for it forever.
+        if (timed_out || output_limited || cancelled || session_lost)
+            && child.status().is_none()
+            && !wait_ended(system, &mut child)
+        {
+            break;
         }
     }
 
@@ -233,6 +238,19 @@ pub(crate) fn run(
                 (None, None) => session.send_app(APP_EXIT, request_id, 125, b"failed"),
             },
             None => session.send_app(APP_EXIT, request_id, 125, b"failed"),
+        }
+    }
+}
+
+/// Waits until the workload that the agent ended has ended, and returns whether its status is
+/// known. A failure to collect it, which leaves the agent without the status, is the
+/// `exec-wait` diagnostic.
+fn wait_ended(system: &mut impl System, child: &mut Child) -> bool {
+    match child.wait() {
+        Ok(_) => true,
+        Err(error) => {
+            super::diagnostics::error(system, "exec-wait", sys::errno_of(&error) as i32);
+            false
         }
     }
 }

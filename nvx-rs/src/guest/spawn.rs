@@ -184,6 +184,18 @@ impl Cgroup {
         )?;
         Ok(Self { procs })
     }
+
+    /// Opens the membership file of the cgroup v2 whose directory `directory` holds open, so
+    /// that a child joins that cgroup even once another cgroup takes its path.
+    pub(crate) fn open_in(directory: &FileDescriptor) -> io::Result<Self> {
+        let procs = sys::open_at(
+            directory,
+            c"cgroup.procs",
+            OpenFlags::O_WRONLY | OpenFlags::O_CLOEXEC,
+            Mode::empty(),
+        )?;
+        Ok(Self { procs })
+    }
 }
 
 /// A program, and how a new process starts it.

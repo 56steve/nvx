@@ -24,8 +24,12 @@
 //! Occupancy is the cgroup's `pids.current`, which counts every process that the cgroup charges,
 //! a zombie that no process has collected included. The library collects no status: settling
 //! calls the caller's own status collector between its checks, as [`process`](super::process)
-//! describes. Each operation opens the cgroup's interface files anew, so a handle stays valid
-//! whatever else changes the cgroup.
+//! describes.
+//!
+//! A handle holds the directories of its cgroups open, from when it was
+//! [opened](ExecutionCgroup::open), and each operation opens the interface files that it uses in
+//! them anew. So a handle stays valid whatever controllers its cgroup gains, and reaches its own
+//! cgroups alone, even once the caller removes one and prepares another at its path.
 //!
 //! ```no_run
 //! use std::time::Duration;
@@ -53,10 +57,11 @@
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::spawn::Cgroup;
-use super::sys::{self, Errno, Mode, OpenFlags, ProcessId};
+use super::sys::{self, Errno, FileDescriptor, Mode, OpenFlags, ProcessId};
 
 /// A cgroup's membership file.
 const PROCS: &str = "cgroup.procs";
@@ -127,42 +132,55 @@ pub enum Scope {
 
 /// The handle of one execution's cgroup: the workload cgroup itself, or a child cgroup of it.
 ///
-/// It names the cgroup by its path, and dropping it changes nothing.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// It holds the directory of the execution's cgroup open, and the workload cgroup's for an
+/// execution with a cgroup of its own, as [`open`](Self::open) found them, and each operation
+/// opens the interface files that it uses in them. So it reaches those cgroups alone, even once
+/// another cgroup takes one of their paths: a cgroup that was removed has no interface file any
+/// more, and an operation on it fails with `ENOENT`. Clones share the directories, and dropping
+/// the last one closes them, but neither kills nor removes the cgroup: the caller does that with
+/// [`kill`](Self::kill), [`settle`](Self::settle), which takes its status collector, and
+/// [`remove`](Self::remove), and sees their failures.
+#[derive(Clone, Debug)]
 pub struct ExecutionCgroup {
-    /// The execution's cgroup.
+    /// The path of the execution's cgroup.
     path: PathBuf,
-    /// The workload cgroup.
+    /// The path of the workload cgroup.
     workload: PathBuf,
     /// Whether the execution has a cgroup of its own below the workload cgroup.
     own: bool,
+    /// The directories of the cgroups, which the clones share.
+    directories: Arc<Directories>,
+}
+
+/// The open directories of an [`ExecutionCgroup`]'s cgroups.
+#[derive(Debug)]
+struct Directories {
+    /// The execution's cgroup.
+    execution: FileDescriptor,
+    /// The workload cgroup, for an execution with a cgroup of its own; otherwise `execution`
+    /// names it.
+    workload: Option<FileDescriptor>,
 }
 
 impl ExecutionCgroup {
-    /// Names the cgroup of an execution in `layout`, without changing the hierarchy: the
-    /// workload cgroup itself, or, with `name`, its child cgroup `name`.
+    /// Opens the cgroup of an execution in `layout`, without changing the hierarchy: the
+    /// workload cgroup itself, or, with `name`, its child cgroup `name`. It holds the directory
+    /// of that cgroup open, and the workload cgroup's for a child cgroup, so both must exist.
     ///
     /// A name that is not one path component, such as an empty one, `.`, `..`, or one with a
-    /// `/` or a NUL, is `EINVAL`.
+    /// `/` or a NUL, is `EINVAL`, and a cgroup that does not exist `ENOENT`.
     pub fn open(layout: &Layout, name: Option<&str>) -> io::Result<Self> {
-        let path = match name {
-            None => layout.workload.clone(),
-            Some(name) => {
-                let mut components = Path::new(name).components();
-                if name.contains('\0')
-                    || !matches!(components.next(), Some(Component::Normal(_)))
-                    || components.next().is_some()
-                    || name.contains('/')
-                {
-                    return Err(Errno::EINVAL.into());
-                }
-                layout.workload.join(name)
-            }
-        };
+        let path = execution_path(layout, name)?;
+        let workload = name.map(|_| open_directory(&layout.workload)).transpose()?;
+        let execution = open_directory(&path)?;
         Ok(Self {
             path,
             workload: layout.workload.clone(),
             own: name.is_some(),
+            directories: Arc::new(Directories {
+                execution,
+                workload,
+            }),
         })
     }
 
@@ -193,7 +211,7 @@ impl ExecutionCgroup {
         for (file, _) in resources {
             controller(file)?;
         }
-        let execution = Self::open(layout, name)?;
+        let path = execution_path(layout, name)?;
         let above_workload = layout
             .workload
             .parent()
@@ -201,17 +219,18 @@ impl ExecutionCgroup {
         let files = || std::iter::once(PIDS_CURRENT).chain(resources.iter().map(|(file, _)| *file));
         create(&layout.workload, false)?;
         provide(&layout.workload, above_workload, files())?;
-        if execution.own {
-            create(&execution.path, true)?;
+        if name.is_some() {
+            create(&path, true)?;
         }
-        if let Err(error) = execution.configure(files(), resources) {
-            if execution.own {
-                // The new cgroup holds no process yet.
-                let _ = fs::remove_dir(&execution.path);
-            }
-            return Err(error);
+        let prepared = Self::open(layout, name).and_then(|execution| {
+            execution.configure(files(), resources)?;
+            Ok(execution)
+        });
+        if prepared.is_err() && name.is_some() {
+            // The new cgroup holds no process yet.
+            let _ = fs::remove_dir(&path);
         }
-        Ok(execution)
+        prepared
     }
 
     /// Gives the execution's own cgroup, if it has one, the interface files `files` through the
@@ -227,7 +246,7 @@ impl ExecutionCgroup {
         for (file, value) in resources {
             // Writing nothing would reach no controller.
             let value = if value.is_empty() { "\n" } else { value };
-            write(&self.path.join(file), value.as_bytes())?;
+            write_in(&self.directories.execution, file, value.as_bytes())?;
         }
         Ok(())
     }
@@ -241,7 +260,7 @@ impl ExecutionCgroup {
     /// the execution's cgroup before its program runs, so that the program and its descendants
     /// start in it.
     pub fn placement(&self) -> io::Result<Cgroup> {
-        Cgroup::open(&self.path)
+        Cgroup::open_in(&self.directories.execution)
     }
 
     /// Moves the process `id`, with all of its threads, into the execution's cgroup. An ID of 0,
@@ -249,7 +268,7 @@ impl ExecutionCgroup {
     pub fn place(&self, id: u32) -> io::Result<()> {
         let process = ProcessId::from_positive(i64::from(id))
             .ok_or_else(|| io::Error::from(Errno::EINVAL))?;
-        write(&self.path.join(PROCS), &process.line())
+        write_in(&self.directories.execution, PROCS, &process.line())
     }
 
     /// Returns whether `scope` holds a process, a zombie that no process has collected included.
@@ -257,12 +276,7 @@ impl ExecutionCgroup {
     /// It reads `pids.current`, which must be one canonical decimal and a newline: another form
     /// is `EPROTO`, and one of more than 31 bytes `EOVERFLOW`.
     pub fn is_occupied(&self, scope: Scope) -> io::Result<bool> {
-        let path = sys::path_c_string(&self.scope(scope).join(PIDS_CURRENT))?;
-        let descriptor = sys::open(
-            &path,
-            OpenFlags::O_RDONLY | OpenFlags::O_CLOEXEC,
-            Mode::empty(),
-        )?;
+        let descriptor = open_file(self.directory(scope), PIDS_CURRENT, OpenFlags::O_RDONLY)?;
         let mut buffer = [0u8; COUNT_CAPACITY];
         let mut length = 0;
         let result = loop {
@@ -288,7 +302,7 @@ impl ExecutionCgroup {
     /// process that one of them forks meanwhile. It does not wait for them to end: see
     /// [`settle`](Self::settle).
     pub fn kill(&self, scope: Scope) -> io::Result<()> {
-        write(&self.scope(scope).join(KILL), b"1")
+        write_in(self.directory(scope), KILL, b"1")
     }
 
     /// Waits at most `timeout` until `scope` holds no process, and fails with `ETIMEDOUT` if one
@@ -327,7 +341,8 @@ impl ExecutionCgroup {
     /// Removes the execution's own cgroup unless it is gone already, and fails with `EBUSY`
     /// while a process, a zombie included, or a cgroup is left in it, so that a removal never
     /// hides a status that the caller has yet to collect. An execution that runs in the workload
-    /// cgroup itself leaves it in place.
+    /// cgroup itself leaves it in place, and a cgroup that the caller prepared at the path of a
+    /// removed one stays.
     pub fn remove(&self) -> io::Result<()> {
         if !self.own {
             return Ok(());
@@ -335,7 +350,7 @@ impl ExecutionCgroup {
         match self.is_occupied(Scope::Execution) {
             Ok(false) => {}
             Ok(true) => return Err(Errno::EBUSY.into()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound && !self.path.exists() => {
+            Err(error) if error.kind() == io::ErrorKind::NotFound && self.is_removed() => {
                 return Ok(());
             }
             Err(error) => return Err(error),
@@ -346,13 +361,71 @@ impl ExecutionCgroup {
         }
     }
 
+    /// Returns whether the execution's cgroup was removed, which leaves its directory without
+    /// even the membership file that every cgroup has.
+    fn is_removed(&self) -> bool {
+        open_file(&self.directories.execution, PROCS, OpenFlags::O_RDONLY)
+            .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
+    }
+
     /// Returns the directory of the cgroup that `scope` covers.
-    fn scope(&self, scope: Scope) -> &Path {
-        match scope {
-            Scope::Execution => &self.path,
-            Scope::Workload => &self.workload,
+    fn directory(&self, scope: Scope) -> &FileDescriptor {
+        match (scope, &self.directories.workload) {
+            (Scope::Workload, Some(workload)) => workload,
+            _ => &self.directories.execution,
         }
     }
+}
+
+/// Returns the path of an execution's cgroup in `layout`: the workload cgroup itself, or its
+/// child cgroup `name`, which is one path component, or `EINVAL`.
+fn execution_path(layout: &Layout, name: Option<&str>) -> io::Result<PathBuf> {
+    let Some(name) = name else {
+        return Ok(layout.workload.clone());
+    };
+    let mut components = Path::new(name).components();
+    if name.contains('\0')
+        || !matches!(components.next(), Some(Component::Normal(_)))
+        || components.next().is_some()
+        || name.contains('/')
+    {
+        return Err(Errno::EINVAL.into());
+    }
+    Ok(layout.workload.join(name))
+}
+
+/// Opens the directory of the cgroup at `path`, which names that cgroup from then on, whatever
+/// takes its path.
+fn open_directory(path: &Path) -> io::Result<FileDescriptor> {
+    Ok(sys::open(
+        &sys::path_c_string(path)?,
+        OpenFlags::O_RDONLY | OpenFlags::O_DIRECTORY | OpenFlags::O_CLOEXEC,
+        Mode::empty(),
+    )?)
+}
+
+/// Opens the interface file `file` of the cgroup whose directory `directory` holds, with `flags`.
+fn open_file(
+    directory: &FileDescriptor,
+    file: &str,
+    flags: OpenFlags,
+) -> io::Result<FileDescriptor> {
+    let name = sys::c_string(file.as_bytes())?;
+    Ok(sys::open_at(
+        directory,
+        &name,
+        flags | OpenFlags::O_CLOEXEC,
+        Mode::empty(),
+    )?)
+}
+
+/// Writes a whole control value to the interface file `file` of the cgroup whose directory
+/// `directory` holds, and reports a failure to close it, with which the kernel may refuse the
+/// value.
+fn write_in(directory: &FileDescriptor, file: &str, bytes: &[u8]) -> io::Result<()> {
+    let descriptor = open_file(directory, file, OpenFlags::O_WRONLY)?;
+    descriptor.write_all(bytes)?;
+    Ok(descriptor.close()?)
 }
 
 /// Returns whether `path` is absolute and has no `..` component, so that its components name
@@ -558,10 +631,11 @@ mod tests {
 
     #[test]
     fn executions_run_in_the_workload_cgroup_or_in_one_child_of_it() {
-        let layout = Layout::new("/sys/fs/cgroup", "/sys/fs/cgroup/workloads").unwrap();
+        let (_temporary, layout) = hierarchy();
         let workload = ExecutionCgroup::open(&layout, None).unwrap();
         assert_eq!(workload.path(), layout.workload());
         for name in ["exec-1", "exec.1", "..."] {
+            fs::create_dir(layout.workload().join(name)).unwrap();
             let execution = ExecutionCgroup::open(&layout, Some(name)).unwrap();
             assert_eq!(execution.path(), layout.workload().join(name));
         }
@@ -577,6 +651,21 @@ mod tests {
                 "{name:?}"
             );
         }
+        // A handle holds its cgroups' directories, which must exist.
+        assert_eq!(
+            error(ExecutionCgroup::open(&layout, Some("missing"))),
+            Some(Errno::ENOENT as i32)
+        );
+        fs::write(layout.workload().join("file"), b"").unwrap();
+        assert_eq!(
+            error(ExecutionCgroup::open(&layout, Some("file"))),
+            Some(Errno::ENOTDIR as i32)
+        );
+        let missing = Layout::new(layout.agent(), layout.agent().join("missing")).unwrap();
+        assert_eq!(
+            error(ExecutionCgroup::open(&missing, None)),
+            Some(Errno::ENOENT as i32)
+        );
     }
 
     #[test]
@@ -818,12 +907,39 @@ mod tests {
         for id in [0, u32::MAX] {
             assert_eq!(error(execution.place(id)), Some(Errno::EINVAL as i32));
         }
-        assert!(
-            ExecutionCgroup::open(&layout, Some("missing"))
-                .unwrap()
-                .placement()
-                .is_err()
-        );
+    }
+
+    #[test]
+    fn a_handle_reaches_its_own_cgroups_alone_once_another_takes_a_path() {
+        let (_temporary, layout) = hierarchy();
+        let old = fake_execution(&layout, "exec-1", b"0\n");
+        let clone = old.clone();
+        // The caller removes the cgroup, as `remove` does in a real hierarchy, and prepares
+        // another of the same name.
+        fs::remove_dir_all(old.path()).unwrap();
+        let new = fake_execution(&layout, "exec-1", b"1\n");
+        for handle in [&old, &clone] {
+            assert_eq!(
+                error(handle.kill(Scope::Execution)),
+                Some(Errno::ENOENT as i32)
+            );
+            assert_eq!(
+                error(handle.is_occupied(Scope::Execution)),
+                Some(Errno::ENOENT as i32)
+            );
+            assert_eq!(error(handle.place(1)), Some(Errno::ENOENT as i32));
+            assert_eq!(error(handle.placement()), Some(Errno::ENOENT as i32));
+            handle.remove().unwrap();
+        }
+        assert!(new.path().is_dir());
+        assert_eq!(fs::read(new.path().join(KILL)).unwrap(), b"");
+        assert_eq!(fs::read(new.path().join(PROCS)).unwrap(), b"");
+        assert!(new.is_occupied(Scope::Execution).unwrap());
+        // The workload cgroup is still the one that the old handle opened.
+        old.kill(Scope::Workload).unwrap();
+        assert_eq!(fs::read(layout.workload().join(KILL)).unwrap(), b"1");
+        new.kill(Scope::Execution).unwrap();
+        assert_eq!(fs::read(new.path().join(KILL)).unwrap(), b"1");
     }
 
     #[test]
@@ -1021,6 +1137,19 @@ mod tests {
         assert!(rest.is_empty());
         first.remove().unwrap();
         assert!(!first.path().exists());
+        // A cgroup prepared at the removed one's path is out of the old handle's reach.
+        let again = ExecutionCgroup::prepare(layout, Some("first"), &[]).unwrap();
+        assert_eq!(
+            error(first.kill(Scope::Execution)),
+            Some(Errno::ENOENT as i32)
+        );
+        assert_eq!(
+            error(first.is_occupied(Scope::Execution)),
+            Some(Errno::ENOENT as i32)
+        );
+        first.remove().unwrap();
+        assert!(again.path().is_dir());
+        again.remove().unwrap();
         assert_eq!(sibling.try_wait().unwrap(), None);
         assert!(second.is_occupied(Scope::Execution).unwrap());
 

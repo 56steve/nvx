@@ -1,4 +1,3 @@
-use std::io;
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process::ExitStatus;
@@ -93,15 +92,15 @@ pub(crate) fn reap(child: &mut Child) {
 }
 
 /// Collects the status of every child that has ended once the workload's status is known, when
-/// every child left is an orphaned descendant.
-fn reap_orphans() -> io::Result<()> {
+/// every child left is an orphaned descendant. Like the C agent's loop, it stops once no ended
+/// child is left to collect, and has no failure to report.
+fn reap_orphans() {
     while sys::reap_any_nonblocking().is_some() {}
-    Ok(())
 }
 
 /// Reaps orphaned descendants and returns the cgroup's current occupancy.
 pub(crate) fn verify_empty(system: &impl System) -> Result<bool, Errno> {
-    let _ = reap_orphans();
+    reap_orphans();
     has_tasks(system)
 }
 
@@ -109,7 +108,10 @@ pub(crate) fn verify_empty(system: &impl System) -> Result<bool, Errno> {
 pub(crate) fn settle(system: &mut impl System) -> Result<(), Errno> {
     kill(system)?;
     execution(system.paths())?
-        .settle(Scope::Workload, SETTLE_TIMEOUT, reap_orphans)
+        .settle(Scope::Workload, SETTLE_TIMEOUT, || {
+            reap_orphans();
+            Ok(())
+        })
         .map_err(|error| sys::errno_of(&error))
 }
 
