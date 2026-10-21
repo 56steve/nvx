@@ -116,8 +116,8 @@ runs `tests/guest_tools.rs` against the exact guest-profile binaries. Tests of t
 mechanics, such as the golden fixtures of the control protocol, belong in
 `nvx`, and tests of the ACI Edge Sandboxes contract in
 `aci_edge_sandboxes`. Tests of what an independent adapter observes through
-the public API of `nvx` alone, such as the consumer-contract scenarios of
-[microsoft/nvx#535](https://github.com/microsoft/nvx/issues/535), belong in the
+the public API of `nvx` alone, such as its own framing over the control
+session between the host and the guest, belong in the
 [runtime adapter](../tests/runtime-adapter/README.md), whose ignored tests the
 microVM jobs run on each backend. The `scripts/nvx.py test-aci-edge-sandboxes --backend
 BACKEND` command runs all ignored `openvmm_e2e` tests on a real hypervisor,

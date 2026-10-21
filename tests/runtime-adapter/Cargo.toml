@@ -14,9 +14,9 @@ publish = false
 # No default features: each configuration selects one side of `nvx`, as an independent adapter
 # does. Without features, the adapter builds against the protocol-only `nvx`.
 default = []
-# The host half: the host API of `nvx` and the `runtime-adapter-host` binary.
+# The host program: the host API of `nvx` and the `runtime-adapter-host` binary.
 host = ["nvx/host"]
-# The guest half: the guest API of `nvx` and the `runtime-adapter-guest` binary, which builds as a
+# The guest agent: the guest API of `nvx` and the `runtime-adapter-guest` binary, which builds as a
 # static `x86_64-unknown-linux-musl` executable.
 guest = ["nvx/guest"]
 

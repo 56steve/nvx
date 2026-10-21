@@ -143,8 +143,8 @@ runs:
         python3 ../scripts/nvx.py test-guest-binaries --binaries "${directory}"
 
     # The runtime adapter builds on nvx-rs as an independent adapter does: with a lockfile of its
-    # own, default features off, and the public API only. Its tests check consumer-contract
-    # scenario C0 in each configuration, which also builds with nvx-rs's minimum Rust version.
+    # own, default features off, and the public API only. Its tests check that each configuration
+    # builds that way, and each configuration also builds with nvx-rs's minimum Rust version.
     - name: Check the runtime adapter's protocol-only configuration
       shell: bash
       working-directory: tests/runtime-adapter
@@ -168,7 +168,7 @@ runs:
         cargo "+${{ steps.toolchains.outputs.toolchain }}" test --locked --features host
         cargo "+${{ steps.toolchains.outputs.msrv }}" check --locked --all-targets --features host
 
-    # The guest half runs in Linux guests, as a static executable that a test checks.
+    # The guest agent runs in Linux guests, as a static executable that a test checks.
     - name: Check the runtime adapter's guest-only configuration
       if: runner.os == 'Linux'
       shell: bash

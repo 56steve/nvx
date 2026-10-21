@@ -161,8 +161,8 @@ nvx/
 |   `-- test_*.py                Python tooling unit tests
 |-- tests/                       Tests that build on the repository's crates from outside them
 |   `-- runtime-adapter/         Rust crate `runtime-adapter`, an independent adapter of nvx
-|       |-- src/                 Its library, and its host and guest skeleton binaries
-|       `-- tests/               Consumer-contract scenario C0, the independent build
+|       |-- src/                 Its framing, its host program, and its guest agent
+|       `-- tests/               Its independent build, and its guest agent against a test broker
 |-- SECURITY.md                 Microsoft security vulnerability reporting policy
 |-- .dockerignore                Docker build-context exclusions
 |-- .gitattributes               Git path attributes
@@ -335,8 +335,9 @@ Tests that build on the repository's crates from outside them.
 crate with its own `Cargo.lock` that depends on `nvx` with default features
 off and uses its public API only. Its protocol-only, host-only, and guest-only
 configurations build in CI, and its tests check that each one builds as an
-independent adapter's does. See its
-[README](../tests/runtime-adapter/README.md).
+independent adapter's does. Its guest agent serves the control session between
+the host and the guest with the adapter's own framing, which its tests check
+against a test broker. See its [README](../tests/runtime-adapter/README.md).
 
 ## Root files
 
