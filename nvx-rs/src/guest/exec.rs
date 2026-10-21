@@ -33,7 +33,8 @@
 //! uses up as much of the stream's allowance, which the caller grants again as its sink takes
 //! the bytes; a caller whose peer grants credit grants what the peer credits. The execution reads
 //! into a buffer that the caller lends and holds no input, so its memory stays bounded. A stream
-//! that the caller [discards](Execution::discard) is read and dropped instead.
+//! that the caller [discards](Execution::discard) is read into the same buffer and dropped
+//! instead, so the buffer bounds every read.
 //!
 //! # Status and ending
 //!
@@ -98,9 +99,6 @@ use super::cgroup::{ExecutionCgroup, Scope};
 use super::process::Child;
 use super::spawn::{LaunchFailure, LaunchReport, Spawned};
 use super::sys::{self, Errno, FileDescriptor, ProcessId};
-
-/// The bytes that the execution reads at a time from a stream that it discards.
-const DISCARD_CHUNK: usize = 8 * 1024;
 
 /// One of a program's output streams.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -388,7 +386,7 @@ enum Read {
     Idle,
     /// The execution read this many bytes into the caller's buffer.
     Data(usize),
-    /// The execution read and dropped this many bytes.
+    /// The execution read this many bytes into the caller's buffer, and dropped them.
     Discarded(usize),
     /// Every writer closed the stream.
     Closed,
@@ -418,33 +416,33 @@ impl Output {
         self.is_open() && (self.discarding || self.allowance > 0)
     }
 
-    /// Reads the stream once, into `buffer` as far as the allowance lets it, or into a buffer
-    /// of its own that it drops.
+    /// Reads the stream once into `buffer`: as far as the allowance lets it, or, while the
+    /// execution discards the stream, as far as the buffer goes, dropping what it read.
     fn read(&mut self, buffer: &mut [u8]) -> Read {
         if !self.is_open() {
             return Read::Idle;
         }
-        if self.discarding {
-            let mut scratch = [0u8; DISCARD_CHUNK];
-            return match self.read_into(&mut scratch) {
-                Read::Data(length) => {
-                    self.discarded += length as u64;
-                    Read::Discarded(length)
-                }
-                other => other,
-            };
-        }
-        let length = self.allowance.min(buffer.len());
+        let length = if self.discarding {
+            buffer.len()
+        } else {
+            self.allowance.min(buffer.len())
+        };
         if length == 0 {
             return Read::Idle;
         }
-        let read = self.read_into(&mut buffer[..length]);
-        if let Read::Data(length) = read
-            && self.allowance != usize::MAX
-        {
-            self.allowance -= length;
+        match self.read_into(&mut buffer[..length]) {
+            Read::Data(length) if self.discarding => {
+                self.discarded += length as u64;
+                Read::Discarded(length)
+            }
+            Read::Data(length) => {
+                if self.allowance != usize::MAX {
+                    self.allowance -= length;
+                }
+                Read::Data(length)
+            }
+            other => other,
         }
-        read
     }
 
     /// Reads the open stream once into `buffer`, which is not empty, retrying interruptions.
@@ -576,9 +574,9 @@ impl Execution {
         output.allowance = output.allowance.saturating_add(bytes);
     }
 
-    /// Reads and drops the rest of `stream`, whatever its allowance, from the next event on.
-    /// The execution reports each read as [`Event::Discarded`], and counts the bytes in its
-    /// [`Outcome`].
+    /// Reads and drops the rest of `stream`, whatever its allowance, from the next event on. It
+    /// reads into the buffer that the caller lends [`next_event`](Self::next_event), as output
+    /// does, reports each read as [`Event::Discarded`], and counts the bytes in its [`Outcome`].
     pub fn discard(&mut self, stream: Stream) {
         self.outputs[stream.index()].discarding = true;
     }
@@ -718,8 +716,9 @@ impl Execution {
 
     /// Takes the next step of the execution without blocking, and returns its event, or `None`
     /// if no step can be taken until a descriptor polls readable, the deadline passes, or the
-    /// caller acts on the execution. Output events read into `buffer`, which bounds them; an
-    /// empty buffer reads no output, but discarding still proceeds.
+    /// caller acts on the execution. Every read of an output stream goes into `buffer`, which
+    /// bounds its event, whether the execution returns the bytes or discards them; an empty
+    /// buffer reads nothing.
     ///
     /// Within a step, the execution reports a failed kill first, then the launch report, then
     /// collects the program's status, unless the caller reaps the program, ends it if its

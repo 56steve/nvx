@@ -16,6 +16,10 @@ use crate::guest::spawn::{Command, LaunchStage};
 /// How long a test waits for an execution before it fails.
 const PATIENCE: Duration = Duration::from_secs(20);
 
+/// The most bytes that one event carries in these tests: the size of the buffer that they lend
+/// the execution, and the allowance that they grant each stream at a time.
+const MAX_EVENT_BYTES: usize = 4096;
+
 /// Returns a command that runs `/bin/sh -c script`, with `$0` set to `sh`.
 fn shell(script: &str) -> Command {
     Command::new(
@@ -71,7 +75,7 @@ impl Record {
     /// one. With `regrant`, it grants each stream's output back, as a sink that takes everything
     /// would.
     fn pump(&mut self, execution: &mut Execution, regrant: bool) -> bool {
-        let mut buffer = [0u8; 4096];
+        let mut buffer = [0u8; MAX_EVENT_BYTES];
         let mut progressed = false;
         while let Some(event) = execution.next_event(&mut buffer).unwrap() {
             progressed = true;
@@ -90,6 +94,8 @@ impl Record {
                     }
                 }
                 Event::Discarded(stream, length) => {
+                    // Discarding reads into the same buffer as output.
+                    assert!((1..=MAX_EVENT_BYTES).contains(&length), "{length}");
                     self.discarded[stream.index()] += length as u64;
                 }
                 Event::Closed(stream) => {
@@ -159,8 +165,8 @@ fn wait_any(executions: &[&Execution]) {
 /// returns what it saw.
 fn run(execution: &mut Execution) -> Record {
     let mut record = Record::default();
-    execution.grant(Stream::Stdout, 4096);
-    execution.grant(Stream::Stderr, 4096);
+    execution.grant(Stream::Stdout, MAX_EVENT_BYTES);
+    execution.grant(Stream::Stderr, MAX_EVENT_BYTES);
     record.drive_until(execution, true, |record, _| record.outcome.is_some());
     assert!(execution.descriptors().next().is_none());
     assert!(execution.next_event(&mut [0u8; 16]).unwrap().is_none());
@@ -241,8 +247,8 @@ fn concurrent_executions_progress_independently() {
         .collect::<Vec<_>>();
     let mut records = (0..16).map(|_| Record::default()).collect::<Vec<_>>();
     for (index, execution) in executions.iter_mut().enumerate() {
-        execution.grant(Stream::Stdout, 4096);
-        execution.grant(Stream::Stderr, 4096);
+        execution.grant(Stream::Stdout, MAX_EVENT_BYTES);
+        execution.grant(Stream::Stderr, MAX_EVENT_BYTES);
         let input = format!("input {index}\n");
         assert_eq!(
             execution.write_input(input.as_bytes()).unwrap(),
@@ -283,9 +289,9 @@ fn a_stalled_sink_stalls_only_its_own_execution_and_loses_nothing() {
         Options::new(),
     );
     let mut other = start(shell("printf done"), false, Options::new());
-    stalled.grant(Stream::Stderr, 4096);
-    other.grant(Stream::Stdout, 4096);
-    other.grant(Stream::Stderr, 4096);
+    stalled.grant(Stream::Stderr, MAX_EVENT_BYTES);
+    other.grant(Stream::Stdout, MAX_EVENT_BYTES);
+    other.grant(Stream::Stderr, MAX_EVENT_BYTES);
     let mut stalled_record = Record::default();
     let mut other_record = Record::default();
     let started = Instant::now();
@@ -312,7 +318,7 @@ fn a_stalled_sink_stalls_only_its_own_execution_and_loses_nothing() {
             .all(|(source, _)| source != Source::Output(Stream::Stdout))
     );
     // Once its sink takes output again, every byte arrives.
-    stalled.grant(Stream::Stdout, 4096);
+    stalled.grant(Stream::Stdout, MAX_EVENT_BYTES);
     stalled_record.drive_until(&mut stalled, true, |record, _| record.outcome.is_some());
     assert_eq!(stalled_record.output[0].len(), LENGTH);
     assert!(stalled_record.output[0].iter().all(|&byte| byte == 0));
@@ -329,7 +335,7 @@ fn cancellation_ends_a_stalled_program_and_the_caller_discards_the_rest() {
         true,
         Options::new(),
     );
-    execution.grant(Stream::Stderr, 4096);
+    execution.grant(Stream::Stderr, MAX_EVENT_BYTES);
     let mut record = Record::default();
     record.drive_until(&mut execution, false, |record, _| {
         record.output[1] == b"ready"
@@ -375,8 +381,8 @@ fn stdin_eof_follows_every_byte_that_a_write_took() {
         true,
         Options::new(),
     );
-    execution.grant(Stream::Stdout, 4096);
-    execution.grant(Stream::Stderr, 4096);
+    execution.grant(Stream::Stdout, MAX_EVENT_BYTES);
+    execution.grant(Stream::Stderr, MAX_EVENT_BYTES);
     let mut record = Record::default();
     let mut written = 0;
     let started = Instant::now();
@@ -547,7 +553,7 @@ fn a_disconnection_discards_the_output_and_ends_the_execution() {
 #[test]
 fn causes_count_only_while_the_program_runs() {
     let mut execution = start(shell("printf x"), false, Options::new());
-    execution.grant(Stream::Stderr, 4096);
+    execution.grant(Stream::Stderr, MAX_EVENT_BYTES);
     let mut record = Record::default();
     record.drive_until(&mut execution, false, |_, execution| {
         execution.status().is_some()
@@ -556,7 +562,7 @@ fn causes_count_only_while_the_program_runs() {
     assert!(record.outcome.is_none());
     assert!(!execution.cancel());
     assert!(!execution.terminate());
-    execution.grant(Stream::Stdout, 4096);
+    execution.grant(Stream::Stdout, MAX_EVENT_BYTES);
     record.drive_until(&mut execution, true, |record, _| record.outcome.is_some());
     assert_eq!(record.output[0], b"x");
     let outcome = record.outcome.unwrap();
@@ -596,8 +602,8 @@ fn a_caller_that_reaps_is_the_program_s_only_collector() {
         assert!(started.elapsed() < PATIENCE, "the program ended in time");
         std::thread::sleep(Duration::from_millis(1));
     }
-    execution.grant(Stream::Stdout, 4096);
-    execution.grant(Stream::Stderr, 4096);
+    execution.grant(Stream::Stdout, MAX_EVENT_BYTES);
+    execution.grant(Stream::Stderr, MAX_EVENT_BYTES);
     let mut record = Record::default();
     record.drive_until(&mut execution, true, |record, _| {
         record.launch.is_some() && record.closed.len() == 2
@@ -667,8 +673,8 @@ fn ending_the_program_ends_the_process_group_that_it_leads() {
         false,
         Options::new(),
     );
-    execution.grant(Stream::Stdout, 4096);
-    execution.grant(Stream::Stderr, 4096);
+    execution.grant(Stream::Stdout, MAX_EVENT_BYTES);
+    execution.grant(Stream::Stderr, MAX_EVENT_BYTES);
     let mut record = Record::default();
     record.drive_until(&mut execution, true, |record, _| {
         record.output[0] == b"started\n"
@@ -706,8 +712,8 @@ fn a_status_that_another_collector_took_first_is_left_to_it() {
             let error = execution.wait().unwrap_err();
             assert_eq!(error.raw_os_error(), Some(Errno::ECHILD as i32));
         }
-        execution.grant(Stream::Stdout, 4096);
-        execution.grant(Stream::Stderr, 4096);
+        execution.grant(Stream::Stdout, MAX_EVENT_BYTES);
+        execution.grant(Stream::Stderr, MAX_EVENT_BYTES);
         let mut record = Record::default();
         let mut buffer = [0u8; 64];
         let mut failures = 0;
@@ -782,8 +788,8 @@ fn the_program_s_end_closes_its_input_for_a_descendant_that_reads_it() {
         true,
         Options::new(),
     );
-    execution.grant(Stream::Stdout, 4096);
-    execution.grant(Stream::Stderr, 4096);
+    execution.grant(Stream::Stdout, MAX_EVENT_BYTES);
+    execution.grant(Stream::Stderr, MAX_EVENT_BYTES);
     let mut record = Record::default();
     record.drive_until(&mut execution, true, |_, execution| {
         execution.status().is_some()
@@ -915,8 +921,8 @@ fn the_cgroup_is_killed_once_another_collector_took_the_status_with_the_output_h
     // The fake cgroup ends nothing, so the test ends the descendant.
     descendant.assert_runs();
     assert!(execution.observe(id, status));
-    execution.grant(Stream::Stdout, 4096);
-    execution.grant(Stream::Stderr, 4096);
+    execution.grant(Stream::Stdout, MAX_EVENT_BYTES);
+    execution.grant(Stream::Stderr, MAX_EVENT_BYTES);
     record.drive_until(&mut execution, true, |record, _| record.outcome.is_some());
     let outcome = record.outcome.unwrap();
     assert!(outcome.status().success());
@@ -934,8 +940,8 @@ fn the_cgroup_is_killed_once_the_program_ends_with_its_output_held() {
         false,
         Options::new().cgroup(&cgroup, Scope::Execution),
     );
-    execution.grant(Stream::Stdout, 4096);
-    execution.grant(Stream::Stderr, 4096);
+    execution.grant(Stream::Stdout, MAX_EVENT_BYTES);
+    execution.grant(Stream::Stderr, MAX_EVENT_BYTES);
     let mut record = Record::default();
     record.drive_until(&mut execution, true, |record, execution| {
         execution.status().is_some() && !record.output[0].is_empty()
