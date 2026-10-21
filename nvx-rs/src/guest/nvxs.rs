@@ -133,12 +133,7 @@ impl<S: Read + Write> GuestConnection<S> {
 
     /// Sends the guest's attachment, which the broker answers with a RESET.
     pub fn attach(&mut self) -> Result<(), GuestConnectionError> {
-        self.check()?;
-        self.output.clear();
-        self.session
-            .attach(&mut self.output)
-            .map_err(GuestConnectionError::Protocol)?;
-        self.write()
+        self.send_record(GuestSession::attach)
     }
 
     /// Blocks until the broker's next record completes, and returns its event.
@@ -182,12 +177,7 @@ impl<S: Read + Write> GuestConnection<S> {
     /// [`OUTER_MAX_RECEIVE_WINDOW`](crate::protocol::OUTER_MAX_RECEIVE_WINDOW), once the guest
     /// abandoned the work of the earlier epoch.
     pub fn acknowledge(&mut self, window: u32) -> Result<(), GuestConnectionError> {
-        self.check()?;
-        self.output.clear();
-        self.session
-            .acknowledge(window, &mut self.output)
-            .map_err(GuestConnectionError::Protocol)?;
-        self.write()
+        self.send_record(|session, output| session.acknowledge(window, output))
     }
 
     /// Sends `data` to the host in as many DATA records as it takes, of at most
@@ -216,11 +206,19 @@ impl<S: Read + Write> GuestConnection<S> {
     /// Returns `bytes` consumed DATA bytes to the receive window, from 1 through the session's
     /// [`outstanding`](GuestSession::outstanding) bytes.
     pub fn credit(&mut self, bytes: u32) -> Result<(), GuestConnectionError> {
+        self.send_record(|session, output| session.credit(bytes, output))
+    }
+
+    /// Encodes one record with `encode`, which appends it to the output through the session, and
+    /// writes it, unless an earlier failure ended the connection. A record that the session
+    /// refuses changes nothing.
+    fn send_record(
+        &mut self,
+        encode: impl FnOnce(&mut GuestSession, &mut Vec<u8>) -> Result<(), SessionError>,
+    ) -> Result<(), GuestConnectionError> {
         self.check()?;
         self.output.clear();
-        self.session
-            .credit(bytes, &mut self.output)
-            .map_err(GuestConnectionError::Protocol)?;
+        encode(&mut self.session, &mut self.output).map_err(GuestConnectionError::Protocol)?;
         self.write()
     }
 
