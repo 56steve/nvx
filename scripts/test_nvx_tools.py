@@ -3079,14 +3079,23 @@ class CiTests(unittest.TestCase):
                 patch.object(ci, "require_tool", return_value="cargo"),
                 patch.object(ci, "run_capture", return_value=fuzz_crates) as capture,
                 patch.object(ci, "run_checked") as run_checked,
+                patch.dict(os.environ, {"NVX_TEST_VARIABLE": "1"}, clear=True),
             ):
                 ci.run_openvmm_unit_tests()
 
+            environment = capture.call_args.kwargs["env"]
+            expected_environment = {"NVX_TEST_VARIABLE": "1"}
+            if os.name == "nt":
+                expected_environment["_LINK_"] = ci.MSVC_REPRODUCIBLE_LINK_OPTION
+            self.assertEqual(environment, expected_environment)
             capture.assert_called_once_with(
                 ["cargo", "xtask", "fuzz", "list", "--crates"],
                 cwd=openvmm,
+                env=environment,
             )
             self.assertEqual(run_checked.call_count, 3)
+            for command in run_checked.call_args_list:
+                self.assertIs(command.kwargs["env"], environment)
             self.assertEqual(
                 run_checked.call_args_list[0],
                 call(
@@ -3097,6 +3106,7 @@ class CiTests(unittest.TestCase):
                         "--no-compat-igvm",
                     ],
                     cwd=openvmm,
+                    env=environment,
                 ),
             )
             command = run_checked.call_args_list[1].args[0]
@@ -3141,8 +3151,22 @@ class CiTests(unittest.TestCase):
                         "--no-fail-fast",
                     ],
                     cwd=openvmm,
+                    env=environment,
                 ),
             )
+
+    def test_openvmm_windows_builds_link_reproducibly(self):
+        for options, expected in (
+            (None, "/Brepro"),
+            ("", "/Brepro"),
+            ("/DEBUG:FULL", "/DEBUG:FULL /Brepro"),
+            ("/brepro", "/brepro"),
+            ("-BREPRO /DEBUG:FULL", "-BREPRO /DEBUG:FULL"),
+        ):
+            with self.subTest(options=options):
+                environment = {} if options is None else {"_LINK_": options}
+                ci._link_reproducibly_with_msvc(environment)
+                self.assertEqual(environment, {"_LINK_": expected})
 
     def test_openvmm_unit_tests_stop_when_fuzz_crate_query_fails(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -3211,6 +3235,7 @@ class CiTests(unittest.TestCase):
                     {
                         "PETRI_CAPABILITIES": "vpci",
                         "RUNNER_TEMP": os.fspath(root),
+                        "_LINK_": "",
                     },
                 ),
             ):
@@ -3262,6 +3287,10 @@ class CiTests(unittest.TestCase):
                 os.fspath(initrd.resolve()),
             )
             self.assertEqual(environment["PETRI_CAPABILITIES"], "vpci")
+            self.assertEqual(
+                environment["_LINK_"],
+                ci.MSVC_REPRODUCIBLE_LINK_OPTION if os.name == "nt" else "",
+            )
             if os.name == "nt":
                 self.assertEqual(
                     command[command.index("--dir") + 1],
@@ -3285,10 +3314,12 @@ class CiTests(unittest.TestCase):
         ):
             environment = ci._prepare_openvmm_test_environment("whp", "rustup")
 
-        self.assertEqual(
-            environment,
-            {"RUSTUP_TOOLCHAIN": OpenVMMBuildConstants.RUST_TOOLCHAIN},
-        )
+        expected_environment = {
+            "RUSTUP_TOOLCHAIN": OpenVMMBuildConstants.RUST_TOOLCHAIN,
+        }
+        if os.name == "nt":
+            expected_environment["_LINK_"] = ci.MSVC_REPRODUCIBLE_LINK_OPTION
+        self.assertEqual(environment, expected_environment)
         run_checked.assert_not_called()
 
     def test_openvmm_tests_prepare_job_local_toolchain_for_missing_targets(self):
@@ -3419,6 +3450,7 @@ class CiTests(unittest.TestCase):
                         environment["RUSTUP_TOOLCHAIN"],
                         OpenVMMBuildConstants.RUST_TOOLCHAIN,
                     )
+                    self.assertEqual("_LINK_" in environment, os.name == "nt")
                     if runner_temp is None:
                         self.assertNotIn("RUSTUP_HOME", environment)
                     else:

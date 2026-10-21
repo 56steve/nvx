@@ -400,7 +400,10 @@ python3 scripts/nvx.py test-openvmm-unit
 Runs the OpenVMM workspace's unit-test binaries with cargo-nextest's `agent`
 profile and the `ci` feature. Packages that require specialized test harnesses
 are excluded, along with all fuzz crates reported by OpenVMM's `xtask`.
-Afterward, runs the workspace doctests with Cargo.
+Afterward, runs the workspace doctests with Cargo. On Windows, it appends
+`/Brepro` to `_LINK_`, so that MSVC links proc macros reproducibly and sccache
+can reuse the crates that use them; see
+[Compilation cache](ci.md#compilation-cache).
 
 ### `test-openvmm`
 
@@ -411,6 +414,7 @@ python3 scripts/nvx.py test-openvmm --backend {kvm,mshv,whp}
 Builds and runs OpenVMM's checkout-owned VMM tests. The Linux-direct microVM
 TTRPC test boots NVX's `build/vmlinux` and `build/initramfs.cpio.gz`, so build
 the guest first; the remaining test artifacts are produced by OpenVMM itself.
+On Windows, it appends `/Brepro` to `_LINK_`, as `test-openvmm-unit` does.
 
 ### `test-microvm`
 
