@@ -41,7 +41,11 @@ use crate::protocol::CAPABILITY_LEN;
 
 /// Longest wait for a terminated OpenVMM process to exit.
 pub(crate) const KILL_TIMEOUT: Duration = Duration::from_secs(10);
-/// Interval at which process shutdown and identity are polled.
+/// Interval at which the exit or identity of a process is polled where no exit event serves: the
+/// exit of any process on Linux hosts without pidfds, and the exit of a child that a [`Launched`]
+/// waits for with a timeout on Linux, since [`std::process::Child`] can wait only without one.
+/// [`wait_for_exit`] also checks again at this interval an identity that it could not read. An
+/// exit is noticed at most this late, for about 40 checks a second.
 pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// The identity of one boot of the host, which changes whenever the host restarts.
