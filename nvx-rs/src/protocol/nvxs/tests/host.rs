@@ -180,15 +180,11 @@ fn the_host_checks_the_brokers_sequence_numbers() {
     );
 
     // DATA and RESET out of sequence after READY at 0.
-    let next = Identity {
-        epoch: 2,
-        ..IDENTITY
-    };
     for (encoded, actual) in [
         (record(RecordType::Data, IDENTITY, 0, b"x"), 0),
         (record(RecordType::Data, IDENTITY, 2, b"x"), 2),
         (record(RecordType::Data, IDENTITY, u64::MAX, b"x"), u64::MAX),
-        (record(RecordType::Reset, next, 0, &[]), 0),
+        (record(RecordType::Reset, epoch(2), 0, &[]), 0),
     ] {
         let mut host = attached_host();
         let expected = SessionError::Sequence {
@@ -217,10 +213,7 @@ fn the_host_checks_the_sessions_identity() {
             instance_id: [0; 16],
             epoch: 1,
         },
-        Identity {
-            instance_id: INSTANCE,
-            epoch: 0,
-        },
+        epoch(0),
     ] {
         let mut host = attaching_host();
         let ready = record(RecordType::Ready, identity, 0, &[]);
@@ -244,30 +237,14 @@ fn the_host_checks_the_sessions_identity() {
             instance_error.clone(),
         ),
         (
-            record(
-                RecordType::Data,
-                Identity {
-                    epoch: 2,
-                    ..IDENTITY
-                },
-                1,
-                b"x",
-            ),
+            record(RecordType::Data, epoch(2), 1, b"x"),
             SessionError::Epoch {
                 expected: 1,
                 actual: 2,
             },
         ),
         (
-            record(
-                RecordType::Data,
-                Identity {
-                    epoch: 0,
-                    ..IDENTITY
-                },
-                1,
-                b"x",
-            ),
+            record(RecordType::Data, epoch(0), 1, b"x"),
             SessionError::Epoch {
                 expected: 1,
                 actual: 0,
@@ -285,15 +262,7 @@ fn the_host_checks_the_sessions_identity() {
             },
         ),
         (
-            record(
-                RecordType::Reset,
-                Identity {
-                    epoch: 0,
-                    ..IDENTITY
-                },
-                1,
-                &[],
-            ),
+            record(RecordType::Reset, epoch(0), 1, &[]),
             SessionError::MissingIdentity(RecordType::Reset),
         ),
     ];
@@ -304,19 +273,8 @@ fn the_host_checks_the_sessions_identity() {
     }
 
     // A reset never moves an instance's epoch back.
-    let mut host = attached_host_at(Identity {
-        epoch: 3,
-        ..IDENTITY
-    });
-    let reset = record(
-        RecordType::Reset,
-        Identity {
-            epoch: 2,
-            ..IDENTITY
-        },
-        1,
-        &[],
-    );
+    let mut host = attached_host_at(epoch(3));
+    let reset = record(RecordType::Reset, epoch(2), 1, &[]);
     let expected = SessionError::StaleEpoch {
         current: 3,
         actual: 2,
@@ -327,10 +285,7 @@ fn the_host_checks_the_sessions_identity() {
 #[test]
 fn a_reset_ends_the_hosts_attachment() {
     let mut host = attached_host();
-    let next = Identity {
-        epoch: 2,
-        ..IDENTITY
-    };
+    let next = epoch(2);
     let stream = [
         record(RecordType::Data, IDENTITY, 1, b"x"),
         record(RecordType::Reset, next, 2, &[]),

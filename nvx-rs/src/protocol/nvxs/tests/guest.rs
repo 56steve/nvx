@@ -139,10 +139,7 @@ fn the_guest_checks_the_identity_of_each_reset() {
             instance_id: [0; 16],
             epoch: 1,
         },
-        Identity {
-            instance_id: INSTANCE,
-            epoch: 0,
-        },
+        epoch(0),
     ] {
         let mut guest = attaching_guest();
         let reset = record(RecordType::Reset, identity, 0, &[]);
@@ -163,23 +160,12 @@ fn the_guest_checks_the_identity_of_each_reset() {
     let reset = record(RecordType::Reset, IDENTITY, 1, &[]);
     assert_eq!(guest.receive(&reset), Err(expected));
     let mut guest = active_guest(OUTER_RECEIVE_WINDOW);
-    let later = Identity {
-        epoch: 9,
-        ..IDENTITY
-    };
+    let later = epoch(9);
     let reset = record(RecordType::Reset, later, 0, &[]);
     let event = Some(GuestEvent::Reset(later));
     assert_eq!(guest.receive(&reset), Ok((reset.len(), event)));
     let mut stale = guest.clone();
-    let earlier = record(
-        RecordType::Reset,
-        Identity {
-            epoch: 8,
-            ..IDENTITY
-        },
-        1,
-        &[],
-    );
+    let earlier = record(RecordType::Reset, epoch(8), 1, &[]);
     let expected = SessionError::StaleEpoch {
         current: 9,
         actual: 8,
@@ -246,15 +232,7 @@ fn the_guest_checks_the_sequence_and_identity_of_data() {
             },
         ),
         (
-            record(
-                RecordType::Data,
-                Identity {
-                    epoch: 2,
-                    ..IDENTITY
-                },
-                1,
-                b"x",
-            ),
+            record(RecordType::Data, epoch(2), 1, b"x"),
             SessionError::Epoch {
                 expected: 1,
                 actual: 2,
@@ -393,10 +371,7 @@ fn a_reset_in_the_middle_of_a_message_abandons_it() {
 
     // The broker resets the session before the rest arrives, so the application abandons the
     // message, and the outstanding bytes of the old epoch need no credit.
-    let next = Identity {
-        epoch: 2,
-        ..IDENTITY
-    };
+    let next = epoch(2);
     let reset = record(RecordType::Reset, next, 0, &[]);
     let event = Some(GuestEvent::Reset(next));
     assert_eq!(guest.receive(&reset), Ok((reset.len(), event)));
@@ -470,10 +445,7 @@ fn the_guest_session_closes_only_at_a_record_boundary() {
 
 #[test]
 fn the_guest_reports_the_same_events_for_every_split_of_its_stream() {
-    let next = Identity {
-        epoch: 2,
-        ..IDENTITY
-    };
+    let next = epoch(2);
     let stream = [
         record(RecordType::Reset, IDENTITY, 0, &[]),
         record(RecordType::Data, IDENTITY, 1, b"x"),

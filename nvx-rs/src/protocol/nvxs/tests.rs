@@ -24,6 +24,12 @@ const NONE: Identity = Identity {
     epoch: 0,
 };
 
+/// Returns the identity of `epoch` of the sessions' instance, such as an epoch that a RESET
+/// starts, or epoch 0, which no session has.
+fn epoch(epoch: u64) -> Identity {
+    Identity { epoch, ..IDENTITY }
+}
+
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -127,17 +133,13 @@ fn feed<T>(
 /// The broker's records to a host that attaches after waiting, receives three DATA records, and
 /// is reset: payloads of 1, 21, and 300 bytes, one of them with the magic inside.
 fn host_stream() -> Vec<u8> {
-    let next = Identity {
-        epoch: 2,
-        ..IDENTITY
-    };
     [
         record(RecordType::Wait, IDENTITY, 0, &[]),
         record(RecordType::Ready, IDENTITY, 1, &[]),
         record(RecordType::Data, IDENTITY, 2, b"x"),
         record(RecordType::Data, IDENTITY, 3, b"NVXS inside a payload"),
         record(RecordType::Data, IDENTITY, 4, &[0x5a; 300]),
-        record(RecordType::Reset, next, 5, &[]),
+        record(RecordType::Reset, epoch(2), 5, &[]),
     ]
     .concat()
 }
