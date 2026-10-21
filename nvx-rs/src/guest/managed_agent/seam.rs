@@ -7,10 +7,8 @@ use crate::guest::sys::{self, Errno, FileDescriptor, Mode, MountFlags, OpenFlags
 /// Production paths used by the managed agent and replaceable paths used by tests.
 #[derive(Clone, Debug)]
 pub(crate) struct Paths {
-    /// Unified cgroup-v2 root.
+    /// Unified cgroup-v2 root, which holds the agent's cgroup and its workloads' in each mode.
     pub(crate) cgroup_root: PathBuf,
-    /// Sandbox container cgroup membership file.
-    pub(crate) container_cgroup_procs: PathBuf,
     /// Parent of OpenVMM's aggregate host-filesystem exports.
     pub(crate) hostfs_dir: PathBuf,
     /// Kernel command line containing the announced mapping count.
@@ -36,7 +34,6 @@ impl Default for Paths {
     fn default() -> Self {
         Self {
             cgroup_root: "/sys/fs/cgroup".into(),
-            container_cgroup_procs: "/sys/fs/cgroup/container/cgroup.procs".into(),
             hostfs_dir: "/run/nvx/hostfs".into(),
             proc_cmdline: "/proc/cmdline".into(),
             diagnostic_port: "/dev/port".into(),

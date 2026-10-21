@@ -32,6 +32,15 @@
 //! workload's environment in memory too, as C's environment functions changed its own, and
 //! passes it to `execve`, so neither process changes its environment.
 //!
+//! The agent is its process's one status collector, as the direct agent must be as PID 1: its own
+//! `waitpid(-1)` loop collects every child's status and hands the workload's to the workload's
+//! [`process::Child`](crate::guest::process::Child). Its cgroups are a
+//! [`cgroup::Layout`](crate::guest::cgroup::Layout): the direct agent runs in the hierarchy's
+//! root and its workloads in `nvx-exec`, which it kills and settles whole through an
+//! [`ExecutionCgroup`](crate::guest::cgroup::ExecutionCgroup), and the sandbox agent places
+//! each launcher in the `container` cgroup that the init agent prepared, and ends only the
+//! workload's process group.
+//!
 //! Linux arguments, paths, and environment strings are bytes, not necessarily UTF-8, so the
 //! protocol's guest `EXEC` and `MAPS` decoders accept what the C guest accepts. The boot contract
 //! is one `nvx_maps=COUNT` token from 1 through 4096, and retired `nvx_map=` tokens are ignored.

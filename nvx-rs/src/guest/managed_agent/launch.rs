@@ -1,7 +1,7 @@
 use std::os::unix::ffi::OsStrExt;
 
 use crate::guest::parse::parse_decimal;
-use crate::guest::spawn::{Cgroup, Command};
+use crate::guest::spawn::Command;
 use crate::guest::sys::{self, Errno, FileDescriptor, Mode, OpenFlags, c_string};
 use crate::protocol::GuestExecPayload;
 
@@ -97,8 +97,7 @@ pub(crate) fn command(paths: &Paths, request: LaunchRequest<'_>) -> Result<Comma
         arguments.push(c_string(argument)?);
     }
     let cgroup = if request.config.direct {
-        let directory = paths.cgroup_root.join("nvx-exec");
-        Some(Cgroup::open(&directory).map_err(|error| sys::errno_of(&error))?)
+        Some(super::cgroup::placement(paths)?)
     } else {
         None
     };

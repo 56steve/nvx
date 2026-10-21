@@ -1,10 +1,12 @@
-//! The programs that run in NVX's Linux guests, which ship as `/sbin/nvx-*`, and two libraries:
-//! [`nvxs`], the guest's I/O driver of the NVXS session, which guest agents call, and [`spawn`],
-//! through which a guest init or agent starts a program.
+//! The programs that run in NVX's Linux guests, which ship as `/sbin/nvx-*`, and the libraries
+//! on which any guest init or agent builds: [`nvxs`], the guest's I/O driver of the NVXS session;
+//! [`spawn`], through which it starts a program; [`process`], through which it collects the
+//! status of each child that it names, and of no other; and [`cgroup`], through which it places,
+//! accounts, kills, and settles the processes of its executions.
 //!
 //! Each other module holds one program, and the crate's binary of the same name runs its `main`.
-//! [`spawn`] needs none of NVX's control protocol, managed agent, or workload identity, and NVX's
-//! managed agent starts its workloads through it.
+//! The libraries need none of NVX's control protocol, managed agent, or workload identity, and
+//! NVX's managed agent starts, collects, and settles its workloads through them.
 //!
 //! The programs keep the command lines, exit statuses, and output of the C programs that they
 //! replace, except that numeric arguments are plain decimal, with a `-` sign where `nvx-time`'s
@@ -62,6 +64,7 @@ mod sys;
 #[cfg(target_arch = "x86_64")]
 mod kernel_text;
 
+pub mod cgroup;
 pub mod console_pending;
 #[cfg(target_arch = "x86_64")]
 pub mod device_io;
@@ -72,6 +75,7 @@ pub mod managed_agent;
 #[cfg(target_arch = "x86_64")]
 pub mod mmio_write;
 pub mod nvxs;
+pub mod process;
 pub mod reseed;
 pub mod spawn;
 #[cfg(target_arch = "x86_64")]

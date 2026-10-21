@@ -2,7 +2,7 @@
 
 use std::ffi::{CStr, CString};
 use std::io::{self, Read, Write};
-use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, kill};
@@ -222,11 +222,13 @@ pub(crate) struct ReapedChild {
     pub(crate) process: ProcessId,
     /// Terminal state reported by the kernel.
     pub(crate) status: ChildStatus,
+    /// The raw wait status that `waitpid` reported, from which `status` is decoded.
+    pub(crate) wait_status: i32,
 }
 
 /// Decodes Linux's raw wait status without narrowing real-time signal numbers.
 fn child_status(process: nix::libc::pid_t, status: nix::libc::c_int) -> ReapedChild {
-    let status = if nix::libc::WIFEXITED(status) {
+    let decoded = if nix::libc::WIFEXITED(status) {
         ChildStatus::Exited(nix::libc::WEXITSTATUS(status))
     } else if nix::libc::WIFSIGNALED(status) {
         ChildStatus::Signaled(nix::libc::WTERMSIG(status))
@@ -235,11 +237,17 @@ fn child_status(process: nix::libc::pid_t, status: nix::libc::c_int) -> ReapedCh
     };
     ReapedChild {
         process: ProcessId::from_pid(Pid::from_raw(process)),
-        status,
+        status: decoded,
+        wait_status: status,
     }
 }
 
 /// Reaps one available child without blocking.
+///
+/// Only a program that is its process's one status collector calls this: the managed agent, which
+/// as the direct agent is PID 1 and also collects its workloads' orphaned descendants, and the
+/// time daemon. The guest libraries wait only for the child that the caller names, with
+/// [`wait_named`].
 ///
 /// libc is used instead of `nix` because `nix` converts a terminating signal to its finite
 /// `Signal` enum and rejects Linux real-time signal numbers, after the child is reaped.
@@ -298,6 +306,131 @@ pub(crate) fn try_wait(process: ProcessId) -> Result<Option<ChildStatus>, Errno>
 /// Sends `SIGKILL` to the process group led by `process`.
 pub(crate) fn kill_process_group(process: ProcessId) {
     let _ = kill(Pid::from_raw(-process.0.as_raw()), Signal::SIGKILL);
+}
+
+/// One child that a wait names, which is all that it may collect.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum WaitTarget<'a> {
+    /// The child with this process ID.
+    Process(ProcessId),
+    /// The child to which this pidfd refers.
+    Pidfd(BorrowedFd<'a>),
+}
+
+/// Collects the status of the child that `target` names once it has ended, and returns its raw
+/// wait status, in the form that `waitpid` reports. Without `block`, it returns `None` while the
+/// child runs.
+///
+/// Only an exit or a terminating signal ends the child. `waitid` also reports each stop of a
+/// child that this process traces, whatever its options, which leaves the child running: a
+/// blocking wait goes on past such a stop, and one without `block` returns `None`.
+///
+/// Only the named child's status is collected, so every other child's stays for its collector.
+/// Interruptions are retried. A target that is not a child of this process, or whose status was
+/// collected already, is `ECHILD`.
+///
+/// libc is used because `nix`'s `waitid` decodes the state into a `WaitStatus`, which fails for a
+/// real-time signal after the child is reaped. The raw status is rebuilt from the child event's
+/// code and status, which keeps the signal number and the core dump.
+pub(crate) fn wait_named(target: WaitTarget<'_>, block: bool) -> Result<Option<i32>, Errno> {
+    let (kind, id) = match target {
+        WaitTarget::Process(process) => (nix::libc::P_PID, process.0.as_raw() as nix::libc::id_t),
+        WaitTarget::Pidfd(descriptor) => (
+            nix::libc::P_PIDFD,
+            descriptor.as_raw_fd() as nix::libc::id_t,
+        ),
+    };
+    let options = if block {
+        nix::libc::WEXITED
+    } else {
+        nix::libc::WEXITED | nix::libc::WNOHANG
+    };
+    loop {
+        // SAFETY: zero is a valid initial representation for `siginfo_t`, and leaves `si_pid` zero
+        // unless a child event fills it.
+        let mut information = unsafe { std::mem::zeroed::<nix::libc::siginfo_t>() };
+        // SAFETY: `information` is writable, and the call collects at most the named child.
+        let result = unsafe { nix::libc::waitid(kind, id, &mut information, options) };
+        if result < 0 {
+            match Errno::last() {
+                Errno::EINTR => continue,
+                error => return Err(error),
+            }
+        }
+        // SAFETY: a successful `waitid` either initialized the Linux child-event fields, or, for a
+        // child that still runs, left the zeroed `si_pid`.
+        let (process, status) = unsafe { (information.si_pid(), information.si_status()) };
+        if process == 0 {
+            return Ok(None);
+        }
+        return Ok(Some(match information.si_code {
+            nix::libc::CLD_EXITED => (status & 0xff) << 8,
+            nix::libc::CLD_KILLED => status & 0x7f,
+            nix::libc::CLD_DUMPED => (status & 0x7f) | 0x80,
+            // A traced child's stop, which does not end it.
+            _ if block => continue,
+            _ => return Ok(None),
+        }));
+    }
+}
+
+/// Forks a child that makes the calling thread its tracer, stops with `SIGSTOP`, and exits with
+/// `status` once its tracer continues it, or with 99 if it cannot be traced.
+///
+/// libc's `ptrace` is used because the crate does not enable `nix`'s.
+#[cfg(test)]
+pub(crate) fn spawn_traced_child(status: u8) -> ProcessId {
+    // SAFETY: the child makes only the async-signal-safe `ptrace`, `raise`, and `_exit` calls,
+    // as a child of a multithreaded process may.
+    match unsafe { nix::unistd::fork() }.expect("fork") {
+        nix::unistd::ForkResult::Child => {
+            // SAFETY: `PTRACE_TRACEME` reads none of the other arguments.
+            let traced = unsafe {
+                nix::libc::ptrace(
+                    nix::libc::PTRACE_TRACEME,
+                    0,
+                    std::ptr::null_mut::<nix::libc::c_void>(),
+                    std::ptr::null_mut::<nix::libc::c_void>(),
+                )
+            };
+            if traced != 0 {
+                exit_immediately(99);
+            }
+            let _ = nix::sys::signal::raise(Signal::SIGSTOP);
+            exit_immediately(status)
+        }
+        nix::unistd::ForkResult::Parent { child } => ProcessId::from_pid(child),
+    }
+}
+
+/// Continues `process`, which the calling thread traces and which is stopped, without a signal.
+#[cfg(test)]
+pub(crate) fn continue_traced(process: ProcessId) {
+    // SAFETY: `PTRACE_CONT` reads the process ID, and a null signal, which delivers none.
+    let result = unsafe {
+        nix::libc::ptrace(
+            nix::libc::PTRACE_CONT,
+            process.0.as_raw(),
+            std::ptr::null_mut::<nix::libc::c_void>(),
+            std::ptr::null_mut::<nix::libc::c_void>(),
+        )
+    };
+    assert_eq!(result, 0, "PTRACE_CONT: {}", Errno::last());
+}
+
+/// Opens a close-on-exec pidfd that refers to `process`, which polls readable once the process
+/// ends, and keeps naming it after it is reaped.
+///
+/// libc's `syscall` is used because neither `nix` nor musl wraps `pidfd_open`.
+pub(crate) fn open_pidfd(process: ProcessId) -> Result<FileDescriptor, Errno> {
+    // SAFETY: `pidfd_open` reads only its integer arguments, and returns a new descriptor or -1.
+    let descriptor = Errno::result(unsafe {
+        nix::libc::syscall(nix::libc::SYS_pidfd_open, process.0.as_raw(), 0)
+    })?;
+    // A descriptor number fits a `RawFd`.
+    let descriptor = descriptor as RawFd;
+    // SAFETY: the kernel has just created `descriptor`, so it is open and nothing else owns it.
+    Ok(unsafe { FileDescriptor::from_raw(descriptor) })
 }
 
 /// Returns whether `process` has reached a waitable terminal state without reaping it.

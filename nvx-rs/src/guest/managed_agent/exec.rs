@@ -1,9 +1,9 @@
+use std::os::unix::process::ExitStatusExt;
 use std::time::{Duration, Instant};
 
+use crate::guest::process::Child;
 use crate::guest::spawn::{LaunchReport, LaunchStage};
-use crate::guest::sys::{
-    self, ChildStatus, Errno, FileDescriptor, Mode, OpenFlags, ProcessId, c_string,
-};
+use crate::guest::sys::{self, Errno, FileDescriptor, Mode, OpenFlags, ProcessId, c_string};
 use crate::protocol::{
     self, APP_CANCEL, APP_EXIT, APP_STDERR, APP_STDOUT, BUSY, CWD_FAILED, GuestExecPayload,
     LAUNCH_FAILED, OUTER_DATA,
@@ -68,7 +68,7 @@ pub(crate) fn run(
     }
 
     let Ok(Launched {
-        child,
+        mut child,
         stdout,
         stderr,
         report,
@@ -80,12 +80,12 @@ pub(crate) fn run(
     let mut launch_failed =
         tty::make_nonblocking(&stdout).is_err() || tty::make_nonblocking(&stderr).is_err();
     if !launch_failed && !config.direct {
-        launch_failed = cgroup::write_container_pid(system, child).is_err()
-            || release_barrier(system, child).is_err();
+        launch_failed = cgroup::write_container_pid(system, child.process()).is_err()
+            || release_barrier(system, child.process()).is_err();
     }
     if launch_failed {
-        cgroup::terminate(system, config.direct, child);
-        let _ = sys::wait(child);
+        cgroup::terminate(system, config.direct, child.process());
+        wait_ended(system, &mut child);
         unlink_barrier(system);
         return session.send_error(request_id, 125, LAUNCH_FAILED);
     }
@@ -100,9 +100,8 @@ pub(crate) fn run(
     let mut cancelled = false;
     let mut session_lost = false;
     let mut stragglers_killed = false;
-    let mut wait_status = None;
 
-    while wait_status.is_none() || stdout_pipe.is_some() || stderr_pipe.is_some() {
+    while child.status().is_none() || stdout_pipe.is_some() || stderr_pipe.is_some() {
         let ready = match sys::readable_or_hung_up(
             [
                 stdout_pipe.as_ref(),
@@ -114,7 +113,7 @@ pub(crate) fn run(
             Ok(ready) => ready,
             Err(Errno::EINTR) => [false; 3],
             Err(_) => {
-                cgroup::terminate(system, config.direct, child);
+                cgroup::terminate(system, config.direct, child.process());
                 [false; 3]
             }
         };
@@ -122,21 +121,21 @@ pub(crate) fn run(
             let control = match handle_control(system, session, request_id) {
                 Ok(control) => control,
                 Err(error) => {
-                    cgroup::terminate(system, config.direct, child);
-                    let _ = sys::wait(child);
+                    cgroup::terminate(system, config.direct, child.process());
+                    wait_ended(system, &mut child);
                     return Err(error);
                 }
             };
             match control {
                 ExecControl::None => {}
-                ExecControl::Cancel if wait_status.is_none() && !cancelled => {
+                ExecControl::Cancel if child.status().is_none() && !cancelled => {
                     cancelled = true;
-                    cgroup::terminate(system, config.direct, child);
+                    cgroup::terminate(system, config.direct, child.process());
                 }
                 ExecControl::Cancel => {}
                 ExecControl::SessionLost => {
                     session_lost = true;
-                    cgroup::terminate(system, config.direct, child);
+                    cgroup::terminate(system, config.direct, child.process());
                 }
             }
         }
@@ -156,10 +155,10 @@ pub(crate) fn run(
         if stdout_result.is_failure() || stderr_result.is_failure() {
             output_limited =
                 stdout_result == StreamResult::Limited || stderr_result == StreamResult::Limited;
-            cgroup::terminate(system, config.direct, child);
+            cgroup::terminate(system, config.direct, child.process());
         }
-        cgroup::reap(child, &mut wait_status);
-        if wait_status.is_some()
+        cgroup::reap(&mut child);
+        if child.status().is_some()
             && config.direct
             && !stragglers_killed
             && (stdout_pipe.is_some() || stderr_pipe.is_some())
@@ -167,18 +166,20 @@ pub(crate) fn run(
             stragglers_killed = true;
             let _ = cgroup::kill(system);
         }
-        if wait_status.is_none()
+        if child.status().is_none()
             && execution.timeout_ms != 0
             && started.elapsed() >= Duration::from_millis(u64::from(execution.timeout_ms))
         {
             timed_out = true;
-            cgroup::terminate(system, config.direct, child);
+            cgroup::terminate(system, config.direct, child.process());
         }
+        // The outcome is the cause for which the agent ended the workload, so a status that it
+        // cannot collect only ends the loop, which would otherwise wait for it forever.
         if (timed_out || output_limited || cancelled || session_lost)
-            && wait_status.is_none()
-            && let Some(status) = sys::wait(child)
+            && child.status().is_none()
+            && !wait_ended(system, &mut child)
         {
-            wait_status = Some(status);
+            break;
         }
     }
 
@@ -228,24 +229,37 @@ pub(crate) fn run(
     } else if output_limited {
         session.send_app(APP_EXIT, request_id, 125, b"output-limit")
     } else {
-        match wait_status {
-            Some(ChildStatus::Exited(status)) => {
-                session.send_app(APP_EXIT, request_id, status, b"exit")
-            }
-            Some(ChildStatus::Signaled(signal)) => {
-                session.send_app(APP_EXIT, request_id, 128 + signal, b"signal")
-            }
-            Some(ChildStatus::Other) | None => {
-                session.send_app(APP_EXIT, request_id, 125, b"failed")
-            }
+        match child.status() {
+            Some(status) => match (status.code(), status.signal()) {
+                (Some(code), _) => session.send_app(APP_EXIT, request_id, code, b"exit"),
+                (None, Some(signal)) => {
+                    session.send_app(APP_EXIT, request_id, 128 + signal, b"signal")
+                }
+                (None, None) => session.send_app(APP_EXIT, request_id, 125, b"failed"),
+            },
+            None => session.send_app(APP_EXIT, request_id, 125, b"failed"),
+        }
+    }
+}
+
+/// Waits until the workload that the agent ended has ended, and returns whether its status is
+/// known. A failure to collect it, which leaves the agent without the status, is the
+/// `exec-wait` diagnostic.
+fn wait_ended(system: &mut impl System, child: &mut Child) -> bool {
+    match child.wait() {
+        Ok(_) => true,
+        Err(error) => {
+            super::diagnostics::error(system, "exec-wait", sys::errno_of(&error) as i32);
+            false
         }
     }
 }
 
 /// A spawned workload and the parent's ends of its pipes.
 struct Launched {
-    /// The workload process, which leads its own process group.
-    child: ProcessId,
+    /// The workload process, which leads its own process group, and whose status the agent
+    /// collects.
+    child: Child,
     /// Reader of the workload's standard output.
     stdout: FileDescriptor,
     /// Reader of the workload's standard error.
@@ -278,7 +292,7 @@ fn launch(
     )?;
     let spawned = system.spawn(command)?;
     Ok(Launched {
-        child: spawned.process(),
+        child: Child::from_process(spawned.process()),
         stdout,
         stderr,
         report: spawned.into_report(),

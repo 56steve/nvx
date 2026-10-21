@@ -954,6 +954,48 @@ mod tests {
     }
 
     #[test]
+    fn a_workload_status_that_the_agent_cannot_collect_still_ends_its_request() -> TestResult {
+        // While `SIGCHLD` is ignored, which applies to the whole process, the kernel collects
+        // every child's status itself, so the test runs in a process of its own.
+        if super::super::isolate_process_test(
+            "NVX_DISPATCH_LOST_STATUS_TEST_CHILD",
+            "guest::managed_agent::dispatch::tests::a_workload_status_that_the_agent_cannot_collect_still_ends_its_request",
+        ) {
+            return Ok(());
+        }
+        let _process = super::super::PROCESS_TEST_LOCK.lock()?;
+        let (temporary, mut system) = TestSystem::with_cgroup();
+        system.paths.setpriv = super::super::seam::setpriv_shim(temporary.path(), ":");
+        system.spawner = Some(super::super::seam::spawn_as_privileged);
+        crate::guest::sys::ignore_signals(&[crate::guest::sys::Signal::SIGCHLD]);
+        let payload = encode_exec_payload(&Workload {
+            argv: vec!["/bin/sleep".to_owned(), "30".to_owned()],
+            timeout_ms: 100,
+            cwd: None,
+            environment: WorkloadEnvironment::Default,
+        })?;
+        let mut harness = Harness::with_system(true, system, 0);
+        // An agent that waited for the lost status would never answer.
+        harness
+            .host
+            .set_read_timeout(Some(std::time::Duration::from_secs(20)))?;
+        assert_eq!(
+            harness.request_all(42, APP_EXEC, &payload),
+            vec![response(APP_EXIT, 42, 124, b"timeout")]
+        );
+        let system = harness.stop();
+        assert_eq!(
+            system.diagnostics,
+            format!(
+                "NVX-MANAGED-ERROR: stage=exec-wait status={}\n",
+                Errno::ECHILD as i32
+            )
+            .as_bytes()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn direct_launch_starts_the_workload_in_the_directory_that_it_checked() -> TestResult {
         if super::super::isolate_process_test(
             "NVX_DISPATCH_CHECKED_DIRECTORY_TEST_CHILD",

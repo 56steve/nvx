@@ -36,8 +36,9 @@ nvx-rs/
 │   │                with the Python semantics they keep; with feature `cli`, the `nvx-rs` CLI
 │   ├── testing/     feature `testing`: the fake OpenVMM
 │   ├── guest/       feature `guest`: the programs that run in Linux guests, the guest's NVXS
-│   │                connection, and the library through which a guest init or agent starts a
-│   │                program
+│   │                connection, and the libraries through which a guest init or agent starts
+│   │                a program, collects its children's statuses, and settles its executions'
+│   │                cgroups
 │   └── bin/         nvx-rs, nvx-fake-openvmm, and the guest binaries
 ├── tests/           fake-OpenVMM, CLI, NVXS session, process-supervision, store, and guest-binary
 │                    tests, the store's record fixtures, and the golden fixtures that Python
@@ -69,6 +70,8 @@ nvx-rs/
 | `nvx::guest` | The programs that run in Linux guests; see [Guest binaries](#guest-binaries) |
 | `nvx::guest::nvxs` | `GuestConnection`: the guest's role of the NVXS session over a byte stream, such as the control console, on which NVX's managed agent and other guest agents run their sessions. It never reads past the record in progress, so a caller that polls the stream between records sees every record that it has not returned |
 | `nvx::guest::spawn` | `Command`: starts a program in a new process for any guest init or agent, with its arguments, environment, root and working directories, standard streams, inherited descriptors, cgroup, and process group, without NVX's control protocol, managed agent, or workload identity. Its `LaunchReport` tells whether the program started, or which `LaunchStage` failed and why. NVX's managed agent is one caller |
+| `nvx::guest::process` | `Child`: the status of one child that the caller names, by its pidfd or its process ID. It waits for that child alone, so another child's status stays for the caller; a caller that collects every status itself, such as a PID 1 that adopts orphans, hands each one to its `Child` with `observe`. Statuses are `std::process::ExitStatus`, real-time signals included |
+| `nvx::guest::cgroup` | `Layout`: the agent's cgroup and the workload cgroup, which the caller names, and which may not hold the agent's. `ExecutionCgroup`: the cgroup of one execution, the workload cgroup itself or a child of it, which it prepares with the caller's resource values, places processes in, checks for occupancy through `pids.current`, kills with `cgroup.kill`, and settles, over the execution's cgroup or the whole workload subtree, as the caller's `Scope` chooses. It holds its cgroups' directories open, and the process's removals and preparations of cgroups take turns, so that it never reaches another cgroup that takes one of their paths. Settling calls the caller's status collector between its checks, and collects no status itself |
 
 Lowering functions take the names by which messages refer to their inputs, such
 as `EgressRules::name` and `PathList::name`, so callers' messages name their own
@@ -490,9 +493,11 @@ as `nvx/`.
 The `guest` feature adds the programs that run in NVX's Linux guests: the
 `nvx::guest` module and one binary per program. The Alpine, Ubuntu, and Azure
 Linux images ship all nine at their established `/sbin/nvx-*` paths. The
-module's `spawn` library, which starts a program in a new process, is not a
-program: `nvx-managed-agent` launches its workloads through it, and any other
-guest init or agent can too.
+module's libraries are not programs: `spawn` starts a program in a new
+process, `process` collects the status of a child that the caller names, and
+`cgroup` places, kills, and settles the processes of an execution.
+`nvx-managed-agent` launches, collects, and settles its workloads through them,
+and any other guest init or agent can too.
 
 | Binary | Program |
 | --- | --- |
