@@ -1010,6 +1010,20 @@ python3 scripts/nvx.py sandbox deprovision \
   --state-dir /run/user/1000/nvx-example
 ```
 
+`provision` verifies the distro layer as `run` does, hashing it against its
+manifest when one sits beside it, and records the layer's binding in the
+configuration: its identity and metadata, its manifest's, or the manifest's
+absence, and the distro policy that accepted it. It records the layer at its
+resolved path, so for a layer given through a link to another name, it also
+verifies the manifest beside the link's target. `start` checks the binding
+from metadata alone, without reading the layer again, and refuses a layer or
+manifest that was replaced, modified, added, or removed since `provision`, and a
+configuration without a binding, as an older `nvx.py` wrote; deprovision such a
+sandbox and provision it again. `provision` and `start` refuse a manifest path
+that they cannot look up, as through a link loop, rather than take it for no
+manifest. Keep provisioned layers and their manifests read-only, and never
+rewrite them in place.
+
 Lifecycle transitions fail closed: `start` rejects an already-running or stale
 runtime record; `exec` and `stop` require a live OpenVMM process; and
 `deprovision` refuses to remove a running sandbox or unknown files. A control

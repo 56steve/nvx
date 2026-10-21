@@ -5,7 +5,8 @@
 //!
 //! ```text
 //! <state>/
-//!   config.json          the launch that provision records, in formats 1 to 6
+//!   config.json          the launch that provision records, in formats 1 to 6, with the binding
+//!                        of its distro layer
 //!   lifecycle.lock       the lock that serializes provision, start, stop, and deprovision
 //!   runtime.json         format 1: the pid, start_time, and control_endpoint of OpenVMM
 //!   control.capability   the 32-byte capability of the running OpenVMM
@@ -16,8 +17,10 @@
 //!
 //! [`provision`], [`start`], [`stop`], and [`deprovision`] hold the [`LifecycleLock`] for their
 //! whole transition; [`exec_workload`] does not, so a long workload cannot delay a stop. Every
-//! state file is written as `sandbox_lifecycle.py` wrote it, and a state directory that either
-//! implementation wrote serves the other, so an older `nvx.py` and `nvx-rs` share sandboxes.
+//! state file is written as `sandbox_lifecycle.py` wrote it, except that `config.json` also
+//! records the binding of the distro layer that `provision` verified, which `start` checks from
+//! metadata alone. An older `nvx.py` starts a sandbox that `nvx-rs` provisioned, without the
+//! check, and `nvx-rs` refuses to start one that `nvx.py` provisioned, which has no binding.
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -30,9 +33,11 @@ use super::lock::{
     os_error_class,
 };
 use super::state::{
-    CONFIG_FORMATS, STATE_FORMAT, config_int, config_text, deserialize_launch, hex, member,
-    random_bytes, read_json, serialize_launch, temporary_path, uuid4_hex, write_json,
+    CONFIG_FORMATS, RecordedDistro, STATE_FORMAT, config_int, config_text, deserialize_binding,
+    deserialize_launch, hex, member, random_bytes, read_json, serialize_launch, temporary_path,
+    uuid4_hex, write_json,
 };
+use crate::ErrorKind;
 use crate::host::cli::deadline::{Deadline, RETRY_INTERVAL, sleep};
 use crate::host::cli::session::{EXIT_CATEGORIES, ExecRequest, ExecResult, Session};
 use crate::host::cli::{Exit, Result};
@@ -43,6 +48,7 @@ use crate::host::python::fs::{self, os_error_message};
 use crate::host::python::json::{Document, Node};
 use crate::host::python::path::PurePath;
 use crate::host::python::value::py_str;
+use crate::host::sandbox::distro::DISTRO_POLICY_REVISION;
 use crate::host::sandbox::{SandboxLaunch, require_file};
 use crate::protocol::{CAPABILITY_LEN, GuestFeatures};
 
@@ -323,10 +329,12 @@ pub(crate) fn write_exec_outcome(path: &str, result: &ExecResult) -> Result {
     )
 }
 
-/// Records a launch in a new state directory, as `provision` does.
+/// Records a launch and its distro layer, at the path at which it was verified, with the layer's
+/// binding, in a new state directory, as `provision` does.
 pub(crate) fn provision(
     state_path: &str,
     launch: &SandboxLaunch,
+    distro: &RecordedDistro,
     config: &ProvisionConfig<'_>,
     timeout: f64,
 ) -> Result {
@@ -338,7 +346,7 @@ pub(crate) fn provision(
         return Err(Exit::error("sandbox is already provisioned"));
     }
     launch.validated()?;
-    write_json(&config_path, &serialize_launch(launch, config)?)
+    write_json(&config_path, &serialize_launch(launch, distro, config)?)
 }
 
 /// The pid and start time that a runtime record names, as `_runtime_process` reads them.
@@ -472,6 +480,12 @@ fn start_locked(state_dir: &PurePath, artifacts: &Artifacts<'_>, timeout: f64) -
     let outcome_path = state_dir.join(OUTCOME_NAME);
     unlink_missing_ok(&outcome_path)?;
     let launch = deserialize_launch(&config)?;
+    // The check reads no content of the layer or its manifest, and never verifies them again.
+    // Its file holds the layer until the start ends: on Windows, it keeps anything from modifying
+    // or replacing the layer before OpenVMM, whose read-only open shares it, has opened the layer.
+    let _distro = deserialize_binding(&config)?
+        .check(launch.distro(), DISTRO_POLICY_REVISION)
+        .map_err(distro_error)?;
     let [executable, kernel, initrd] = artifacts.require()?;
     let capability = random_bytes::<CAPABILITY_LEN>()?;
     if capability == [0; CAPABILITY_LEN] {
@@ -572,6 +586,18 @@ fn start_locked(state_dir: &PurePath, artifacts: &Artifacts<'_>, timeout: f64) -
             Err(Exit::error(startup_exit_message(&outcome_path, status)?))
         }
         _ => Err(error),
+    }
+}
+
+/// Returns the error of a start whose distro layer fails the check of its binding: a binding that
+/// no longer holds needs a new provision, which verifies the layer again.
+fn distro_error(error: crate::Error) -> Exit {
+    match error.kind() {
+        ErrorKind::Io => error.into(),
+        _ => Exit::error(format!(
+            "{}; deprovision the sandbox and provision it again",
+            error.message()
+        )),
     }
 }
 

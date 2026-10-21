@@ -27,6 +27,8 @@
 //!   exits and termination reaches only it, whether or not the caller started it.
 //! - [`sandbox`] is the launch profile of `nvx.py sandbox`: a container over read-only EROFS
 //!   layers and a private ext4 scratch disk, with live shares, and the checks of its options.
+//!   [`sandbox::distro`] binds a distro layer to what explicit verification found, so that a
+//!   launch checks the layer through [`seal`], which seals open files from their metadata alone.
 //! - `cli` (feature `cli`) is the `nvx-rs` command-line interface, which `nvx.py` runs for the
 //!   steps that it delegates: artifact lookup, egress policy compilation, and sandboxes.
 //!
@@ -35,8 +37,8 @@
 //!
 //! The host modules deny unsafe code. On Unix, the private `sys` module confines the system calls
 //! that the standard library lacks behind documented safe functions, which call `nix`. The
-//! Windows platform module, and the module of the Win32 calls that Python's filesystem queries
-//! make, still call `windows-sys` directly.
+//! Windows platform module, the Windows module of [`seal`], and the module of the Win32 calls that
+//! Python's filesystem queries make, still call `windows-sys` directly.
 #![deny(unsafe_code)]
 
 pub mod artifacts;
@@ -52,6 +54,7 @@ pub mod process;
 pub(crate) mod python;
 pub mod report;
 pub mod sandbox;
+pub mod seal;
 pub mod session;
 pub mod store;
 pub mod supervisor;

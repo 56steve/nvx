@@ -3,9 +3,12 @@
 use std::fs;
 use std::path::Path;
 
+use sha2::{Digest, Sha256};
+
 use super::*;
 use crate::ErrorKind;
 use crate::host::python::fs::resolve;
+use crate::host::sandbox::layer::LayerRole;
 use crate::host::sandbox::mount::{aggregate_child_name, mounts_openvmm_arguments};
 use crate::host::sandbox::{SandboxLayer, SandboxSettings};
 
@@ -114,6 +117,36 @@ fn sandbox_allows_non_systemd_sbin_init() {
 }
 
 #[test]
+fn the_entrypoint_check_needs_no_manifest_and_precedes_the_distro_verification() {
+    let layer = Layer::new();
+    for entrypoint in SYSTEMD_ENTRYPOINTS {
+        assert_eq!(
+            message(validate_sandbox_entrypoint(entrypoint)),
+            "systemd entrypoints are unsupported by the sandbox security profile"
+        );
+    }
+    validate_sandbox_entrypoint("/sbin/init").unwrap();
+    // A layer without a manifest passes the distro verification unread, and its binding records
+    // the manifest's absence, but the entrypoint check still refuses systemd.
+    let binding = validate_sandbox_systemd_policy(&layer.launch("/sbin/init")).unwrap();
+    assert_eq!(binding.manifest(), None);
+    assert_eq!(
+        message(validate_sandbox_systemd_policy(
+            &layer.launch("/usr/lib/systemd/systemd")
+        )),
+        "systemd entrypoints are unsupported by the sandbox security profile"
+    );
+    // The entrypoint check precedes the manifest, which it never reads.
+    layer.manifest("not JSON");
+    assert_eq!(
+        message(validate_sandbox_systemd_policy(
+            &layer.launch("/lib/systemd/systemd")
+        )),
+        "systemd entrypoints are unsupported by the sandbox security profile"
+    );
+}
+
+#[test]
 fn sandbox_rejects_systemd_from_bound_distro_metadata() {
     let layer = Layer::new();
     let digest = distro_sha256();
@@ -136,13 +169,19 @@ fn sandbox_rejects_systemd_from_bound_distro_metadata() {
     );
     // Python compares the format numerically, so 1.0 and true are 1.
     for format in ["1", "1.0", "true"] {
-        manifest(
+        let binding = manifest(
             format,
             "\"distro.erofs\"",
             &sha256,
             "[{\"name\": \"bash\"}]",
         )
         .unwrap();
+        // The binding seals the manifest that the verification read.
+        let sealed = crate::host::seal::FileSeal::of(
+            &fs::File::open(layer.path("distro.erofs.manifest.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(binding.manifest(), Some(&sealed));
     }
     for (format, artifact, sha256) in [
         ("\"1\"", "\"distro.erofs\"", sha256.as_str()),

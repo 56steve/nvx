@@ -10,6 +10,11 @@
 //! - [`serialize_launch`] writes a provisioned launch in the lowest format that holds it, and
 //!   [`deserialize_launch`] reads it back with the conversions, defaults, and checks of
 //!   `_deserialize_launch`.
+//! - Every configuration also records the [`DistroBinding`] of the sandbox's distro layer, under
+//!   `distro_binding` in its serde form, which [`deserialize_binding`] reads back for `start` to
+//!   check. `nvx.py` never wrote one, and `start` refuses a configuration without one. The
+//!   binding is of the layer at the path that the configuration records, which a
+//!   [`RecordedDistro`] holds.
 
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -24,6 +29,7 @@ use crate::host::python::json::{self, Document, Loads, Node, NodeId, ReadError};
 use crate::host::python::path::PurePath;
 use crate::host::python::text::decode_utf8;
 use crate::host::python::value::{self, IntError, equals_int, py_int, py_str};
+use crate::host::sandbox::distro::{DISTRO_POLICY_REVISION, DistroBinding};
 use crate::host::sandbox::layer::{LayerRole, SandboxLayer};
 use crate::host::sandbox::mount::{
     MountAccess, MountKind, MountOwner, MountPolicy, SandboxMount, validate_mount_target,
@@ -54,6 +60,10 @@ pub(crate) const CONFIG_FORMATS: [u64; 6] = [
     POLICY_CONFIG_FORMAT,
     FILE_MOUNT_CONFIG_FORMAT,
 ];
+/// The member of a configuration that records the binding of the sandbox's distro layer.
+pub(crate) const DISTRO_BINDING: &str = "distro_binding";
+/// How deeply a recorded binding may nest its values, which its serde form nests three deep.
+const MAX_BINDING_DEPTH: usize = 8;
 
 /// Returns the name of a temporary file next to `path`: `.NAME.UUID.tmp`, with a fresh UUID4 in
 /// hexadecimal.
@@ -237,6 +247,49 @@ fn resolved(path: &std::path::Path) -> Result<String> {
     Ok(resolved.as_str().to_owned())
 }
 
+/// The distro layer that `provision` records, at the path that it records for it, with the
+/// binding of the layer at that path, which `start` checks.
+pub(crate) struct RecordedDistro {
+    /// `path.resolve()` of the layer's path, as `provision` records it.
+    path: String,
+    /// The layer at that path.
+    layer: SandboxLayer,
+    /// The binding of the layer at that path.
+    binding: DistroBinding,
+}
+
+impl RecordedDistro {
+    /// Returns the distro layer of `launch` at the path that `provision` records, `path.resolve()`
+    /// of the path given, with a binding of the layer there: `binding`, which explicit
+    /// verification of the layer at the path given made, if it holds at the recorded path, and
+    /// otherwise the binding that explicit verification of the layer at the recorded path makes,
+    /// which must then hold there.
+    ///
+    /// The check of `binding` at the recorded path reads nothing, and passes unless the paths name
+    /// different manifests: when the path given is a link to a layer of another name, `start`
+    /// checks the manifest beside the link's target, so `provision` verifies the layer there too.
+    pub(crate) fn new(launch: &SandboxLaunch, binding: DistroBinding) -> Result<Self> {
+        let distro = launch.distro();
+        let path = resolved(distro.path())?;
+        let layer = SandboxLayer::new(distro.role(), &path, distro.uuid());
+        let binding = match binding.check(&layer, DISTRO_POLICY_REVISION) {
+            Ok(_) => binding,
+            Err(_) => {
+                let binding = DistroBinding::verify(&layer)?;
+                // Verification counts a manifest path whose lookup fails as no manifest, which
+                // the check refuses: provision records no binding that every start would refuse.
+                binding.check(&layer, DISTRO_POLICY_REVISION)?;
+                binding
+            }
+        };
+        Ok(Self {
+            path,
+            layer,
+            binding,
+        })
+    }
+}
+
 /// Returns a list of strings.
 fn strings(values: &[String]) -> Value {
     Value::List(
@@ -248,20 +301,21 @@ fn strings(values: &[String]) -> Value {
 }
 
 /// Returns the configuration that `provision` records for `launch` and the other options, as
-/// `_serialize_launch` builds it.
+/// `_serialize_launch` builds it, with `distro`, the launch's distro layer at the path that
+/// `provision` verified and records, and its binding.
 pub(crate) fn serialize_launch(
     launch: &SandboxLaunch,
+    distro: &RecordedDistro,
     config: &ProvisionConfig<'_>,
 ) -> Result<Value> {
     let format = config_format(launch.mounts());
-    let mut layers = Vec::new();
-    for layer in launch.ordered_layers() {
-        layers.push(dict([
-            ("role", Value::from(layer.role().as_str())),
-            ("path", Value::from(resolved(layer.path())?)),
-            ("uuid", Value::from(layer.uuid())),
-        ]));
-    }
+    // The distro layer is the one layer that a launch holds.
+    let layer = &distro.layer;
+    let layers = vec![dict([
+        ("role", Value::from(layer.role().as_str())),
+        ("path", Value::from(distro.path.as_str())),
+        ("uuid", Value::from(layer.uuid())),
+    ])];
     let settings = launch.settings();
     let (uid, gid) = settings.workload_identity;
     let mut value = dict([
@@ -292,6 +346,12 @@ pub(crate) fn serialize_launch(
     let Value::Dict(members) = &mut value else {
         unreachable!("dict builds a dict")
     };
+    let binding = serde_json::to_value(&distro.binding)
+        .ok()
+        .as_ref()
+        .and_then(python_value)
+        .ok_or_else(|| Exit::error("cannot record the distro binding"))?;
+    members.insert(DISTRO_BINDING.to_owned(), binding);
     if lists_mounts(format) {
         let mut mounts = Vec::new();
         for mount in launch.mounts() {
@@ -310,6 +370,79 @@ pub(crate) fn serialize_launch(
         members.insert("mount".to_owned(), mount);
     }
     Ok(value)
+}
+
+/// Returns the value that `dumps` writes for `value`, a serde value of integers, strings, and
+/// containers, or `None` for a value with a float.
+fn python_value(value: &serde_json::Value) -> Option<Value> {
+    use serde_json::Value as Json;
+
+    Some(match value {
+        Json::Null => Value::Null,
+        Json::Bool(boolean) => Value::Bool(*boolean),
+        Json::Number(number) => number
+            .as_u64()
+            .map(Value::from)
+            .or_else(|| number.as_i64().map(Value::from))?,
+        Json::String(text) => Value::from(text.as_str()),
+        Json::Array(items) => Value::List(items.iter().map(python_value).collect::<Option<_>>()?),
+        Json::Object(members) => Value::Dict(
+            members
+                .iter()
+                .map(|(name, member)| Some((name.clone(), python_value(member)?)))
+                .collect::<Option<_>>()?,
+        ),
+    })
+}
+
+/// Returns the serde value of the value at `id`, as the dict that Python builds holds it, in
+/// which the last of repeated names wins, or `None` for a value nested more than `depth` levels
+/// deep, a string that is not Unicode, or a number that JSON cannot hold.
+fn json_value(document: &Document, id: NodeId, depth: usize) -> Option<serde_json::Value> {
+    use serde_json::Value as Json;
+
+    let depth = depth.checked_sub(1)?;
+    Some(match document.node(id) {
+        Node::Null => Json::Null,
+        Node::Bool(boolean) => Json::Bool(*boolean),
+        Node::Integer(literal) => Json::Number(literal.parse().ok()?),
+        Node::Float(float) => Json::Number(serde_json::Number::from_f64(*float)?),
+        Node::String(text) => Json::String(text.as_str()?.to_owned()),
+        Node::Array(items) => Json::Array(
+            items
+                .iter()
+                .map(|&item| json_value(document, item, depth))
+                .collect::<Option<_>>()?,
+        ),
+        Node::Object(members) => {
+            let mut object = serde_json::Map::new();
+            for (name, member) in members {
+                object.insert(
+                    name.as_str()?.to_owned(),
+                    json_value(document, *member, depth)?,
+                );
+            }
+            Json::Object(object)
+        }
+    })
+}
+
+/// Reads the binding of the distro layer that a configuration records, which `start` checks.
+///
+/// A configuration without one, as `nvx.py` and earlier releases of `nvx-rs` wrote, fails as
+/// `sandbox configuration has no distro binding`: the sandbox is provisioned again rather than
+/// migrated. A binding that is not of the binding's serde form fails as `sandbox configuration is
+/// malformed`.
+pub(crate) fn deserialize_binding(document: &Document) -> Result<DistroBinding> {
+    let Some(binding) = member(document, document.root(), DISTRO_BINDING) else {
+        return Err(Exit::error(
+            "sandbox configuration has no distro binding; deprovision the sandbox and provision \
+             it again",
+        ));
+    };
+    json_value(document, binding, MAX_BINDING_DEPTH)
+        .and_then(|value| serde_json::from_value(value).ok())
+        .ok_or_else(|| Exit::error("sandbox configuration is malformed"))
 }
 
 /// Returns a share as `_serialize_mount` records it, with its host path made absolute, and with
