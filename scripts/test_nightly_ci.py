@@ -4,10 +4,12 @@
 
 from __future__ import annotations
 
+import argparse
 import contextlib
 import io
 import json
 import re
+import shlex
 import sys
 import tempfile
 import threading
@@ -21,6 +23,8 @@ from email.message import Message
 from pathlib import Path
 from typing import cast
 from unittest.mock import patch
+
+import yaml
 
 sys.path.insert(0, str(Path(__file__).parent))
 import nvx  # noqa: E402
@@ -36,6 +40,7 @@ from nvx_tools.nightly_ci import (  # noqa: E402
 REPOSITORY = "microsoft/nvx"
 REPOSITORY_URL = "https://github.com/microsoft/nvx"
 WORKFLOW_ID = 348569047
+WORKFLOWS = Path(__file__).resolve().parent.parent / ".github" / "workflows"
 
 
 def _run(
@@ -1854,6 +1859,158 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(
             nightly_ci.describe_action(nightly_ci.CloseIssue(5, "completed")),
             "would close #5 as completed",
+        )
+
+
+def _workflow(name: str) -> dict[object, object]:
+    document = yaml.safe_load((WORKFLOWS / name).read_text(encoding="utf-8"))
+    assert isinstance(document, dict)
+    return cast(dict[object, object], document)
+
+
+def _triggers(workflow: Mapping[object, object]) -> dict[str, object]:
+    # YAML 1.1 reads the bare key "on" as true.
+    triggers = workflow.get("on", workflow.get(True))
+    assert isinstance(triggers, dict)
+    return cast(dict[str, object], triggers)
+
+
+def _jobs(workflow: Mapping[object, object]) -> dict[str, dict[str, object]]:
+    return cast(dict[str, dict[str, object]], workflow["jobs"])
+
+
+class WorkflowTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.workflow = _workflow("nightly-ci-report.yml")
+        jobs = _jobs(self.workflow)
+        self.assertEqual(list(jobs), ["report"])
+        self.job = jobs["report"]
+
+    def step(self, name: str) -> dict[str, object]:
+        steps = cast(list[dict[str, object]], self.job["steps"])
+        [step] = [step for step in steps if step.get("name") == name]
+        return step
+
+    def test_the_report_follows_completed_ci_runs_on_dev(self):
+        ci = _workflow("ci.yml")
+        self.assertEqual(
+            _triggers(self.workflow),
+            {
+                "workflow_run": {
+                    "workflows": [ci["name"]],
+                    "types": ["completed"],
+                    "branches": ["dev"],
+                }
+            },
+        )
+        self.assertIn("schedule", _triggers(ci))
+
+    def test_only_scheduled_runs_are_reported(self):
+        self.assertEqual(
+            self.job["if"],
+            f"github.event.workflow_run.event == '{nightly_ci.NIGHTLY_EVENT}'",
+        )
+        self.assertEqual(nightly_ci.NIGHTLY_EVENT, "schedule")
+
+    def test_only_the_report_job_writes_and_only_issues(self):
+        self.assertEqual(self.workflow["permissions"], {})
+        self.assertEqual(
+            self.job["permissions"],
+            {
+                "actions": "read",
+                "checks": "read",
+                "contents": "read",
+                "issues": "write",
+            },
+        )
+        # Pull requests and pushes keep the permissions that they had: no other
+        # workflow or job can write issues.
+        writers: list[str] = []
+        for path in sorted(WORKFLOWS.glob("*.yml")):
+            workflow = _workflow(path.name)
+            scopes = [("", workflow.get("permissions"))] + [
+                (name, job.get("permissions")) for name, job in _jobs(workflow).items()
+            ]
+            for name, permissions in scopes:
+                if permissions == "write-all" or (
+                    isinstance(permissions, dict)
+                    and cast(dict[str, object], permissions).get("issues") == "write"
+                ):
+                    writers.append(f"{path.name}:{name}")
+        self.assertEqual(writers, ["nightly-ci-report.yml:report"])
+
+    def test_the_report_runs_the_default_branch_without_credentials(self):
+        self.assertEqual(self.job["runs-on"], "ubuntu-latest")
+        checkout = self.step("Checkout")
+        self.assertEqual(checkout["uses"], "actions/checkout@v5")
+        # Without a ref, the checkout is the default branch, not the run's code.
+        self.assertEqual(checkout["with"], {"persist-credentials": False})
+        # The triggering run reaches the command only through the environment.
+        self.assertNotIn(
+            "${{", cast(str, self.step("Report the nightly CI run")["run"])
+        )
+
+    def test_the_report_names_the_triggering_run_attempt(self):
+        report = self.step("Report the nightly CI run")
+        self.assertEqual(
+            report["env"],
+            {
+                "GH_TOKEN": "${{ github.token }}",
+                "RUN_ID": "${{ github.event.workflow_run.id }}",
+                "RUN_ATTEMPT": "${{ github.event.workflow_run.run_attempt }}",
+            },
+        )
+        args = self.report_arguments()
+        self.assertIs(args.handler, nightly_ci.command_report_nightly_ci)
+        self.assertEqual(
+            (args.repository, args.run_id, args.run_attempt), (REPOSITORY, 5001, 2)
+        )
+        self.assertEqual(args.assignee, ["ppenna"])
+        self.assertEqual(args.label, ["bug"])
+        self.assertEqual(args.summary, Path("summary.md"))
+        self.assertFalse(args.dry_run)
+
+    def report_arguments(self) -> argparse.Namespace:
+        environment = {
+            "GITHUB_REPOSITORY": REPOSITORY,
+            "RUN_ID": "5001",
+            "RUN_ATTEMPT": "2",
+            "GITHUB_STEP_SUMMARY": "summary.md",
+        }
+        command = re.sub(
+            r"\$\{(\w+)\}",
+            lambda match: environment[match.group(1)],
+            cast(str, self.step("Report the nightly CI run")["run"]),
+        )
+        argv = shlex.split(command)
+        self.assertEqual(argv[:2], ["python3", "scripts/nvx.py"])
+        return nvx.parse_args(argv[2:])
+
+    def test_the_documentation_names_the_owner_and_the_label(self):
+        document = (WORKFLOWS.parent.parent / "doc" / "ci.md").read_text(
+            encoding="utf-8"
+        )
+        section = document.split("\n## Nightly failure reports\n", 1)[1]
+        section = section.split("\n## ", 1)[0]
+        args = self.report_arguments()
+        for name in (*args.assignee, *args.label):
+            with self.subTest(name=name):
+                self.assertIn(f"`{name}`", section)
+
+    def test_reports_never_run_concurrently(self):
+        # The group keeps at most one reporter waiting, so a newer reporter
+        # can replace a waiting one; plan_report follows the latest nightly
+        # result, whichever run triggered it, so no result goes unreported
+        # (ReportTests.test_the_report_follows_the_latest_nightly_result).
+        self.assertEqual(
+            self.job["concurrency"],
+            {"group": "nightly-ci-report", "cancel-in-progress": False},
+        )
+
+    def test_the_summary_job_is_the_required_status_check(self):
+        jobs = _jobs(_workflow("ci.yml"))
+        self.assertIn(
+            jobs["required-status-check"]["name"], nightly_ci.SUMMARY_JOB_NAMES
         )
 
 

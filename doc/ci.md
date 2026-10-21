@@ -527,7 +527,8 @@ input of the
 and [`check-quality`](../.github/actions/check-quality/action.yml) actions. A
 full run still builds the guest artifacts that miss the cache, but installs
 the Python tools without the pip cache, which `setup-python` saves whenever it
-misses.
+misses. A failed nightly run opens or updates the
+[nightly failure report](#nightly-failure-reports).
 
 For a push or pull request, the detector runs the full matrix instead when the
 comparison base or a commit is unavailable, when the diff or the classifier
@@ -562,6 +563,21 @@ records. A late result therefore cannot reopen, rewrite, or close the
 report. When it finds several open reports, it updates the oldest and
 closes the others as duplicates.
 
+The [`nightly-ci-report.yml`](../.github/workflows/nightly-ci-report.yml)
+workflow runs the command whenever a CI run on `dev` completes, so a failing
+nightly run is reported within minutes of its last job. Its `workflow_run`
+trigger reacts to the run rather than to its jobs, so it also reports a run
+that was cancelled or whose jobs never started, and it adds nothing to
+`ci.yml`. Its job runs only for scheduled runs: a `dev` push's run skips it,
+pull request runs, whose branches the trigger excludes, never start the
+workflow, and a manually dispatched run notifies the person who started it.
+The job checks out the default branch, never the run's code. Its token can
+read the repository, the run's jobs and logs, and their check annotations,
+and write issues, and no other workflow can write issues. The job runs one
+report at a time; a newer reporter can replace one that waits for its turn,
+but it reports the latest nightly result anyway. Its job summary repeats
+the report.
+
 The report links every job that failed, timed out, or was cancelled, names
 its failing step, and quotes its evidence: the step's own error annotation,
 or else the last error line of its log, or, without the log, the job's most
@@ -592,6 +608,25 @@ steps alone. Each job counts in one group:
 lists it apart, unless it fails alone, for example because a job that
 should have run was skipped. A run that fails without a failing job, as when
 GitHub cannot start it, is reported with no jobs.
+
+The workflow assigns each new report to its triage owner, the CI maintainer
+`ppenna` by default, and labels it `bug`, which the repository defines. The
+owner triages a new report within a working day:
+
+1. Open the failed jobs of the latest failing run. For an infrastructure
+   failure, remove its cause, then rerun the run's failed jobs; a rerun that
+   passes closes the report. A runner that fails `Validate runner` needs the
+   [runner setup](../scripts/setup/README.md) again, and one that stays
+   offline needs its virtual machine restarted or replaced.
+2. For a test or build failure, find the change that caused it, typically
+   one that merged since the last passing nightly run without running the
+   failing suite, and open an issue or a pull request that links the report.
+3. Leave the report open until a nightly run passes, which closes it. Close
+   it by hand only when nothing needs a fix, as after a deliberate
+   cancellation.
+
+To hand triage over or to rotate it, change the workflow's `--assignee`
+options, and reassign the open report.
 
 ## Host qualification
 
