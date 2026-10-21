@@ -872,8 +872,11 @@ function Install-Toolchain {
         }
     }
     Update-ProcessPath
+    # Keep the pinned rustup. Its self-update replaces rustup.exe from a
+    # detached process after rustup exits, racing the next rustup command.
     Invoke-Native $rustupPath @(
-        "toolchain", "install", $RustToolchain, "--profile", "minimal"
+        "toolchain", "install", $RustToolchain, "--profile", "minimal",
+        "--no-self-update"
     )
     Invoke-Native $rustupPath @(
         "target", "add",

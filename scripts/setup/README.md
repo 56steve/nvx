@@ -277,7 +277,10 @@ parse their options and before they inspect or change the host. They exit with
 an error when the manifest is missing or malformed, lacks a pin that they
 need, or names another platform; the error names the manifest and, for a
 malformed entry, its line. They run or install a downloaded artifact only after
-it matches its checksum.
+it matches its checksum. They install the Rust toolchain with
+`--no-self-update`, so rustup never replaces itself with a release that the
+manifest doesn't pin; on Windows, that replacement would also race the
+script's next rustup command.
 
 To upgrade a tool, change its version and the checksum of each of its
 artifacts in the manifest. The scripts download rustup from
@@ -288,6 +291,8 @@ Actions runner from
 upgrade also changes `rust-toolchain.toml`; see
 [Rust toolchain](../../doc/ci.md#rust-toolchain). `scripts/test_tool_versions.py`
 checks on Linux and Windows that the manifest pins every tool for both
-platforms, that the shell and PowerShell readers agree on it, and that no
-script, workflow, or setup guide hard-codes a pin. Then rerun the scripts to
-update existing hosts and runners.
+platforms, that the shell and PowerShell readers agree on it, that no setup
+lets rustup update itself, and that no script, workflow, or setup guide
+hard-codes a pin. Then rerun the scripts to update existing hosts and runners.
+They install rustup only where it is missing, so a new rustup pin reaches new
+hosts only.

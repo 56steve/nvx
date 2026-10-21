@@ -6,8 +6,9 @@ install (#129). These tests check that the manifest pins each tool for both
 platforms, that the POSIX shell and PowerShell readers in the setup scripts
 accept, reject, and resolve manifests exactly as the reference reader below
 does, that each setup script reads the manifest before it inspects or changes
-the host, and that no script, workflow, or guide hard-codes a pin. Runner-label selection
-and fresh-install directory checks are exercised without provisioning a host.
+the host, that no setup lets rustup update itself, and that no script,
+workflow, or guide hard-codes a pin. Runner-label selection and fresh-install
+directory checks are exercised without provisioning a host.
 """
 
 from __future__ import annotations
@@ -770,6 +771,41 @@ class ToolManifestReaderTests(unittest.TestCase):
                         result.stdout.splitlines(),
                         [f"{name}={value}" for name, value in expected.items()],
                     )
+
+    def test_setups_never_let_rustup_update_itself(self):
+        # A self-update would replace the pinned rustup with its latest
+        # release. On Windows, a detached process replaces rustup.exe after
+        # rustup exits, so the setup's next rustup command can find it missing.
+        for script, install, invocation in (
+            (
+                LINUX_RUNNER,
+                " toolchain install ",
+                '"$rustup" toolchain install "$RUST_TOOLCHAIN" --profile minimal \\\n'
+                "        --no-self-update\n",
+            ),
+            (
+                LINUX_MSHV,
+                " toolchain install ",
+                'rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal \\\n'
+                "        --no-self-update\n",
+            ),
+            (
+                SPECULA,
+                " toolchain install ",
+                "rustup toolchain install '$RUST_VERSION' --profile minimal"
+                " --no-self-update\n",
+            ),
+            (
+                WINDOWS,
+                '"toolchain", "install"',
+                '"toolchain", "install", $RustToolchain, "--profile", "minimal",\n'
+                '        "--no-self-update"\n',
+            ),
+        ):
+            with self.subTest(script=script.name):
+                source = script.read_text(encoding="utf-8")
+                self.assertEqual(source.count(install), 1)
+                self.assertIn(invocation, source)
 
     def test_setups_read_the_manifest_before_they_inspect_the_host(self):
         runner = LINUX_RUNNER.read_text(encoding="utf-8")
