@@ -1,5 +1,6 @@
-//! The adapter's guest half: it serves the guest's role of the NVXS session with the adapter's
-//! own [framing](crate::frame), through `nvx::guest::nvxs` alone.
+//! The adapter's guest agent: it serves the host program over the guest's end of the control
+//! session between the host and the guest, with the adapter's own [framing](crate::frame), through
+//! `nvx::guest::nvxs` alone.
 
 use std::fmt;
 use std::io::{Read, Write};
@@ -10,8 +11,8 @@ use nvx::protocol::nvxs::GuestEvent;
 
 use crate::frame::{Decoder, FrameError, Message};
 
-/// The receive window that the guest acknowledges each epoch with: the smallest that NVXS allows,
-/// so that the rest of a longer message arrives only as the guest credits what it took.
+/// The receive window that the guest acknowledges each epoch with: the smallest that the session
+/// allows, so that the rest of a longer message arrives only as the guest credits what it took.
 pub const RECEIVE_WINDOW: u32 = OUTER_MIN_RECEIVE_WINDOW;
 
 /// How serving ended, when nothing failed.
@@ -27,7 +28,7 @@ pub enum Served {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum ServeError {
-    /// The NVXS session failed.
+    /// The control session failed.
     Session(GuestConnectionError),
     /// The host sent a malformed message.
     Frame(FrameError),
@@ -72,15 +73,15 @@ impl From<FrameError> for ServeError {
     }
 }
 
-/// Serves the guest's role of the NVXS session on `stream`, which connects to the broker's guest
-/// leg, until the host stops the guest or the broker closes the stream.
+/// Serves the host program on `stream`, the guest's end of the control session, until the host
+/// stops the guest or the broker closes the stream.
 ///
 /// The guest attaches, then:
 ///
-/// - It acknowledges each RESET with [`RECEIVE_WINDOW`], once it dropped the earlier epoch's
-///   partial message: a new epoch starts with a new message.
-/// - It credits each DATA payload back once it holds the payload, so that a message longer than
-///   the window arrives whole.
+/// - It acknowledges each reset of the session with [`RECEIVE_WINDOW`], once it dropped the
+///   earlier epoch's partial message: a new epoch starts with a new message.
+/// - It credits each payload back once it holds the payload, so that a message longer than the
+///   window arrives whole.
 /// - It answers [`Message::Ping`] with [`Message::Pong`], sends each [`Message::Echo`] back, and
 ///   answers [`Message::Stop`] with [`Message::Stopped`], then returns without reading further.
 ///

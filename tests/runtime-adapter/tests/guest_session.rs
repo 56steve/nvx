@@ -1,11 +1,12 @@
-//! Consumer-contract scenario C1, the guest's part: the adapter's guest half serves the guest's
-//! role of the NVXS session with the adapter's own framing, through public APIs only.
+//! The adapter's guest agent serves the control session between the host and the guest with the
+//! adapter's own framing, through public APIs only.
 //!
-//! A test broker plays the broker's guest leg over a Unix socket pair, with the public record API
-//! of `nvx`: for the guest half in a thread, and for the guest binary, whose standard input and
-//! output are the socket. The tests cover messages that span records, partial records, resets in
-//! the middle of a message, disconnects, record lengths, bootstrap identity, ERROR payloads,
-//! sequence and identity errors, and the bounded buffer of the adapter's decoder.
+//! A test broker plays the broker's end of the guest's session over a Unix socket pair, with the
+//! public record API of `nvx`: for the guest agent's `serve` in a thread, and for the
+//! `runtime-adapter-guest` binary, whose standard input and output are the socket. The tests cover
+//! messages that span records, partial records, resets in the middle of a message, disconnects,
+//! record lengths, bootstrap identity, ERROR payloads, sequence and identity errors, and the
+//! bounded buffer of the adapter's decoder.
 #![cfg(all(feature = "guest", target_os = "linux"))]
 
 use std::io::{self, Read, Write};
@@ -45,10 +46,10 @@ const INSTANCE_OFFSET: usize = 8;
 /// Offset of the payload length in a record's header.
 const LENGTH_OFFSET: usize = 40;
 
-/// The broker's guest leg. It resets the guest once the guest attaches, numbers its records to
-/// the guest from 0 in each epoch, and sends DATA only while the guest's receive window has room.
-/// It checks the identity and sequence number of each of the guest's records, and panics on any
-/// record that the protocol does not allow.
+/// The broker's end of the guest's session. It resets the guest once the guest attaches, numbers
+/// its records to the guest from 0 in each epoch, and sends DATA only while the guest's receive
+/// window has room. It checks the identity and sequence number of each of the guest's records,
+/// and panics on any record that the protocol does not allow.
 struct Broker {
     /// Stream to the guest.
     stream: UnixStream,
@@ -271,15 +272,15 @@ fn longest() -> Message {
     Message::Echo((0..=u8::MAX).cycle().take(MAX_BODY).collect())
 }
 
-/// Starts the guest half in a thread, on one end of a socket pair, and returns the broker on the
-/// other end with the thread.
+/// Starts the guest agent's `serve` in a thread, on one end of a socket pair, and returns the
+/// broker on the other end with the thread.
 fn start() -> (Broker, JoinHandle<Result<Served, ServeError>>) {
     let (broker, guest) = UnixStream::pair().unwrap();
     let serving = thread::spawn(move || guest::serve(guest));
     (Broker::new(broker), serving)
 }
 
-/// Starts the guest half, attaches it in the first epoch, sends it `bytes`, and returns the
+/// Starts the guest agent, attaches it in the first epoch, sends it `bytes`, and returns the
 /// error that ended serving.
 fn refused(bytes: &[u8]) -> ServeError {
     let (mut broker, serving) = start();
@@ -294,7 +295,7 @@ fn refused(bytes: &[u8]) -> ServeError {
 }
 
 #[test]
-fn the_guest_half_answers_messages_that_span_records() {
+fn the_guest_agent_answers_messages_that_span_records() {
     let (mut broker, serving) = start();
     broker.attach(FIRST);
     let replies = broker.exchange(&[Message::Ping], OUTER_MAX_PAYLOAD, 1);
@@ -375,7 +376,7 @@ fn a_reset_starts_the_new_epoch_with_a_new_message() {
 }
 
 #[test]
-fn the_guest_half_ends_with_its_stream() {
+fn the_guest_agent_ends_with_its_stream() {
     // A stream that ends at a record boundary closes the session.
     let (mut broker, serving) = start();
     broker.attach(FIRST);
@@ -401,7 +402,7 @@ fn the_guest_half_ends_with_its_stream() {
 }
 
 #[test]
-fn the_guest_half_fails_on_records_that_the_protocol_does_not_allow() {
+fn the_guest_agent_fails_on_records_that_the_protocol_does_not_allow() {
     let ping = Message::Ping.encode().unwrap();
     let data = |identity, sequence| record(RecordType::Data, identity, sequence, &ping);
     let next_epoch = Identity { epoch: 2, ..FIRST };
@@ -567,7 +568,7 @@ fn the_guest_half_fails_on_records_that_the_protocol_does_not_allow() {
 }
 
 #[test]
-fn the_guest_half_refuses_messages_that_its_framing_does_not_allow() {
+fn the_guest_agent_refuses_messages_that_its_framing_does_not_allow() {
     // A message is refused at its header, before its body arrives: the decoder never buffers a
     // body beyond the limit.
     let too_long = u32::try_from(MAX_BODY + 1).unwrap().to_le_bytes();
@@ -597,7 +598,7 @@ fn the_guest_half_refuses_messages_that_its_framing_does_not_allow() {
         assert!(failed, "{message:?}: {error:?}");
     }
 
-    // The guest half answers requests, and refuses the messages that only it sends.
+    // The guest agent answers requests, and refuses the messages that only it sends.
     for message in [Message::Pong, Message::Stopped] {
         let bytes = record(RecordType::Data, FIRST, 1, &message.encode().unwrap());
         let error = refused(&bytes);

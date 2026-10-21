@@ -657,13 +657,14 @@ lockfile of its own, default features off, and the public API only. For each
 of its configurations, protocol-only, host-only, and, on Linux, guest-only for
 `x86_64-unknown-linux-musl`, the action runs Clippy with warnings denied, the
 build, the tests, and a check with the minimum Rust version of `nvx`, after
-rustfmt. The tests check consumer-contract scenario C0: each configuration
-enables only its side of `nvx`, the guest-only build pulls in neither Tokio
-nor a dependency that only the host side declares, and the guest binary is a
-static executable. The guest-only configuration also checks the guest's part
-of scenario C1: the adapter's guest half and its binary serve the NVXS session
-with the adapter's own framing against a test broker, which sends them
-messages that span records, resets, disconnects, and malformed records.
+rustfmt. The tests check that each configuration builds as an independent
+adapter's does: it enables only its side of `nvx`, the guest-only build pulls
+in neither Tokio nor a dependency that only the host side declares, and the
+guest binary is a static executable. In the guest-only configuration, they
+also check that the adapter's guest agent serves the control session between
+the host and the guest with the adapter's own framing, against a test broker
+that sends it messages that span records, resets, disconnects, and malformed
+records.
 
 The development release job depends on `aci-edge-sandboxes` and `nvx-rs` and
 requires their combined Linux/Windows results to be successful; failed,
@@ -685,9 +686,7 @@ therefore trigger the NVX microVM test matrix.
 
 The same jobs, except the debug-kernel ones, run the runtime adapter's
 scenarios on their backend: the ignored tests of its host-only configuration,
-with `NVX_HYPERVISOR` naming the backend. Later steps of
-[microsoft/nvx#535](https://github.com/microsoft/nvx/issues/535) add them; until
-then, the step only builds the adapter. Changes under `tests/runtime-adapter/`
+with `NVX_HYPERVISOR` naming the backend. Changes under `tests/runtime-adapter/`
 therefore trigger the NVX microVM test matrix too.
 
 ## Adversarial campaigns

@@ -1,24 +1,19 @@
 # Runtime adapter
 
-The runtime adapter is an independent adapter of the NVX runtime. It lives in
-this repository so that NVX's own CI builds and runs it, and it depends on
-[`nvx`](../../nvx-rs/README.md) the way an adapter outside the repository
-does:
+The runtime adapter is an independent adapter of the NVX runtime, with a host
+program and a guest agent. It lives in this repository so that NVX's own CI
+builds and runs it, and it depends on [`nvx`](../../nvx-rs/README.md) the way
+an adapter outside the repository does:
 
 - as a path dependency with default features off;
 - with a `Cargo.lock` of its own, outside any other workspace;
 - through the public API alone, with unsafe code forbidden;
 - with the minimum supported Rust version of `nvx`.
 
-[microsoft/nvx#535](https://github.com/microsoft/nvx/issues/535) sets the
-contract that it proves: an adapter brings its own application framing over
-the NVXS session, its own init, and its own status collector. Its guest half
-serves the guest's role of the NVXS session with the adapter's own framing.
-Its host binary is still a skeleton that reports the contract that it was
-built against. Later steps give the guest half the rest of the guest API
-([microsoft/nvx#619](https://github.com/microsoft/nvx/issues/619)), fill the
-host half ([microsoft/nvx#620](https://github.com/microsoft/nvx/issues/620)),
-and add the scenarios that run both halves on a hypervisor.
+The adapter brings its own application framing to the control session between
+the host and the guest, in place of NVX's `NVXC` frames. Its guest agent serves
+requests in that framing. Its host program reports the contract that it was
+built against.
 
 ## Configurations
 
@@ -32,10 +27,10 @@ Each configuration enables one side of `nvx`:
 
 ## Framing
 
-The `frame` module is the adapter's application framing, which its halves
-exchange in the payloads of the session's DATA records in place of NVX's
-`NVXC` frames. A message is a 5-byte header, then a body. The header holds the
-body's length, a little-endian `u32`, then the message's kind:
+The `frame` module is the adapter's application framing, which its host program
+and guest agent exchange over the control session in place of NVX's `NVXC`
+frames. A message is a 5-byte header, then a body. The header holds the body's
+length, a little-endian `u32`, then the message's kind:
 
 | Kind | Message | Body |
 | --- | --- | --- |
@@ -45,22 +40,21 @@ body's length, a little-endian `u32`, then the message's kind:
 | 4 | `Stop`: asks the guest to stop serving | none |
 | 5 | `Stopped`: the guest's confirmation of `Stop`, its last message | none |
 
-The session keeps no message boundaries, so a message may span several DATA
+The session keeps no message boundaries, so a message may span several of its
 records, and one record may end a message and start the next. `Decoder`
 reassembles the messages. It checks each header before it takes any byte of
 the body, and holds at most one partial message. A malformed message ends the
 stream, because the framing cannot find the next message after it.
 
-## Guest half
+## Guest agent
 
-`guest::serve` serves the guest's role of the NVXS session on a stream that
-connects to the broker's guest leg, through `nvx::guest::nvxs`. It attaches,
-then:
+`guest::serve` serves the host program on a stream to the guest's end of the
+control session, through `nvx::guest::nvxs`. It attaches, then:
 
-- acknowledges each RESET with the smallest receive window that NVXS allows,
-  once it dropped the earlier epoch's partial message, because a new epoch
-  starts with a new message;
-- credits each DATA payload back once it holds the payload, so that a message
+- acknowledges each reset of the session with the smallest receive window that
+  the session allows, once it dropped the earlier epoch's partial message,
+  because a new epoch starts with a new message;
+- credits each payload back once it holds the payload, so that a message
   longer than the window still arrives whole;
 - answers each `Ping` with `Pong`, sends each `Echo` back, and answers `Stop`
   with `Stopped`, then returns.
@@ -68,16 +62,17 @@ then:
 A failure of the session, a malformed message, and a message that only the
 guest sends end serving with an error.
 
-`runtime-adapter-guest serve` runs the guest half on its standard input and
-output, which connect to the broker's guest leg, such as a control console in
-raw mode. It exits with 0 once the host stopped it or the broker closed the
-stream, and with 1, after a diagnostic on standard error, once serving failed.
-Without arguments, it reports the contract that it was built against.
+`runtime-adapter-guest serve` runs the guest agent on its standard input and
+output, which connect to the guest's end of the session, such as a control
+console in raw mode. It exits with 0 once the host stopped it or the broker
+closed the stream, and with 1, after a diagnostic on standard error, once
+serving failed. Without arguments, it reports the contract that it was built
+against.
 
 ## Tests
 
-`tests/independent_build.rs` checks consumer-contract scenario C0 in every
-configuration:
+`tests/independent_build.rs` checks that every configuration builds as an
+independent adapter's does:
 
 - The adapter is a workspace of its own with its own lockfile, and declares
   the minimum supported Rust version of `nvx`.
@@ -95,17 +90,17 @@ The unit tests of `frame` run in every configuration. They cover each kind's
 encoding, messages in pieces of any size and split at every byte, and the
 headers that the framing refuses before their body arrives.
 
-`tests/guest_session.rs` checks the guest's part of consumer-contract scenario
-C1, NVXS with independent framing, in the guest-only configuration. A test
-broker plays the broker's guest leg over a Unix socket pair with the public
-record API of `nvx`, for `guest::serve` and for `runtime-adapter-guest
-serve`. It covers messages that span records both ways and fill the receive
-window, a record whose bytes arrive one at a time, resets in the middle of a
-message, with the next epoch of the instance and with a new instance, streams
-that end at and inside a record, and the records and messages that the guest
-half refuses: sequence, epoch, and instance errors, stale and identity-less
-resets, record lengths, bootstrap identity, ERROR payloads, and malformed
-headers.
+`tests/guest_session.rs` checks, in the guest-only configuration, that the
+guest agent serves the control session with the adapter's own framing. A test
+broker plays the broker's end of the guest's session over a Unix socket pair
+with the public record API of `nvx`, for `guest::serve` and for
+`runtime-adapter-guest serve`. It covers messages that span records both ways
+and fill the receive window, a record whose bytes arrive one at a time, resets
+in the middle of a message, with the next epoch of the instance and with a new
+instance, streams that end at and inside a record, and the records and
+messages that the guest agent refuses: sequence, epoch, and instance errors,
+stale and identity-less resets, record lengths, bootstrap identity, ERROR
+payloads, and malformed headers.
 
 Run the checks of each configuration in this directory. The guest-only
 configuration needs Linux and the musl target, which
@@ -133,4 +128,4 @@ NVX microVM tests. Their
 [workflow](../../.github/workflows/run-nvx-microvm-tests.yml) runs the
 adapter's hypervisor scenarios on each backend: its ignored tests in the
 host-only configuration, with `NVX_HYPERVISOR` naming the backend, which
-`nvx::Hypervisor::from_env_or_default` reads. There are none yet.
+`nvx::Hypervisor::from_env_or_default` reads.

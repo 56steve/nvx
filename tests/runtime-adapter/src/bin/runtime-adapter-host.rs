@@ -1,6 +1,5 @@
-//! The host half of the runtime adapter. This skeleton reports the contract that it was built
-//! against and whether `nvx` supports this host; later steps make it start, reattach to, and
-//! stop sandboxes through the host API.
+//! The runtime adapter's host program. It reports the contract that it was built against and
+//! whether `nvx` supports this host.
 
 use std::process::ExitCode;
 

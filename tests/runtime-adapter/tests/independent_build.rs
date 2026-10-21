@@ -1,4 +1,4 @@
-//! Consumer-contract scenario C0: the adapter builds on `nvx` independently.
+//! The adapter builds on `nvx` independently, as an adapter outside the repository does.
 //!
 //! - It is a workspace of its own, with a lockfile of its own, and declares the minimum supported
 //!   Rust version of `nvx`.

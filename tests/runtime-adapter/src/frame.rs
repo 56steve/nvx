@@ -1,9 +1,9 @@
-//! The adapter's own application framing, which its halves exchange over the NVXS session where
-//! NVX's own adapter exchanges `NVXC` frames.
+//! The adapter's own application framing, which its host program and guest agent exchange over the
+//! control session between the host and the guest, in place of NVX's `NVXC` frames.
 //!
 //! A message is a header of [`HEADER_LEN`] bytes, then a body. The header holds the body's length,
-//! a little-endian `u32`, then the message's kind. NVXS carries bytes and keeps no message
-//! boundaries, so a message may span several DATA records, and one record may end a message and
+//! a little-endian `u32`, then the message's kind. The session carries bytes and keeps no message
+//! boundaries, so a message may span several of its records, and one record may end a message and
 //! start the next. [`Decoder`] reassembles the messages: it checks each header before it takes any
 //! byte of the body, and holds at most one partial message, whose body has at most [`MAX_BODY`]
 //! bytes.
@@ -16,7 +16,7 @@ use std::fmt;
 /// Bytes of a message's header: the body's length, then the message's kind.
 pub const HEADER_LEN: usize = 5;
 
-/// Most bytes of a message's body, which is more than four NVXS DATA records carry.
+/// Most bytes of a message's body, which is more than four of the session's records carry.
 pub const MAX_BODY: usize = 256 * 1024;
 
 /// A message of the adapter's framing.
@@ -160,8 +160,8 @@ impl fmt::Display for FrameError {
 
 impl std::error::Error for FrameError {}
 
-/// Reassembles messages from bytes that arrive in pieces of any size, such as the payloads of an
-/// NVXS session's DATA records.
+/// Reassembles messages from bytes that arrive in pieces of any size, such as the payloads of the
+/// control session's records.
 #[derive(Clone, Debug, Default)]
 pub struct Decoder {
     /// Header of the message in progress.

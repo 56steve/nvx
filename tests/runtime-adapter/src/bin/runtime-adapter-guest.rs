@@ -1,10 +1,11 @@
-//! The guest half of the runtime adapter, a static `x86_64-unknown-linux-musl` executable.
+//! The runtime adapter's guest agent, a static `x86_64-unknown-linux-musl` executable.
 //!
 //! - `runtime-adapter-guest` reports the contract that it was built against.
-//! - `runtime-adapter-guest serve` serves the guest's role of the NVXS session with the adapter's
-//!   own framing on its standard input and output, which connect to the broker's guest leg, such
-//!   as a control console in raw mode. It exits with 0 once the host stopped it or the broker
-//!   closed the stream, and with 1, after a diagnostic on standard error, once serving failed.
+//! - `runtime-adapter-guest serve` serves the host program with the adapter's own framing on its
+//!   standard input and output, which connect to the guest's end of the control session between
+//!   the host and the guest, such as a control console in raw mode. It exits with 0 once the host
+//!   stopped it or the broker closed the stream, and with 1, after a diagnostic on standard error,
+//!   once serving failed.
 //!
 //! Anything else is a usage error, with status 2.
 
@@ -69,7 +70,7 @@ impl std::io::Write for Stdio {
     }
 }
 
-// The guest half runs only in Linux guests. Elsewhere this stub fails, so that every target still
+// The guest agent runs only in Linux guests. Elsewhere this stub fails, so that every target still
 // builds with every feature.
 #[cfg(not(target_os = "linux"))]
 fn main() -> ExitCode {
