@@ -259,10 +259,13 @@ def _write_release_fixture(
     binary = openvmm_dir / "target" / "release" / binary_name
     revision = "0bc357bbcf3a654b63dfb51f1103c5751bf3d31f"
     guest_names = ReleaseBuildConstants.GUEST_ARTIFACT_NAMES
+    # The guest artifacts' inputs, and the sources of the nvx-rs executable that
+    # the release ships, whose host side no guest artifact reads.
     source_files = (
         set(build._initramfs_source_files())
         | set(ubuntu.customization_files())
         | set(azurelinux.input_files())
+        | set(nvx_rs.source_files())
     )
     for source in source_files:
         destination = root / source.relative_to(BuildConstants.REPO_ROOT)

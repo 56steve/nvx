@@ -106,12 +106,13 @@ def _fake_guest_build(
 
 
 class GuestBinaryBuildTests(unittest.TestCase):
-    def test_source_identity_covers_the_crate_and_the_toolchain(self):
+    def test_source_identity_covers_the_guest_build_inputs_only(self):
+        root = BuildConstants.REPO_ROOT
         relative = {
-            path.relative_to(BuildConstants.REPO_ROOT).as_posix()
+            path.relative_to(root).as_posix()
             for path in guest_binaries.guest_binary_source_files()
         }
-        # The build constants list the inputs that the inventory reads.
+        # The build constants list the inputs that Cargo's dep-info omits.
         self.assertLessEqual(
             {path.as_posix() for path in GuestRustBuildConstants.SOURCE_FILES},
             relative,
@@ -122,14 +123,128 @@ class GuestBinaryBuildTests(unittest.TestCase):
         self.assertIn("nvx-rs/build.rs", relative)
         self.assertIn("scripts/nvx_tools/build_constants.py", relative)
         self.assertIn("scripts/nvx_tools/guest_binaries.py", relative)
-        self.assertIn("nvx-rs/src/guest/exit.rs", relative)
-        self.assertIn("nvx-rs/src/guest/device_io.rs", relative)
-        self.assertFalse(any("/target/" in f"/{path}/" for path in relative))
+        # The guest build compiles every source file of the crate but the host
+        # side, which the host and testing modules and the host binaries hold, and
+        # the test modules.
+        source = root / GuestRustBuildConstants.SOURCE_DIRECTORY
+        guest_roots = {
+            f"bin/{binary}.rs" for binary in GuestRustBuildConstants.BINARIES
+        }
+        test_modules = {
+            path.relative_to(GuestRustBuildConstants.SOURCE_DIRECTORY).as_posix()
+            for path in GuestRustBuildConstants.TEST_MODULES
+        }
+        compiled: set[str] = set()
+        for path in source.rglob("*"):
+            name = path.relative_to(source).as_posix()
+            parts = path.relative_to(source).parts
+            host = parts[0] in ("host", "host.rs", "testing", "testing.rs") or (
+                parts[0] == "bin" and name not in guest_roots
+            )
+            test = (
+                "tests" in parts[:-1] or parts[-1] == "tests.rs" or name in test_modules
+            )
+            if path.is_file() and not host and not test:
+                compiled.add(f"nvx-rs/src/{name}")
+        self.assertEqual(
+            {path for path in relative if path.startswith("nvx-rs/src/")}, compiled
+        )
+        for path in (
+            "nvx-rs/src/lib.rs",
+            "nvx-rs/src/contract.rs",
+            "nvx-rs/src/protocol/nvxs/host.rs",
+            "nvx-rs/src/guest/exit.rs",
+            "nvx-rs/src/guest/device_io.rs",
+            *(f"nvx-rs/src/{name}" for name in sorted(guest_roots)),
+        ):
+            with self.subTest(compiled=path):
+                self.assertIn(path, relative)
+        for path in (
+            "nvx-rs/README.md",
+            "nvx-rs/artifacts.json",
+            "nvx-rs/tests/guest_tools.rs",
+            "nvx-rs/src/host/mod.rs",
+            "nvx-rs/src/testing/mod.rs",
+            "nvx-rs/src/bin/nvx-rs.rs",
+            "nvx-rs/src/bin/nvx-fake-openvmm.rs",
+            "nvx-rs/src/protocol/tests.rs",
+            "nvx-rs/src/protocol/nvxs/tests/guest.rs",
+            "nvx-rs/src/guest/managed_agent/loopback.rs",
+        ):
+            with self.subTest(omitted=path):
+                self.assertTrue((root / path).is_file())
+                self.assertNotIn(path, relative)
         self.assertRegex(guest_binaries.guest_binary_source_sha256(), r"^[0-9a-f]{64}$")
         self.assertEqual(
             guest_binaries.pinned_guest_rust_toolchain(),
             GuestRustBuildConstants.TOOLCHAIN,
         )
+
+    def test_source_identity_changes_only_with_the_guest_build_inputs(self):
+        # The guest image cache keys end with this identity, so a change to the
+        # host side or to a test must leave it as it is, and a change to a file
+        # that the guest build reads must change it.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            inputs = (
+                *(path.as_posix() for path in GuestRustBuildConstants.SOURCE_FILES),
+                "nvx-rs/src/lib.rs",
+                "nvx-rs/src/contract.rs",
+                "nvx-rs/src/net/cidr.rs",
+                "nvx-rs/src/protocol/mod.rs",
+                "nvx-rs/src/protocol/nvxs/host.rs",
+                "nvx-rs/src/guest/managed_agent/exec.rs",
+                "nvx-rs/src/bin/nvx-time.rs",
+            )
+            others = (
+                "nvx-rs/README.md",
+                "nvx-rs/artifacts.json",
+                "nvx-rs/tests/guest_tools.rs",
+                "nvx-rs/src/host/mod.rs",
+                "nvx-rs/src/host/cli/args.rs",
+                "nvx-rs/src/testing/fake_openvmm.rs",
+                "nvx-rs/src/bin/nvx-rs.rs",
+                "nvx-rs/src/bin/nvx-fake-openvmm.rs",
+                "nvx-rs/src/protocol/tests.rs",
+                "nvx-rs/src/protocol/nvxs/tests/host.rs",
+                "nvx-rs/src/guest/managed_agent/loopback.rs",
+            )
+            for name in (*inputs, *others):
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(f"{name}\n", encoding="utf-8")
+            identity = guest_binaries.guest_binary_source_sha256(root)
+
+            for name in (*others, "nvx-rs/src/host/added.rs", "nvx-rs/tests/added.rs"):
+                with self.subTest(unchanged=name):
+                    (root / name).write_text("changed\n", encoding="utf-8")
+                    self.assertEqual(
+                        guest_binaries.guest_binary_source_sha256(root), identity
+                    )
+            for name in inputs:
+                with self.subTest(changed=name):
+                    path = root / name
+                    original = path.read_bytes()
+                    path.write_text("changed\n", encoding="utf-8")
+                    self.assertNotEqual(
+                        guest_binaries.guest_binary_source_sha256(root), identity
+                    )
+                    path.write_bytes(original)
+            # A new module counts unless it belongs to the host side or tests.
+            for name in (
+                "nvx-rs/src/guest/added.rs",
+                "nvx-rs/src/added.rs",
+                "nvx-rs/.cargo/config.toml",
+            ):
+                with self.subTest(added=name):
+                    path = root / name
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text("added\n", encoding="utf-8")
+                    self.assertNotEqual(
+                        guest_binaries.guest_binary_source_sha256(root), identity
+                    )
+                    path.unlink()
+            self.assertEqual(guest_binaries.guest_binary_source_sha256(root), identity)
 
     def test_toolchain_pin_must_match_the_guest_build_constants(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -391,6 +506,16 @@ class GuestBinaryBuildTests(unittest.TestCase):
                     "file in the checkout",
                     crate / "artifacts.json",
                     "source identity omits.*: nvx-rs/artifacts.json$",
+                ),
+                (
+                    "host module",
+                    crate / "src" / "host" / "mod.rs",
+                    "source identity omits.*: nvx-rs/src/host/mod.rs$",
+                ),
+                (
+                    "test module",
+                    crate / "src" / "protocol" / "tests.rs",
+                    "source identity omits.*: nvx-rs/src/protocol/tests.rs$",
                 ),
                 (
                     "directory in the checkout",

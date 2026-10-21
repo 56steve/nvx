@@ -40,11 +40,17 @@ def guest_binary_source_files(root: Path | None = None) -> tuple[Path, ...]:
     source = root / GuestRustBuildConstants.SOURCE_DIRECTORY
     if not source.is_dir():
         raise ScriptError(f"nvx-rs source directory not found: {source}")
-    files.update(
-        path
-        for path in source.rglob("*")
-        if path.is_file() and "target" not in path.relative_to(source).parts
-    )
+    for directory in GuestRustBuildConstants.SOURCE_DIRECTORIES:
+        if not (root / directory).is_dir():
+            continue
+        files.update(
+            path
+            for path in (root / directory).rglob("*")
+            if path.is_file()
+            and GuestRustBuildConstants.SOURCE_PATTERN.fullmatch(
+                path.relative_to(root).as_posix()
+            )
+        )
     return tuple(
         sorted(
             (require_file(path, "Rust guest binary source input") for path in files),
