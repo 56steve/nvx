@@ -256,12 +256,13 @@ pub(crate) fn detach(command: &mut Command, inherit: &[Inherited<'_>]) -> io::Re
     let mut descriptors: Vec<RawFd> = Vec::with_capacity(inherit.len());
     for inherited in inherit {
         let descriptor = inherited.as_fd().as_raw_fd();
-        if descriptor <= 2 {
+        if descriptor <= sys::LAST_STANDARD_STREAM {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
                     "descriptor {descriptor} cannot be inherited: the VMM's own standard streams \
-                     replace descriptors 0 to 2"
+                     replace descriptors 0 to {}",
+                    sys::LAST_STANDARD_STREAM
                 ),
             ));
         }

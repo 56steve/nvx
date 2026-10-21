@@ -16,6 +16,14 @@ use nix::unistd::{Pid, setsid};
 
 use super::Errno;
 
+/// The highest descriptor of a standard stream: standard error.
+///
+/// Standard input, output, and error are descriptors 0, 1, and 2 in every process, and a spawn
+/// gives the new process its own standard streams under those numbers. A descriptor of the
+/// caller's at or below this one therefore cannot reach the new process under its number, and
+/// the descriptors that a detached spawn marks close-on-exec are the ones above it.
+pub(crate) const LAST_STANDARD_STREAM: RawFd = libc::STDERR_FILENO;
+
 /// A pidfd: an owned descriptor that refers to one process. Signals sent through it reach that
 /// process or fail, even once another process reuses its ID.
 pub(crate) struct PidFd(OwnedFd);
@@ -156,7 +164,7 @@ pub(crate) fn clear_close_on_exec(descriptor: impl AsFd) -> io::Result<()> {
 /// pipe writer it holds, for example, keeps the reader from seeing end-of-file. Marking rather
 /// than closing keeps the descriptor through which `Command::spawn` reports a failed exec.
 fn mark_descriptors_close_on_exec() -> io::Result<()> {
-    let first: libc::c_uint = 3;
+    let first: libc::c_uint = LAST_STANDARD_STREAM.unsigned_abs() + 1;
     // SAFETY: close_range takes two descriptor bounds and flags and changes no memory.
     let marked = unsafe {
         libc::syscall(
@@ -221,7 +229,7 @@ fn mark_directory_entries(directory: &OwnedFd) -> io::Result<()> {
             let (record, rest) = records.split_at_checked(length).ok_or_else(malformed)?;
             let name = record.get(19..).ok_or_else(malformed)?;
             if let Some(descriptor) = descriptor_number(name)
-                && descriptor > 2
+                && descriptor > LAST_STANDARD_STREAM
                 && descriptor != directory.as_raw_fd()
             {
                 // SAFETY: the listing shows the descriptor open, and between fork and exec only
