@@ -77,9 +77,9 @@ pub(crate) use fd::{
     create_memfd, create_pipe, lock_file, open, open_at, page_size, unlink,
 };
 pub(crate) use filesystem::{
-    MountFlags, ScratchDirectory, TmpfsMount, change_directory, check_exists, chmod, chown,
-    current_directory, enter_private_mount_namespace, mount, path_c_string, path_exists, read_file,
-    read_line, read_number, write_file, write_number,
+    MountFlags, PATH_MAX, ScratchDirectory, TmpfsMount, change_directory, check_exists, chmod,
+    chown, current_directory, enter_private_mount_namespace, mount, path_c_string, path_exists,
+    read_file, read_line, read_number, write_file, write_number,
 };
 pub(crate) use ioctl::{console_pending, reseed_random};
 pub(crate) use mapping::MemoryMapping;

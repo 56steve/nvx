@@ -15,6 +15,10 @@ use nix::unistd::{AccessFlags, Gid, Uid};
 
 use super::{Errno, errno_of};
 
+/// Linux's `PATH_MAX`: the size of the longest path that the kernel takes, with its terminating
+/// NUL.
+pub(crate) const PATH_MAX: usize = nix::libc::PATH_MAX as usize;
+
 /// Converts a Unix path to a NUL-terminated string, or `EINVAL` if it contains a NUL.
 pub(crate) fn path_c_string(path: &Path) -> Result<CString, Errno> {
     super::c_string(path.as_os_str().as_bytes())

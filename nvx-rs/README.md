@@ -37,8 +37,8 @@ nvx-rs/
 │   ├── testing/     feature `testing`: the fake OpenVMM
 │   ├── guest/       feature `guest`: the programs that run in Linux guests, the guest's NVXS
 │   │                connection, and the libraries through which a guest init or agent starts
-│   │                a program, collects its children's statuses, and settles its executions'
-│   │                cgroups
+│   │                a program, collects its children's statuses, settles its executions'
+│   │                cgroups, and bind-mounts host mappings below the roots that it names
 │   └── bin/         nvx-rs, nvx-fake-openvmm, and the guest binaries
 ├── tests/           fake-OpenVMM, CLI, NVXS session, process-supervision, store, and guest-binary
 │                    tests, the store's record fixtures, and the golden fixtures that Python
@@ -69,6 +69,7 @@ nvx-rs/
 | `nvx::testing::fake_openvmm` | A fake OpenVMM that serves the control console and runs scripted workloads without a VM, for direct launches and for the managed and one-shot sandboxes of `nvx-rs sandbox` and `nvx.py sandbox` |
 | `nvx::host::cli` | Feature `cli`: the `nvx-rs` executable; see [The nvx-rs CLI](#the-nvx-rs-cli) |
 | `nvx::guest` | The programs that run in Linux guests; see [Guest binaries](#guest-binaries) |
+| `nvx::guest::mappings` | `Mapping`: one host mapping for any guest init or agent, a relative source below an export root, where the host's shares appear, and a target below a target root, the tree that the mappings go into, with its `Access`. `Mapping::apply` takes both roots explicitly: it creates the target as the kind of its source, a directory or a regular file, bind-mounts the source on it, and remounts the bind `nosuid` and `nodev`, and read-only when asked. A `MappingFailure` tells which `MappingStage` failed and its `errno`. The caller keeps the order of its mappings and what a failure means for the rest |
 | `nvx::guest::nvxs` | `GuestConnection`: the guest's role of the NVXS session over a byte stream, such as the control console, on which NVX's managed agent and other guest agents run their sessions. It never reads past the record in progress, so a caller that polls the stream between records sees every record that it has not returned |
 | `nvx::guest::spawn` | `Command`: starts a program in a new process for any guest init or agent, with its arguments, environment, root and working directories, standard streams, inherited descriptors, cgroup, and process group, without NVX's control protocol, managed agent, or workload identity. Its `LaunchReport` tells whether the program started, or which `LaunchStage` failed and why. NVX's managed agent is one caller |
 | `nvx::guest::process` | `Child`: the status of one child that the caller names, by its pidfd or its process ID. It waits for that child alone, so another child's status stays for the caller; a caller that collects every status itself, such as a PID 1 that adopts orphans, hands each one to its `Child` with `observe`. Statuses are `std::process::ExitStatus`, real-time signals included |
@@ -495,10 +496,13 @@ The `guest` feature adds the programs that run in NVX's Linux guests: the
 `nvx::guest` module and one binary per program. The Alpine, Ubuntu, and Azure
 Linux images ship all nine at their established `/sbin/nvx-*` paths. The
 module's libraries are not programs: `spawn` starts a program in a new
-process, `process` collects the status of a child that the caller names, and
-`cgroup` places, kills, and settles the processes of an execution.
+process, `process` collects the status of a child that the caller names,
+`cgroup` places, kills, and settles the processes of an execution, and
+`mappings` bind-mounts host mappings below the roots that its caller names.
 `nvx-managed-agent` launches, collects, and settles its workloads through them,
-and any other guest init or agent can too.
+and applies its host mapping table through `mappings`, with its mount of the
+host's export and `/` as the roots, and any other guest init or agent can use
+them too.
 
 | Binary | Program |
 | --- | --- |
