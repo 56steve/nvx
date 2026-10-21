@@ -232,8 +232,9 @@ pub(crate) fn port_range(
     Ok((start, end))
 }
 
-/// Returns the selectors of an MXC port selector `description` whose protocol is valid, as the
-/// rest of `_parse_mxc_port` does.
+/// Returns the selectors of the port fields, `port` and the optional `endPort`, of
+/// `description`, an MXC port selector or a legacy flat rule whose protocol is valid, as the rest
+/// of `_parse_mxc_port` does. ICMP takes no port.
 pub(crate) fn port_selectors(
     protocol: RuleProtocol,
     port: Option<PortValue>,
@@ -246,16 +247,6 @@ pub(crate) fn port_selectors(
         }
         return Ok(vec![(protocol.native(), None)]);
     };
-    port_protocol_selectors(protocol, port, end_port, description)
-}
-
-/// Returns the selectors of a protocol with ports, which ICMP does not have.
-pub(crate) fn port_protocol_selectors(
-    protocol: RuleProtocol,
-    port: PortValue,
-    end_port: Option<PortValue>,
-    description: &str,
-) -> Result<Vec<Selector>> {
     if protocol == RuleProtocol::Icmp {
         return Err(invalid(format!(
             "{description}.port is not supported with icmp"

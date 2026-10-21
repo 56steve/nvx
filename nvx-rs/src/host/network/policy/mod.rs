@@ -348,16 +348,17 @@ fn parse_rule(document: &Document, id: NodeId, description: &str) -> Result<Vec<
     parse_mxc_rule(&rule, description)
 }
 
-/// Parses a destination network and its exceptions, the `cidr` and optional `except` fields of
-/// `description`, as the rest of `_parse_peer` does.
+/// Parses a destination network and its exceptions, the required `cidr` and optional `except`
+/// fields of `description`, as the rest of `_parse_peer` does.
 fn parse_peer_fields(
     object: &Object<'_>,
-    cidr: NodeId,
-    except: Option<NodeId>,
     description: &str,
 ) -> Result<(Family, Vec<(u128, u128)>)> {
+    let Some(cidr) = object.get("cidr") else {
+        return Err(invalid(format!("{description}.cidr is required")));
+    };
     let parent = parse_network(object.node(cidr), &format!("{description}.cidr"))?;
-    let exceptions = match except {
+    let exceptions = match object.get("except") {
         Some(except) => array(object.document, except, &format!("{description}.except"))?,
         None => &[],
     };
@@ -389,20 +390,13 @@ fn parse_peer(
 ) -> Result<(Family, Vec<(u128, u128)>)> {
     let peer = object(document, id, description)?;
     peer.check_fields(PEER_FIELDS, description)?;
-    let Some(cidr) = peer.get("cidr") else {
-        return Err(invalid(format!("{description}.cidr is required")));
-    };
-    parse_peer_fields(&peer, cidr, peer.get("except"), description)
+    parse_peer_fields(&peer, description)
 }
 
 /// Parses a legacy flat rule, as `_parse_legacy_rule` does.
 fn parse_legacy_rule(rule: &Object<'_>, description: &str) -> Result<Vec<Rule>> {
     rule.check_fields(LEGACY_RULE_FIELDS, description)?;
-    let Some(cidr) = rule.get("cidr") else {
-        return Err(invalid(format!("{description}.cidr is required")));
-    };
-    let (family, addresses) = parse_peer_fields(rule, cidr, rule.get("except"), description)?;
-    let destinations = Some(vec![(family, addresses)]);
+    let destinations = Some(vec![parse_peer_fields(rule, description)?]);
     let port = rule.get("port");
     let end_port = rule.get("endPort");
     if end_port.is_some() && port.is_none() {
@@ -415,15 +409,12 @@ fn parse_legacy_rule(rule: &Object<'_>, description: &str) -> Result<Vec<Rule>> 
         return Ok(lowering::combine(destinations, None));
     };
     let protocol = self::protocol(rule.document, protocol, description)?;
-    let selectors: Vec<Selector> = match port {
-        None => vec![(protocol.native(), None)],
-        Some(port) => lowering::port_protocol_selectors(
-            protocol,
-            port_value(rule.node(port)),
-            end_port.map(|end_port| port_value(rule.node(end_port))),
-            description,
-        )?,
-    };
+    let selectors = lowering::port_selectors(
+        protocol,
+        port.map(|port| port_value(rule.node(port))),
+        end_port.map(|end_port| port_value(rule.node(end_port))),
+        description,
+    )?;
     Ok(lowering::combine(destinations, Some(selectors)))
 }
 
