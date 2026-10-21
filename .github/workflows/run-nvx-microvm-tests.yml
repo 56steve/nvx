@@ -1180,9 +1180,10 @@ jobs:
           --backend "${{ inputs.backend }}"
           --output-dir "build/test-results/aci-edge-sandboxes-${{ inputs.backend }}"
 
-      # The runtime adapter's scenarios on this backend: the ignored tests of its
-      # host-only configuration, which read the backend through
-      # `nvx::Hypervisor::from_env_or_default`.
+      # The runtime adapter's hypervisor scenarios on this backend: any ignored
+      # tests of its host-only configuration, which read the backend through
+      # `nvx::Hypervisor::from_env_or_default`. The step builds the adapter
+      # whether or not it declares any.
       - name: Run runtime adapter scenarios on Linux
         if: runner.os != 'Windows' && !inputs.debug-kernel
         shell: bash

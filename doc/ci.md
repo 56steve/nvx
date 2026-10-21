@@ -684,10 +684,12 @@ it keeps the OpenVMM log under `build/test-results/aci-edge-sandboxes-<backend>`
 uploaded with the other microVM logs. Changes under `aci_edge_sandboxes/` or `nvx-rs/`
 therefore trigger the NVX microVM test matrix.
 
-The same jobs, except the debug-kernel ones, run the runtime adapter's
-scenarios on their backend: the ignored tests of its host-only configuration,
-with `NVX_HYPERVISOR` naming the backend. Changes under `tests/runtime-adapter/`
-therefore trigger the NVX microVM test matrix too.
+The same jobs, except the debug-kernel ones, build the runtime adapter's
+host-only configuration on their backend and run any ignored tests that it
+declares, its hypervisor scenarios, with `NVX_HYPERVISOR` naming the backend.
+The adapter's other tests, including those of its guest agent, run in the
+`nvx-rs` job. Changes under `tests/runtime-adapter/` therefore trigger the NVX
+microVM test matrix too.
 
 ## Adversarial campaigns
 

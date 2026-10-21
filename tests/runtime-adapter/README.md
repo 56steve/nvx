@@ -125,7 +125,7 @@ supported Rust version, on Linux and Windows, where it skips the guest-only
 configuration. A change to the adapter is a test input of CI's
 [change classification](../../doc/ci.md#change-classification), so it runs the
 NVX microVM tests. Their
-[workflow](../../.github/workflows/run-nvx-microvm-tests.yml) runs the
-adapter's hypervisor scenarios on each backend: its ignored tests in the
-host-only configuration, with `NVX_HYPERVISOR` naming the backend, which
-`nvx::Hypervisor::from_env_or_default` reads.
+[workflow](../../.github/workflows/run-nvx-microvm-tests.yml) builds the
+host-only configuration on each backend and runs any ignored tests that it
+declares, the adapter's hypervisor scenarios, with `NVX_HYPERVISOR` naming the
+backend, which `nvx::Hypervisor::from_env_or_default` reads.
