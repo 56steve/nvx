@@ -7,10 +7,11 @@ import io
 import json
 import re
 import statistics
+import subprocess
 import sys
 import tempfile
 import unittest
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any, cast
 from unittest.mock import patch
@@ -452,6 +453,24 @@ def validate_attempt(source: Path, log: Path) -> int:
                 str(log),
             ]
         )
+
+
+def git_repository(path: Path) -> Callable[..., str]:
+    """Initialize a git repository at ``path`` and return a git runner for it."""
+
+    def git(*args: str) -> str:
+        return subprocess.run(
+            ["git", "-C", str(path), *args],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+    git("init", "-q")
+    git("config", "user.email", "test@example.invalid")
+    git("config", "user.name", "test")
+    git("config", "commit.gpgsign", "false")
+    return git
 
 
 class PerformanceTests(unittest.TestCase):
@@ -2388,6 +2407,440 @@ class PerformanceTests(unittest.TestCase):
                     root / "results",
                     lifecycle_input=lifecycle_path,
                 )
+
+    def test_reset_check_ignores_side_branch_history_that_never_reset_a_row(self):
+        # A side branch forked before the measurement can hold fewer rows than the
+        # measurement without resetting them. Comparing it with the previous commit
+        # in log order would flag the throughput row, which it never removed.
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+
+            def git(*args: str) -> str:
+                completed = subprocess.run(
+                    ["git", "-C", str(repo), *args],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                return completed.stdout.strip()
+
+            git("init", "-q")
+            git("config", "user.email", "test@example.invalid")
+            git("config", "user.name", "test")
+            history_file = repo / "data" / "linux-kvm.csv"
+            performance.write_results(
+                history_file,
+                [performance.Result("s0", "latency", "ms", "lower", 10.0)],
+            )
+            git("add", "data")
+            git("commit", "-q", "-m", "seed")
+            main = git("rev-parse", "--abbrev-ref", "HEAD")
+            git("checkout", "-q", "-b", "side")
+            performance.write_results(
+                history_file,
+                [performance.Result("x", "latency", "ms", "lower", 11.0)],
+            )
+            git("commit", "-q", "-am", "side change")
+            git("checkout", "-q", main)
+            performance.write_results(
+                history_file,
+                [
+                    performance.Result("s0", "latency", "ms", "lower", 10.0),
+                    performance.Result("A", "throughput", "MB/s", "higher", 20.0),
+                ],
+            )
+            git("commit", "-q", "-am", "measured")
+            measured = git("rev-parse", "HEAD")
+            # The merge keeps the side branch's latency change and A's throughput row.
+            git("merge", "-q", "--no-commit", "--no-ff", "-X", "ours", "side")
+            performance.write_results(
+                history_file,
+                [
+                    performance.Result("x", "latency", "ms", "lower", 11.0),
+                    performance.Result("A", "throughput", "MB/s", "higher", 20.0),
+                ],
+            )
+            git("commit", "-q", "-am", "merge side")
+
+            self.assertEqual(
+                performance._reset_dimensions_since(repo, history_file, measured),
+                set(),
+            )
+
+    def test_reset_check_ignores_a_merged_branch_that_predates_an_earlier_reset(self):
+        # Dev resets latency before measurement A. A branch forked before that reset
+        # keeps the old latency rows and adds throughput; merging it into dev keeps the
+        # reset, so the merge drops latency relative to that branch. The reset preceded A,
+        # so A's latency row must not be discarded.
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+
+            def git(*args: str) -> str:
+                completed = subprocess.run(
+                    ["git", "-C", str(repo), *args],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                return completed.stdout.strip()
+
+            git("init", "-q")
+            git("config", "user.email", "test@example.invalid")
+            git("config", "user.name", "test")
+            history_file = repo / "data" / "linux-kvm.csv"
+            performance.write_results(
+                history_file,
+                [performance.Result("s0", "latency", "ms", "lower", 10.0)],
+            )
+            git("add", "data")
+            git("commit", "-q", "-m", "seed")
+            main = git("rev-parse", "--abbrev-ref", "HEAD")
+            git("checkout", "-q", "-b", "branch")
+            performance.write_results(
+                history_file,
+                [
+                    performance.Result("s0", "latency", "ms", "lower", 12.0),
+                    performance.Result("b", "throughput", "MB/s", "higher", 5.0),
+                ],
+            )
+            git("commit", "-q", "-am", "branch work")
+            git("checkout", "-q", main)
+            performance.write_results(history_file, [])
+            git("commit", "-q", "-am", "reset latency before the measurement")
+            git("commit", "-q", "--allow-empty", "-m", "measured")
+            measured = git("rev-parse", "HEAD")
+            git("merge", "-q", "--no-commit", "--no-ff", "-X", "ours", "branch")
+            performance.write_results(
+                history_file,
+                [performance.Result("b", "throughput", "MB/s", "higher", 5.0)],
+            )
+            git("commit", "-q", "-am", "merge branch")
+
+            self.assertEqual(
+                performance._reset_dimensions_since(repo, history_file, measured),
+                set(),
+            )
+
+    def test_persist_drops_rows_measured_before_a_later_history_reset(self):
+        # A row measured before a commit that reset its metric must not refill the reset
+        # series, or nine post-reset rows would already gate the metric. Unaffected metrics
+        # measured at the same commit still persist.
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+
+            def git(*args: str) -> str:
+                completed = subprocess.run(
+                    ["git", "-C", str(repo), *args],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                return completed.stdout.strip()
+
+            def commit(message: str) -> str:
+                git("add", "data")
+                git("commit", "-q", "--allow-empty", "-m", message)
+                return git("rev-parse", "HEAD")
+
+            git("init", "-q")
+            git("config", "user.email", "test@example.invalid")
+            git("config", "user.name", "test")
+            history = repo / "data"
+            source = repo / "source"
+            history_file = history / "linux-kvm.csv"
+            source_file = source / "linux-kvm.csv"
+            performance.write_results(
+                history_file,
+                [
+                    performance.Result("seed", "latency", "ms", "lower", 10.0),
+                    performance.Result("seed", "throughput", "MB/s", "higher", 20.0),
+                ],
+            )
+            measured = commit("seed")
+
+            # Commit B resets only the latency metric; throughput keeps its history.
+            performance.write_results(
+                history_file,
+                [performance.Result("seed", "throughput", "MB/s", "higher", 20.0)],
+            )
+            commit("reset latency")
+
+            for number in range(9):
+                sha = commit(f"post-reset {number}")
+                performance.write_results(
+                    source_file,
+                    [performance.Result(sha, "latency", "ms", "lower", 100.0)],
+                )
+                performance.persist_results(source, history, git_checkout=repo)
+
+            # The measurement of A arrives after the reset. It must not refill latency.
+            performance.write_results(
+                source_file,
+                [
+                    performance.Result(measured, "latency", "ms", "lower", 10.0),
+                    performance.Result(measured, "throughput", "MB/s", "higher", 20.0),
+                ],
+            )
+            performance.persist_results(source, history, git_checkout=repo)
+
+            rows = performance.read_results(history_file)
+            latency = [row for row in rows if row.metric == "latency"]
+            throughput = [row for row in rows if row.metric == "throughput"]
+            self.assertEqual(len(latency), 9)
+            self.assertNotIn(measured, {row.commit for row in latency})
+            self.assertEqual({row.commit for row in throughput}, {"seed", measured})
+
+    def test_persist_detects_merged_reset_and_ignores_reverted_side_reset(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+
+            def git(*args: str) -> str:
+                return subprocess.run(
+                    ["git", "-C", str(repo), *args],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
+
+            def commit(message: str) -> str:
+                git("add", "data")
+                git("commit", "-q", "--allow-empty", "-m", message)
+                return git("rev-parse", "HEAD")
+
+            git("init", "-q")
+            git("config", "user.email", "test@example.invalid")
+            git("config", "user.name", "test")
+            history_file = repo / "data" / "linux-kvm.csv"
+            original = [performance.Result("seed", "latency", "ms", "lower", 10.0)]
+            performance.write_results(history_file, original)
+            commit("seed")
+            main = git("rev-parse", "--abbrev-ref", "HEAD")
+
+            # A side branch forked before the measurement resets and restores
+            # rows; its temporary reset is outside the measured ancestry.
+            git("checkout", "-q", "-b", "reverted")
+            unrelated = repo / "data" / "unrelated.txt"
+            unrelated.write_text("x", encoding="utf-8")
+            git("add", "data/unrelated.txt")
+            git("commit", "-q", "-m", "unrelated")
+            performance.write_results(history_file, [])
+            commit("temporary reset")
+            performance.write_results(history_file, original)
+            commit("restore rows")
+            git("checkout", "-q", main)
+            measured = commit("measurement")
+            git("merge", "-q", "--no-ff", "reverted", "-m", "merge restored branch")
+
+            source = repo / "source"
+            performance.write_results(
+                source / "linux-kvm.csv",
+                [performance.Result(measured, "latency", "ms", "lower", 11.0)],
+            )
+            performance.persist_results(source, repo / "data", git_checkout=repo)
+            rows = performance.read_results(history_file)
+            self.assertIn(measured, {row.commit for row in rows})
+
+            # A second branch performs a multi-commit reset. The integration
+            # merge must expose the loss even when git's path simplification
+            # would otherwise omit an intermediate commit.
+            git("checkout", "-q", "-b", "reset-branch")
+            performance.write_results(history_file, [])
+            commit("begin reset")
+            commit("continue reset")
+            git("checkout", "-q", main)
+            git("merge", "-q", "--no-ff", "reset-branch", "-m", "merge reset")
+            performance.write_results(
+                source / "linux-kvm.csv",
+                [performance.Result(measured, "latency", "ms", "lower", 12.0)],
+            )
+            performance.persist_results(source, repo / "data", git_checkout=repo)
+            self.assertEqual(performance.read_results(history_file), [])
+
+    def test_persist_filters_stale_metadata_before_validation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+
+            def git(*args: str) -> str:
+                return subprocess.run(
+                    ["git", "-C", str(repo), *args],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
+
+            def commit(message: str) -> str:
+                git("add", "data")
+                git("commit", "-q", "-m", message)
+                return git("rev-parse", "HEAD")
+
+            git("init", "-q")
+            git("config", "user.email", "test@example.invalid")
+            git("config", "user.name", "test")
+            history_file = repo / "data" / "linux-kvm.csv"
+            performance.write_results(
+                history_file,
+                [
+                    performance.Result("seed", "latency", "ms", "lower", 10.0),
+                    performance.Result("seed", "throughput", "MB/s", "higher", 20.0),
+                ],
+            )
+            measured = commit("measurement")
+            performance.write_results(
+                history_file,
+                [
+                    performance.Result("seed", "throughput", "MB/s", "higher", 20.0),
+                ],
+            )
+            commit("reset latency")
+            source = repo / "source"
+            performance.write_results(
+                source / "linux-kvm.csv",
+                [
+                    performance.Result(measured, "latency", "seconds", "higher", 1.0),
+                    performance.Result(measured, "throughput", "MB/s", "higher", 21.0),
+                ],
+            )
+            performance.persist_results(source, repo / "data", git_checkout=repo)
+            rows = performance.read_results(history_file)
+            self.assertEqual(
+                [(row.metric, row.commit) for row in rows],
+                [("throughput", "seed"), ("throughput", measured)],
+            )
+
+    def test_resolve_commit_id_records_the_commit_that_a_revision_names(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+            git = git_repository(repo)
+            git("commit", "-q", "--allow-empty", "-m", "measured")
+            head = git("rev-parse", "HEAD")
+
+            self.assertEqual(performance._resolve_commit_id("HEAD", repo), head)
+            self.assertEqual(performance._resolve_commit_id(head[:12], repo), head)
+            # A full commit ID is already immutable, so it needs no checkout.
+            self.assertEqual(performance._resolve_commit_id(head, repo / "none"), head)
+            for revision in ("missing", "--verify"):
+                with (
+                    self.subTest(revision=revision),
+                    self.assertRaisesRegex(
+                        performance.PerformanceError, "does not name a commit"
+                    ),
+                ):
+                    performance._resolve_commit_id(revision, repo)
+
+    def test_collect_clis_record_the_commit_id_of_a_symbolic_revision(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+            git = git_repository(repo)
+            git("commit", "-q", "--allow-empty", "-m", "measured")
+            head = git("rev-parse", "HEAD")
+
+            for command, collector, inputs in (
+                ("collect", "collect_results", ["--input-dir", "logs"]),
+                ("collect-openvmm", "collect_openvmm_results", ["--input", "e2e"]),
+            ):
+                args = nvx.parse_args(
+                    [
+                        "performance",
+                        command,
+                        "--platform",
+                        "linux-kvm",
+                        "--commit",
+                        "HEAD",
+                        *inputs,
+                        "--output-dir",
+                        "results",
+                    ]
+                )
+                with (
+                    self.subTest(command=command),
+                    patch.object(performance, "ROOT", repo),
+                    patch.object(performance, collector) as collect,
+                ):
+                    self.assertEqual(args.handler(args), 0)
+                    self.assertEqual(collect.call_args.args[1], head)
+
+    def test_persist_rejects_a_result_commit_that_is_not_a_commit_id(self):
+        # Results collected with --commit HEAD would compare the reset history with
+        # itself, find no reset, and refill the reset series.
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+            git = git_repository(repo)
+            history_file = repo / "data" / "linux-kvm.csv"
+            performance.write_results(
+                history_file,
+                [performance.Result("seed", "latency", "ms", "lower", 10.0)],
+            )
+            git("add", "data")
+            git("commit", "-q", "-m", "measured")
+            performance.write_results(history_file, [])
+            git("commit", "-q", "-am", "reset latency")
+            source = repo / "source"
+            performance.write_results(
+                source / "linux-kvm.csv",
+                [performance.Result("HEAD", "latency", "ms", "lower", 11.0)],
+            )
+
+            with self.assertRaisesRegex(
+                performance.PerformanceError, "HEAD is not a full commit ID"
+            ):
+                performance.persist_results(source, repo / "data", git_checkout=repo)
+            self.assertEqual(performance.read_results(history_file), [])
+
+    def test_git_checkout_of_probes_the_nearest_existing_directory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary) / "repo"
+            outside = Path(temporary) / "outside"
+            repo.mkdir()
+            outside.mkdir()
+            git_repository(repo)
+
+            self.assertEqual(
+                performance._git_checkout_of(repo / "data" / "new"), repo.resolve()
+            )
+            self.assertIsNone(performance._git_checkout_of(outside / "data"))
+
+    def test_persist_cli_checks_a_history_directory_that_does_not_exist(self):
+        # A reset can remove the history directory, and a new series has none yet;
+        # neither may skip the reset and ancestry checks.
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+            git = git_repository(repo)
+            history = repo / "data"
+            performance.write_results(
+                history / "linux-kvm.csv",
+                [performance.Result("seed", "latency", "ms", "lower", 10.0)],
+            )
+            git("add", "data")
+            git("commit", "-q", "-m", "measured")
+            measured = git("rev-parse", "HEAD")
+            git("rm", "-q", "-r", "data")
+            git("commit", "-q", "-m", "reset the series")
+            source = repo / "source"
+
+            def persist(commit: str, history_dir: Path) -> int:
+                performance.write_results(
+                    source / "linux-kvm.csv",
+                    [performance.Result(commit, "latency", "ms", "lower", 11.0)],
+                )
+                with (
+                    contextlib.redirect_stdout(io.StringIO()),
+                    contextlib.redirect_stderr(io.StringIO()),
+                ):
+                    return nvx.main(
+                        [
+                            "performance",
+                            "persist",
+                            "--source-dir",
+                            str(source),
+                            "--history-dir",
+                            str(history_dir),
+                        ]
+                    )
+
+            self.assertEqual(persist(measured, history), 0)
+            self.assertFalse((history / "linux-kvm.csv").exists())
+            self.assertEqual(persist("f" * 40, repo / "new"), 2)
+            self.assertFalse((repo / "new" / "linux-kvm.csv").exists())
 
     def test_persist_and_gate_isolate_processor_counts(self):
         with tempfile.TemporaryDirectory() as temporary:

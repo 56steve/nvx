@@ -1012,8 +1012,10 @@ python3 scripts/nvx.py performance collect
     [--summary PATH]
 ```
 
-Parses canonical benchmark logs into p50 CSV files. The `--require-*` flags
-reject incomplete inputs for their respective workload sets.
+Parses canonical benchmark logs into p50 CSV files. Each row records `--commit`
+as a full commit ID, resolving a revision such as `HEAD` in the NVX checkout.
+The `--require-*` flags reject incomplete inputs for their respective workload
+sets.
 `--require-shell-snapshot-restore-512` accepts only the canonical 512 MiB
 restore metric from a 2-, 4-, or 8-vCPU run.
 `--lifecycle-input` validates and merges a 128 MiB, guest-exit `e2e` JSON
@@ -1064,8 +1066,9 @@ python3 scripts/nvx.py performance collect-openvmm
 ```
 
 Converts a complete 128 MiB, guest-exit OpenVMM `e2e` result into an
-eight-metric lifecycle p50 CSV. Like `performance collect`, it writes the
-recorded benchmark host to `--output-dir` as `<platform>-host.json`.
+eight-metric lifecycle p50 CSV. Like `performance collect`, it records `--commit`
+as a full commit ID and writes the recorded benchmark host to `--output-dir` as
+`<platform>-host.json`.
 
 #### `performance gate`
 
@@ -1108,7 +1111,11 @@ more than one metric. When both directories contain a platform's host file,
 if their recorded host differs from the history's in a required property, and
 warns about advisory differences. It also refuses results without a host file
 for a history that has one. `--require-host` requires both files for every
-platform.
+platform. When `--history-dir` lies in a git checkout, even before the
+directory exists, the command refuses results whose commit is not a full
+commit ID or not an ancestor of `HEAD`, and skips results measured before a
+later commit removed rows of their metric from the history file, as a reset
+does; see [CI collection](benchmarks.md#ci-collection).
 
 #### `performance check-host`
 

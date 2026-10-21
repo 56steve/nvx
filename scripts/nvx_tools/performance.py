@@ -9,17 +9,20 @@ import math
 import os
 import re
 import statistics
+import subprocess
 import sys
 import tempfile
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import cast
 
 from . import benchmark_host, host_telemetry
+from .build_constants import BuildConstants
 from .common import bytes_to_mib, positive_int, sha256_file
 
+ROOT = BuildConstants.REPO_ROOT
 LEGACY_CSV_FIELDS = ["commit", "metric", "unit", "direction", "p50"]
 CSV_FIELDS = [
     "platform",
@@ -82,6 +85,7 @@ LIFECYCLE_ATTEMPT_LOG_SCHEMA_VERSION = 1
 LIFECYCLE_ATTEMPT_STATUSES = {0: "valid", UNSTABLE_LIFECYCLE_EXIT_CODE: "unstable"}
 """Validation statuses by exit status; any other status is ``invalid``."""
 SHA256_HEX = re.compile(r"[0-9a-f]{64}")
+COMMIT_ID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 NUMBER = r"[0-9]+(?:,[0-9]{3})*(?:\.[0-9]+)?"
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 SHELL_SNAPSHOT_MEMORIES_MIB = (128, 256, 512)
@@ -2248,11 +2252,195 @@ def _verify_result_hosts(
             )
 
 
+def _git(checkout: Path, *args: str) -> str:
+    completed = subprocess.run(
+        ["git", "-C", str(checkout), *args],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        raise PerformanceError(
+            f"git {' '.join(args)} failed: {completed.stderr.strip()}"
+        )
+    return completed.stdout
+
+
+def _resolve_commit_id(revision: str, checkout: Path) -> str:
+    """Return the full ID of the commit that ``revision`` names in ``checkout``.
+
+    A symbolic revision such as ``HEAD`` names another commit by the time its
+    results are persisted, so results record the commit ID instead.
+    """
+    if COMMIT_ID.fullmatch(revision):
+        return revision
+    if not revision.startswith("-"):
+        try:
+            commit = _git(
+                checkout, "rev-parse", "--verify", "--quiet", f"{revision}^{{commit}}"
+            ).strip()
+        except PerformanceError:
+            commit = ""
+        if COMMIT_ID.fullmatch(commit):
+            return commit
+    raise PerformanceError(f"--commit {revision} does not name a commit in {checkout}")
+
+
+def _committed_results(top: Path, revision: str, relative: str) -> list[Result]:
+    shown = subprocess.run(
+        ["git", "-C", str(top), "show", f"{revision}:{relative}"],
+        check=False,
+        capture_output=True,
+    )
+    if shown.returncode != 0:
+        return []
+    with tempfile.TemporaryDirectory() as temporary:
+        # Keep the basename: a legacy CSV takes its platform from the file name.
+        path = Path(temporary) / Path(relative).name
+        path.write_bytes(shown.stdout)
+        return read_results(path)
+
+
+def _dimension_counts(
+    top: Path,
+    revision: str,
+    relative: str,
+) -> Counter[tuple[str, int, int, str]]:
+    return Counter(
+        _dimension_key(result, "")
+        for result in _committed_results(top, revision, relative)
+    )
+
+
+def _reset_dimensions_since(
+    git_checkout: Path,
+    history_path: Path,
+    commit: str,
+) -> set[tuple[str, int, int, str]]:
+    """Return the dimensions whose committed history lost rows after ``commit``.
+
+    A result measured at ``commit`` predates any later commit that removes the
+    dimension's rows, so it must not be appended onto the reset series.
+    """
+    # A mutable reference such as HEAD would compare the history with itself.
+    if not COMMIT_ID.fullmatch(commit):
+        raise PerformanceError(f"result commit {commit} is not a full commit ID")
+    top = Path(_git(git_checkout, "rev-parse", "--show-toplevel").strip()).resolve()
+    try:
+        relative = history_path.resolve().relative_to(top).as_posix()
+    except ValueError as error:
+        raise PerformanceError(f"{history_path} is outside the git checkout") from error
+    ancestor = subprocess.run(
+        ["git", "-C", str(top), "merge-base", "--is-ancestor", commit, "HEAD"],
+        check=False,
+        capture_output=True,
+    )
+    if ancestor.returncode != 0:
+        raise PerformanceError(
+            f"result commit {commit} is not an ancestor of the target history"
+        )
+    # Compare each commit with its own parents: a side branch forked before
+    # ``commit`` can hold fewer rows than ``commit`` without having reset them.
+    later = _git(
+        top,
+        "log",
+        "--reverse",
+        "--full-history",
+        "--sparse",
+        "--format=%H %P",
+        f"{commit}..HEAD",
+        "--",
+        relative,
+    ).splitlines()
+    resets: set[tuple[str, int, int, str]] = set()
+    for line in later:
+        revision, *parents = line.split()
+        # Ignore commits on side branches that are not part of the history
+        # leading from the measurement to HEAD, even if later merged/reverted.
+        if not _on_measurement_line(top, revision, commit):
+            continue
+        current = _dimension_counts(top, revision, relative)
+        for parent in parents:
+            # A branch that neither predates nor follows the measurement can drop rows
+            # that were already reset before it, so only the measurement's line counts.
+            if not _on_measurement_line(top, parent, commit):
+                continue
+            before = _dimension_counts(top, parent, relative)
+            resets.update(key for key, count in before.items() if current[key] < count)
+    return resets
+
+
+def _on_measurement_line(top: Path, revision: str, measured: str) -> bool:
+    """Return whether ``revision`` is on the path from ``measured`` to HEAD."""
+    return all(
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(top),
+                "merge-base",
+                "--is-ancestor",
+                ancestor,
+                descendant,
+            ],
+            check=False,
+            capture_output=True,
+        ).returncode
+        == 0
+        for ancestor, descendant in ((measured, revision), (revision, "HEAD"))
+    )
+
+
+def _without_reset_rows(
+    git_checkout: Path,
+    history_path: Path,
+    results: Sequence[Result],
+) -> list[Result]:
+    resets: dict[str, set[tuple[str, int, int, str]]] = {}
+    kept: list[Result] = []
+    for result in results:
+        if result.commit not in resets:
+            resets[result.commit] = _reset_dimensions_since(
+                git_checkout, history_path, result.commit
+            )
+        if _dimension_key(result, "") in resets[result.commit]:
+            print(
+                f"Skipped {result.metric} measured at {result.commit[:12]}: "
+                f"{history_path.name} was reset after that commit"
+            )
+            continue
+        kept.append(result)
+    return kept
+
+
+def _git_checkout_of(path: Path) -> Path | None:
+    """Return the nearest existing directory of ``path`` when it is in a git checkout.
+
+    ``path`` need not exist, as for a new history directory or one that a reset
+    removed; neither may skip the reset and ancestry checks. CI's history is
+    always in a checkout.
+    """
+    directory = path.resolve()
+    while not directory.is_dir():
+        if directory.parent == directory:
+            return None
+        directory = directory.parent
+    probe = subprocess.run(
+        ["git", "-C", str(directory), "rev-parse", "--is-inside-work-tree"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    inside = probe.returncode == 0 and probe.stdout.strip() == "true"
+    return directory if inside else None
+
+
 def persist_results(
     source_dir: Path,
     history_dir: Path,
     excluded_metrics: Iterable[str] = (),
     require_host: bool = False,
+    git_checkout: Path | None = None,
 ) -> None:
     source_files = sorted(source_dir.glob("*.csv"))
     if not source_files:
@@ -2275,6 +2463,14 @@ def persist_results(
         current = [result for result in source_results if result.metric not in excluded]
         history_path = history_dir / source_path.name
         existing = read_results(history_path) if history_path.exists() else []
+        existing_keys = {_result_identity(result) for result in existing}
+        current = [
+            result
+            for result in current
+            if _result_identity(result) not in existing_keys
+        ]
+        if git_checkout is not None:
+            current = _without_reset_rows(git_checkout, history_path, current)
         metadata = {
             (
                 result.platform,
@@ -2300,12 +2496,7 @@ def persist_results(
                     f"{expected} -> {actual}"
                 )
 
-        existing_keys = {_result_identity(result) for result in existing}
-        new_results = [
-            result
-            for result in current
-            if _result_identity(result) not in existing_keys
-        ]
+        new_results = current
         if not new_results:
             print(f"No new performance rows to persist for {source_path.name}")
             continue
@@ -2850,7 +3041,7 @@ def command_performance(args: argparse.Namespace) -> int:
         if args.performance_command == "collect":
             collect_results(
                 args.platform,
-                args.commit,
+                _resolve_commit_id(args.commit, ROOT),
                 args.input_dir,
                 args.output_dir,
                 require_network=args.require_network,
@@ -2886,7 +3077,7 @@ def command_performance(args: argparse.Namespace) -> int:
         if args.performance_command == "collect-openvmm":
             collect_openvmm_results(
                 args.platform,
-                args.commit,
+                _resolve_commit_id(args.commit, ROOT),
                 args.input,
                 args.output_dir,
                 args.summary,
@@ -2916,6 +3107,7 @@ def command_performance(args: argparse.Namespace) -> int:
             args.history_dir,
             args.exclude_metric,
             require_host=args.require_host,
+            git_checkout=_git_checkout_of(args.history_dir),
         )
         return 0
     except (PerformanceError, OSError, csv.Error) as error:
