@@ -233,6 +233,18 @@ draining without adding sleeps to the measured benchmark workloads.
 The harness waits for the output reader's EOF notification even after the
 process exits, so delayed final output chunks cannot create a false failure.
 
+The `command-line-limit` scenario covers the x86 guest kernel's 2,048-byte
+command-line buffer. OpenVMM appends its own tokens after the caller's, ending
+with the network bootstrap, so they are the first that the kernel would cut
+from a command line that doesn't fit, and OpenVMM refuses an effective command
+line longer than 2,047 bytes instead. With a NIC attached, the scenario boots
+once with a one-byte padding token to learn the effective command line from
+the guest, then pads the caller's tokens until it holds 2,047 bytes. The
+guest's `/proc/cmdline` must equal the first one with the longer padding, and
+the guest must have installed the IPv6 default route that the last token,
+`virtnet_gw6=`, names. OpenVMM must refuse a command line one byte longer
+before boot, with an error that names its length and the limit.
+
 Shared guest artifacts are built with Docker on a GitHub-hosted Ubuntu runner.
 The kernel, Alpine initramfs, Ubuntu initramfs, and Ubuntu EROFS layer use
 separate cache keys. Every guest key includes `nvx-rs/**` except its `target`

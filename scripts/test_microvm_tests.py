@@ -6008,6 +6008,170 @@ class MicrovmTests(unittest.TestCase):
             microvm_tests.VIRTIO_NET_COMPLETION_MARKER,
         )
 
+    def test_command_line_limit_fills_the_guest_kernel_buffer(self):
+        self.assertIn("command-line-limit", microvm_tests.MICROVM_TEST_SCENARIOS)
+        # The tokens that OpenVMM reports around the caller's, ending with its
+        # network bootstrap.
+        head = "earlycon=xe9 console=hvc0 reboot=t panic=-1 quiet loglevel=0"
+        tail = (
+            "nr_cpus=1 virtio_mmio.device=0x1000@0xd0000000:5 virtnet_ip=10.0.0.2 "
+            "virtnet_mask=255.255.255.0 virtnet_gw=10.0.0.1 "
+            "virtnet_ip6=fd00::a00:2/120 virtnet_gw6=fd00::a00:1"
+        )
+
+        def line(padding: int) -> str:
+            return f"{head} cmdline_limit.padding={'x' * padding} {tail}"
+
+        padding = 2048 - len(line(1))
+        self.assertEqual(len(line(padding)), 2047)
+        refused = openvmm_process.OpenvmmProcessResult(
+            1, b"Error: " + microvm_tests.COMMAND_LINE_LIMIT_ERROR + b"\n"
+        )
+
+        def guest(text: str) -> dict[str, object]:
+            return {
+                "text": f"NVX-COMMAND-LINE: {text}\r\nNVX-COMMAND-LINE-LIMIT-OK\r\n"
+            }
+
+        def run_scenario(
+            longest: str, over: openvmm_process.OpenvmmProcessResult
+        ) -> tuple[MagicMock, MagicMock]:
+            with (
+                tempfile.TemporaryDirectory() as temporary,
+                patch.object(
+                    microvm_tests,
+                    "run_guest_script",
+                    side_effect=[guest(line(1)), guest(longest)],
+                ) as run_guest_script,
+                patch.object(microvm_tests, "OpenvmmProcess") as process,
+            ):
+                process.return_value.__enter__.return_value.wait.return_value = over
+                microvm_tests.run_command_line_limit(
+                    Path("openvmm"),
+                    Path("vmlinux"),
+                    Path("initrd"),
+                    "whp",
+                    memory_mib=128,
+                    timeout=60,
+                    output_dir=Path(temporary),
+                )
+            return run_guest_script, process
+
+        run_guest_script, process = run_scenario(line(padding), refused)
+        commands = [call.args[0] for call in run_guest_script.call_args_list]
+        commands.append(process.call_args.args[0])
+        self.assertEqual(
+            [command[command.index("--cmdline") + 1] for command in commands],
+            [
+                f"quiet loglevel=0 cmdline_limit.padding={'x' * length}"
+                for length in (1, padding, padding + 1)
+            ],
+        )
+        for command in commands:
+            self.assertEqual(command[command.index("--net") + 1], "10.0.0.2/24")
+        for call in run_guest_script.call_args_list:
+            self.assertEqual(
+                call.args[1:],
+                (
+                    microvm_tests._read_script("command-line-limit.sh"),
+                    microvm_tests.COMMAND_LINE_LIMIT_COMPLETION_MARKER,
+                ),
+            )
+        self.assertEqual(
+            [call.kwargs["log_path"].name for call in run_guest_script.call_args_list],
+            ["command-line-limit-shortest.log", "command-line-limit.log"],
+        )
+
+        # A guest that lost a token, or an OpenVMM that boots or fails
+        # otherwise one byte over the limit, fails the scenario.
+        for longest, over, message in (
+            (line(padding)[:-1], refused, "not the expected 2047-byte one"),
+            (
+                line(padding),
+                openvmm_process.OpenvmmProcessResult(
+                    0, microvm_tests.BOOT_MARKER + b" alpine\n"
+                ),
+                "did not refuse",
+            ),
+            (
+                line(padding),
+                openvmm_process.OpenvmmProcessResult(1, b"Error: other\n"),
+                "did not refuse",
+            ),
+        ):
+            with (
+                self.subTest(message=message),
+                self.assertRaisesRegex(RuntimeError, message),
+            ):
+                run_scenario(longest, over)
+
+    def test_command_line_limit_script_requires_the_last_token_route(self):
+        shell = _posix_shell()
+        if shell is None:
+            self.skipTest("POSIX shell is unavailable")
+        route = (
+            "00000000000000000000000000000000 00 00000000000000000000000000000000 00 "
+            "fd00000000000000000000000a000001 00000400 00000001 00000000 00000003 "
+            "eth0\n"
+        )
+        command_line = "console=hvc0 virtnet_gw6=fd00::a00:1"
+        for name, table, status, expected in (
+            ("route", route, 0, "NVX-COMMAND-LINE-LIMIT-OK"),
+            ("no-route", "", 20, "NVX-COMMAND-LINE-LIMIT-FAIL code=20"),
+        ):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                (root / "proc" / "net").mkdir(parents=True)
+                (root / "proc" / "cmdline").write_text(
+                    command_line + "\n", encoding="ascii"
+                )
+                (root / "proc" / "net" / "ipv6_route").write_text(
+                    table, encoding="ascii"
+                )
+                path = root / "command-line-limit.sh"
+                path.write_text(
+                    "nvx_exit() { :; }\n"
+                    + microvm_tests._read_script("command-line-limit.sh")
+                    .replace("nvx-exit", "nvx_exit")
+                    .replace("/proc/", f"{root.as_posix()}/proc/"),
+                    encoding="utf-8",
+                    newline="\n",
+                )
+                result = subprocess.run(
+                    [shell, path.as_posix()],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    check=False,
+                )
+                self.assertEqual(
+                    result.returncode, status, result.stdout + result.stderr
+                )
+                self.assertIn(f"NVX-COMMAND-LINE: {command_line}\n", result.stdout)
+                self.assertIn(expected, result.stdout)
+
+    def test_runner_runs_the_command_line_limit_scenario(self):
+        def require(path: Path, _description: str) -> Path:
+            return path
+
+        with tempfile.TemporaryDirectory() as temporary:
+            args = nvx.parse_args(
+                ["test-microvm", "--backend", "mshv", "--output-dir", temporary]
+            )
+            with (
+                patch.object(microvm_tests, "validate_openvmm_test_backend"),
+                patch.object(
+                    microvm_tests, "MICROVM_TEST_SCENARIOS", ("command-line-limit",)
+                ),
+                patch.object(microvm_tests, "require_file", side_effect=require),
+                patch.object(microvm_tests, "run_command_line_limit") as run,
+            ):
+                self.assertEqual(microvm_tests.run(args), 0)
+
+        run.assert_called_once()
+        self.assertEqual(run.call_args.args[3], "mshv")
+        self.assertEqual(run.call_args.kwargs["output_dir"], Path(temporary))
+
     def test_directional_network_commands_map_generic_default_actions(self):
         with patch.object(
             microvm_tests,
