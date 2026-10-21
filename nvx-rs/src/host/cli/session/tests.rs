@@ -510,7 +510,9 @@ fn session_reset_is_not_a_closed_endpoint() {
     // closure with which OpenVMM shuts down.
     let (mut session, worker) = session_with(|guest| {
         let _ = guest.request();
-        let reset = encode_outer(OUTER_RESET, &INSTANCE, 1, 0, &[]).unwrap();
+        // The reset starts the session's next epoch, at the next sequence number of the host's
+        // leg.
+        let reset = encode_outer(OUTER_RESET, &INSTANCE, 2, guest.sequence + 1, &[]).unwrap();
         guest.stream.write_all(&reset, None).unwrap();
         let _ = guest.record();
     });

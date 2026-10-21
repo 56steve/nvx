@@ -1,17 +1,19 @@
-//! Host side of an authenticated control session with a sandbox's guest agent.
+//! Host side of an authenticated control session with a sandbox's guest agent: NVX's control
+//! protocol, `NVXC`, over the host's role of the shared NVXS session, [`HostConnection`].
 
 use std::fmt;
 use std::io;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use super::nvxs::{HostConnection, HostConnectionError};
 use super::platform::{self, Transport};
+use crate::protocol::nvxs::{self, RecordError, RecordType};
 use crate::protocol::{
     self, APP_CANCEL, APP_ERROR, APP_EXEC, APP_EXIT, APP_FEATURES, APP_HEADER_LEN, APP_MAPS,
     APP_PING, APP_READY, APP_STDERR, APP_STDOUT, APP_STOP, APP_STOPPED, CAPABILITY_LEN,
-    ExitCategory, GuestFeatures, HostMap, OUTER_DATA, OUTER_ERROR, OUTER_HEADER_LEN,
-    OUTER_HOST_ATTACH, OUTER_MAX_PAYLOAD, OUTER_READY, OUTER_RESET, OUTER_WAIT, OuterHeader,
-    ProtocolError, UNSUPPORTED_OPERATION, Workload,
+    ExitCategory, GuestFeatures, HostMap, OUTER_MAX_PAYLOAD, ProtocolError, UNSUPPORTED_OPERATION,
+    Workload,
 };
 
 /// Failure of a control session.
@@ -127,68 +129,29 @@ pub enum ExecEvent {
     },
 }
 
-/// Authenticated control session.
+/// Authenticated control session: `NVXC` frames, each in one DATA record of the host's NVXS
+/// connection to OpenVMM's broker.
 ///
 /// Received bytes are buffered until a whole record is available, so a read that times out
-/// loses nothing and callers can poll with short deadlines.
+/// loses nothing and callers can poll with short deadlines. A failure that leaves the stream
+/// unusable, such as a reset or a record that the protocol does not allow, ends the session, and
+/// later calls fail.
 pub struct ControlSession {
-    /// Platform transport connected to OpenVMM's control endpoint.
-    transport: Box<dyn Transport>,
-    /// Bytes received beyond the last complete outer record.
-    received: Vec<u8>,
-    /// Random instance identity assigned by the broker during attachment.
-    instance_id: [u8; 16],
-    /// Broker connection epoch assigned during attachment.
-    epoch: u64,
-    /// Sequence number of the next host-to-guest outer record.
-    send_sequence: u64,
-    /// Sequence number expected on the next guest-to-host outer record.
-    receive_sequence: u64,
+    /// The host's NVXS connection to OpenVMM's control endpoint.
+    connection: HostConnection,
 }
 
 impl ControlSession {
-    /// Authenticates with the capability OpenVMM received at launch.
+    /// Authenticates with the capability OpenVMM received at launch, and waits until `deadline`
+    /// while OpenVMM's broker waits for the guest to acknowledge the session.
     pub fn attach(
         transport: Box<dyn Transport>,
         capability: &[u8; CAPABILITY_LEN],
         deadline: Instant,
     ) -> Result<Self, SessionError> {
-        let mut session = Self {
-            transport,
-            received: Vec::new(),
-            instance_id: [0; 16],
-            epoch: 0,
-            send_sequence: 0,
-            receive_sequence: 0,
-        };
-        let record = protocol::encode_outer(OUTER_HOST_ATTACH, &[0; 16], 0, 0, capability)?;
-        session
-            .transport
-            .write_all(&record, remaining(Some(deadline))?)?;
-        loop {
-            let (header, payload) = session.read_outer(Some(deadline))?;
-            if !payload.is_empty() {
-                return Err(SessionError::Protocol(
-                    "control attach response carried a payload".to_owned(),
-                ));
-            }
-            match header.record_type {
-                // Another client holds the broker's single host slot.
-                OUTER_WAIT => continue,
-                OUTER_ERROR => return Err(SessionError::AuthenticationFailed),
-                OUTER_READY if header.instance_id != [0; 16] && header.epoch != 0 => {
-                    session.instance_id = header.instance_id;
-                    session.epoch = header.epoch;
-                    session.receive_sequence = header.sequence.wrapping_add(1);
-                    return Ok(session);
-                }
-                _ => {
-                    return Err(SessionError::Protocol(
-                        "control endpoint returned an invalid attach response".to_owned(),
-                    ));
-                }
-            }
-        }
+        let connection = HostConnection::attach(transport, capability, deadline)
+            .map_err(|error| failure(error, Stage::Attach))?;
+        Ok(Self { connection })
     }
 
     /// Waits until the guest agent acknowledges readiness.
@@ -321,7 +284,7 @@ impl ControlSession {
         self.read_app(deadline)
     }
 
-    /// Encodes and sends one application frame in the next sequenced outer record.
+    /// Encodes and sends one application frame in the next DATA record.
     fn send_app(
         &mut self,
         kind: u8,
@@ -330,38 +293,27 @@ impl ControlSession {
         deadline: Option<Instant>,
     ) -> Result<(), SessionError> {
         let frame = protocol::encode_app(kind, request_id, 0, payload);
-        let record = protocol::encode_outer(
-            OUTER_DATA,
-            &self.instance_id,
-            self.epoch,
-            self.send_sequence,
-            &frame,
-        )?;
-        self.transport.write_all(&record, remaining(deadline)?)?;
-        self.send_sequence = self.send_sequence.wrapping_add(1);
-        Ok(())
+        // The guest agent takes each DATA record as one frame, so a frame must fit one.
+        if frame.len() > OUTER_MAX_PAYLOAD {
+            return Err(SessionError::Protocol(
+                "control payload exceeds the outer protocol limit".to_owned(),
+            ));
+        }
+        self.connection
+            .send(&frame, deadline)
+            .map_err(|error| failure(error, Stage::Data))
     }
 
-    /// Reads and validates the next application frame, advancing the receive sequence.
+    /// Reads and decodes the next application frame, the payload of the next DATA record.
     fn read_app(
         &mut self,
         deadline: Option<Instant>,
     ) -> Result<(u8, u64, i32, Vec<u8>), SessionError> {
-        let (header, frame) = self.read_outer(deadline)?;
-        if header.record_type == OUTER_RESET {
-            return Err(SessionError::Reset);
-        }
-        if header.record_type != OUTER_DATA
-            || header.instance_id != self.instance_id
-            || header.epoch != self.epoch
-            || header.sequence != self.receive_sequence
-        {
-            return Err(SessionError::Protocol(
-                "control endpoint returned an invalid data record".to_owned(),
-            ));
-        }
-        self.receive_sequence = self.receive_sequence.wrapping_add(1);
-        let frame = protocol::decode_app(&frame)?;
+        let payload = self
+            .connection
+            .receive(deadline)
+            .map_err(|error| failure(error, Stage::Data))?;
+        let frame = protocol::decode_app(&payload)?;
         Ok((
             frame.kind,
             frame.request_id,
@@ -405,57 +357,67 @@ impl ControlSession {
         }
         Ok(())
     }
-
-    /// Buffers transport bytes until one complete outer record can be returned.
-    fn read_outer(
-        &mut self,
-        deadline: Option<Instant>,
-    ) -> Result<(OuterHeader, Vec<u8>), SessionError> {
-        loop {
-            if self.received.len() >= OUTER_HEADER_LEN {
-                let header = protocol::decode_outer_header(
-                    self.received[..OUTER_HEADER_LEN]
-                        .try_into()
-                        .expect("the slice has the header length"),
-                )?;
-                let end = OUTER_HEADER_LEN + header.length;
-                if self.received.len() >= end {
-                    let payload = self.received[OUTER_HEADER_LEN..end].to_vec();
-                    self.received.drain(..end);
-                    return Ok((header, payload));
-                }
-            }
-            self.fill(deadline)?;
-        }
-    }
-
-    /// Appends the next bytes from the transport to the receive buffer.
-    fn fill(&mut self, deadline: Option<Instant>) -> Result<(), SessionError> {
-        let mut chunk = [0u8; 16 * 1024];
-        loop {
-            match self.transport.read(&mut chunk, remaining(deadline)?) {
-                Ok(0) => return Err(SessionError::Closed),
-                Ok(count) => {
-                    self.received.extend_from_slice(&chunk[..count]);
-                    return Ok(());
-                }
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) => return Err(error.into()),
-            }
-        }
-    }
 }
 
-/// Converts a deadline into the time left, failing once it has passed.
-fn remaining(deadline: Option<Instant>) -> Result<Option<Duration>, SessionError> {
-    match deadline {
-        None => Ok(None),
-        Some(deadline) => deadline
-            .checked_duration_since(Instant::now())
-            .filter(|remaining| !remaining.is_zero())
-            .map(Some)
-            .ok_or(SessionError::TimedOut),
-    }
+/// Stage of a control session at which a failure arrived, which names a protocol violation.
+#[derive(Clone, Copy)]
+enum Stage {
+    /// The host attaches.
+    Attach,
+    /// Application frames flow.
+    Data,
+}
+
+/// Converts a failure of the host's NVXS connection at `stage` into the session's failure.
+///
+/// A violation keeps the message of the check that it fails: a malformed or oversized header, a
+/// payload in WAIT or READY, an empty DATA record, which carries no frame, and otherwise an
+/// invalid attach response or data record. A stream that ends inside a record has closed.
+fn failure(error: HostConnectionError, stage: Stage) -> SessionError {
+    let violation = match error {
+        HostConnectionError::TimedOut => return SessionError::TimedOut,
+        HostConnectionError::Closed => return SessionError::Closed,
+        HostConnectionError::Rejected(_) => return SessionError::AuthenticationFailed,
+        HostConnectionError::Reset(_) => return SessionError::Reset,
+        HostConnectionError::Io(error) => return error.into(),
+        HostConnectionError::Ended => {
+            return SessionError::Protocol(
+                "the control session ended after an earlier failure".to_owned(),
+            );
+        }
+        HostConnectionError::Protocol(violation) => violation,
+    };
+    let message = match (violation, stage) {
+        (nvxs::SessionError::Truncated { .. }, _) => return SessionError::Closed,
+        (
+            nvxs::SessionError::Record(
+                RecordError::Magic(_) | RecordError::Version(_) | RecordError::Flags(_),
+            ),
+            _,
+        ) => "control endpoint returned an invalid outer record",
+        (nvxs::SessionError::Record(RecordError::Length { length, .. }), _)
+            if length > OUTER_MAX_PAYLOAD =>
+        {
+            "control endpoint returned an oversized outer record"
+        }
+        (
+            nvxs::SessionError::Record(RecordError::Length {
+                record_type: RecordType::Wait | RecordType::Ready,
+                ..
+            }),
+            Stage::Attach,
+        ) => "control attach response carried a payload",
+        (
+            nvxs::SessionError::Record(RecordError::Length {
+                record_type: RecordType::Data,
+                length: 0,
+            }),
+            Stage::Data,
+        ) => "control endpoint returned a truncated application frame",
+        (_, Stage::Attach) => "control endpoint returned an invalid attach response",
+        (_, Stage::Data) => "control endpoint returned an invalid data record",
+    };
+    SessionError::Protocol(message.to_owned())
 }
 
 /// Returns the error category that the payload of an `APP_ERROR` response names, truncated to 64
@@ -482,32 +444,66 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
+    use crate::protocol::nvxs::{ErrorCode, Identity};
     use crate::protocol::{
-        WorkloadEnvironment, decode_app, decode_outer_header, encode_app, encode_outer,
+        OUTER_DATA, OUTER_ERROR, OUTER_HEADER_LEN, OUTER_HOST_ATTACH, OUTER_READY, OUTER_RESET,
+        OUTER_WAIT, WorkloadEnvironment, decode_app, decode_outer_header, encode_app, encode_outer,
     };
 
     const INSTANCE: [u8; 16] = [7; 16];
 
-    /// Transport that replays scripted guest records and records host writes.
-    struct Scripted {
+    /// What a test shares with a [`Scripted`] transport.
+    #[derive(Default)]
+    struct Wire {
+        /// Bytes for the host to read.
         input: VecDeque<u8>,
-        output: Arc<Mutex<Vec<u8>>>,
+        /// Whether the stream ends once the host read `input`.
+        closed: bool,
+        /// Bytes that the host wrote.
+        output: Vec<u8>,
+    }
+
+    /// Transport of a scripted guest, whose records the test supplies at any time. A read
+    /// without input times out, or ends the stream once the test closed it.
+    #[derive(Clone, Default)]
+    struct Scripted(Arc<Mutex<Wire>>);
+
+    impl Scripted {
+        /// Supplies records for the host to read.
+        fn supply(&self, records: &[Vec<u8>]) {
+            self.0.lock().unwrap().input.extend(records.concat());
+        }
+
+        /// Ends the stream after the records that the test supplied.
+        fn close(&self) {
+            self.0.lock().unwrap().closed = true;
+        }
+
+        /// Returns the bytes that the host wrote.
+        fn output(&self) -> Vec<u8> {
+            self.0.lock().unwrap().output.clone()
+        }
     }
 
     impl Transport for Scripted {
         fn read(&mut self, buffer: &mut [u8], _timeout: Option<Duration>) -> io::Result<usize> {
-            if self.input.is_empty() {
-                return Err(io::ErrorKind::TimedOut.into());
+            let mut wire = self.0.lock().unwrap();
+            if wire.input.is_empty() {
+                return if wire.closed {
+                    Ok(0)
+                } else {
+                    Err(io::ErrorKind::TimedOut.into())
+                };
             }
-            let count = buffer.len().min(self.input.len());
-            for byte in &mut buffer[..count] {
-                *byte = self.input.pop_front().unwrap();
+            let count = buffer.len().min(wire.input.len());
+            for (byte, input) in buffer.iter_mut().zip(wire.input.drain(..count)) {
+                *byte = input;
             }
             Ok(count)
         }
 
         fn write_all(&mut self, data: &[u8], _timeout: Option<Duration>) -> io::Result<()> {
-            self.output.lock().unwrap().extend_from_slice(data);
+            self.0.lock().unwrap().output.extend_from_slice(data);
             Ok(())
         }
     }
@@ -517,17 +513,31 @@ mod tests {
         encode_outer(record_type, &instance, epoch, sequence, payload).unwrap()
     }
 
-    fn scripted(records: &[Vec<u8>]) -> (Box<dyn Transport>, Arc<Mutex<Vec<u8>>>) {
-        let output = Arc::new(Mutex::new(Vec::new()));
-        let transport = Scripted {
-            input: records.concat().into(),
-            output: Arc::clone(&output),
-        };
-        (Box::new(transport), output)
+    /// Returns `record` with `bytes` at `offset`.
+    fn patched(mut record: Vec<u8>, offset: usize, bytes: &[u8]) -> Vec<u8> {
+        record[offset..offset + bytes.len()].copy_from_slice(bytes);
+        record
     }
 
     fn deadline() -> Instant {
         Instant::now() + Duration::from_secs(5)
+    }
+
+    /// Attaches through a scripted guest that supplied `records`, and returns the attachment
+    /// with the guest's transport.
+    fn scripted(records: &[Vec<u8>]) -> (Result<ControlSession, SessionError>, Scripted) {
+        let wire = Scripted::default();
+        wire.supply(records);
+        let session =
+            ControlSession::attach(Box::new(wire.clone()), &[1; CAPABILITY_LEN], deadline());
+        (session, wire)
+    }
+
+    /// Attaches through a scripted guest whose broker attaches the host at its sequence 0, in
+    /// epoch 1.
+    fn ready() -> (ControlSession, Scripted) {
+        let (session, wire) = scripted(&[outer(OUTER_READY, 1, 0, &[])]);
+        (session.unwrap(), wire)
     }
 
     /// Kind and payload of each application request that a guest received.
@@ -608,33 +618,115 @@ mod tests {
         records
     }
 
+    /// Checks that `error` is a protocol violation with `message`.
+    #[track_caller]
+    fn assert_violation(error: &SessionError, message: &str, case: &str) {
+        let matched = matches!(error, SessionError::Protocol(text) if text == message);
+        assert!(matched, "{case}: {error:?}");
+    }
+
     #[test]
-    fn attach_waits_for_the_host_slot_then_authenticates() {
-        let (transport, output) =
-            scripted(&[outer(OUTER_WAIT, 0, 0, &[]), outer(OUTER_READY, 4, 9, &[])]);
-        let capability = [0x5a; CAPABILITY_LEN];
-        let session = ControlSession::attach(transport, &capability, deadline()).unwrap();
-        assert_eq!(session.epoch, 4);
-        assert_eq!(session.receive_sequence, 10);
-        let records = host_records(&output.lock().unwrap());
-        assert_eq!(records, [(OUTER_HOST_ATTACH, 0, capability.to_vec())]);
+    fn attach_waits_for_the_guest_then_authenticates() {
+        // The broker asks the host to wait while the guest has not acknowledged the session.
+        let (session, wire) =
+            scripted(&[outer(OUTER_WAIT, 0, 0, &[]), outer(OUTER_READY, 4, 1, &[])]);
+        let session = session.unwrap();
+        let identity = Identity {
+            instance_id: INSTANCE,
+            epoch: 4,
+        };
+        assert_eq!(session.connection.identity(), identity);
+        let records = host_records(&wire.output());
+        assert_eq!(records, [(OUTER_HOST_ATTACH, 0, vec![1; CAPABILITY_LEN])]);
     }
 
     #[test]
     fn attach_reports_authentication_failure() {
-        let (transport, _) = scripted(&[outer(OUTER_ERROR, 0, 0, &[])]);
-        let error = ControlSession::attach(transport, &[1; CAPABILITY_LEN], deadline())
-            .err()
-            .unwrap();
-        assert!(matches!(error, SessionError::AuthenticationFailed));
+        let code = ErrorCode::Authentication.code().to_le_bytes();
+        let (session, _) = scripted(&[outer(OUTER_ERROR, 0, 0, &code)]);
+        assert!(matches!(session, Err(SessionError::AuthenticationFailed)));
+    }
+
+    #[test]
+    fn attach_responses_that_the_protocol_does_not_allow_fail_closed() {
+        let ready = outer(OUTER_READY, 1, 0, &[]);
+        let oversized = u32::try_from(OUTER_MAX_PAYLOAD + 1).unwrap().to_le_bytes();
+        let payload = "control attach response carried a payload";
+        let invalid = "control endpoint returned an invalid attach response";
+        let outer_record = "control endpoint returned an invalid outer record";
+        let cases = [
+            (
+                "a READY with a payload",
+                outer(OUTER_READY, 1, 0, b"x"),
+                payload,
+            ),
+            (
+                "a WAIT with a payload",
+                outer(OUTER_WAIT, 0, 0, b"x"),
+                payload,
+            ),
+            (
+                "a READY without an identity",
+                outer(OUTER_READY, 0, 0, &[]),
+                invalid,
+            ),
+            (
+                "a READY out of sequence",
+                outer(OUTER_READY, 1, 3, &[]),
+                invalid,
+            ),
+            ("DATA before READY", outer(OUTER_DATA, 1, 0, b"x"), invalid),
+            (
+                "an ERROR without a code",
+                outer(OUTER_ERROR, 0, 0, &[]),
+                invalid,
+            ),
+            (
+                "an ERROR with an unknown code",
+                outer(OUTER_ERROR, 0, 0, &2u32.to_le_bytes()),
+                invalid,
+            ),
+            ("an unknown record type", outer(0x7f, 1, 0, &[]), invalid),
+            (
+                "a wrong magic",
+                patched(ready.clone(), 0, b"NVXT"),
+                outer_record,
+            ),
+            (
+                "another version",
+                patched(ready.clone(), 4, &2u16.to_le_bytes()),
+                outer_record,
+            ),
+            (
+                "nonzero flags",
+                patched(ready.clone(), 7, &[1]),
+                outer_record,
+            ),
+            (
+                "an oversized record",
+                patched(ready.clone(), 40, &oversized),
+                "control endpoint returned an oversized outer record",
+            ),
+        ];
+        for (case, record, message) in cases {
+            let error = scripted(&[record]).0.err().unwrap();
+            assert_violation(&error, message, case);
+        }
+
+        // A stream that ends, at a record boundary or inside a record, has closed.
+        for records in [Vec::new(), vec![ready[..20].to_vec()]] {
+            let wire = Scripted::default();
+            wire.supply(&records);
+            wire.close();
+            let attached = ControlSession::attach(Box::new(wire), &[1; CAPABILITY_LEN], deadline());
+            assert!(matches!(attached, Err(SessionError::Closed)));
+        }
     }
 
     #[test]
     fn exec_streams_events_in_order() {
         // The request ID is random, so the scripted guest answers the frames the host sent.
-        let (transport, output) = scripted(&[outer(OUTER_READY, 1, 0, &[])]);
-        let mut session =
-            ControlSession::attach(transport, &[1; CAPABILITY_LEN], deadline()).unwrap();
+        let (mut session, wire) = ready();
         let workload = Workload {
             argv: vec!["/bin/sh".to_owned(), "-c".to_owned(), "echo hi".to_owned()],
             timeout_ms: 1000,
@@ -642,13 +734,13 @@ mod tests {
             environment: WorkloadEnvironment::Default,
         };
         let request_id = session.start_exec(&workload, deadline()).unwrap();
-        let records = host_records(&output.lock().unwrap());
+        let records = host_records(&wire.output());
         let (record_type, sequence, frame) = &records[1];
         assert_eq!((*record_type, *sequence), (OUTER_DATA, 0));
         let frame = decode_app(frame).unwrap();
         assert_eq!((frame.kind, frame.request_id), (APP_EXEC, request_id));
 
-        let replies = [
+        wire.supply(&[
             outer(
                 OUTER_DATA,
                 1,
@@ -667,8 +759,7 @@ mod tests {
                 3,
                 &encode_app(APP_EXIT, request_id, 3, b"exit"),
             ),
-        ];
-        session.transport = scripted(&replies).0;
+        ]);
         let events: Vec<ExecEvent> = (0..3)
             .map(|_| {
                 session
@@ -691,9 +782,7 @@ mod tests {
 
     #[test]
     fn exec_sends_the_working_directory_and_reports_its_refusal() {
-        let (transport, output) = scripted(&[outer(OUTER_READY, 1, 0, &[])]);
-        let mut session =
-            ControlSession::attach(transport, &[1; CAPABILITY_LEN], deadline()).unwrap();
+        let (mut session, wire) = ready();
         let workload = Workload {
             argv: vec!["/bin/pwd".to_owned()],
             timeout_ms: 0,
@@ -701,7 +790,7 @@ mod tests {
             environment: WorkloadEnvironment::Default,
         };
         let request_id = session.start_exec(&workload, deadline()).unwrap();
-        let records = host_records(&output.lock().unwrap());
+        let records = host_records(&wire.output());
         let frame = decode_app(&records[1].2).unwrap();
         assert_eq!((frame.kind, frame.request_id), (APP_EXEC, request_id));
         assert_eq!(
@@ -710,7 +799,7 @@ mod tests {
         );
 
         let diagnostic = b"nvx-managed-agent: cannot enter working directory /work: No such file\n";
-        session.transport = scripted(&[
+        wire.supply(&[
             outer(
                 OUTER_DATA,
                 1,
@@ -723,8 +812,7 @@ mod tests {
                 2,
                 &encode_app(APP_ERROR, request_id, 2, protocol::CWD_FAILED.as_bytes()),
             ),
-        ])
-        .0;
+        ]);
         let events: Vec<ExecEvent> = (0..2)
             .map(|_| {
                 session
@@ -745,38 +833,111 @@ mod tests {
     }
 
     #[test]
-    fn out_of_order_and_reset_records_fail_closed() {
-        let (transport, _) = scripted(&[outer(OUTER_READY, 1, 0, &[])]);
-        let mut session =
-            ControlSession::attach(transport, &[1; CAPABILITY_LEN], deadline()).unwrap();
-        session.transport =
-            scripted(&[outer(OUTER_DATA, 1, 5, &encode_app(APP_STDOUT, 1, 0, b"x"))]).0;
-        assert!(matches!(
-            session.next_exec_event(1, Some(deadline())),
-            Err(SessionError::Protocol(_))
-        ));
-        session.transport = scripted(&[outer(OUTER_RESET, 1, 1, &[])]).0;
+    fn records_that_the_protocol_does_not_allow_fail_closed() {
+        let frame = encode_app(APP_STDOUT, 1, 0, b"x");
+        let data = outer(OUTER_DATA, 1, 1, &frame);
+        let oversized = u32::try_from(OUTER_MAX_PAYLOAD + 1).unwrap().to_le_bytes();
+        let invalid = "control endpoint returned an invalid data record";
+        let truncated = "control endpoint returned a truncated application frame";
+        let cases = [
+            (
+                "DATA out of sequence",
+                outer(OUTER_DATA, 1, 5, &frame),
+                invalid,
+            ),
+            (
+                "a repeated sequence number",
+                outer(OUTER_DATA, 1, 0, &frame),
+                invalid,
+            ),
+            (
+                "DATA of another epoch",
+                outer(OUTER_DATA, 2, 1, &frame),
+                invalid,
+            ),
+            (
+                "DATA of another instance",
+                encode_outer(OUTER_DATA, &[9; 16], 1, 1, &frame).unwrap(),
+                invalid,
+            ),
+            ("a WAIT", outer(OUTER_WAIT, 1, 1, &[]), invalid),
+            (
+                "a RESET of the session's epoch",
+                outer(OUTER_RESET, 1, 1, &[]),
+                invalid,
+            ),
+            ("an unknown record type", outer(0x7f, 1, 1, &[]), invalid),
+            (
+                "an empty DATA record",
+                outer(OUTER_DATA, 1, 1, &[]),
+                truncated,
+            ),
+            (
+                "a truncated frame",
+                outer(OUTER_DATA, 1, 1, &frame[..APP_HEADER_LEN - 1]),
+                truncated,
+            ),
+            (
+                "nonzero flags",
+                patched(data.clone(), 7, &[1]),
+                "control endpoint returned an invalid outer record",
+            ),
+            (
+                "an oversized record",
+                patched(data.clone(), 40, &oversized),
+                "control endpoint returned an oversized outer record",
+            ),
+        ];
+        for (case, record, message) in cases {
+            let (mut session, wire) = ready();
+            wire.supply(&[record]);
+            let error = session.next_exec_event(1, Some(deadline())).unwrap_err();
+            assert_violation(&error, message, case);
+        }
+
+        // A violation ends the session.
+        let (mut session, wire) = ready();
+        wire.supply(&[outer(OUTER_DATA, 1, 5, &frame)]);
+        assert!(session.next_exec_event(1, Some(deadline())).is_err());
+        wire.supply(std::slice::from_ref(&data));
+        let error = session.next_exec_event(1, Some(deadline())).unwrap_err();
+        let ended = "the control session ended after an earlier failure";
+        assert_violation(&error, ended, "a call after a violation");
+        let error = session.cancel_exec(1, deadline()).unwrap_err();
+        assert_violation(&error, ended, "a request after a violation");
+
+        // A reset to a later epoch ends the session too.
+        let (mut session, wire) = ready();
+        wire.supply(&[outer(OUTER_RESET, 2, 1, &[])]);
         assert!(matches!(
             session.next_exec_event(1, Some(deadline())),
             Err(SessionError::Reset)
         ));
+
+        // A stream that ends, at a record boundary or inside a record, has closed.
+        for records in [Vec::new(), vec![data[..OUTER_HEADER_LEN + 1].to_vec()]] {
+            let (mut session, wire) = ready();
+            wire.supply(&records);
+            wire.close();
+            assert!(matches!(
+                session.next_exec_event(1, Some(deadline())),
+                Err(SessionError::Closed)
+            ));
+        }
     }
 
     #[test]
     fn timed_out_polls_keep_partial_records() {
-        let (transport, _) = scripted(&[outer(OUTER_READY, 1, 0, &[])]);
-        let mut session =
-            ControlSession::attach(transport, &[1; CAPABILITY_LEN], deadline()).unwrap();
+        let (mut session, wire) = ready();
         let record = outer(OUTER_DATA, 1, 1, &encode_app(APP_EXIT, 9, 0, b"cancelled"));
         let (first, second) = record.split_at(30);
-        let (transport, output) = scripted(&[first.to_vec()]);
-        session.transport = transport;
+        wire.supply(&[first.to_vec()]);
         assert!(matches!(
             session.next_exec_event(9, Some(deadline())),
             Err(SessionError::TimedOut)
         ));
         session.cancel_exec(9, deadline()).unwrap();
-        session.transport = scripted(&[second.to_vec()]).0;
+        wire.supply(&[second.to_vec()]);
         assert_eq!(
             session.next_exec_event(9, Some(deadline())).unwrap(),
             ExecEvent::Exit {
@@ -784,9 +945,39 @@ mod tests {
                 status: 0
             }
         );
-        let records = host_records(&output.lock().unwrap());
+        let records = host_records(&wire.output());
         let frame = decode_app(&records.last().unwrap().2).unwrap();
         assert_eq!((frame.kind, frame.request_id), (APP_CANCEL, 9));
+    }
+
+    #[test]
+    fn frames_travel_in_one_record_each() {
+        let (mut session, wire) = ready();
+        let longest = vec![0x5a; OUTER_MAX_PAYLOAD - APP_HEADER_LEN];
+        session
+            .send_request(APP_EXEC, 1, &longest, deadline())
+            .unwrap();
+        let error = session
+            .send_request(
+                APP_EXEC,
+                2,
+                &[longest.as_slice(), &[0]].concat(),
+                deadline(),
+            )
+            .unwrap_err();
+        let message = "control payload exceeds the outer protocol limit";
+        assert_violation(&error, message, "a frame longer than a record");
+        let records = host_records(&wire.output());
+        assert_eq!(records.len(), 2);
+        let (record_type, sequence, frame) = &records[1];
+        assert_eq!((*record_type, *sequence), (OUTER_DATA, 0));
+        let frame = decode_app(frame).unwrap();
+        assert_eq!((frame.kind, frame.request_id), (APP_EXEC, 1));
+        assert_eq!(frame.payload, longest);
+        // The refused frame changed nothing.
+        session.cancel_exec(1, deadline()).unwrap();
+        let records = host_records(&wire.output());
+        assert_eq!((records[2].0, records[2].1), (OUTER_DATA, 1));
     }
 
     /// The response kind that acknowledges a ping or a stop request.
@@ -955,8 +1146,8 @@ mod tests {
 
     #[test]
     fn expired_deadlines_time_out() {
-        let (transport, _) = scripted(&[]);
-        let error = ControlSession::attach(transport, &[1; CAPABILITY_LEN], Instant::now())
+        let wire = Scripted::default();
+        let error = ControlSession::attach(Box::new(wire), &[1; CAPABILITY_LEN], Instant::now())
             .err()
             .unwrap();
         assert!(matches!(error, SessionError::TimedOut));

@@ -72,6 +72,7 @@ use std::process::ExitCode;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::protocol::nvxs::ErrorCode;
 use crate::protocol::{
     APP_CANCEL, APP_ERROR, APP_EXEC, APP_EXIT, APP_FEATURES, APP_MAPS, APP_PING, APP_READY,
     APP_STDERR, APP_STDOUT, APP_STOP, APP_STOPPED, BUSY, CAPABILITY_LEN, CWD_FAILED, ExitCategory,
@@ -967,9 +968,10 @@ impl Pending for fs::File {
     }
 }
 
-/// Encodes an outer record without a payload, which the broker sends to answer an attach.
-fn control_record(record_type: u8, instance: &[u8; 16], epoch: u64) -> Vec<u8> {
-    encode_outer(record_type, instance, epoch, 0, &[]).expect("an empty payload fits a record")
+/// Encodes the broker's answer to an attachment, its first record to the host: READY, which
+/// carries the session's identity, or ERROR, whose payload is the refusal's code.
+fn control_record(record_type: u8, instance: &[u8; 16], epoch: u64, payload: &[u8]) -> Vec<u8> {
+    encode_outer(record_type, instance, epoch, 0, payload).expect("an answer fits a record")
 }
 
 /// Decoded outer header paired with its owned payload.
@@ -1327,7 +1329,8 @@ fn serve_client<S: Read + Write + Pending>(
         return Flow::Continue;
     };
     if header.record_type != OUTER_HOST_ATTACH || payload != capability {
-        let _ = stream.write_all(&control_record(OUTER_ERROR, &[0; 16], 0));
+        let code = ErrorCode::Authentication.code().to_le_bytes();
+        let _ = stream.write_all(&control_record(OUTER_ERROR, &[0; 16], 0, &code));
         return Flow::Continue;
     }
     let mut instance = [0u8; 16];
@@ -1337,7 +1340,7 @@ fn serve_client<S: Read + Write + Pending>(
         }
     }
     if stream
-        .write_all(&control_record(OUTER_READY, &instance, epoch))
+        .write_all(&control_record(OUTER_READY, &instance, epoch, &[]))
         .is_err()
     {
         return Flow::Continue;

@@ -487,8 +487,8 @@ impl Session {
 
 /// Returns Python's message for a violation of the protocol that `nvx::host::session` reports.
 ///
-/// The two sessions check the same records in the same order, and their messages differ only
-/// where Python folds a case into a broader one.
+/// The two sessions report the same violations of records that have one fault, and their
+/// messages differ only where Python folds a case into a broader one.
 fn protocol_message(message: String) -> String {
     match message.as_str() {
         "control attach response carried a payload" => {

@@ -141,10 +141,13 @@ impl BrokerCore {
             .epoch
             .checked_add(1)
             .ok_or_else(|| io::Error::from(Errno::EOVERFLOW))?;
-        self.host_output.clear();
         self.receive_credit = 0;
         self.reset_guest()?;
-        self.queue_host(OUTER_RESET, 0, &[])
+        // The RESET ends the host's attachment with the session's new identity, after the
+        // records that the host has not read, at the next sequence number of the host's leg.
+        let sequence = self.host_send_sequence;
+        self.host_send_sequence = self.host_send_sequence.wrapping_add(1);
+        self.queue_host(OUTER_RESET, sequence, &[])
     }
 
     fn reset_guest(&mut self) -> io::Result<()> {
