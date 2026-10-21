@@ -34,7 +34,7 @@
 //! # }
 //! ```
 
-use std::ffi::{CStr, CString};
+use std::ffi::{CStr, CString, OsStr};
 use std::fmt;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
@@ -44,7 +44,19 @@ use super::sys::{self, Errno, Mode, MountFlags, OpenFlags};
 
 /// The longest source or target of a [`Mapping`], in bytes: Linux's `PATH_MAX` without its
 /// terminating NUL.
-pub const MAX_PATH_BYTES: usize = 4095;
+pub const MAX_PATH_BYTES: usize = sys::PATH_MAX - 1;
+
+/// The mode of each directory that [`Mapping::apply`] creates, before the umask: `rwxr-xr-x`.
+const DIRECTORY_MODE: Mode = Mode::S_IRWXU
+    .union(Mode::S_IRGRP)
+    .union(Mode::S_IXGRP)
+    .union(Mode::S_IROTH)
+    .union(Mode::S_IXOTH);
+/// The mode of each file target that [`Mapping::apply`] creates, before the umask: `rw-r--r--`.
+const FILE_MODE: Mode = Mode::S_IRUSR
+    .union(Mode::S_IWUSR)
+    .union(Mode::S_IRGRP)
+    .union(Mode::S_IROTH);
 
 /// Whether programs can write a mapping's target.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -158,7 +170,8 @@ impl std::error::Error for MappingFailure {}
 pub struct Mapping {
     /// The source, relative to the export root.
     source: PathBuf,
-    /// The target, absolute as seen from the target root.
+    /// The target, relative to the target root: the absolute target that [`Mapping::new`] took,
+    /// without its leading `/`.
     target: PathBuf,
     /// Whether programs can write the target.
     access: Access,
@@ -177,13 +190,13 @@ impl Mapping {
         target: impl Into<PathBuf>,
         access: Access,
     ) -> Result<Self, InvalidMapping> {
-        let (source, target) = (source.into(), target.into());
-        if !names_a_path_below_its_root(&source, false) {
+        let source = source.into();
+        if below_its_root(&source, false).is_none() {
             return Err(InvalidMapping::Source);
         }
-        if !names_a_path_below_its_root(&target, true) {
-            return Err(InvalidMapping::Target);
-        }
+        let target = below_its_root(&target.into(), true)
+            .ok_or(InvalidMapping::Target)?
+            .to_path_buf();
         Ok(Self {
             source,
             target,
@@ -196,7 +209,8 @@ impl Mapping {
         &self.source
     }
 
-    /// Returns the target, absolute as seen from the target root.
+    /// Returns the target, relative to the target root: the target that [`new`](Self::new) took,
+    /// without its leading `/`, such as `workspace` for `/workspace`.
     pub fn target(&self) -> &Path {
         &self.target
     }
@@ -237,21 +251,17 @@ impl Mapping {
         target_root: &Path,
         mut mount: impl FnMut(Option<&CStr>, &CStr, MountFlags) -> Result<(), Errno>,
     ) -> Result<(), MappingFailure> {
-        let below_target_root = self
-            .target
-            .strip_prefix("/")
-            .expect("a mapping's target is absolute");
         let (source, c_source) = below(export_root, &self.source)
             .map_err(|error| MappingStage::Source.failure(error))?;
-        let (target, c_target) = below(target_root, below_target_root)
+        let (target, c_target) = below(target_root, &self.target)
             .map_err(|error| MappingStage::Target.failure(error))?;
         let kind = std::fs::symlink_metadata(&source)
             .map_err(|error| MappingStage::Source.failure(sys::errno_of(&error)))?
             .file_type();
         let created = if kind.is_dir() {
-            create_directories(target_root, below_target_root)
+            create_directories(target_root, &self.target)
         } else if kind.is_file() {
-            let parent = below_target_root.parent().unwrap_or(Path::new(""));
+            let parent = self.target.parent().unwrap_or(Path::new(""));
             create_directories(target_root, parent).and_then(|()| file_target(&target, &c_target))
         } else {
             return Err(MappingStage::Source.failure(Errno::EINVAL));
@@ -270,24 +280,24 @@ impl Mapping {
     }
 }
 
-/// Whether `path` holds at most [`MAX_PATH_BYTES`] bytes and no NUL byte, and, after a leading
-/// `/` if it is `absolute` and only then, at least one component, each neither empty, `.`, nor
-/// `..`.
-fn names_a_path_below_its_root(path: &Path, absolute: bool) -> bool {
+/// Returns the part of `path` below its root: the whole of a relative path, or what follows the
+/// leading `/` of an `absolute` one. It returns `None` unless `path` holds at most
+/// [`MAX_PATH_BYTES`] bytes and no NUL byte, starts with `/` exactly when it is `absolute`, and
+/// has a part below its root of at least one component, each neither empty, `.`, nor `..`.
+fn below_its_root(path: &Path, absolute: bool) -> Option<&Path> {
     let bytes = path.as_os_str().as_bytes();
     let components = if absolute {
-        bytes.strip_prefix(b"/")
+        bytes.strip_prefix(b"/")?
     } else {
-        Some(bytes)
+        bytes
     };
-    bytes.len() <= MAX_PATH_BYTES
+    let valid = bytes.len() <= MAX_PATH_BYTES
         && !bytes.contains(&0)
-        && components.is_some_and(|components| {
-            !components.is_empty()
-                && components
-                    .split(|&byte| byte == b'/')
-                    .all(|component| !matches!(component, b"" | b"." | b".."))
-        })
+        && !components.is_empty()
+        && components
+            .split(|&byte| byte == b'/')
+            .all(|component| !matches!(component, b"" | b"." | b".."));
+    valid.then(|| Path::new(OsStr::from_bytes(components)))
 }
 
 /// Returns the path that the relative `path` names below `root`, and the same path as a C string,
@@ -302,15 +312,12 @@ fn below(root: &Path, path: &Path) -> Result<(PathBuf, CString), Errno> {
 }
 
 /// Creates each missing directory of the relative `directories` below `root`, outermost first,
-/// with mode 0755 before the umask. It uses the entries that exist as they are.
+/// with [`DIRECTORY_MODE`] before the umask. It uses the entries that exist as they are.
 fn create_directories(root: &Path, directories: &Path) -> Result<(), Errno> {
     let mut directory = root.to_path_buf();
     for component in directories {
         directory.push(component);
-        match sys::create_directory(
-            &sys::path_c_string(&directory)?,
-            Mode::from_bits_retain(0o755),
-        ) {
+        match sys::create_directory(&sys::path_c_string(&directory)?, DIRECTORY_MODE) {
             Ok(()) | Err(Errno::EEXIST) => {}
             Err(error) => return Err(error),
         }
@@ -331,7 +338,7 @@ fn file_target(target: &Path, c_target: &CStr) -> Result<(), Errno> {
     }
 }
 
-/// Creates the regular file `path`, empty and with mode 0644 before the umask, failing if any
+/// Creates the regular file `path`, empty and with [`FILE_MODE`] before the umask, failing if any
 /// entry is there, even a symbolic link.
 ///
 /// The new file closes at once, and a failure to close it is ignored.
@@ -343,15 +350,13 @@ fn create_file(path: &CStr) -> Result<(), Errno> {
             | OpenFlags::O_EXCL
             | OpenFlags::O_CLOEXEC
             | OpenFlags::O_NOFOLLOW,
-        Mode::from_bits_retain(0o644),
+        FILE_MODE,
     )
     .map(|_created| ())
 }
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsStr;
-
     use super::*;
 
     /// One recorded mount: the source, if any, the target, and the flags.
@@ -448,7 +453,7 @@ mod tests {
         assert_eq!(std::fs::read(export.join("0/notes.txt")).unwrap(), b"notes");
         assert_eq!(
             (directory.source(), directory.target()),
-            (Path::new("0/src"), Path::new("/srv/data"))
+            (Path::new("0/src"), Path::new("srv/data"))
         );
     }
 

@@ -110,6 +110,10 @@ pub(crate) fn apply_request(
 
 /// Returns the library's mapping of one decoded entry, which the decoder's path rules let
 /// through unchanged.
+///
+/// The paths are the decoder's buffers, which it bounds: it refuses a payload of more than
+/// `MAX_HOST_MAPPINGS` entries before it allocates them, and a source or target of more than
+/// `MAX_MAP_PATH_BYTES` bytes.
 fn mapping_of(entry: GuestHostMap) -> Result<Mapping, InvalidMapping> {
     let path = |bytes: Vec<u8>| PathBuf::from(OsString::from_vec(bytes));
     let access = if entry.read_only {
@@ -384,8 +388,8 @@ mod tests {
         assert_eq!(
             converted.iter().map(parts).collect::<Vec<_>>(),
             [
-                (longest, target, Access::ReadOnly),
-                (b"0/\xff".to_vec(), b"/\xfe".to_vec(), Access::ReadWrite),
+                (longest, target[1..].to_vec(), Access::ReadOnly),
+                (b"0/\xff".to_vec(), b"\xfe".to_vec(), Access::ReadWrite),
             ]
         );
     }
