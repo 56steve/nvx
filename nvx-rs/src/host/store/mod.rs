@@ -111,6 +111,11 @@
 //! endpoint. The claim relies on the VMM keeping its standard output and error until it exits, as
 //! OpenVMM does, and on the directory being on a local file system.
 //!
+//! On Linux, a process that another thread spawns while the log is open, such as another
+//! sandbox's VMM, also holds the claim, from its fork until it executes its program, which closes
+//! its copy. Recovery therefore checks a held claim again for up to a second before it concludes
+//! that a process of the launch may still run.
+//!
 //! # Recovery
 //!
 //! A caller that dies during a launch leaves its journal, and [`LockedStore::recover`] ends the
@@ -203,6 +208,17 @@ pub const FILE_NAMES: [&str; 8] = [
 
 /// Interval at which a lock with a deadline is tried again.
 const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(25);
+
+/// How long recovery waits for a held claim on a launch's log to be released before it concludes
+/// that a process of the launch may still run.
+///
+/// On Linux, a process holds a copy of each descriptor of its parent from its fork until it
+/// executes its program, so a spawn by another thread of the process that holds the log, such
+/// as the launch of another sandbox's VMM, holds the claim for that moment.
+const CLAIM_RELEASE_WAIT: Duration = Duration::from_secs(1);
+
+/// Interval at which a held claim is checked again while recovery waits for its release.
+const CLAIM_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Returns `dir` as an absolute path, which a relative one names from the current directory.
 fn absolute(dir: PathBuf) -> Result<PathBuf> {
@@ -522,15 +538,26 @@ impl LockedStore {
 
     /// Returns whether a process still holds the claim of the launch of `journal` on its log, or
     /// why that cannot be determined.
+    ///
+    /// A held claim is checked again until [`CLAIM_RELEASE_WAIT`] passes, so that a process that
+    /// another thread spawned while the log was open, which holds the claim only until it
+    /// executes its program, is not taken for a process of the launch.
     fn claim_held(&self, journal: &LaunchJournal) -> std::result::Result<bool, String> {
         let path = self.log_path();
         let identity = journal.log().identity;
-        platform::log_claim_held(&path, (identity.device, identity.index)).map_err(|error| {
-            format!(
-                "its claim on the log {} cannot be checked: {error}",
-                path.display()
-            )
-        })
+        let deadline = Instant::now() + CLAIM_RELEASE_WAIT;
+        loop {
+            match platform::log_claim_held(&path, (identity.device, identity.index)) {
+                Ok(true) if Instant::now() < deadline => thread::sleep(CLAIM_RETRY_INTERVAL),
+                Ok(held) => return Ok(held),
+                Err(error) => {
+                    return Err(format!(
+                        "its claim on the log {} cannot be checked: {error}",
+                        path.display()
+                    ));
+                }
+            }
+        }
     }
 
     /// Ends a launch through the recorded `reference` to its VMM, which `open`, [`Process::open`]

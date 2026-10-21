@@ -44,6 +44,25 @@ fn write(store: &SandboxStore, name: &str, value: &serde_json::Value) {
     fs::write(store.path(name), serde_json::to_vec(value).unwrap()).unwrap();
 }
 
+/// How long a test waits for a lock or claim that it released to be free.
+///
+/// A process that a concurrent test spawns holds a copy of each descriptor of this process from
+/// its fork until it executes its program, and with it the lock or claim of a file that a test
+/// had open, for that moment.
+const RELEASE_WAIT: Duration = Duration::from_secs(10);
+
+/// Returns whether `free` holds before [`RELEASE_WAIT`] passes, checking it again until then.
+fn released(mut free: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + RELEASE_WAIT;
+    while !free() {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    true
+}
+
 #[test]
 fn artifact_identities_are_printable_tokens() {
     assert_eq!(
@@ -291,7 +310,11 @@ fn the_lock_excludes_other_holders() {
     // A deadline that has passed still tries once.
     assert!(store.lock(Some(Instant::now())).is_err());
     drop(held);
-    drop(store.lock(Some(Instant::now())).unwrap());
+    assert!(released(|| match store.lock(Some(Instant::now())) {
+        Ok(_) => true,
+        Err(error) if error.kind() == ErrorKind::TimedOut => false,
+        Err(error) => panic!("{error}"),
+    }));
 
     // A waiter without a deadline takes the lock once its holder releases it.
     let held = store.lock(None).unwrap();
@@ -558,7 +581,8 @@ fn a_launch_writes_its_marker_before_its_vmm_runs() {
     drop(log);
     assert!(platform::log_claim_held(&store.log_path(), identity).unwrap());
     drop(copy);
-    assert!(!platform::log_claim_held(&store.log_path(), identity).unwrap());
+    let free = || !platform::log_claim_held(&store.log_path(), identity).unwrap();
+    assert!(released(free));
     // A log that is not the claimed file proves nothing.
     assert!(platform::log_claim_held(&store.log_path(), previous_log).is_err());
 
