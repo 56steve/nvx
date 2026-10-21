@@ -47,6 +47,9 @@ generation_id_packet="$(
 [ "$generation_id_after" = "$generation_id_packet" ] || fail 52
 /sbin/nvx-reseed "$entropy" || fail 45
 rng="$(/sbin/nvx-reseed --sample)" || fail 53
+# nvx-time holds the port permission only for each port transaction, so a
+# process that it starts afterwards cannot reach the ports.
+port_access="$(/sbin/nvx-time test port-access)" || fail 55
 uuid="$(cat /proc/sys/kernel/random/uuid)"
 temp_path="$(mktemp /tmp/nvx-clone.XXXXXX)" || fail 54
 temp_id=${temp_path##*/}
@@ -55,6 +58,7 @@ echo "NVX-SNAPSHOT-RNG-$rng"
 echo "NVX-SNAPSHOT-GENERATION-ID-$generation_id_after"
 echo "NVX-SNAPSHOT-UUID-$uuid"
 echo "NVX-SNAPSHOT-TEMP-ID-$temp_id"
+echo "NVX-SNAPSHOT-PORT-ACCESS-$port_access"
 dd if=/dev/zero of=/tmp/nvx-snapshot-dirty bs=1M count=32 2>/dev/null
 echo NVX-SNAPSHOT-CORE-OK
 nvx-exit 0

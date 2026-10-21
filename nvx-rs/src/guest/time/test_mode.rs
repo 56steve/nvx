@@ -1,5 +1,6 @@
 //! The `nvx-time test` compatibility interface: the C program's test hooks, which exercise its
-//! decoders, formats, and process structure without the hypervisor.
+//! decoders, formats, and process structure without the hypervisor, and `port-access`, which
+//! checks in a VM that the processes that the time tools start cannot reach OpenVMM's ports.
 //!
 //! A hook prints a decoded failure as its output and succeeds; it fails with the usage status
 //! only when its own command line is malformed: a wrong number of arguments, a fixture that it
@@ -10,7 +11,7 @@
 //! `console` writes its whole line, as the program writes every event, which is shorter than
 //! the 638 bytes after which the C program's buffer cut an asynchronous line.
 
-use std::ffi::OsStr;
+use std::ffi::{CStr, CString, OsStr};
 use std::fs;
 use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
@@ -25,18 +26,26 @@ use super::decoders::{
 };
 use super::events::{CheckId, DETAIL_MAX, EventSource, ViolationCode, escape_text, format_event};
 use super::state::TimeState;
-use super::system::{clock_ns, cpu_time_ns};
+use super::system::{self, Runtime, SampleError, clock_ns, cpu_time_ns};
 use super::{DEFERRED_START_NS, IDLE_BOUND_NS, NSEC_PER_MSEC, NSEC_PER_SEC, Phase};
 use crate::guest::parse::{parse_integer, parse_u64};
 use crate::guest::status::CommandError;
 use crate::guest::sys::x86::CpuidResult;
-use crate::guest::sys::{self, ChildStatus, ClockAdjustment, Errno, ForkResult};
+use crate::guest::sys::{
+    self, ChildStatus, ClockAdjustment, Errno, ForkResult, Port, PortAccess, Signal,
+};
 
 /// How long after its start the `promote` hook's first promoter promotes the threads.
 const PROMOTION_DELAY_NS: i64 = 50 * NSEC_PER_MSEC;
 /// How long after its start the `promote` hook's second promoter would promote the threads,
 /// long enough that stopping it first cancels the promotion.
 const CANCELLED_PROMOTION_DELAY_NS: i64 = 10 * NSEC_PER_SEC;
+/// The ports that `port-access` probes, one in each range that a port transaction grants, by
+/// the names that `port-probe` takes. Reading either changes nothing in OpenVMM.
+const PROBED_PORTS: [(&CStr, Port); 2] = [
+    (c"portb-status", Port::PortbStatus),
+    (c"snapshot", Port::Snapshot),
+];
 
 /// Runs a named test hook. The C interface exits 0 for a decoded failure and 2 only when the
 /// hook's invocation itself is malformed.
@@ -78,6 +87,8 @@ pub(super) fn run(arguments: &[&[u8]], out: &mut dyn Write) -> Result<(), Comman
         b"cpuinfo" => test_cpuinfo(arguments, out),
         b"cmdline" => test_cmdline(arguments, out),
         b"clocksource" => test_clocksource(arguments, out),
+        b"port-access" if arguments.is_empty() => test_port_access(out),
+        b"port-probe" => test_port_probe(arguments),
         _ => Err(CommandError::Usage),
     }
 }
@@ -678,6 +689,96 @@ fn test_deferred_restore_cpu(arguments: &[&[u8]], out: &mut dyn Write) -> Result
     }
 }
 
+/// Checks, in a VM, that a process that `nvx-time` starts after a port transaction cannot reach
+/// OpenVMM's ports. It takes a time sample under the port-B lock, as the daemon does, whose
+/// transaction ends before the sample returns, and then starts `port-probe` twice for each
+/// probed port, as the time tools start a process: once to take the permission itself, which
+/// must read the port, and once without it, which the processor must refuse. Prints `denied`,
+/// or the first unexpected result.
+fn test_port_access(out: &mut dyn Write) -> Result<(), CommandError> {
+    sys::reset_child_signal();
+    let runtime = Runtime::new(&system::RealOps, true);
+    // The time daemon samples port B too, so the sample holds the lock that serializes port-B
+    // transactions, and gives it up before the probes start.
+    let sample = {
+        let _lock = match system::lock_portb() {
+            Ok(lock) => lock,
+            Err(detail) => {
+                let _ = writeln!(out, "{}", String::from_utf8_lossy(&detail));
+                return Ok(());
+            }
+        };
+        system::best_sample(&runtime, 1, i64::MAX, 0)
+    };
+    if let Err(SampleError::Ports(error)) = sample {
+        let _ = writeln!(out, "the transaction failed: {error}");
+        return Ok(());
+    }
+    for (name, _) in PROBED_PORTS {
+        let granted = probe(name, true)?;
+        if granted != ChildStatus::Exited(0) {
+            let _ = writeln!(
+                out,
+                "{} with the permission: {granted:?}",
+                name.to_string_lossy()
+            );
+            return Ok(());
+        }
+        let inherited = probe(name, false)?;
+        if inherited != ChildStatus::Signaled(Signal::SIGSEGV as i32) {
+            let _ = writeln!(
+                out,
+                "{} without the permission: {inherited:?}",
+                name.to_string_lossy()
+            );
+            return Ok(());
+        }
+    }
+    let _ = writeln!(out, "denied");
+    Ok(())
+}
+
+/// Starts `nvx-time test port-probe NAME`, with `grant` when the probe takes the permission
+/// itself, and returns how it ended.
+fn probe(name: &CStr, grant: bool) -> Result<ChildStatus, CommandError> {
+    let arguments: Vec<CString> = [c"nvx-time", c"test", c"port-probe", name]
+        .into_iter()
+        .chain(grant.then_some(c"grant"))
+        .map(CStr::to_owned)
+        .collect();
+    match system::fork_process() {
+        Ok(ForkResult::Child) => {
+            sys::exec(c"/proc/self/exe", &arguments, None);
+            sys::exit_immediately(127)
+        }
+        Ok(ForkResult::Parent(process)) => sys::wait(process).ok_or(CommandError::Operation),
+        Err(_) => Err(CommandError::Operation),
+    }
+}
+
+/// Reads the port that `port-access` names, without the permission unless `grant` follows, in
+/// which case it takes the permission first. Without the permission, the processor refuses the
+/// read, and Linux ends the process with `SIGSEGV`.
+fn test_port_probe(arguments: &[&[u8]]) -> Result<(), CommandError> {
+    let (name, grant) = match arguments {
+        [name] => (*name, false),
+        [name, b"grant"] => (*name, true),
+        _ => return Err(CommandError::Usage),
+    };
+    let (_, port) = PROBED_PORTS
+        .into_iter()
+        .find(|(probed, _)| probed.to_bytes() == name)
+        .ok_or(CommandError::Usage)?;
+    // The probe holds the permission that it takes until it returns.
+    let _ports = if grant {
+        Some(PortAccess::request().map_err(|_| CommandError::Operation)?)
+    } else {
+        None
+    };
+    sys::probe_port(port);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     //! Focused regressions for the conversions of the test hooks.
@@ -718,6 +819,16 @@ mod tests {
             run(&[b"deferral", b"x"], &mut out),
             Err(CommandError::Usage)
         );
+        // Only malformed: a well-formed probe without the permission ends the process.
+        for arguments in [
+            &[b"port-access".as_slice(), b"x"][..],
+            &[b"port-probe"],
+            &[b"port-probe", b"control"],
+            &[b"port-probe", b"snapshot", b"revoke"],
+            &[b"port-probe", b"snapshot", b"grant", b"x"],
+        ] {
+            assert_eq!(run(arguments, &mut out), Err(CommandError::Usage));
+        }
         assert_eq!(
             run(
                 &[b"exhaustive-report", b"X\xff", b"0", b"pass", b"ok"],

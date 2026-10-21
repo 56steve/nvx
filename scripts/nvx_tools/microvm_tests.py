@@ -5382,6 +5382,14 @@ def run_snapshot_core(
                     f"snapshot restore {restore_index} emitted a malformed temp ID"
                 )
             temp_ids.append(temp_id)
+            port_access = _single_marker_value(
+                restored.output, b"NVX-SNAPSHOT-PORT-ACCESS-"
+            )
+            if port_access != b"denied":
+                raise RuntimeError(
+                    f"snapshot restore {restore_index} started a process that reached "
+                    f"OpenVMM's ports: {port_access.decode(errors='replace')}"
+                )
             if _snapshot_fingerprint(snapshot_path) != fingerprint:
                 raise RuntimeError(
                     f"snapshot restore {restore_index} modified snapshot artifacts"

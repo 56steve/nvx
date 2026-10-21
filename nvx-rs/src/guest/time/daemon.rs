@@ -14,14 +14,14 @@ use super::state::{Discontinuity, SampleRejection, TimeState};
 use super::system::{
     self, DAEMON_PID_PATH, DAEMON_PID_TEMP_PATH, DEFAULT_STALL_TIMEOUT_S, PowerOffStatus,
     RCU_SYNC_PATH, RESTORE_PATH, Runtime, SNAPSHOT_ACKNOWLEDGE, SampleError, SampleResult,
-    clock_ns, cpu_time_ns, current_frequency, set_frequency, state_apply, state_load,
-    suppression_restore,
+    SpawnError, clock_ns, cpu_time_ns, current_frequency, fork_process, set_frequency, state_apply,
+    state_load, suppression_restore,
 };
 use super::{DEFERRED_START_NS, IDLE_BOUND_NS, NSEC_PER_MSEC, NSEC_PER_SEC, NSEC_PER_USEC, Phase};
 use crate::guest::kernel_text::KmsgRecord;
 use crate::guest::sys::{
-    self, ChildStatus, Errno, FileDescriptor, ForkResult, Mode, Pollable, Port, ProcessId, Signal,
-    SignalDescriptor, Timer, kernel,
+    self, ChildStatus, Errno, FileDescriptor, ForkResult, Mode, Pollable, Port, PortAccess,
+    PortError, ProcessId, Signal, SignalDescriptor, Timer, kernel,
 };
 
 /// Maximum accepted polling bracket width.
@@ -69,8 +69,10 @@ pub(crate) struct Promoter {
 }
 
 impl Promoter {
-    /// Starts a promoter whose deadline is `IDLE_BOUND_NS` after the monotonic `start_ns`.
+    /// Starts a promoter whose deadline is `IDLE_BOUND_NS` after the monotonic `start_ns`,
+    /// unless the calling thread may hold port permission, which the promoter would inherit.
     pub(crate) fn start(start_ns: i64) -> Option<Self> {
+        sys::check_released().ok()?;
         let (cancel, cancelled) = mpsc::channel();
         let deadline = start_ns.wrapping_add(IDLE_BOUND_NS);
         let thread = thread::Builder::new()
@@ -291,6 +293,10 @@ fn discipline_poll(runtime: &Runtime<'_>, daemon: &mut Daemon) {
                 }
             }
             Err(SampleError::Generation { .. }) => return,
+            // Nothing else would report it, and the daemon goes on without the sample.
+            Err(SampleError::Ports(error @ PortError::Revoke(_))) => {
+                runtime.log_release_failure(error);
+            }
             Ok((SampleResult::Wide, _))
             | Err(SampleError::Ports(_) | SampleError::NoTimeWindow(_) | SampleError::Invalid(_)) =>
                 {}
@@ -364,7 +370,7 @@ fn release_with_deadline(timeout_s: i64) -> bool {
     let Ok(wait) = sys::ChildSignalWait::new() else {
         return false;
     };
-    let process = match sys::fork() {
+    let process = match fork_process() {
         Ok(ForkResult::Child) => {
             let _ = wait.restore();
             sys::exit_immediately(u8::from(!grace_period_release()));
@@ -433,14 +439,14 @@ pub(crate) fn fork_deferred_restore(
     cpu_start_ns: i64,
     timing: &mut RestoreTiming,
     at_fork: impl FnOnce(),
-) -> Result<ForkResult, Errno> {
+) -> Result<ForkResult, SpawnError> {
     let pipe = sys::create_pipe().ok();
     timing.fork_reader = None;
     timing.cpu_base_ns = 0;
     let forked = {
         let _idle = sys::IdlePriority::enter();
         timing.prior_cpu_ns = cpu_time_ns().wrapping_sub(cpu_start_ns);
-        let forked = sys::fork();
+        let forked = fork_process();
         if matches!(forked, Ok(ForkResult::Parent(_))) {
             at_fork();
         }
@@ -571,7 +577,7 @@ fn start_restore(runtime: &Runtime<'_>, daemon: &mut Daemon, restore: PendingRes
         Err(error) => {
             runtime.repair_failure(
                 ViolationCode::RepairSuppression,
-                format!("cannot start the restore work: {}", error.desc()).as_bytes(),
+                format!("cannot start the restore work: {error}").as_bytes(),
             );
             return;
         }
@@ -758,40 +764,53 @@ pub(crate) fn daemon_loop(runtime: &Runtime<'_>, mut daemon: Daemon) -> ! {
     }
 }
 
-/// How repair steps 6 and 7 reached the daemon.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum RestoreSignal {
-    /// The daemon received the queued signal.
-    Queued,
-    /// No daemon runs.
-    NoDaemon,
-    /// The daemon runs, but the signal could not be queued.
-    Failed,
+/// Returns the recorded `daemon` while it runs.
+pub(crate) fn running_daemon(daemon: Option<ProcessId>) -> Option<ProcessId> {
+    daemon.filter(|&process| sys::process_exists(process))
 }
 
-/// Repair steps 6 and 7 on the readiness path: the acknowledgement when the host gated its
-/// input, then hand step 7 to the daemon. The `sigqueue` value is the readiness path's wall
-/// time since `start_ns`, on the monotonic clock, in microseconds clamped to 32 bits, read
-/// after the acknowledgement so that the read does not delay it.
-pub(crate) fn signal_restore(
-    runtime: &Runtime<'_>,
-    daemon: Option<ProcessId>,
-    acknowledge: bool,
-    start_ns: i64,
-) -> RestoreSignal {
-    let Some(daemon) = daemon.filter(|&process| sys::process_exists(process)) else {
-        return RestoreSignal::NoDaemon;
-    };
-    if acknowledge && let Ok(ports) = runtime.ports() {
-        ports.outb(Port::Snapshot, SNAPSHOT_ACKNOWLEDGE);
-    }
+/// Repair step 6: acknowledges the restore through the snapshot port, when the host gated its
+/// input, and ends the port transaction.
+pub(crate) fn acknowledge_restore(ports: PortAccess<'_>) {
+    ports.write_u8(Port::Snapshot, SNAPSHOT_ACKNOWLEDGE);
+}
+
+/// Repair step 7 on the readiness path: hands the step to `daemon`, after any acknowledgement.
+/// The `sigqueue` value is the readiness path's wall time since `start_ns`, on the monotonic
+/// clock, in microseconds clamped to 32 bits, read after the acknowledgement so that the read
+/// does not delay it.
+pub(crate) fn queue_restore(daemon: ProcessId, start_ns: i64) -> Result<(), Errno> {
     let elapsed = clock_ns(sys::Clock::Monotonic).wrapping_sub(start_ns) / NSEC_PER_USEC;
     let value = elapsed.clamp(0, i64::from(u32::MAX)) as u32;
-    if sys::queue_user_signal(daemon, value).is_ok() {
-        RestoreSignal::Queued
-    } else {
-        RestoreSignal::Failed
+    sys::queue_user_signal(daemon, value)
+}
+
+/// Repair steps 6 and 7 of a restore that a capture finishes, on the readiness path: the
+/// acknowledgement through the snapshot port when `acknowledge`, in a port transaction of its
+/// own, and then the handoff of step 7 to `daemon`. Returns whether it finished the restore.
+///
+/// When the acknowledgement cannot take the port permission, it neither acknowledges nor
+/// signals, and the restore stays unfinished, as without a daemon: the caller's own finish then
+/// takes the permission again, and reports a failure. A handoff that fails after the
+/// acknowledgement fails check C10, which stops the VM unless report-only, and the restore
+/// still counts as finished, so that the caller does not acknowledge it again.
+pub(crate) fn finish_restore(
+    runtime: &Runtime<'_>,
+    daemon: ProcessId,
+    acknowledge: bool,
+    start_ns: i64,
+) -> bool {
+    if acknowledge {
+        let Ok(ports) = runtime.open_ports() else {
+            return false;
+        };
+        acknowledge_restore(ports);
     }
+    if queue_restore(daemon, start_ns).is_err() {
+        let mut checks = Checks::empty(Phase::Restore);
+        checks.fail(runtime, CheckId::C10, "the time daemon is not running");
+    }
+    true
 }
 
 /// Constructs accounting for an inline report-only restore.
@@ -821,6 +840,7 @@ pub(crate) fn empty_restore_timing() -> RestoreTiming {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::guest::time::system::tests::FakeOps;
 
     #[test]
     fn daemon_timing_constants_match_the_abi() {
@@ -850,5 +870,73 @@ mod tests {
         let started = std::time::Instant::now();
         drop(Promoter::start(far).unwrap());
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_failed_revocation_stops_the_daemon_before_it_starts_anything() {
+        let mut ops = FakeOps::new([]);
+        ops.revoke_error = Some(Errno::ENOMEM);
+        Runtime::new(&ops, true).repair_failure(ViolationCode::RepairSuppression, b"revoke");
+        let refused = Err(SpawnError::Ports(PortError::Revoke(Errno::ENOMEM)));
+        // Without the check, `fork` itself would refuse with `EBUSY`, in a process with more
+        // than one thread, such as the test harness.
+        let mut timing = empty_restore_timing();
+        let mut forked = false;
+        assert_eq!(
+            fork_deferred_restore(0, &mut timing, || forked = true),
+            refused
+        );
+        assert!(!forked);
+        assert!(Promoter::start(clock_ns(sys::Clock::Monotonic)).is_none());
+    }
+
+    /// Returns a process ID above Linux's largest, which no process has, so that a signal to it
+    /// fails.
+    fn absent_process() -> ProcessId {
+        ProcessId::from_positive(i64::from(i32::MAX)).unwrap()
+    }
+
+    #[test]
+    fn a_restore_whose_acknowledgement_cannot_take_the_ports_stays_unfinished() {
+        let mut ops = FakeOps::new([]);
+        ops.grant_error = Some(Errno::ENOMEM);
+        let runtime = Runtime::new(&ops, false);
+        assert!(!finish_restore(&runtime, absent_process(), true, 0));
+        // Neither an acknowledgement nor the event of a failed handoff.
+        assert!(ops.output.lock().unwrap().is_empty());
+        assert!(ops.console.lock().unwrap().is_empty());
+        assert_eq!(ops.power.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(sys::check_released(), Ok(()));
+    }
+
+    #[test]
+    fn a_finished_restore_is_acknowledged_before_its_handoff() {
+        let ops = FakeOps::new([]);
+        let runtime = Runtime::new(&ops, true);
+        // The handoff to a process that does not exist fails check C10 after the
+        // acknowledgement, and the restore still counts as finished.
+        assert!(finish_restore(&runtime, absent_process(), true, 0));
+        assert_eq!(
+            ops.output.lock().unwrap().first(),
+            Some(&(Port::Snapshot, SNAPSHOT_ACKNOWLEDGE))
+        );
+        let console = String::from_utf8(ops.console.lock().unwrap().clone()).unwrap();
+        assert!(console.contains("G_CONFORMANCE_C10"), "{console}");
+        assert_eq!(sys::check_released(), Ok(()));
+
+        // Without an acknowledgement, the call takes no port transaction of its own.
+        let ops = FakeOps::new([]);
+        assert!(finish_restore(
+            &Runtime::new(&ops, true),
+            absent_process(),
+            false,
+            0
+        ));
+        assert!(
+            !ops.output
+                .lock()
+                .unwrap()
+                .contains(&(Port::Snapshot, SNAPSHOT_ACKNOWLEDGE))
+        );
     }
 }

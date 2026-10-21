@@ -824,7 +824,8 @@ fn side_check(base: &Checks, check: impl FnOnce(&mut Checks)) -> Checks {
 }
 
 /// Runs every boot check except C12 in the same per-CPU and side-job parallel shape as C. With
-/// one online CPU, every check runs on this thread.
+/// one online CPU, every check runs on this thread, as they do when the thread may hold port
+/// permission, which the threads would inherit.
 pub(crate) fn run_boot_checks(
     runtime: &Runtime<'_>,
     checks: &mut Checks,
@@ -839,7 +840,7 @@ pub(crate) fn run_boot_checks(
         let verdict = check_cpuinfo(side, selected, true);
         side.record(runtime, verdict);
     };
-    if selected.len() <= 1 {
+    if selected.len() <= 1 || sys::check_released().is_err() {
         run_boot_foreground(runtime, checks);
         checks.failures += side_check(&base, |side| boot_log(runtime, side, log)).failures;
         checks.failures += side_check(&base, timer_list).failures;

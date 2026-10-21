@@ -6,23 +6,27 @@ use std::io::Write;
 
 use super::checks::{self, BootLog, Checks};
 use super::cpu_mask::CpuMask;
-use super::daemon::{self, Promoter, RestoreSignal};
-use super::decoders::{self, GENERATION_ID_SIZE, PACKET_HEADER_SIZE, PacketHeader, RestorePacket};
+use super::daemon::{self, Promoter};
+use super::decoders::{
+    self, GENERATION_ID_SIZE, PACKET_HEADER_SIZE, PacketError, PacketHeader, RestorePacket,
+};
 use super::events::{CheckId, ViolationCode};
 use super::state::{
     CheckState, CheckStatus, Discontinuity, DowntimeSource, SampleRejection, TimeState,
 };
 use super::system::{
     self, PORTB_GENERATION_ID_AVAILABLE, PORTB_PACKET_AVAILABLE, PORTB_TIME_WINDOW,
-    PRIVATE_FILE_MODE, PortIo, RESTORE_PATH, RESTORE_TEMP_PATH, Runtime, SELECT_GENERATION_ID,
-    SELECT_PACKET, SNAPSHOT_ACKNOWLEDGE, SampleError, clock_ns, cpu_time_ns, current_frequency,
+    PRIVATE_FILE_MODE, RESTORE_PATH, RESTORE_TEMP_PATH, Runtime, SELECT_GENERATION_ID,
+    SELECT_PACKET, SampleError, clock_ns, cpu_time_ns, current_frequency, fork_process,
     initial_sample, portb_read, set_frequency, state_apply, state_load, state_store, step_clock,
     suppression_restore, suppression_save,
 };
 use super::{DEFERRED_START_NS, NSEC_PER_USEC, Phase, USAGE};
 use crate::guest::parse::parse_decimal;
 use crate::guest::status::CommandError;
-use crate::guest::sys::{self, Errno, FileDescriptor, ForkResult, Mode, OpenFlags, Port, kernel};
+use crate::guest::sys::{
+    self, Errno, FileDescriptor, ForkResult, Mode, OpenFlags, Port, PortAccess, PortError, kernel,
+};
 
 /// Maximum accepted restore pairing uncertainty.
 const REPAIR_BOUND_NS: i64 = 1_000_000;
@@ -44,12 +48,10 @@ fn usage(err: &mut dyn Write, line: &[u8]) -> Result<(), CommandError> {
     Err(CommandError::Usage)
 }
 
-/// Reports that the process may not access the time ABI's ports, and fails.
-fn ports_unavailable(err: &mut dyn Write, error: Errno) -> CommandError {
-    report(
-        err,
-        &[b"nvx-time: ioperm: ", error.desc().as_bytes(), b"\n"],
-    );
+/// Reports why the thread could not take, or give up, its permission for the time ABI's ports,
+/// such as `nvx-time: ioperm: Operation not permitted`, and fails.
+fn port_failure(err: &mut dyn Write, error: PortError) -> CommandError {
+    report(err, &[format!("nvx-time: {error}\n").as_bytes()]);
     CommandError::Operation
 }
 
@@ -206,7 +208,7 @@ fn cmd_boot(runtime: &Runtime<'_>) -> Result<(), CommandError> {
         return Err(CommandError::Operation);
     }
     let c12_cpu = cpu_time_ns().wrapping_sub(cpu_start);
-    match sys::fork() {
+    match fork_process() {
         Ok(ForkResult::Child) => boot_checker(
             runtime,
             initial.map(|(_, accepted_ns)| accepted_ns),
@@ -219,7 +221,7 @@ fn cmd_boot(runtime: &Runtime<'_>) -> Result<(), CommandError> {
             checks.fail(
                 runtime,
                 CheckId::C10,
-                format!("cannot start the boot checks: {}", error.desc()),
+                format!("cannot start the boot checks: {error}"),
             );
             Err(CommandError::Operation)
         }
@@ -417,50 +419,92 @@ struct RepairTarget<'a> {
     daemon_pid: Option<sys::ProcessId>,
 }
 
-/// Repair steps 2 and 3: reads the packet with four-byte reads, validates it, steps and slews
-/// the clock, and records the restore, after `cmd_capture` read the status, step 1.
-fn repair_restore(
-    runtime: &Runtime<'_>,
-    ports: &dyn PortIo,
-    target: RepairTarget<'_>,
-    start_ns: i64,
-    out: &mut dyn Write,
-) -> Result<(), CommandError> {
+/// What repair step 2's port reads returned, which repair validates once their transaction
+/// ended.
+enum PacketRead {
+    /// The packet's header is invalid.
+    InvalidHeader(PacketError),
+    /// The packet is of the recorded generation: the VM continued without a restore.
+    Stale,
+    /// The packet's generation, which does not follow the recorded generation.
+    Generation(u32),
+    /// The packet, or why its body is invalid, and the realtime clock around its selection.
+    Packet {
+        /// Realtime before the selection.
+        t0: i64,
+        /// Realtime after the selection.
+        t1: i64,
+        /// The packet, or why its body is invalid.
+        packet: Result<RestorePacket, PacketError>,
+    },
+}
+
+/// Repair step 2's port reads, after `cmd_capture` read the status, step 1: selects the restore
+/// packet, and reads its header and, when the header is valid and follows the `recorded`
+/// generation, its body, with four-byte reads.
+fn read_packet(ports: &PortAccess<'_>, recorded: u32) -> PacketRead {
     let t0 = clock_ns(sys::Clock::Realtime);
-    ports.outb(Port::PortbStatus, SELECT_PACKET);
+    ports.write_u8(Port::PortbStatus, SELECT_PACKET);
     let t1 = clock_ns(sys::Clock::Realtime);
     let mut header = [0_u8; PACKET_HEADER_SIZE];
     portb_read(ports, Port::PortbData, &mut header);
     let header = match PacketHeader::parse(&header) {
         Ok(header) => header,
-        Err(error) => {
-            return repair_failed(runtime, ViolationCode::RepairPacket, error.to_string());
-        }
+        Err(error) => return PacketRead::InvalidHeader(error),
     };
-    if header.generation == runtime.generation() {
-        discard_entropy(target.entropy_file, target.entropy_path);
-        let _ = out.write_all(b"0\n");
-        return Ok(());
+    if header.generation == recorded {
+        return PacketRead::Stale;
     }
-    if u64::from(header.generation) != u64::from(runtime.generation()) + 1 {
-        return repair_failed(
-            runtime,
-            ViolationCode::RepairGeneration,
-            format!(
-                "restore packet generation {} does not follow recorded generation {}",
-                header.generation,
-                runtime.generation()
-            ),
-        );
+    if u64::from(header.generation) != u64::from(recorded) + 1 {
+        return PacketRead::Generation(header.generation);
     }
     let mut body = vec![0_u8; header.body_size()];
     portb_read(ports, Port::PortbData, &mut body);
-    let packet = match RestorePacket::parse(header, &body) {
+    PacketRead::Packet {
+        t0,
+        t1,
+        packet: RestorePacket::parse(header, &body),
+    }
+}
+
+/// Repair steps 2 and 3, once the port transaction that read the packet ended: validates it,
+/// steps and slews the clock, and records the restore.
+fn repair_restore(
+    runtime: &Runtime<'_>,
+    read: PacketRead,
+    target: RepairTarget<'_>,
+    start_ns: i64,
+    out: &mut dyn Write,
+) -> Result<(), CommandError> {
+    let (t0, t1, packet) = match read {
+        PacketRead::InvalidHeader(error) => {
+            return repair_failed(runtime, ViolationCode::RepairPacket, error.to_string());
+        }
+        PacketRead::Stale => {
+            discard_entropy(target.entropy_file, target.entropy_path);
+            let _ = out.write_all(b"0\n");
+            return Ok(());
+        }
+        PacketRead::Generation(generation) => {
+            return repair_failed(
+                runtime,
+                ViolationCode::RepairGeneration,
+                format!(
+                    "restore packet generation {} does not follow recorded generation {}",
+                    generation,
+                    runtime.generation()
+                ),
+            );
+        }
+        PacketRead::Packet { t0, t1, packet } => (t0, t1, packet),
+    };
+    let packet = match packet {
         Ok(packet) => packet,
         Err(error) => {
             return repair_failed(runtime, ViolationCode::RepairPacket, error.to_string());
         }
     };
+    let header = packet.header;
     if packet.generation_id() == target.previous_id {
         return repair_failed(
             runtime,
@@ -532,20 +576,17 @@ fn repair_restore(
             format!("record the restore: {}", error.desc()),
         );
     }
-    let finished = finishing.then(|| {
-        let signal = daemon::signal_restore(
-            runtime,
-            target.daemon_pid,
-            header.acknowledgement_required(),
-            start_ns,
-        );
-        if signal == RestoreSignal::Failed {
-            let mut checks = Checks::empty(Phase::Restore);
-            checks.fail(runtime, CheckId::C10, "the time daemon is not running");
-        }
-        signal
+    // Repair steps 6 and 7 on the readiness path, when the call finishes the restore. Without a
+    // running daemon, or without the permission for the acknowledgement, the restore stays
+    // unfinished, and `nvx-snapshot` finishes it with `restore-finish`.
+    let daemon = if finishing {
+        daemon::running_daemon(target.daemon_pid)
+    } else {
+        None
+    };
+    let handed_off = daemon.is_some_and(|daemon| {
+        daemon::finish_restore(runtime, daemon, header.acknowledgement_required(), start_ns)
     });
-    let handed_off = finished.is_some_and(|signal| signal != RestoreSignal::NoDaemon);
     let mut line = format!(
         "{} {} {} {} {}",
         if handed_off { 2 } else { 1 },
@@ -596,9 +637,11 @@ fn cmd_capture(
         return Err(CommandError::Operation);
     }
     load_generation(runtime);
+    // The port transaction of the snapshot request and of repair steps 1 and 2 starts before
+    // the entropy file opens, so that a guest without the permission fails first.
     let ports = runtime
-        .ports()
-        .map_err(|error| ports_unavailable(err, error))?;
+        .open_ports()
+        .map_err(|error| port_failure(err, error))?;
     let daemon_pid = if finish { checks::daemon_pid() } else { None };
     let flags = OpenFlags::O_WRONLY
         | OpenFlags::O_CREAT
@@ -629,13 +672,16 @@ fn cmd_capture(
             return Err(CommandError::Operation);
         }
     };
-    ports.outb(Port::Snapshot, request);
+    ports.write_u8(Port::Snapshot, request);
     let start = clock_ns(sys::Clock::Monotonic);
-    if ports.inb(Port::PortbStatus) & PORTB_PACKET_AVAILABLE == 0 {
+    let read = (ports.read_u8(Port::PortbStatus) & PORTB_PACKET_AVAILABLE != 0)
+        .then(|| read_packet(&ports, runtime.generation()));
+    drop(ports);
+    let Some(read) = read else {
         discard_entropy(entropy_file, &entropy_path);
         let _ = out.write_all(b"0\n");
         return Ok(());
-    }
+    };
     let target = RepairTarget {
         previous_id: &previous_id,
         entropy_path: &entropy_path,
@@ -643,7 +689,7 @@ fn cmd_capture(
         finish,
         daemon_pid,
     };
-    repair_restore(runtime, ports, target, start, out)
+    repair_restore(runtime, read, target, start, out)
 }
 
 /// Records new CPUs and signals or inlines deferred restore completion.
@@ -685,8 +731,8 @@ fn cmd_restore_finish(
     let ports = if acknowledge {
         Some(
             runtime
-                .ports()
-                .map_err(|error| ports_unavailable(err, error))?,
+                .open_ports()
+                .map_err(|error| port_failure(err, error))?,
         )
     } else {
         None
@@ -699,21 +745,27 @@ fn cmd_restore_finish(
                 .map_or(0, |restore| restore.elapsed_us)
                 * NSEC_PER_USEC,
         );
-    match daemon::signal_restore(runtime, checks::daemon_pid(), acknowledge, start) {
-        RestoreSignal::Queued => return Ok(()),
-        RestoreSignal::NoDaemon if runtime.report_only() => {}
-        RestoreSignal::NoDaemon | RestoreSignal::Failed => {
-            let mut checks = Checks::empty(Phase::Restore);
-            checks.fail(runtime, CheckId::C10, "the time daemon is not running");
-            return Err(CommandError::Operation);
-        }
+    let daemon = daemon::running_daemon(checks::daemon_pid());
+    if daemon.is_none() && !runtime.report_only() {
+        // The failure's event writes the debug console in a transaction of its own.
+        drop(ports);
+        let mut checks = Checks::empty(Phase::Restore);
+        checks.fail(runtime, CheckId::C10, "the time daemon is not running");
+        return Err(CommandError::Operation);
     }
     if let Some(ports) = ports {
-        ports.outb(Port::Snapshot, SNAPSHOT_ACKNOWLEDGE);
+        daemon::acknowledge_restore(ports);
     }
-    let timing = daemon::inline_restore_timing(start);
-    let _ = daemon::restore_work(runtime, new_cpus, true, &timing);
-    Ok(())
+    let Some(daemon) = daemon else {
+        let timing = daemon::inline_restore_timing(start);
+        let _ = daemon::restore_work(runtime, new_cpus, true, &timing);
+        return Ok(());
+    };
+    daemon::queue_restore(daemon, start).map_err(|_| {
+        let mut checks = Checks::empty(Phase::Restore);
+        checks.fail(runtime, CheckId::C10, "the time daemon is not running");
+        CommandError::Operation
+    })
 }
 
 /// Prints persisted status after waiting for pending checks.
@@ -733,23 +785,26 @@ fn cmd_sample(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> Result<(), CommandError> {
-    let ports = runtime
-        .ports()
-        .map_err(|error| ports_unavailable(err, error))?;
-    let status = ports.inb(Port::PortbStatus);
-    if status & PORTB_TIME_WINDOW == 0 {
-        report(
-            err,
-            &[format!("nvx-time: portb status 0x{status:02x} has no time window\n").as_bytes()],
-        );
-        return Err(CommandError::Operation);
-    }
     let sample = {
+        let ports = runtime
+            .open_ports()
+            .map_err(|error| port_failure(err, error))?;
+        let status = ports.read_u8(Port::PortbStatus);
+        if status & PORTB_TIME_WINDOW == 0 {
+            report(
+                err,
+                &[
+                    format!("nvx-time: portb status 0x{status:02x} has no time window\n")
+                        .as_bytes(),
+                ],
+            );
+            return Err(CommandError::Operation);
+        }
         let _lock = system::lock_portb().map_err(|detail| {
             report(err, &[b"nvx-time: ", &detail, b"\n"]);
             CommandError::Operation
         })?;
-        system::take_sample(ports)
+        system::take_sample(&ports)
     };
     let sample = sample.map_err(|error| {
         report(err, &[format!("nvx-time: {error}\n").as_bytes()]);
@@ -770,22 +825,23 @@ fn cmd_generation_id(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> Result<(), CommandError> {
-    let ports = runtime
-        .ports()
-        .map_err(|error| ports_unavailable(err, error))?;
-    if ports.inb(Port::PortbStatus) & PORTB_GENERATION_ID_AVAILABLE == 0 {
-        report(err, &[b"nvx-time: the VM generation ID is unavailable\n"]);
-        return Err(CommandError::Operation);
-    }
-    let mut id = [0_u8; GENERATION_ID_SIZE];
-    {
+    let id = {
+        let ports = runtime
+            .open_ports()
+            .map_err(|error| port_failure(err, error))?;
+        if ports.read_u8(Port::PortbStatus) & PORTB_GENERATION_ID_AVAILABLE == 0 {
+            report(err, &[b"nvx-time: the VM generation ID is unavailable\n"]);
+            return Err(CommandError::Operation);
+        }
         let _lock = system::lock_portb().map_err(|detail| {
             report(err, &[b"nvx-time: ", &detail, b"\n"]);
             CommandError::Operation
         })?;
-        ports.outb(Port::PortbStatus, SELECT_GENERATION_ID);
-        portb_read(ports, Port::PortbData, &mut id);
-    }
+        let mut id = [0_u8; GENERATION_ID_SIZE];
+        ports.write_u8(Port::PortbStatus, SELECT_GENERATION_ID);
+        portb_read(&ports, Port::PortbData, &mut id);
+        id
+    };
     let mut text = decoders::format_hex(&id).into_bytes();
     text.push(b'\n');
     let _ = out.write_all(&text);
@@ -802,19 +858,25 @@ fn cmdline_requests_report_only() -> bool {
 }
 
 /// Dispatches a production `nvx-time` command.
+///
+/// A command takes the port permission only for each of its port transactions. When the kernel
+/// refused to revoke it, the thread starts nothing more, and the command fails once its work
+/// ended, because the thread may still hold some of the permission.
 pub(super) fn run(
     arguments: &[&[u8]],
     report_only: bool,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> Result<(), CommandError> {
-    let ops = system::RealOps::new();
-    let runtime = Runtime::new(&ops, report_only || cmdline_requests_report_only());
+    let runtime = Runtime::new(
+        &system::RealOps,
+        report_only || cmdline_requests_report_only(),
+    );
     sys::reset_child_signal();
     let Some((&command, rest)) = arguments.split_first() else {
         return usage(err, USAGE);
     };
-    match (command, rest) {
+    let result = match (command, rest) {
         (b"boot", []) => cmd_boot(&runtime),
         (b"check", arguments) => cmd_check(&runtime, arguments, err),
         (b"pre-capture", []) => cmd_pre_capture(&runtime, err),
@@ -826,6 +888,10 @@ pub(super) fn run(
         (b"generation-id", []) => cmd_generation_id(&runtime, out, err),
         (b"exhaustive", []) => checks::exhaustive(&runtime, out),
         _ => usage(err, USAGE),
+    };
+    match sys::check_released() {
+        Ok(()) => result,
+        Err(error) => Err(port_failure(err, error)),
     }
 }
 
