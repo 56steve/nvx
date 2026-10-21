@@ -83,7 +83,15 @@ class OpenvmmProcess:
         process_environment["OPENVMM_LOG"] = "off"
         if environment is not None:
             process_environment.update(environment)
-        self._interaction = InteractiveProcess(command, process_environment)
+        # The transcript is open before OpenVMM starts, so a failure to create it
+        # stops the run here, and every consumed byte reaches it as it is read.
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        self._log = log_path.open("wb")
+        try:
+            self._interaction = InteractiveProcess(command, process_environment)
+        except BaseException:
+            self._log.close()
+            raise
         self._chunks: queue.Queue[bytes | None] = queue.Queue()
         self._reader = threading.Thread(
             target=self._interaction.read_output,
@@ -97,6 +105,7 @@ class OpenvmmProcess:
         except BaseException:
             terminate(self._interaction.process)
             self._interaction.close()
+            self._log.close()
             raise
         self._output = bytearray()
         self._search_offset = 0
@@ -154,7 +163,7 @@ class OpenvmmProcess:
             self._consume(chunk)
 
     def _consume(self, chunk: bytes) -> None:
-        self._output.extend(chunk)
+        self._record(chunk)
         try:
             self._monitor.feed(chunk)
         except TimeAbiFailure as error:
@@ -266,7 +275,7 @@ class OpenvmmProcess:
         except TimeAbiFailure as error:
             self._fail(error)
         self._finished = True
-        self._write_log()
+        self._close_log()
         return OpenvmmProcessResult(returncode, bytes(self._output))
 
     def close(self) -> None:
@@ -279,24 +288,52 @@ class OpenvmmProcess:
         """
         if not self._finished and self.process.poll() is None:
             terminate(self.process)
-        self._drain_available()
-        self._write_log()
-        self._interaction.close()
-        self._finished = True
+        try:
+            # The reader queues its last chunks while the interaction shuts down, so
+            # drain only after it has stopped. Drain even if that shutdown fails, and
+            # release the transcript either way.
+            try:
+                self._interaction.close()
+            finally:
+                if not self._log.closed:
+                    self._drain_available()
+        finally:
+            self._close_log()
+            self._finished = True
 
     def _drain_available(self) -> None:
-        """Keep the output still queued; failure paths only, so no scan."""
+        """Keep the output still queued; failure paths only, so no scan.
+
+        A transcript write error does not stop the drain: every queued chunk is
+        kept in memory, and the first error is re-raised once the queue is empty.
+        """
+        error: Exception | None = None
         while True:
             try:
                 chunk = self._chunks.get_nowait()
             except queue.Empty:
-                return
-            if chunk is not None:
-                self._output.extend(chunk)
+                break
+            if chunk is None:
+                continue
+            self._output.extend(chunk)
+            if error is None:
+                try:
+                    self._log.write(chunk)
+                    self._log.flush()
+                except Exception as write_error:
+                    error = write_error
+        if error is not None:
+            raise error
 
-    def _write_log(self) -> None:
-        self._log_path.parent.mkdir(parents=True, exist_ok=True)
-        self._log_path.write_bytes(self._output)
+    def _record(self, chunk: bytes) -> None:
+        """Keep a consumed chunk in memory and in the transcript, flushed for readers."""
+        self._output.extend(chunk)
+        self._log.write(chunk)
+        self._log.flush()
+
+    def _close_log(self) -> None:
+        if not self._log.closed:
+            self._log.close()
 
     def _fail(self, error: Exception):
         self.close()
