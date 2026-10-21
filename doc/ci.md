@@ -233,13 +233,25 @@ process exits, so delayed final output chunks cannot create a false failure.
 
 Shared guest artifacts are built with Docker on a GitHub-hosted Ubuntu runner.
 The kernel, Alpine initramfs, Ubuntu initramfs, and Ubuntu EROFS layer use
-separate cache keys. Every guest key includes `nvx-rs/**` except its `target`
-directory, `rust-toolchain.toml`, the shared binary-build modules, the
-Dockerfile, and `.dockerignore`; the Rust builder image itself is pinned by
-digest. Because `hashFiles` hashes contents only, every guest key also ends
-with the path-aware Rust source digest that the guest package manifests
-record, which `nvx.py guest-binary-source-identity` prints. Ubuntu keys also
-include the Canonical archive pin, supplemental
+separate cache keys. Every guest image key includes the shared binary-build
+modules, the Dockerfile, and `.dockerignore`; the Rust builder image itself is
+pinned by digest. Every guest image key also ends with the path-aware digest
+of the Rust guest binaries' inputs that the guest package manifests record,
+which `nvx.py guest-binary-source-identity` prints, because the images carry
+only those binaries of `nvx-rs` and `hashFiles` hashes contents only. The
+inputs are the files that the guest binaries' build reads:
+`rust-toolchain.toml`; the crate's manifest, lockfile, build script, and Cargo
+configuration; every file under `nvx-rs/src/` but the host side, which is the
+`host` and `testing` modules and the `nvx-rs` and `nvx-fake-openvmm` binaries,
+and the test modules, which are the `tests.rs` files, the `tests` directories,
+and the managed agent's `loopback` harness; and the two Python modules that
+define the build. `GuestRustBuildConstants` in
+[`build_constants.py`](../scripts/nvx_tools/build_constants.py) selects them,
+and every guest build fails when Cargo's dep-info for the nine executables
+lists another file, such as a host module that guest code starts to compile.
+A change to the host side or a test of `nvx-rs` therefore rebuilds no guest
+image, and a change to any file that a guest binary compiles rebuilds them
+all. Ubuntu keys also include the Canonical archive pin, supplemental
 package lock, common guest sources, shared download and guest descriptor
 modules, and converter implementation. Artifact upload
 retains the Alpine filenames and adds the distinct Ubuntu filenames. Each
@@ -510,12 +522,16 @@ participate in the decision:
   runner setup scripts, `ci.yml`, the actions that their job uses, `nvx.py`,
   and the modules that `ci.py` imports. The VMM tests also boot the kernel and
   Alpine initramfs, so they add every input of those artifacts' cache keys and
-  the `build-guest-artifacts` action.
+  the `build-guest-artifacts` action. Of `nvx-rs`, those are only the inputs
+  of the guest binaries, which `GuestRustBuildConstants.SOURCE_PATTERN`
+  matches, so a change to its host side or tests runs the NVX microVM tests
+  but not the VMM tests.
 
 A push or pull request that changes neither OpenVMM suite's inputs, such as
-one that changes only the microVM tests, the benchmarks, or the Ubuntu or
-Azure Linux guests, therefore skips the two jobs that occupy the WHP runners
-longest. The nightly schedule runs at 05:17 UTC, and a manual workflow
+one that changes only the microVM tests, the benchmarks, the Ubuntu or Azure
+Linux guests, or the host side of `nvx-rs`, therefore skips the two jobs that
+occupy the WHP runners longest. The nightly schedule runs at 05:17 UTC, and a
+manual workflow
 dispatch starts the same full run. Both select the full matrix before the
 detector examines a comparison base. Each full run has a separate concurrency
 key, so it neither cancels nor queues behind a `dev` push. Full runs build,
@@ -537,7 +553,10 @@ missing output would skip its jobs.
 expects every scheduled job to succeed and every other job to be skipped.
 Tests in `scripts/test_nvx_tools.py` derive each suite's inputs from the
 actions that its jobs use, the modules that `ci.py` imports, and the guest
-cache keys, and fail when a pattern misses one.
+cache keys, including the files of the guest binaries' source identity, and
+fail when a pattern misses one. They also check that no other file of
+`nvx-rs` selects the VMM tests or changes a guest image key, while every one
+selects the NVX microVM tests.
 
 ## Host qualification
 

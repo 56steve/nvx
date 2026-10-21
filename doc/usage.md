@@ -157,10 +157,11 @@ binaries; the test modules are the `tests.rs` files, the `tests` directories,
 and the managed agent's `loopback` harness. `GuestRustBuildConstants` in
 `scripts/nvx_tools/build_constants.py` defines the set, and
 [`build-guest-binaries`](#build-guest-binaries) fails when Cargo's dep-info
-lists a file outside it. The guest build appends the digest to the Alpine,
-Ubuntu, and Azure Linux cache keys, because `hashFiles` hashes contents only:
-moving a module into its own `mod.rs` changes the key even when no bytes
-change.
+lists a file outside it. The Alpine, Ubuntu, and Azure Linux cache keys end
+with the digest and hash no other file of `nvx-rs`, so a change to the
+crate's host side or tests rebuilds no guest image. Because the digest covers
+paths, and `hashFiles` hashes contents only, moving a module into its own
+`mod.rs` changes the keys even when no bytes change.
 
 ### `classify-ci-changes`
 

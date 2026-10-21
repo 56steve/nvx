@@ -526,6 +526,21 @@ Native guest builds, the digest-pinned Docker Rust stage, and CI all call this
 routine. Docker builds the set once and installs identical bytes in all three
 guest images; Ubuntu determinism checks rebuild from fresh targets.
 
+Of this crate, the guest images depend only on the files that this build reads:
+`Cargo.toml`, `Cargo.lock`, `build.rs`, any Cargo configuration in `.cargo/`,
+and every file under `src/` but the host side and the test modules. The host
+side is `src/host/`, `src/testing/`, and the `nvx-rs` and `nvx-fake-openvmm`
+binaries; the test modules are the `tests.rs` files, the `tests` directories,
+and the managed agent's `loopback` harness. CI keys the guest images on those
+files and runs the OpenVMM VMM tests, which boot the Alpine image, only when
+one of them changes, while every change to the crate runs the NVX microVM
+tests; see [Continuous integration](../doc/ci.md#change-classification). Keep
+host-only code under `src/host/` and test-only modules in `tests.rs` files or
+`tests` directories. The build fails when Cargo's dep-info lists another file,
+which `GuestRustBuildConstants` in
+[`build_constants.py`](../scripts/nvx_tools/build_constants.py) then has to
+select.
+
 ## Testing
 
 ```bash
