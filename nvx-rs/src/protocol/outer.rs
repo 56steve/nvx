@@ -82,17 +82,34 @@ pub fn encode_outer(
         .ok()
         .filter(|&length| length as usize <= OUTER_MAX_PAYLOAD)
         .ok_or_else(|| violation("control payload exceeds the outer protocol limit"))?;
+    let header = encode_header(record_type, instance_id, epoch, sequence, length);
     let mut record = Vec::with_capacity(OUTER_HEADER_LEN + payload.len());
-    record.extend_from_slice(&OUTER_MAGIC);
-    record.extend_from_slice(&OUTER_VERSION.to_le_bytes());
-    record.push(record_type);
-    record.push(0);
-    record.extend_from_slice(instance_id);
-    record.extend_from_slice(&epoch.to_le_bytes());
-    record.extend_from_slice(&sequence.to_le_bytes());
-    record.extend_from_slice(&length.to_le_bytes());
+    record.extend_from_slice(&header);
     record.extend_from_slice(payload);
     Ok(record)
+}
+
+/// Returns the header of a record: [`OUTER_MAGIC`], [`OUTER_VERSION`], `record_type`, a zero
+/// flags byte, `instance_id`, `epoch`, `sequence`, and the payload's `length`, with the integers
+/// little-endian. It checks nothing: [`encode_outer`] and
+/// [`encode_record`](super::nvxs::encode_record) each validate their record first.
+pub(super) fn encode_header(
+    record_type: u8,
+    instance_id: &[u8; 16],
+    epoch: u64,
+    sequence: u64,
+    length: u32,
+) -> [u8; OUTER_HEADER_LEN] {
+    let mut header = [0; OUTER_HEADER_LEN];
+    header[..4].copy_from_slice(&OUTER_MAGIC);
+    header[4..6].copy_from_slice(&OUTER_VERSION.to_le_bytes());
+    header[6] = record_type;
+    // The flags byte, header[7], stays zero.
+    header[8..24].copy_from_slice(instance_id);
+    header[24..32].copy_from_slice(&epoch.to_le_bytes());
+    header[32..40].copy_from_slice(&sequence.to_le_bytes());
+    header[40..].copy_from_slice(&length.to_le_bytes());
+    header
 }
 
 /// Decodes and validates an outer record header.

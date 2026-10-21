@@ -2,6 +2,7 @@
 
 use std::fmt;
 
+use crate::protocol::outer::encode_header;
 use crate::protocol::{
     CAPABILITY_LEN, OUTER_ACK, OUTER_CREDIT, OUTER_DATA, OUTER_ERROR, OUTER_GUEST_ATTACH,
     OUTER_HEADER_LEN, OUTER_HOST_ATTACH, OUTER_MAGIC, OUTER_MAX_PAYLOAD, OUTER_MAX_RECEIVE_WINDOW,
@@ -315,15 +316,9 @@ pub fn encode_record(
     check_payload(record_type, payload)?;
     // The length check bounds the payload by `OUTER_MAX_PAYLOAD`, so it fits the header's field.
     let length = payload.len() as u32;
+    let header = encode_header(record_type.code(), instance_id, epoch, sequence, length);
     output.reserve(OUTER_HEADER_LEN + payload.len());
-    output.extend_from_slice(&OUTER_MAGIC);
-    output.extend_from_slice(&OUTER_VERSION.to_le_bytes());
-    output.push(record_type.code());
-    output.push(0);
-    output.extend_from_slice(instance_id);
-    output.extend_from_slice(&epoch.to_le_bytes());
-    output.extend_from_slice(&sequence.to_le_bytes());
-    output.extend_from_slice(&length.to_le_bytes());
+    output.extend_from_slice(&header);
     output.extend_from_slice(payload);
     Ok(())
 }
