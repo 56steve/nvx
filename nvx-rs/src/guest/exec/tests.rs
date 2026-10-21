@@ -2,6 +2,7 @@
 
 use std::ffi::CString;
 use std::os::fd::{AsFd, AsRawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -1038,6 +1039,79 @@ fn a_failed_start_ends_the_program_and_its_cgroup_even_without_descriptors() {
         std::fs::read(cgroup.path().join("cgroup.kill")).unwrap(),
         b"1"
     );
+    assert_eq!(signal_of(Child::new(id).unwrap().wait().unwrap()), Some(9));
+}
+
+#[test]
+fn a_failed_start_ends_a_program_that_joined_another_process_group() {
+    const TEST: &str =
+        "guest::exec::tests::a_failed_start_ends_a_program_that_joined_another_process_group";
+    // The test runs its own executable again as the program, with this variable naming a process
+    // group and a file. The program joins that group, which leaves the group that it led,
+    // creates the file to say so, and waits to be ended.
+    const PROGRAM: &str = "NVX_EXEC_GROUP_JOINER_PROGRAM";
+    if let Some(value) = std::env::var_os(PROGRAM) {
+        let value = value.into_string().unwrap();
+        let (group, joined) = value.split_once(':').unwrap();
+        nix::unistd::setpgid(
+            nix::unistd::Pid::from_raw(0),
+            nix::unistd::Pid::from_raw(group.parse().unwrap()),
+        )
+        .unwrap();
+        std::fs::write(joined, b"").unwrap();
+        std::thread::sleep(PATIENCE);
+        return;
+    }
+    // As the test above, it lowers the descriptor limit, so it runs in a process of its own.
+    if crate::guest::managed_agent::isolate_process_test("NVX_EXEC_GROUP_JOINER_TEST_CHILD", TEST) {
+        return;
+    }
+    let temporary = tempfile::tempdir().unwrap();
+    let joined = temporary.path().join("joined");
+    let executable = std::env::current_exe().unwrap();
+    let executable = CString::new(executable.as_os_str().as_bytes()).unwrap();
+    let (pipes, ends) = Pipes::new(false).unwrap();
+    let spawned = Command::new(
+        executable.clone(),
+        vec![
+            executable,
+            c"--exact".to_owned(),
+            CString::new(TEST).unwrap(),
+            c"--nocapture".to_owned(),
+        ],
+    )
+    .environment(vec![
+        CString::new(format!(
+            "{PROGRAM}={}:{}",
+            nix::unistd::getpgrp(),
+            joined.display()
+        ))
+        .unwrap(),
+    ])
+    .stdout(ends.stdout)
+    .stderr(ends.stderr)
+    .new_process_group()
+    .spawn()
+    .unwrap();
+    let id = spawned.id();
+    let started = Instant::now();
+    while !joined.exists() {
+        assert!(
+            started.elapsed() < PATIENCE,
+            "the program joined the test's group in time"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // No process is left in the group that the program led, so a signal to the group alone
+    // would reach nothing.
+    let program = nix::unistd::Pid::from_raw(i32::try_from(id).unwrap());
+    assert_eq!(nix::sys::signal::killpg(program, None), Err(Errno::ESRCH));
+    // Without a spare descriptor, the pidfd does not open, and no cgroup holds the program.
+    let lowest = std::fs::File::open("/dev/null").unwrap().as_raw_fd();
+    let previous = sys::set_descriptor_limit(lowest as _).unwrap();
+    let started = Execution::new(spawned, pipes, Options::new().process_group());
+    sys::set_descriptor_limit(previous).unwrap();
+    assert_eq!(sys::errno_of(&started.unwrap_err()), Errno::EMFILE);
     assert_eq!(signal_of(Child::new(id).unwrap().wait().unwrap()), Some(9));
 }
 

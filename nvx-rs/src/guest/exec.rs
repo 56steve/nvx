@@ -512,11 +512,12 @@ impl Execution {
     /// only until then, and the execution names the program by that pidfd from then on.
     ///
     /// If opening the pidfd fails, `new` ends what the options name before it returns the error:
-    /// the program or its process group, by their IDs, unless `ESRCH` tells that the program's
-    /// status is gone already, as its ID may name another process then; and the processes of the
-    /// options' cgroup. It closes the pipes and the launch report before that kill, so that a
-    /// failure for want of descriptors leaves it one. The program's status is still the caller's
-    /// to collect, by `spawned`'s ID.
+    /// the program, and then the process group that it led if the options say so, by their IDs,
+    /// unless `ESRCH` tells that the program's status is gone already, as its ID may name another
+    /// process then; and the processes of the options' cgroup. A program that joined another
+    /// process group ends too. It closes the pipes and the launch report before that kill, so
+    /// that a failure for want of descriptors leaves it one. The program's status is still the
+    /// caller's to collect, by `spawned`'s ID.
     pub fn new(spawned: Spawned, pipes: Pipes, options: Options) -> io::Result<Self> {
         let process = spawned.process();
         let report = spawned.into_report();
@@ -921,10 +922,12 @@ impl Drop for Execution {
     }
 }
 
-/// Ends what the program of an execution that could not start may leave running: the program
-/// or its process group, by their IDs, while it is `unreaped`, and the processes of the options'
-/// cgroup. It closes the execution's `descriptors` before the cgroup's kill, which opens
-/// `cgroup.kill`, so that a failure for want of descriptors leaves that kill one.
+/// Ends what the program of an execution that could not start may leave running, while it is
+/// `unreaped`: the program, by its ID, and then, if the options say so, the process group that it
+/// led when it started, as the execution's own kill does through the pidfd, so that a program
+/// that joined another group since ends too; and the processes of the options' cgroup. It closes
+/// the execution's `descriptors` before the cgroup's kill, which opens `cgroup.kill`, so that a
+/// failure for want of descriptors leaves that kill one.
 fn abandon(
     process: ProcessId,
     unreaped: bool,
@@ -932,7 +935,10 @@ fn abandon(
     options: &Options,
 ) {
     if unreaped {
-        let _ = signal_by_id(process, options.process_group);
+        let _ = sys::kill_process(process);
+        if options.process_group {
+            let _ = sys::kill_process_group(process);
+        }
     }
     drop(descriptors);
     if let Some((cgroup, scope)) = &options.cgroup {
@@ -948,15 +954,6 @@ fn arrived(report: &LaunchReport) -> bool {
             Err(Errno::EINTR) => {}
             Err(_) => return false,
         }
-    }
-}
-
-/// Sends `SIGKILL` to `process`, or to the process group that it leads, by its ID.
-fn signal_by_id(process: ProcessId, process_group: bool) -> Result<(), Errno> {
-    if process_group {
-        sys::kill_process_group(process)
-    } else {
-        sys::kill_process(process)
     }
 }
 
