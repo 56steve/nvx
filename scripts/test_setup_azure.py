@@ -1225,6 +1225,16 @@ $roleDefinition = $ast.Find({
 }, $true)
 . ([scriptblock]::Create($roleDefinition.Extent.Text))
 . ([scriptblock]::Create($labelsDefinition.Extent.Text))
+foreach ($name in @('Get-InstanceRunnerLabels', 'Select-SafeAzureComputeDisk',
+        'ConvertTo-SafeAzureComputeMetadata', 'Write-AzureComputeSnapshot')) {
+    $definition = $ast.Find({
+        param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -eq $name
+    }, $true)
+    if (-not $definition) { throw "Windows bootstrap is missing $name" }
+    . ([scriptblock]::Create($definition.Extent.Text))
+}
 if ((Get-ExtraRunnerLabels -RunnerLabels @('Windows', 'WHP', 'Virtual-Machine', 'isolated')) -ne
     'isolated') { throw 'Windows bootstrap rejected valid case-insensitive runner labels' }
 if (Test-BenchmarkRunner -RunnerLabels @('windows', 'whp', 'virtual-machine')) {
@@ -1250,26 +1260,117 @@ catch { $rejected = $true }
 if (-not $rejected) { throw 'Windows bootstrap accepted the wrong backend label' }
 $script:config = Get-Content -LiteralPath (Join-Path $env:NVX_TEST_BOOTSTRAP 'config.json') -Raw |
     ConvertFrom-Json
+$config.runnerLabels += @('general', 'isolated')
+$config | Add-Member -NotePropertyName benchmarkRunnerName -NotePropertyValue (
+    $config.runnerNamePrefix + '-8'
+)
+$benchmarkLabels = @(Get-InstanceRunnerLabels -Config $config -RunnerName (
+    $config.runnerNamePrefix + '-8'
+))
+$generalLabels = @(Get-InstanceRunnerLabels -Config $config -RunnerName (
+    $config.runnerNamePrefix + '-9'
+))
+if (-not (Test-BenchmarkRunner -RunnerLabels $benchmarkLabels) -or
+    $benchmarkLabels -contains 'general' -or
+    (Test-BenchmarkRunner -RunnerLabels $generalLabels) -or
+    $generalLabels -notcontains 'general' -or
+    (Get-ExtraRunnerLabels -RunnerLabels $benchmarkLabels) -ne 'isolated' -or
+    (Get-ExtraRunnerLabels -RunnerLabels $generalLabels) -ne 'isolated') {
+    throw 'Windows bootstrap did not select exactly one benchmark runner'
+}
+$config.PSObject.Properties.Remove('benchmarkRunnerName')
+if (Test-BenchmarkRunner -RunnerLabels @(
+    Get-InstanceRunnerLabels -Config $config -RunnerName ($config.runnerNamePrefix + '-8')
+)) { throw 'Windows bootstrap changed the default runner role' }
 $script:metadata = [pscustomobject]@{
     subscriptionId = $config.subscriptionId
     resourceGroupName = $config.resourceGroup
     vmScaleSetName = $config.vmssName
     name = $config.vmssName + '_7'
+    vmSize = 'Standard_D8s_v5'
+    userData = 'DO-NOT-LEAK'
+    storageProfile = [pscustomobject]@{
+        osDisk = [pscustomobject]@{
+            diskSizeGB = '128'
+            caching = 'ReadWrite'
+            writeAcceleratorEnabled = 'false'
+            diffDiskSettings = [pscustomobject]@{ option = '' }
+            managedDisk = [pscustomobject]@{
+                storageAccountType = 'Premium_LRS'
+                id = 'DO-NOT-LEAK'
+            }
+            name = 'DO-NOT-LEAK'
+        }
+        dataDisks = @([pscustomobject]@{
+            lun = '0'
+            diskSizeGB = '512'
+            caching = 'None'
+            writeAcceleratorEnabled = 'false'
+            bytesPerSecondThrottle = ''
+            opsPerSecondThrottle = ''
+            managedDisk = [pscustomobject]@{
+                storageAccountType = 'Premium_LRS'
+                id = 'DO-NOT-LEAK'
+            }
+        })
+        resourceDisk = [pscustomobject]@{ size = '614400' }
+    }
 }
-function Invoke-RestMethod {
-    param($Uri, $Headers, $TimeoutSec)
-    return $script:metadata
+$safe = ConvertTo-SafeAzureComputeMetadata -Metadata $metadata |
+    ConvertTo-Json -Depth 8 -Compress
+$projected = $safe | ConvertFrom-Json
+if ($safe -match 'DO-NOT-LEAK' -or $safe -match 'subscriptionId' -or
+    $projected.vmSize -ne 'Standard_D8s_v5' -or
+    $projected.storageProfile.osDisk.managedDisk.storageAccountType -ne 'Premium_LRS' -or
+    $projected.storageProfile.dataDisks[0].lun -ne '0' -or
+    $projected.storageProfile.resourceDisk.size -ne '614400') {
+    throw 'Windows bootstrap published unsafe or incomplete host metadata'
 }
-if ((Get-RunnerName) -ne ($config.runnerNamePrefix + '-8')) {
+$script:metadataAclWrites = 0
+function Set-Acl {
+    param($LiteralPath, $AclObject)
+    $owner = $AclObject.GetOwner([Security.Principal.SecurityIdentifier])
+    $rules = @($AclObject.GetAccessRules(
+        $true, $false, [Security.Principal.SecurityIdentifier]
+    ))
+    $principals = @($rules | ForEach-Object { $_.IdentityReference.Value })
+    $networkService = @($rules | Where-Object {
+        $_.IdentityReference.Value -eq 'S-1-5-20'
+    })
+    if ($owner.Value -ne 'S-1-5-32-544' -or
+        -not $AclObject.AreAccessRulesProtected -or
+        @(Compare-Object @('S-1-5-18', 'S-1-5-20', 'S-1-5-32-544') $principals).Count -ne 0 -or
+        $networkService.Count -ne 1 -or
+        ($networkService[0].FileSystemRights -band [Security.AccessControl.FileSystemRights]::Write) -ne 0 -or
+        ($networkService[0].FileSystemRights -band [Security.AccessControl.FileSystemRights]::Delete) -ne 0) {
+        throw "Host metadata ACL allows untrusted modification: $LiteralPath"
+    }
+    $script:metadataAclWrites++
+}
+$hostMetadataRoot = Join-Path $env:NVX_TEST_BOOTSTRAP 'host-metadata'
+Write-AzureComputeSnapshot -Metadata $metadata
+Write-AzureComputeSnapshot -Metadata $metadata
+$snapshot = Get-Content -LiteralPath (Join-Path $hostMetadataRoot 'compute.json') -Raw
+if ($script:metadataAclWrites -lt 6 -or $snapshot -match 'DO-NOT-LEAK' -or
+    $snapshot -notmatch 'Standard_D8s_v5') {
+    throw 'Windows host metadata snapshot was not sanitized and protected'
+}
+$metadata.vmSize = 'DO-NOT-LEAK'
+$rejected = $false
+try { ConvertTo-SafeAzureComputeMetadata -Metadata $metadata | Out-Null }
+catch { $rejected = $true }
+if (-not $rejected) { throw 'Windows bootstrap accepted an invalid VM size' }
+$metadata.vmSize = 'Standard_D8s_v5'
+if ((Get-RunnerName -Metadata $metadata) -ne ($config.runnerNamePrefix + '-8')) {
     throw 'Windows runner offset 1 produced the wrong name'
 }
 $config.runnerNumberOffset = 0
-if ((Get-RunnerName) -ne ($config.runnerNamePrefix + '-7')) {
+if ((Get-RunnerName -Metadata $metadata) -ne ($config.runnerNamePrefix + '-7')) {
     throw 'Windows runner offset 0 produced the wrong name'
 }
 $metadata.resourceGroupName = 'another-group'
 $rejected = $false
-try { Get-RunnerName | Out-Null }
+try { Get-RunnerName -Metadata $metadata | Out-Null }
 catch {
     if ($_.Exception.Message -notmatch 'configured VMSS') { throw }
     $rejected = $true
@@ -1337,7 +1438,12 @@ function Get-ScheduledTask {
     if ($TaskName -ne $continuationTask) { throw 'Wrong continuation task' }
     if ($script:scenario -ne 'missing-task') { return [pscustomobject]@{ TaskName = $TaskName } }
 }
-function Get-RunnerName { throw 'fixture metadata failure' }
+$script:firewallChecks = 0
+function Set-RunnerMetadataFirewall { $script:firewallChecks++ }
+function Invoke-RestMethod {
+    if ($script:firewallChecks -eq 0) { throw 'IMDS was queried before the runner firewall' }
+    throw 'fixture metadata failure'
+}
 foreach ($scenario in @('invalid-config', 'missing-task', 'metadata-failure')) {
     $script:scenario = $scenario
     $captured = [Collections.Generic.List[string]]::new()
@@ -1362,6 +1468,7 @@ foreach ($scenario in @('invalid-config', 'missing-task', 'metadata-failure')) {
     }
 }
 if ($script:stops -ne 3) { throw 'Bootstrap did not close its transcript after failure' }
+if ($script:firewallChecks -ne 1) { throw 'Runner firewall was not installed before IMDS' }
 """
         self.execute_windows(
             script,
@@ -2370,6 +2477,40 @@ if (-not $rejected) { throw 'Firewall creation failure was ignored' }
                 ):
                     builder.normalize_config(config)
 
+    def test_windows_benchmark_name_selects_one_general_runner(self):
+        config = self.configuration("windows")
+        config["runnerLabels"].extend(("general", "isolated"))
+        config["benchmarkRunnerName"] = "nvx-windows-5"
+        self.assertEqual(
+            builder.normalize_config(config).get("benchmarkRunnerName"),
+            "nvx-windows-5",
+        )
+        for name in (
+            "nvx-windows-0",
+            "nvx-windows-05",
+            "nvx-windows-other",
+            "other-5",
+            None,
+        ):
+            with self.subTest(name=name):
+                invalid = dict(config)
+                invalid["benchmarkRunnerName"] = name
+                with self.assertRaisesRegex(ValueError, "benchmarkRunnerName"):
+                    builder.normalize_config(invalid)
+        for labels in (
+            ["windows", "whp", "virtual-machine"],
+            ["windows", "whp", "virtual-machine", "benchmark"],
+        ):
+            with self.subTest(labels=labels):
+                invalid = dict(config)
+                invalid["runnerLabels"] = labels
+                with self.assertRaisesRegex(ValueError, "requires general labels"):
+                    builder.normalize_config(invalid)
+        linux = dict(self.configuration("linux"))
+        linux["benchmarkRunnerName"] = "nvx-windows-5"
+        with self.assertRaisesRegex(ValueError, "Unknown"):
+            builder.normalize_config(linux)
+
     def test_windows_drive_and_path_validation(self):
         for update in (
             {"driveLetter": "C"},
@@ -2545,7 +2686,7 @@ if (-not $rejected) { throw 'Firewall creation failure was ignored' }
                     config.pop("kernelMode")
                 else:
                     for name in builder.PLATFORM_FIELDS[platform]:
-                        config.pop(name)
+                        config.pop(name, None)
                 normalized = builder.normalize_config(config)
                 self.assertEqual(normalized["runnerNumberOffset"], 1)
                 self.assertEqual(normalized["repository"], "microsoft/nvx")

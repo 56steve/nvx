@@ -74,7 +74,12 @@ The owned interrupted-initialization recovery path remains separate.
 Windows uses WHP and defines `dataDisk.driveLetter`,
 `dataDisk.temporaryDriveFallback`, optional
 `benchmarkScratchDirectory` on the managed data volume, `sshDefaultShell`,
-and `publicKeys`. Omitted or null scratch paths resolve to
+`publicKeys`, and `benchmarkRunnerName`. When the scale set uses the `general`
+label, `benchmarkRunnerName` selects one runner by its full name
+(`runnerNamePrefix` plus the VMSS instance number and `runnerNumberOffset`);
+only that runner receives `benchmark` instead of `general`. A dedicated
+benchmark scale set can continue to use the global `benchmark` label.
+Omitted or null scratch paths resolve to
 `<driveLetter>:\nvx-benchmark-scratch` before validation and are passed
 explicitly to setup. Scratch must neither contain the runner installation nor
 overlap it outside its writable `_work` subtree. Windows paths cannot contain
@@ -91,6 +96,14 @@ independent SYSTEM startup task so long-running bootstrap does not consume
 the extension's execution budget. Bootstrap resumes through that task after
 disk or feature reboots, then removes it after successful registration.
 GitHub jobs run as Network Service with access to Azure instance metadata blocked.
+SYSTEM installs the block first, checks the scale set's instance identity, and
+stores only the VM size and disk performance settings under
+`C:\ProgramData\NvxCiHostMetadata\compute.json`. The directory and file
+allow Network Service to read, but not modify, this sanitized snapshot;
+benchmark host telemetry uses it without querying instance metadata.
+Missing or invalid snapshots fail the benchmark host check on provisioned
+Windows runners. Older Windows hosts without this directory continue to use
+instance metadata until they receive the updated bootstrap.
 Linux jobs run as `nvx-runner`, whose metadata block is installed before
 registration. The runner service requires the block on every start; root
 retains metadata access for bootstrap and token retrieval. Metadata-rule updates

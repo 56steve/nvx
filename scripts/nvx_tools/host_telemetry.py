@@ -61,6 +61,7 @@ AZURE_IMDS_URL = (
 AZURE_IMDS_TIMEOUT_SECONDS = 2.0
 AZURE_IMDS_ATTEMPTS = 3
 AZURE_CHASSIS_ASSET_TAG = "7783-7084-3265-9085-8269-3286-77"
+WINDOWS_AZURE_METADATA_SNAPSHOT = Path(r"C:\ProgramData\NvxCiHostMetadata\compute.json")
 DEFENDER_PROCESS_NAMES = frozenset({"msmpeng.exe", "mpdefendercoreservice.exe"})
 MIB = 1024 * 1024
 GIB = 1024 * MIB
@@ -252,6 +253,30 @@ def azure_vm_provenance() -> dict[str, object] | None:
 def _azure_vm_provenance() -> dict[str, object] | None:
     if not may_be_azure_vm():
         return None
+    if sys.platform == "win32" and WINDOWS_AZURE_METADATA_SNAPSHOT.parent.is_dir():
+        try:
+            with WINDOWS_AZURE_METADATA_SNAPSHOT.open("rb") as stream:
+                payload = stream.read(65537)
+            if len(payload) > 65536:
+                raise ValueError("snapshot exceeds 65536 bytes")
+            parsed: object = json.loads(payload)
+            if not isinstance(parsed, dict):
+                raise ValueError("snapshot has no compute disk profile")
+            compute = cast(dict[str, object], parsed)
+            profile = compute.get("storageProfile")
+            if not isinstance(profile, dict):
+                raise ValueError("snapshot has no complete disk profile")
+            disks = cast(dict[str, object], profile)
+            if (
+                not isinstance(disks.get("osDisk"), dict)
+                or not isinstance(disks.get("dataDisks"), list)
+                or not disks["dataDisks"]
+                or not isinstance(disks.get("resourceDisk"), dict)
+            ):
+                raise ValueError("snapshot has no complete disk profile")
+            return azure_compute_provenance(compute)
+        except (OSError, ValueError) as invalid:
+            return {"error": f"Azure host metadata snapshot is invalid: {invalid}"}
     error: Exception | None = None
     for _ in range(AZURE_IMDS_ATTEMPTS):
         try:

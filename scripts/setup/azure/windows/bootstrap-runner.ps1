@@ -12,6 +12,7 @@ $diskScript = Join-Path $stateRoot 'setup-data-disk.ps1'
 $continuationTask = 'Nvx-Setup-GitHub-Runner'
 $featureBootFile = Join-Path $stateRoot 'feature-reboot-pending.txt'
 $prerequisiteBootFile = Join-Path $stateRoot 'prerequisite-reboot-pending.txt'
+$hostMetadataRoot = 'C:\ProgramData\NvxCiHostMetadata'
 
 function Invoke-Setup {
     param(
@@ -52,19 +53,171 @@ function Request-Reboot {
 }
 
 function Get-RunnerName {
-    $metadata = Invoke-RestMethod -Uri (
-        'http://169.254.169.254/metadata/instance/compute?api-version=2021-02-01'
-    ) -Headers @{ Metadata = 'true' } -TimeoutSec 30
+    param([Parameter(Mandatory = $true)]$Metadata)
     $prefix = $config.vmssName + '_'
-    if ($metadata.subscriptionId -ne $config.subscriptionId -or
-        $metadata.resourceGroupName -ne $config.resourceGroup -or
-        $metadata.vmScaleSetName -ne $config.vmssName -or
-        -not ([string]$metadata.name).StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
+    if ($Metadata.subscriptionId -ne $config.subscriptionId -or
+        $Metadata.resourceGroupName -ne $config.resourceGroup -or
+        $Metadata.vmScaleSetName -ne $config.vmssName -or
+        -not ([string]$Metadata.name).StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
         throw 'Azure instance metadata does not identify the configured VMSS.'
     }
-    $instance = ([string]$metadata.name).Substring($prefix.Length)
+    $instance = ([string]$Metadata.name).Substring($prefix.Length)
     if ($instance -notmatch '^[0-9]+$') { throw 'VMSS instance ID is not numeric.' }
     return '{0}-{1}' -f $config.runnerNamePrefix, ([long]$instance + $config.runnerNumberOffset)
+}
+
+function Get-InstanceRunnerLabels {
+    param(
+        [Parameter(Mandatory = $true)]$Config,
+        [Parameter(Mandatory = $true)][string]$RunnerName
+    )
+    $labels = @($Config.runnerLabels)
+    if ($Config.PSObject.Properties['benchmarkRunnerName'] -and
+        $Config.benchmarkRunnerName -ceq $RunnerName) {
+        $labels = @($labels | Where-Object { $_ -ne 'general' }) + @('benchmark')
+    }
+    return $labels
+}
+
+function Select-SafeAzureComputeDisk {
+    param([Parameter(Mandatory = $true)]$Disk, [switch]$DataDisk)
+    $size = [string]$Disk.diskSizeGB
+    $accountType = [string]$Disk.managedDisk.storageAccountType
+    $caching = [string]$Disk.caching
+    $writeAccelerator = [string]$Disk.writeAcceleratorEnabled
+    if ($size -notmatch '^[0-9]{1,10}$' -or
+        $accountType -notmatch '^[A-Za-z0-9_]{1,64}$' -or
+        $caching -notin @('None', 'ReadOnly', 'ReadWrite') -or
+        $writeAccelerator -notmatch '^(?i:true|false)$') {
+        throw 'Azure disk metadata contains an invalid performance setting.'
+    }
+    $safe = [ordered]@{
+        diskSizeGB = $size
+        managedDisk = [ordered]@{ storageAccountType = $accountType }
+        caching = $caching
+        writeAcceleratorEnabled = $writeAccelerator
+    }
+    if ($DataDisk) {
+        $lun = [string]$Disk.lun
+        if ($lun -notmatch '^[0-9]{1,2}$' -or [int]$lun -gt 63) {
+            throw 'Azure data disk metadata contains an invalid LUN.'
+        }
+        $safe.lun = $lun
+        foreach ($field in @('bytesPerSecondThrottle', 'opsPerSecondThrottle')) {
+            $property = $Disk.PSObject.Properties[$field]
+            $value = if ($property) { [string]$property.Value } else { '' }
+            if ($value -notmatch '^[0-9]{0,20}$') {
+                throw 'Azure disk metadata contains an invalid performance limit.'
+            }
+            $safe[$field] = $value
+        }
+    }
+    else {
+        $property = $Disk.PSObject.Properties['diffDiskSettings']
+        $option = if ($property -and $property.Value) {
+            [string]$property.Value.option
+        } else { '' }
+        if ($option -notmatch '^[A-Za-z]{0,32}$') {
+            throw 'Azure OS disk metadata contains an invalid ephemeral option.'
+        }
+        $safe.diffDiskSettings = [ordered]@{ option = $option }
+    }
+    return $safe
+}
+
+function ConvertTo-SafeAzureComputeMetadata {
+    param([Parameter(Mandatory = $true)]$Metadata)
+    $size = [string]$Metadata.vmSize
+    if ($size -notmatch '^Standard_[A-Za-z0-9_]{1,80}$') {
+        throw 'Azure compute metadata contains an invalid VM size.'
+    }
+    $disks = @(
+        foreach ($disk in $Metadata.storageProfile.dataDisks) {
+            Select-SafeAzureComputeDisk -Disk $disk -DataDisk
+        }
+    )
+    if ($disks.Count -eq 0) { throw 'Azure compute metadata has no managed data disks.' }
+    $resourceDisk = $Metadata.storageProfile.PSObject.Properties['resourceDisk']
+    $resourceSize = if ($resourceDisk -and $resourceDisk.Value) {
+        [string]$resourceDisk.Value.size
+    } else { '' }
+    if ($resourceSize -notmatch '^[0-9]{0,16}$') {
+        throw 'Azure resource disk metadata contains an invalid size.'
+    }
+    return [ordered]@{
+        vmSize = $size
+        storageProfile = [ordered]@{
+            osDisk = Select-SafeAzureComputeDisk -Disk $Metadata.storageProfile.osDisk
+            dataDisks = $disks
+            resourceDisk = [ordered]@{ size = $resourceSize }
+        }
+    }
+}
+
+function Write-AzureComputeSnapshot {
+    param([Parameter(Mandatory = $true)]$Metadata)
+    $safe = ConvertTo-SafeAzureComputeMetadata -Metadata $Metadata
+    if (Test-Path -LiteralPath $hostMetadataRoot) {
+        $item = Get-Item -LiteralPath $hostMetadataRoot -Force
+        if (-not $item.PSIsContainer -or $item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+            throw 'Host metadata directory is not a regular directory.'
+        }
+    }
+    else { New-Item -ItemType Directory -Path $hostMetadataRoot | Out-Null }
+    $administrators = [Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
+    $system = [Security.Principal.SecurityIdentifier]::new('S-1-5-18')
+    $runner = [Security.Principal.SecurityIdentifier]::new('S-1-5-20')
+    $directoryAcl = [Security.AccessControl.DirectorySecurity]::new()
+    $directoryAcl.SetAccessRuleProtection($true, $false)
+    $directoryAcl.SetOwner($administrators)
+    foreach ($principal in @($system, $administrators)) {
+        $directoryAcl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+            $principal, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow'))
+    }
+    $directoryAcl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+        $runner, 'ReadAndExecute', 'ContainerInherit,ObjectInherit', 'None', 'Allow'))
+    Set-Acl -LiteralPath $hostMetadataRoot -AclObject $directoryAcl
+
+    $path = Join-Path $hostMetadataRoot 'compute.json'
+    if (Test-Path -LiteralPath $path) {
+        $item = Get-Item -LiteralPath $path -Force
+        if ($item.PSIsContainer -or $item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+            throw 'Host metadata snapshot is not a regular file.'
+        }
+    }
+    $fileAcl = [Security.AccessControl.FileSecurity]::new()
+    $fileAcl.SetAccessRuleProtection($true, $false)
+    $fileAcl.SetOwner($administrators)
+    foreach ($principal in @($system, $administrators)) {
+        $fileAcl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+            $principal, 'FullControl', 'None', 'None', 'Allow'))
+    }
+    $fileAcl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+        $runner, 'Read', 'None', 'None', 'Allow'))
+    if (Test-Path -LiteralPath $path) {
+        Set-Acl -LiteralPath $path -AclObject $fileAcl
+    }
+    $temporary = Join-Path $hostMetadataRoot ([guid]::NewGuid().ToString('N') + '.tmp')
+    $backup = Join-Path $hostMetadataRoot ([guid]::NewGuid().ToString('N') + '.bak')
+    try {
+        [IO.File]::WriteAllText($temporary, ($safe | ConvertTo-Json -Depth 8 -Compress),
+            [Text.UTF8Encoding]::new($false))
+        Set-Acl -LiteralPath $temporary -AclObject $fileAcl
+        if (Test-Path -LiteralPath $path) {
+            # Windows PowerShell requires a backup path for File.Replace.
+            [IO.File]::Replace($temporary, $path, $backup)
+        }
+        else { [IO.File]::Move($temporary, $path) }
+        Set-Acl -LiteralPath $path -AclObject $fileAcl
+    }
+    finally {
+        if (Test-Path -LiteralPath $backup) {
+            Remove-Item -LiteralPath $backup -Force
+        }
+        if (Test-Path -LiteralPath $temporary) {
+            Remove-Item -LiteralPath $temporary -Force
+        }
+    }
 }
 
 function Get-ExtraRunnerLabels {
@@ -228,7 +381,12 @@ try {
     if (-not (Get-ScheduledTask -TaskName $continuationTask -ErrorAction SilentlyContinue)) {
         throw 'Runner continuation task is missing; stage the package before starting bootstrap.'
     }
-    $runnerName = Get-RunnerName
+    Set-RunnerMetadataFirewall
+    $metadata = Invoke-RestMethod -Uri (
+        'http://169.254.169.254/metadata/instance/compute?api-version=2021-02-01'
+    ) -Headers @{ Metadata = 'true' } -TimeoutSec 30
+    $runnerName = Get-RunnerName -Metadata $metadata
+    Write-AzureComputeSnapshot -Metadata $metadata
     $drive = $config.dataDisk.driveLetter
     if ($drive -eq $env:SystemDrive.TrimEnd(':')) { throw 'Data disk must not use the system drive letter.' }
     & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $diskScript `
@@ -282,8 +440,9 @@ try {
     [Environment]::SetEnvironmentVariable('Path', $machinePath, 'Machine')
     $env:Path = $machinePath
 
-    $extraLabels = Get-ExtraRunnerLabels -RunnerLabels @($config.runnerLabels)
-    $benchmarkRunner = Test-BenchmarkRunner -RunnerLabels @($config.runnerLabels)
+    $runnerLabels = @(Get-InstanceRunnerLabels -Config $config -RunnerName $runnerName)
+    $extraLabels = Get-ExtraRunnerLabels -RunnerLabels $runnerLabels
+    $benchmarkRunner = Test-BenchmarkRunner -RunnerLabels $runnerLabels
     $arguments = @(
         '-RunnerOnly', '-RepositoryUrl', "https://github.com/$($config.repository)",
         '-RunnerDirectory', $config.runnerDirectory
