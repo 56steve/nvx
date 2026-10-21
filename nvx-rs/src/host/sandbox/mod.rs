@@ -47,6 +47,11 @@ use crate::host::python::fs;
 use crate::host::python::path::{Flavor, PurePath};
 use crate::net::is_valid_hostname;
 
+/// The largest value the guest cgroup v2 `memory.max` parser can store.
+const MEMORY_MAX_LIMIT: u64 = u64::MAX;
+/// The guest adds one for its init process; Linux rejects `pids.max` at or above 4,194,305.
+const PIDS_MAX_LIMIT: u32 = 4_194_303;
+
 /// The MMIO base of the scratch disk's sandbox block device.
 pub const SCRATCH_MMIO_BASE: u64 = 0xD000_6000;
 /// The size of the x86 kernel command line, including its NUL.
@@ -243,6 +248,18 @@ impl SandboxLaunch {
             if value.as_ref().is_some_and(|value| !value.is_positive()) {
                 return Err(refused(format!("--{name} must be positive")));
             }
+        }
+        if memory_max
+            .as_ref()
+            .is_some_and(|value| value.to_u64().is_none())
+        {
+            return Err(refused(format!("--memory-max must be at most {MEMORY_MAX_LIMIT}")));
+        }
+        if pids_max
+            .as_ref()
+            .is_some_and(|value| value.to_u32().is_none_or(|value| value > PIDS_MAX_LIMIT))
+        {
+            return Err(refused(format!("--pids-max must be at most {PIDS_MAX_LIMIT}")));
         }
         mount::validate_mounts(mounts)?;
         Ok(Self {

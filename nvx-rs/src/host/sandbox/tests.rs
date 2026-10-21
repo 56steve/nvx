@@ -232,6 +232,25 @@ fn launch_settings_are_checked_in_python_order() {
 }
 
 #[test]
+fn launch_rejects_limits_the_guest_cgroup_cannot_store() {
+    let settings = |change: fn(&mut SandboxSettings)| {
+        let mut settings = SandboxSettings::default();
+        change(&mut settings);
+        message(SandboxLaunch::new(vec![distro()], "s.ext4", settings))
+    };
+    assert_eq!(
+        settings(|settings| {
+            settings.memory_max = Some(Int::parse("18446744073709551616").unwrap())
+        }),
+        "--memory-max must be at most 18446744073709551615"
+    );
+    assert_eq!(
+        settings(|settings| settings.pids_max = Some(Int::from(4_194_304_u32))),
+        "--pids-max must be at most 4194303"
+    );
+}
+
+#[test]
 fn workload_identities_parse_as_python_int() {
     assert_eq!(parse_workload_identity("1000:1001").unwrap(), (1000, 1001));
     assert_eq!(
