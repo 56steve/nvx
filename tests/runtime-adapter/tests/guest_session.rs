@@ -115,9 +115,29 @@ impl Broker {
         self.write(&record);
     }
 
-    /// Writes bytes to the guest.
-    fn write(&mut self, bytes: &[u8]) {
-        self.stream.write_all(bytes).unwrap();
+    /// Writes bytes to the guest. A guest that stops reading fails the test once `TIMEOUT` passes,
+    /// instead of hanging it: the socket's buffer can fill before the guest's receive window does.
+    fn write(&mut self, mut bytes: &[u8]) {
+        let deadline = Instant::now() + TIMEOUT;
+        while !bytes.is_empty() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "the guest reads the broker's bytes in time"
+            );
+            self.stream.set_write_timeout(Some(remaining)).unwrap();
+            match self.stream.write(bytes) {
+                Ok(count) => bytes = &bytes[count..],
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock
+                            | io::ErrorKind::TimedOut
+                            | io::ErrorKind::Interrupted
+                    ) => {}
+                Err(error) => panic!("cannot write to the guest: {error}"),
+            }
+        }
     }
 
     /// Ends the broker's stream to the guest.
