@@ -370,6 +370,12 @@ impl ExecutionCgroup {
     /// still there before it removes the cgroup at its path, and a cgroup that the caller
     /// prepared at the path of a removed one stays, even when clones of one handle remove the
     /// cgroup at once.
+    ///
+    /// The caller places no process in the cgroup while it removes it: neither with
+    /// [`place`](Self::place), nor with a child that it spawned with the cgroup's
+    /// [`placement`](Self::placement) and whose launch has yet to report. The kernel removes a
+    /// cgroup that only zombies occupy, so a process that joined the cgroup after the removal's
+    /// check, and ended before the removal, would be a zombie that the removal hides.
     pub fn remove(&self) -> io::Result<()> {
         if !self.own {
             return Ok(());
@@ -1208,22 +1214,31 @@ mod tests {
         second.remove().unwrap();
     }
 
-    /// Runs `racer` on another thread once this thread's next turn pauses, and lets the turn go
-    /// on once `racer` has returned, or after half a second, as it does when the turn holds the
-    /// racer off. Joining the thread returns what `racer` returned, or `None` if no turn paused.
-    fn race<T: Send + 'static>(
-        racer: impl FnOnce() -> T + Send + 'static,
+    /// Runs a racer on another thread once this thread's next turn pauses, and lets the turn go
+    /// on once the racer has returned, or half a second after its setup, as it does when the turn
+    /// holds the racer off. The racer runs `setup` first, which the turn waits for, so that it
+    /// takes place within the pause however late the thread starts, then `racer`, with what
+    /// `setup` returned. Joining the thread returns what `racer` returned, or `None` if no turn
+    /// paused.
+    fn race<S, T: Send + 'static>(
+        setup: impl FnOnce() -> S + Send + 'static,
+        racer: impl FnOnce(S) -> T + Send + 'static,
     ) -> std::thread::JoinHandle<Option<T>> {
         let (go, start) = std::sync::mpsc::channel();
+        let (ready, set_up) = std::sync::mpsc::channel();
         let (finished, done) = std::sync::mpsc::channel();
         let thread = std::thread::spawn(move || {
             start.recv().ok()?;
-            let result = racer();
+            let state = setup();
+            let _ = ready.send(());
+            let result = racer(state);
             let _ = finished.send(());
             Some(result)
         });
         PAUSE.set(Some(Box::new(move || {
             go.send(()).unwrap();
+            // A setup that fails drops its sender, which ends the wait at once.
+            let _ = set_up.recv_timeout(Duration::from_secs(10));
             let _ = done.recv_timeout(Duration::from_millis(500));
         })));
         thread
@@ -1246,13 +1261,20 @@ mod tests {
         let delayed = first.clone();
         // Once the delayed clone found the cgroup empty, the racer removes it through the other
         // clone and prepares another of the same name, unless the delayed removal holds it off.
-        let racer = race({
-            let layout = layout.clone();
+        let racer = race(
             move || {
-                first.remove().unwrap();
-                ExecutionCgroup::prepare(&layout, Some("exec"), &[]).unwrap()
-            }
-        });
+                // The delayed removal pauses between its check and its removal.
+                assert!(!first.is_occupied(Scope::Execution).unwrap());
+                first
+            },
+            {
+                let layout = layout.clone();
+                move |first: ExecutionCgroup| {
+                    first.remove().unwrap();
+                    ExecutionCgroup::prepare(&layout, Some("exec"), &[]).unwrap()
+                }
+            },
+        );
         delayed.remove().unwrap();
         let replacement = finish(racer);
         assert!(replacement.path().is_dir());
@@ -1273,17 +1295,23 @@ mod tests {
             .unwrap()
             .remove()
             .unwrap();
-        // Once the preparation created its cgroup, the racer opens that cgroup, removes it, and
-        // prepares another of the same name, unless the preparation holds it off. The preparation
-        // then fails, as the kernel refuses its value, and removes its cgroup again.
-        let racer = race({
-            let layout = layout.clone();
-            move || {
-                let opened = ExecutionCgroup::open(&layout, Some("exec")).unwrap();
-                opened.remove().unwrap();
-                ExecutionCgroup::prepare(&layout, Some("exec"), &[]).unwrap()
-            }
-        });
+        // Once the preparation created its cgroup, the racer opens that cgroup, within the pause,
+        // removes it, and prepares another of the same name, unless the preparation holds it off.
+        // The preparation then fails, as the kernel refuses its value, and removes its cgroup
+        // again.
+        let racer = race(
+            {
+                let layout = layout.clone();
+                move || ExecutionCgroup::open(&layout, Some("exec")).unwrap()
+            },
+            {
+                let layout = layout.clone();
+                move |opened: ExecutionCgroup| {
+                    opened.remove().unwrap();
+                    ExecutionCgroup::prepare(&layout, Some("exec"), &[]).unwrap()
+                }
+            },
+        );
         assert_eq!(
             error(ExecutionCgroup::prepare(
                 &layout,
