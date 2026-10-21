@@ -9,6 +9,7 @@ use super::*;
 use crate::ErrorKind;
 use crate::contract;
 use crate::host::process::{BootId, ProcessRef};
+use crate::host::test_support::released;
 
 /// A launch capability.
 const CAPABILITY: [u8; CAPABILITY_LEN] = [7; CAPABILITY_LEN];
@@ -42,25 +43,6 @@ fn store() -> (tempfile::TempDir, SandboxStore) {
 /// Writes `value` as the file `name` of `store`.
 fn write(store: &SandboxStore, name: &str, value: &serde_json::Value) {
     fs::write(store.path(name), serde_json::to_vec(value).unwrap()).unwrap();
-}
-
-/// How long a test waits for a lock or claim that it released to be free.
-///
-/// A process that a concurrent test spawns holds a copy of each descriptor of this process from
-/// its fork until it executes its program, and with it the lock or claim of a file that a test
-/// had open, for that moment.
-const RELEASE_WAIT: Duration = Duration::from_secs(10);
-
-/// Returns whether `free` holds before [`RELEASE_WAIT`] passes, checking it again until then.
-fn released(mut free: impl FnMut() -> bool) -> bool {
-    let deadline = Instant::now() + RELEASE_WAIT;
-    while !free() {
-        if Instant::now() >= deadline {
-            return false;
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-    true
 }
 
 #[test]

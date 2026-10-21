@@ -58,3 +58,5 @@ pub mod supervisor;
 #[cfg(unix)]
 #[allow(unsafe_code)]
 mod sys;
+#[cfg(test)]
+mod test_support;
