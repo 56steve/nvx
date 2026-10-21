@@ -620,7 +620,8 @@ install_rust_tools() {
     run_as_root env \
         CARGO_HOME="$trusted_cargo_home" \
         RUSTUP_HOME="$trusted_rustup_home" \
-        "$rustup" toolchain install "$RUST_TOOLCHAIN" --profile minimal
+        "$rustup" toolchain install "$RUST_TOOLCHAIN" --profile minimal \
+        --no-self-update
     run_as_root env \
         CARGO_HOME="$trusted_cargo_home" \
         RUSTUP_HOME="$trusted_rustup_home" \

@@ -226,7 +226,8 @@ install_rust_tools() {
         . "${HOME}/.cargo/env"
     fi
 
-    rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+    rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal \
+        --no-self-update
     rustup target add --toolchain "$RUST_TOOLCHAIN" \
         x86_64-unknown-linux-musl
     rust_version=$(RUSTUP_TOOLCHAIN=$RUST_TOOLCHAIN rustc --version | awk '{print $2}')
