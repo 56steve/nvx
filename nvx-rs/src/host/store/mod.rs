@@ -206,19 +206,24 @@ pub const FILE_NAMES: [&str; 8] = [
     OUTCOME_NAME,
 ];
 
-/// Interval at which a lock with a deadline is tried again.
+/// Interval at which a lock that another holder has is tried again: the sandbox's lock, by a
+/// caller that waits for it until a deadline, and a launch's claim on its log, by a recovery that
+/// waits for the claim's release. A release is noticed at most this late.
 const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(25);
 
 /// How long recovery waits for a held claim on a launch's log to be released before it concludes
 /// that a process of the launch may still run.
 ///
 /// On Linux, a process holds a copy of each descriptor of its parent from its fork until it
-/// executes its program, so a spawn by another thread of the process that holds the log, such
-/// as the launch of another sandbox's VMM, holds the claim for that moment.
+/// executes its program. A spawn by another thread of the process that holds the log, such as
+/// the launch of another sandbox's VMM, therefore holds the claim for that moment, which lasted
+/// about 5 ms on a busy host; a second leaves a wide margin for a more heavily loaded one.
+///
+/// Recovery, and the abandon of a failed launch, wait only while they find the claim held: a
+/// launch that succeeds and a stop never check it. A claim that stays held is still reported held
+/// when the wait ends, so the wait can delay them by up to a second, but never makes them end a
+/// launch that may still run.
 const CLAIM_RELEASE_WAIT: Duration = Duration::from_secs(1);
-
-/// Interval at which a held claim is checked again while recovery waits for its release.
-const CLAIM_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Returns `dir` as an absolute path, which a relative one names from the current directory.
 fn absolute(dir: PathBuf) -> Result<PathBuf> {
@@ -539,17 +544,23 @@ impl LockedStore {
     /// Returns whether a process still holds the claim of the launch of `journal` on its log, or
     /// why that cannot be determined.
     ///
-    /// A held claim is checked again until [`CLAIM_RELEASE_WAIT`] passes, so that a process that
-    /// another thread spawned while the log was open, which holds the claim only until it
-    /// executes its program, is not taken for a process of the launch.
+    /// A held claim is checked again at every [`LOCK_RETRY_INTERVAL`] until [`CLAIM_RELEASE_WAIT`]
+    /// passes, so that a process that another thread spawned while the log was open, which holds
+    /// the claim only until it executes its program, is not taken for a process of the launch.
     fn claim_held(&self, journal: &LaunchJournal) -> std::result::Result<bool, String> {
         let path = self.log_path();
         let identity = journal.log().identity;
         let deadline = Instant::now() + CLAIM_RELEASE_WAIT;
         loop {
             match platform::log_claim_held(&path, (identity.device, identity.index)) {
-                Ok(true) if Instant::now() < deadline => thread::sleep(CLAIM_RETRY_INTERVAL),
-                Ok(held) => return Ok(held),
+                Ok(true) => {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return Ok(true);
+                    }
+                    thread::sleep(left.min(LOCK_RETRY_INTERVAL));
+                }
+                Ok(false) => return Ok(false),
                 Err(error) => {
                     return Err(format!(
                         "its claim on the log {} cannot be checked: {error}",
