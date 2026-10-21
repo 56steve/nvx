@@ -73,6 +73,8 @@ pub(super) fn parse_rate(text: &[u8]) -> Option<f64> {
 
 /// A probe command's arguments, which it reads one option at a time.
 pub(super) struct Arguments<'a> {
+    /// The command, which the diagnostic of an invalid option or value names.
+    command: &'static [u8],
     /// The arguments not read yet.
     rest: std::slice::Iter<'a, &'a [u8]>,
     /// The last argument read, which the diagnostic of an invalid option or value quotes.
@@ -80,9 +82,10 @@ pub(super) struct Arguments<'a> {
 }
 
 impl<'a> Arguments<'a> {
-    /// Starts reading `arguments`.
-    pub(super) fn new(arguments: &'a [&'a [u8]]) -> Self {
+    /// Starts reading the `arguments` of `command`.
+    pub(super) fn new(command: &'static [u8], arguments: &'a [&'a [u8]]) -> Self {
         Self {
+            command,
             rest: arguments.iter(),
             last: &[],
         }
@@ -98,9 +101,23 @@ impl<'a> Arguments<'a> {
         }
     }
 
-    /// Returns the last argument read.
-    pub(super) fn last_read(&self) -> &'a [u8] {
-        self.last
+    /// Prints the byte-exact diagnostic that quotes the last argument read as an invalid option
+    /// or value, and fails with the usage status.
+    ///
+    /// [`value`](Self::value) reads nothing when it returns `None`, so the last argument read is
+    /// the option itself when no call took a value for it.
+    pub(super) fn invalid(&self, err: &mut dyn Write) -> CommandError {
+        sys::report(
+            err,
+            &[
+                b"nvx-time-probe ",
+                self.command,
+                b": invalid option or value: ",
+                self.last,
+                b"\n",
+            ],
+        );
+        CommandError::Usage
     }
 }
 
@@ -112,21 +129,6 @@ impl<'a> Iterator for Arguments<'a> {
         self.last = self.rest.next()?;
         Some(self.last)
     }
-}
-
-/// Prints the byte-exact invalid-option diagnostic and fails with the usage status.
-pub(super) fn bad_option(command: &[u8], argument: &[u8], err: &mut dyn Write) -> CommandError {
-    sys::report(
-        err,
-        &[
-            b"nvx-time-probe ",
-            command,
-            b": invalid option or value: ",
-            argument,
-            b"\n",
-        ],
-    );
-    CommandError::Usage
 }
 
 /// Returns the CPUs in the calling thread's affinity mask.
@@ -461,19 +463,32 @@ mod tests {
         assert!(parse_rate(b"2.5x").is_none());
     }
 
+    /// Returns the diagnostic that `arguments` prints for an invalid option or value.
+    fn diagnostic(arguments: &Arguments<'_>) -> Vec<u8> {
+        let mut err = Vec::new();
+        assert_eq!(arguments.invalid(&mut err), CommandError::Usage);
+        err
+    }
+
     #[test]
     fn options_take_inline_or_following_values() {
         let arguments: [&[u8]; 4] = [b"--batch=5", b"--cpu", b"3", b"--cpu"];
-        let mut arguments = Arguments::new(&arguments);
+        let mut arguments = Arguments::new(b"latency", &arguments);
         let first = arguments.next().unwrap();
         assert_eq!(arguments.value(first, b"--cpu"), None);
         assert_eq!(arguments.value(first, b"--batch"), Some(&b"5"[..]));
         let second = arguments.next().unwrap();
         assert_eq!(arguments.value(second, b"--cpu"), Some(&b"3"[..]));
-        assert_eq!(arguments.last_read(), b"3");
+        assert_eq!(
+            diagnostic(&arguments),
+            b"nvx-time-probe latency: invalid option or value: 3\n"
+        );
         let third = arguments.next().unwrap();
         assert_eq!(arguments.value(third, b"--cpu"), None);
-        assert_eq!(arguments.last_read(), b"--cpu");
+        assert_eq!(
+            diagnostic(&arguments),
+            b"nvx-time-probe latency: invalid option or value: --cpu\n"
+        );
         assert_eq!(arguments.next(), None);
     }
 

@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use super::format::{f0, f9, utc_seconds};
 use super::support::{
-    Arguments, NANOSECONDS_PER_SECOND, bad_option, cpuinfo_has_flag, current_clocksource,
-    detect_tsc_rate, kmsg_foreach, measure_tsc_hz, parse_rate, round_ll,
+    Arguments, NANOSECONDS_PER_SECOND, cpuinfo_has_flag, current_clocksource, detect_tsc_rate,
+    kmsg_foreach, measure_tsc_hz, parse_rate, round_ll,
 };
 use crate::guest::kernel_text::{self, ClockEventState, TickDevice, TickMode, TimerList};
 use crate::guest::parse::parse_u64;
@@ -541,20 +541,18 @@ pub(super) fn run(
     let mut measure_ms = DEFAULT_MEASURE_MS;
     let mut override_hz = None;
     let mut read_msrs = false;
-    let mut arguments = Arguments::new(arguments);
+    let mut arguments = Arguments::new(b"clock", arguments);
     while let Some(argument) = arguments.next() {
         if let Some(value) = arguments.value(argument, b"--measure-ms") {
             measure_ms = parse_u64(value)
                 .filter(|value| *value <= MEASURE_LIMIT_MS)
-                .ok_or_else(|| bad_option(b"clock", arguments.last_read(), err))?;
+                .ok_or_else(|| arguments.invalid(err))?;
         } else if let Some(value) = arguments.value(argument, b"--tsc-hz") {
-            let parsed = parse_rate(value);
-            override_hz =
-                Some(parsed.ok_or_else(|| bad_option(b"clock", arguments.last_read(), err))?);
+            override_hz = Some(parse_rate(value).ok_or_else(|| arguments.invalid(err))?);
         } else if argument == b"--msr" {
             read_msrs = true;
         } else {
-            return Err(bad_option(b"clock", argument, err));
+            return Err(arguments.invalid(err));
         }
     }
     let rate = detect_tsc_rate(override_hz);
