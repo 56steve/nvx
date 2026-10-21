@@ -6,8 +6,8 @@ use std::io::Write;
 
 use super::format::{f0, f1};
 use super::support::{
-    Arguments, TscRate, bad_option, check_cpus_allowed, current_clocksource, cycles_to_ns,
-    detect_tsc_rate, parse_rate,
+    Arguments, TscRate, check_cpus_allowed, current_clocksource, cycles_to_ns, detect_tsc_rate,
+    parse_rate,
 };
 use crate::guest::parse::parse_u64;
 use crate::guest::status::CommandError;
@@ -181,27 +181,25 @@ pub(super) fn run(
     let mut batch = DEFAULT_BATCH;
     let mut cpu = None;
     let mut override_hz = None;
-    let mut arguments = Arguments::new(arguments);
+    let mut arguments = Arguments::new(b"latency", arguments);
     while let Some(argument) = arguments.next() {
         if let Some(value) = arguments.value(argument, b"--iterations") {
             iterations = parse_u64(value)
                 .filter(|value| ITERATIONS.contains(value))
-                .ok_or_else(|| bad_option(b"latency", arguments.last_read(), err))?;
+                .ok_or_else(|| arguments.invalid(err))?;
         } else if let Some(value) = arguments.value(argument, b"--batch") {
             batch = parse_u64(value)
                 .filter(|value| BATCH.contains(value))
-                .ok_or_else(|| bad_option(b"latency", arguments.last_read(), err))?;
+                .ok_or_else(|| arguments.invalid(err))?;
         } else if let Some(value) = arguments.value(argument, b"--cpu") {
             let parsed = parse_u64(value)
                 .and_then(|cpu| usize::try_from(cpu).ok())
                 .filter(|cpu| *cpu < super::MAX_CPUS);
-            cpu = Some(parsed.ok_or_else(|| bad_option(b"latency", arguments.last_read(), err))?);
+            cpu = Some(parsed.ok_or_else(|| arguments.invalid(err))?);
         } else if let Some(value) = arguments.value(argument, b"--tsc-hz") {
-            let parsed = parse_rate(value);
-            override_hz =
-                Some(parsed.ok_or_else(|| bad_option(b"latency", arguments.last_read(), err))?);
+            override_hz = Some(parse_rate(value).ok_or_else(|| arguments.invalid(err))?);
         } else {
-            return Err(bad_option(b"latency", argument, err));
+            return Err(arguments.invalid(err));
         }
     }
 

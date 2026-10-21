@@ -6,8 +6,8 @@ use std::thread;
 
 use super::format::{f0, f1};
 use super::support::{
-    Arguments, NANOSECONDS_PER_SECOND, TscRate, affinity_cpus, bad_option, check_cpus_allowed,
-    cycles_to_ns, detect_tsc_rate, format_cpu_list, parse_cpu_list, parse_rate, round_ll,
+    Arguments, NANOSECONDS_PER_SECOND, TscRate, affinity_cpus, check_cpus_allowed, cycles_to_ns,
+    detect_tsc_rate, format_cpu_list, parse_cpu_list, parse_rate, round_ll,
 };
 use crate::guest::parse::parse_u64;
 use crate::guest::status::CommandError;
@@ -475,24 +475,21 @@ pub(super) fn run(
     let mut bound_ns = DEFAULT_BOUND_NS;
     let mut override_hz = None;
     let mut cpus = None;
-    let mut arguments = Arguments::new(arguments);
+    let mut arguments = Arguments::new(b"warp", arguments);
     while let Some(argument) = arguments.next() {
         if let Some(value) = arguments.value(argument, b"--duration-ms") {
             duration_ms = parse_u64(value)
                 .filter(|value| DURATIONS_MS.contains(value))
-                .ok_or_else(|| bad_option(b"warp", arguments.last_read(), err))?;
+                .ok_or_else(|| arguments.invalid(err))?;
         } else if let Some(value) = arguments.value(argument, b"--cpus") {
             let parsed = parse_cpu_list(value).filter(|cpus| !cpus.is_empty());
-            cpus = Some(parsed.ok_or_else(|| bad_option(b"warp", arguments.last_read(), err))?);
+            cpus = Some(parsed.ok_or_else(|| arguments.invalid(err))?);
         } else if let Some(value) = arguments.value(argument, b"--bound-ns") {
-            bound_ns =
-                parse_u64(value).ok_or_else(|| bad_option(b"warp", arguments.last_read(), err))?;
+            bound_ns = parse_u64(value).ok_or_else(|| arguments.invalid(err))?;
         } else if let Some(value) = arguments.value(argument, b"--tsc-hz") {
-            let parsed = parse_rate(value);
-            override_hz =
-                Some(parsed.ok_or_else(|| bad_option(b"warp", arguments.last_read(), err))?);
+            override_hz = Some(parse_rate(value).ok_or_else(|| arguments.invalid(err))?);
         } else {
-            return Err(bad_option(b"warp", argument, err));
+            return Err(arguments.invalid(err));
         }
     }
     // Linux never reports an empty affinity mask, which would be `EINVAL` to set.
