@@ -77,6 +77,7 @@ nvx-rs/
 | `nvx::guest::spawn` | `Command`: starts a program in a new process for any guest init or agent, with its arguments, environment, root and working directories, standard streams, inherited descriptors, cgroup, and process group, without NVX's control protocol, managed agent, or workload identity. Its `LaunchReport` tells whether the program started, or which `LaunchStage` failed and why. NVX's managed agent is one caller |
 | `nvx::guest::process` | `Child`: the status of one child that the caller names, by its pidfd or its process ID. It waits for that child alone, so another child's status stays for the caller; a caller that collects every status itself, such as a PID 1 that adopts orphans, hands each one to its `Child` with `observe`. Statuses are `std::process::ExitStatus`, real-time signals included |
 | `nvx::guest::cgroup` | `Layout`: the agent's cgroup and the workload cgroup, which the caller names, and which may not hold the agent's. `ExecutionCgroup`: the cgroup of one execution, the workload cgroup itself or a child of it, which it prepares with the caller's resource values, places processes in, checks for occupancy through `pids.current`, kills with `cgroup.kill`, and settles, over the execution's cgroup or the whole workload subtree, as the caller's `Scope` chooses. It holds its cgroups' directories open, and the process's removals and preparations of cgroups take turns, so that it never reaches another cgroup that takes one of their paths. Settling calls the caller's status collector between its checks, and collects no status itself |
+| `nvx::guest::exec` | `Execution`: drives one program that the caller spawned with the program's ends of its `Pipes`, without blocking, from the caller's own loop or reactor, and reports each step as an `Event`: the launch report, the output of each stream, kill failures, and the `Outcome`. It reads a stream only as far as the caller's `grant` allows, so a stalled sink stalls its own execution alone, writes the program's standard input without `SIGPIPE`, and ends the program on a cancellation, a timeout, or a disconnection, with `SIGKILL` to the program or its process group, while no collector has taken its status, and, through the opened directory of a cgroup that the caller names, to that cgroup. It closes the program's input once the program has ended. It waits for its program alone, by a pidfd, or takes the status from the caller's collector with `observe`; with `Options::caller_reaps`, that collector is the program's only one. NVX's managed agent is one caller |
 | `nvx::guest::time` | x86_64: `TimeAbi`, the steps of NVX time ABI v1 as typed calls in the caller's process, for any guest init or agent: the cold-boot time step and, separately, the start of the time daemon in a child process that the caller supervises, the VM generation ID, a `CaptureRequest` that repairs a `Restore`, and a `RestoreFinish`. A call takes the permission for OpenVMM's ports on the calling thread for each port transaction alone, and fails with `TimeError::PortRelease` if the thread may still hold some of it, which a process that it started would inherit, and from which `nvx::guest::spawn` starts none. No call waits for a child that it did not start. `nvx-time` runs its steps through them |
 | `nvx::guest::reseed` | `Seed::read` and `reseed`: a restore's fresh entropy, which starts with its `GenerationId`, and the reseed of the kernel's random number generator with it, in the caller's process. `nvx-reseed` runs them |
 
@@ -568,14 +569,15 @@ The `guest` feature adds the programs that run in NVX's Linux guests: the
 Linux images ship all nine at their established `/sbin/nvx-*` paths. The
 module's libraries are not programs: `spawn` starts a program in a new
 process, `process` collects the status of a child that the caller names,
-`cgroup` places, kills, and settles the processes of an execution, and
-`mappings` bind-mounts host mappings below the roots that its caller names.
-`nvx-managed-agent` launches, collects, and settles its workloads through them,
-and applies its host mapping table through `mappings`, with its mount of the
-host's export and `/` as the roots, and any other guest init or agent can use
-them too. Any guest init or agent can also run the steps of `nvx-time` and
-`nvx-reseed` in its own process, through the `nvx::guest::time` and
-`nvx::guest::reseed` calls, on which both programs run.
+`cgroup` places, kills, and settles the processes of an execution, `exec`
+drives one program as an execution, and `mappings` bind-mounts host mappings
+below the roots that its caller names. `nvx-managed-agent` launches, drives,
+collects, and settles its workloads through them, and applies its host mapping
+table through `mappings`, with its mount of the host's export and `/` as the
+roots, and any other guest init or agent can use them too. Any guest init or
+agent can also run the steps of `nvx-time` and `nvx-reseed` in its own process,
+through the `nvx::guest::time` and `nvx::guest::reseed` calls, on which both
+programs run.
 
 | Binary | Program |
 | --- | --- |
