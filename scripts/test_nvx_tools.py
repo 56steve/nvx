@@ -4030,6 +4030,26 @@ class CiConfigurationTests(unittest.TestCase):
             header,
         )
 
+    def test_ci_dev_pushes_queue_while_pull_requests_cancel(self):
+        workflow = (
+            BuildConstants.REPO_ROOT / ".github" / "workflows" / "ci.yml"
+        ).read_text(encoding="utf-8")
+        header = workflow.split("\njobs:\n", 1)[0]
+        concurrency = header.split("\nconcurrency:\n", 1)[1].split("\n\n", 1)[0]
+
+        # GitHub rejects `queue: max` with `cancel-in-progress: true`, so a
+        # static queue mode would stop every pull-request run from starting.
+        self.assertIn(
+            "\n  cancel-in-progress: ${{ github.event_name == 'pull_request' }}\n",
+            concurrency,
+        )
+        self.assertIn(
+            "\n  queue: ${{ github.event_name == 'pull_request' && "
+            "'single' || 'max' }}",
+            concurrency,
+        )
+        self.assertNotRegex(concurrency, r"(?m)^\s*queue:\s*['\"]?max")
+
     def test_ci_full_runs_short_circuit_change_detection(self):
         workflow = (
             BuildConstants.REPO_ROOT / ".github" / "workflows" / "ci.yml"
