@@ -8,14 +8,13 @@
 use std::ffi::{CStr, CString};
 use std::process::ExitCode;
 
-use super::status::{CommandError, ExitStatus};
+use super::status::{CommandError, run_main};
 use super::sys::{self, Mode, OpenFlags, PORT_DEVICE, Port};
 
 /// Runs `nvx-exit` with the process's arguments. It exits with 0 after it writes the byte,
 /// unless the VM stops first, or with 1 when it cannot write the byte.
 pub fn main() -> ExitCode {
-    sys::restore_sigpipe();
-    ExitStatus::from(run(&sys::args(), PORT_DEVICE)).into()
+    run_main(|args| run(args, PORT_DEVICE))
 }
 
 /// Writes the selected exit code through `port`, which stands for `/dev/port`.
@@ -64,6 +63,7 @@ mod tests {
     use std::os::unix::ffi::OsStrExt;
 
     use super::*;
+    use crate::guest::status::ExitStatus;
 
     fn args(arguments: &[&[u8]]) -> Vec<CString> {
         let mut args = vec![CString::new("nvx-exit").unwrap()];

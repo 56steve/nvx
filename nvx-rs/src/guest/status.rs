@@ -1,6 +1,9 @@
-//! Exit statuses and failures shared by the guest programs.
+//! Exit statuses and failures shared by the guest programs, and the entry point of their `main`.
 
+use std::ffi::CString;
 use std::process::ExitCode;
+
+use super::sys;
 
 /// Process exit statuses of the guest programs.
 ///
@@ -64,6 +67,14 @@ impl From<ExitStatus> for ExitCode {
     fn from(status: ExitStatus) -> Self {
         Self::from(status as u8)
     }
+}
+
+/// Runs a guest program as its `main` does: restores the `SIGPIPE` disposition that the process
+/// inherited, passes `run` the process's arguments, program name first, and returns the exit code
+/// that its outcome selects.
+pub(crate) fn run_main(run: impl FnOnce(&[CString]) -> Result<(), CommandError>) -> ExitCode {
+    sys::restore_sigpipe();
+    ExitStatus::from(run(&sys::args())).into()
 }
 
 #[cfg(test)]

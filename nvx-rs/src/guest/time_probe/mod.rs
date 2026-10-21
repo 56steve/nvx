@@ -17,7 +17,7 @@ use std::ffi::CString;
 use std::io::{self, Write};
 use std::process::ExitCode;
 
-use super::status::{CommandError, ExitStatus};
+use super::status::{CommandError, run_main};
 use super::sys;
 
 /// Stable diagnostic output version.
@@ -58,13 +58,7 @@ pub(super) fn report(stream: &mut dyn Write, parts: &[&[u8]]) {
 
 /// Runs `nvx-time-probe` with the process's arguments.
 pub fn main() -> ExitCode {
-    sys::restore_sigpipe();
-    ExitStatus::from(run(
-        &sys::args(),
-        &mut sys::Stdout::new(),
-        &mut io::stderr(),
-    ))
-    .into()
+    run_main(|args| run(args, &mut sys::Stdout::new(), &mut io::stderr()))
 }
 
 /// Dispatches one argument vector, program name first, to a probe command.
@@ -104,6 +98,7 @@ fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::guest::status::ExitStatus;
 
     fn args(values: &[&[u8]]) -> Vec<CString> {
         std::iter::once(CString::new("nvx-time-probe").unwrap())

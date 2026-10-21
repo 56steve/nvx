@@ -41,7 +41,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use super::parse;
-use super::status::{CommandError, ExitStatus};
+use super::status::{CommandError, run_main};
 use super::sys::{self, Errno, FileDescriptor, Mode, OpenFlags};
 
 mod address;
@@ -175,13 +175,7 @@ struct UdpSocket {
 /// snapshot, or with 1 when a snapshot fails. The announcer runs until it fails, and exits with 1
 /// when it cannot open or bind its socket, or with 2 for a usage error.
 pub fn main() -> ExitCode {
-    sys::restore_sigpipe();
-    ExitStatus::from(run(
-        &sys::args(),
-        &mut sys::Stdout::new(),
-        &mut io::stderr(),
-    ))
-    .into()
+    run_main(|args| run(args, &mut sys::Stdout::new(), &mut io::stderr()))
 }
 
 /// Runs test mode or the announcer, as `args` select.

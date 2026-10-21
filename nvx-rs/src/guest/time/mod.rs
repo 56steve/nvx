@@ -25,7 +25,7 @@ use std::ffi::CString;
 use std::io::{self, Write};
 use std::process::ExitCode;
 
-use super::status::{CommandError, ExitStatus};
+use super::status::{CommandError, run_main};
 use super::sys;
 
 /// Nanoseconds in one second.
@@ -95,13 +95,7 @@ const USAGE: &[u8] = br#"usage: nvx-time [--report-only] COMMAND
 /// Runs `nvx-time` with the process's arguments. It exits with 0 on success, 1 when a command
 /// or a check fails, or 2 for an invalid command line.
 pub fn main() -> ExitCode {
-    sys::restore_sigpipe();
-    ExitStatus::from(run(
-        &sys::args(),
-        &mut sys::Stdout::new(),
-        &mut io::stderr(),
-    ))
-    .into()
+    run_main(|args| run(args, &mut sys::Stdout::new(), &mut io::stderr()))
 }
 
 /// Dispatches one argument vector, program name first, to a command.

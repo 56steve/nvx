@@ -5,19 +5,13 @@ use std::ffi::CString;
 use std::io::{self, Write};
 use std::process::ExitCode;
 
-use super::status::{CommandError, ExitStatus};
+use super::status::{CommandError, run_main};
 use super::sys::{self, Errno, Mode, OpenFlags};
 
 /// Runs `nvx-console-pending` with the process's arguments. It exits with 0, 1 when an operation
 /// fails, or 2 for a usage error.
 pub fn main() -> ExitCode {
-    sys::restore_sigpipe();
-    ExitStatus::from(run(
-        &sys::args(),
-        &mut sys::Stdout::new(),
-        &mut io::stderr(),
-    ))
-    .into()
+    run_main(|args| run(args, &mut sys::Stdout::new(), &mut io::stderr()))
 }
 
 /// Opens the requested device, queries and closes it, and prints its pending byte count.
@@ -67,6 +61,7 @@ mod tests {
     use std::path::Path;
 
     use super::*;
+    use crate::guest::status::ExitStatus;
     use crate::guest::sys::tests::Failing;
 
     fn console_pending(arguments: &[&[u8]]) -> (u8, Vec<u8>, Vec<u8>) {

@@ -16,7 +16,7 @@ use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::process::ExitCode;
 
-use super::status::{CommandError, ExitStatus};
+use super::status::{CommandError, run_main};
 use super::sys::{self, Mode, OpenFlags};
 
 /// Size and required alignment of each file transfer.
@@ -80,8 +80,7 @@ struct Measurement {
 
 /// Runs `nvx-device-io` with the process's arguments; see the module documentation.
 pub fn main() -> ExitCode {
-    sys::restore_sigpipe();
-    ExitStatus::from(run(&sys::args(), &mut sys::DirectStdout)).into()
+    run_main(|args| run(args, &mut sys::DirectStdout))
 }
 
 /// Parses and runs one benchmark, and prints its result to `out`.
@@ -367,6 +366,7 @@ mod tests {
     use std::fs;
 
     use super::*;
+    use crate::guest::status::ExitStatus;
     use crate::guest::sys::tests::Failing;
 
     fn args(arguments: &[&str]) -> Vec<CString> {
