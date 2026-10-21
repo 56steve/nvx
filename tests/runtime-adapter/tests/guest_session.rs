@@ -13,10 +13,10 @@ use std::io::{self, Read, Write};
 use std::net::Shutdown;
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use nvx::guest::nvxs::GuestConnectionError;
 use nvx::protocol::OUTER_MAX_PAYLOAD;
@@ -32,7 +32,7 @@ const FIRST: Identity = Identity {
     epoch: 1,
 };
 
-/// Longest wait for a record from the guest.
+/// Longest wait for a record from the guest, or for the guest to end.
 const TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Offset of the protocol version in a record's header.
@@ -280,13 +280,24 @@ fn start() -> (Broker, JoinHandle<Result<Served, ServeError>>) {
     (Broker::new(broker), serving)
 }
 
+/// Returns how the guest agent's `serve` ended, and fails the test if it does not end in time, so
+/// that a guest that keeps serving fails the test instead of hanging it.
+fn joined(serving: JoinHandle<Result<Served, ServeError>>) -> Result<Served, ServeError> {
+    let deadline = Instant::now() + TIMEOUT;
+    while !serving.is_finished() {
+        assert!(Instant::now() < deadline, "the guest agent ends in time");
+        thread::sleep(Duration::from_millis(10));
+    }
+    serving.join().unwrap()
+}
+
 /// Starts the guest agent, attaches it in the first epoch, sends it `bytes`, and returns the
 /// error that ended serving.
 fn refused(bytes: &[u8]) -> ServeError {
     let (mut broker, serving) = start();
     broker.attach(FIRST);
     broker.write(bytes);
-    let error = serving.join().unwrap().unwrap_err();
+    let error = joined(serving).unwrap_err();
     // The guest ended its stream.
     while let Some(record) = broker.read() {
         assert_eq!(record.record_type(), RecordType::Credit, "{error:?}");
@@ -340,7 +351,7 @@ fn the_guest_agent_answers_messages_that_span_records() {
 
     let replies = broker.exchange(&[Message::Stop], OUTER_MAX_PAYLOAD, 1);
     assert_eq!(replies, [Message::Stopped]);
-    assert_eq!(serving.join().unwrap().unwrap(), Served::Stopped);
+    assert_eq!(joined(serving).unwrap(), Served::Stopped);
     assert!(broker.read().is_none());
 }
 
@@ -372,7 +383,7 @@ fn a_reset_starts_the_new_epoch_with_a_new_message() {
     });
     let replies = broker.exchange(&[Message::Ping, Message::Stop], OUTER_MAX_PAYLOAD, 2);
     assert_eq!(replies, [Message::Pong, Message::Stopped]);
-    assert_eq!(serving.join().unwrap().unwrap(), Served::Stopped);
+    assert_eq!(joined(serving).unwrap(), Served::Stopped);
 }
 
 #[test]
@@ -383,7 +394,7 @@ fn the_guest_agent_ends_with_its_stream() {
     let replies = broker.exchange(&[Message::Ping], OUTER_MAX_PAYLOAD, 1);
     assert_eq!(replies, [Message::Pong]);
     broker.close();
-    assert_eq!(serving.join().unwrap().unwrap(), Served::Closed);
+    assert_eq!(joined(serving).unwrap(), Served::Closed);
     assert!(broker.read().is_none());
 
     // One that ends inside a record fails it.
@@ -392,7 +403,7 @@ fn the_guest_agent_ends_with_its_stream() {
     let ping = record(RecordType::Data, FIRST, 1, &Message::Ping.encode().unwrap());
     broker.write(&ping[..ping.len() - 1]);
     broker.close();
-    let error = serving.join().unwrap().unwrap_err();
+    let error = joined(serving).unwrap_err();
     let truncated = matches!(
         &error,
         ServeError::Session(GuestConnectionError::Protocol(SessionError::Truncated { buffered }))
@@ -622,6 +633,21 @@ fn start_binary() -> (Broker, Child) {
     (Broker::new(broker), child)
 }
 
+/// Returns the guest binary's output once it exits. If it does not exit in time, kills and reaps
+/// it, and fails the test instead of hanging it.
+fn finished(mut child: Child) -> Output {
+    let deadline = Instant::now() + TIMEOUT;
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let output = child.wait_with_output().unwrap();
+            panic!("the guest binary did not exit in time: {output:?}");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    child.wait_with_output().unwrap()
+}
+
 #[test]
 fn the_guest_binary_serves_the_session_on_its_standard_streams() {
     // The host stops the guest.
@@ -631,7 +657,7 @@ fn the_guest_binary_serves_the_session_on_its_standard_streams() {
     let messages = [Message::Ping, echo.clone(), Message::Stop];
     let replies = broker.exchange(&messages, OUTER_MAX_PAYLOAD, 3);
     assert_eq!(replies, [Message::Pong, echo, Message::Stopped]);
-    let output = child.wait_with_output().unwrap();
+    let output = finished(child);
     assert!(output.status.success(), "{output:?}");
     assert!(output.stderr.is_empty(), "{output:?}");
 
@@ -639,7 +665,7 @@ fn the_guest_binary_serves_the_session_on_its_standard_streams() {
     let (mut broker, child) = start_binary();
     broker.attach(FIRST);
     broker.close();
-    let output = child.wait_with_output().unwrap();
+    let output = finished(child);
     assert!(output.status.success(), "{output:?}");
     assert!(output.stderr.is_empty(), "{output:?}");
 
@@ -647,7 +673,7 @@ fn the_guest_binary_serves_the_session_on_its_standard_streams() {
     let (mut broker, child) = start_binary();
     broker.attach(FIRST);
     broker.send_data(&[0, 0, 0, 0, 9], OUTER_MAX_PAYLOAD);
-    let output = child.wait_with_output().unwrap();
+    let output = finished(child);
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     let diagnostic = String::from_utf8_lossy(&output.stderr);
     assert_eq!(
