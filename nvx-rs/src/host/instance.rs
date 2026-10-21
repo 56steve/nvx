@@ -1137,7 +1137,18 @@ mod tests {
         let contender = OpenOptions::new().write(true).open(&path).unwrap();
         assert!(contender.try_lock().is_err());
         drop(guard);
-        contender.try_lock().unwrap();
+        // A process that a concurrent test forked while the guard held the lock holds it until
+        // the process executes its program, so the released lock may take a moment to be free.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match contender.try_lock() {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("the released lock is not free: {error}"),
+            }
+        }
         drop(contender);
         // A waiter takes the lock once the holder releases it.
         let guard = lock(&path).unwrap();
