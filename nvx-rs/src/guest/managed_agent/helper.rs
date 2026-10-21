@@ -133,8 +133,6 @@ pub(crate) fn safe_path(path: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::io::{Seek, Write};
-
     use crate::guest::sys::FileDescriptor;
     use crate::protocol::{self, GuestExecPayload};
 
@@ -164,13 +162,6 @@ mod tests {
         ];
         arguments.extend(workload.iter().map(|argument| c_string(argument).unwrap()));
         arguments
-    }
-
-    fn file_with(bytes: &[u8]) -> FileDescriptor {
-        let mut file = tempfile::tempfile().unwrap();
-        file.write_all(bytes).unwrap();
-        file.rewind().unwrap();
-        FileDescriptor::from_owned(file.into())
     }
 
     /// Returns the inherited environment without the helper's descriptor variable.
@@ -224,26 +215,21 @@ mod tests {
         );
         assert!(system.execs.is_empty());
 
-        let mut relative = Vec::new();
-        relative.extend_from_slice(&protocol::EXEC_CWD_PRESENT.to_le_bytes());
-        relative.extend_from_slice(&0u16.to_le_bytes());
-        relative.extend_from_slice(&1u32.to_le_bytes());
-        relative.push(b'.');
-        let fd = file_with(&relative);
+        let relative = exec_config::encode_fields(protocol::EXEC_CWD_PRESENT, b".", &[]).unwrap();
+        let fd = exec_config::file_with(&relative);
         let helper_arguments = arguments(&mut system, fd, &[b"/bin/pwd"]);
         assert_eq!(
             run(&mut system, &helper_arguments),
             Err(CommandError::Agent)
         );
 
-        let mut conflicting = Vec::new();
-        conflicting.extend_from_slice(
-            &(protocol::EXEC_CWD_PRESENT | exec_config::EXEC_CWD_ENTERED).to_le_bytes(),
-        );
-        conflicting.extend_from_slice(&0u16.to_le_bytes());
-        conflicting.extend_from_slice(&1u32.to_le_bytes());
-        conflicting.push(b'/');
-        let fd = file_with(&conflicting);
+        let conflicting = exec_config::encode_fields(
+            protocol::EXEC_CWD_PRESENT | exec_config::EXEC_CWD_ENTERED,
+            b"/",
+            &[],
+        )
+        .unwrap();
+        let fd = exec_config::file_with(&conflicting);
         let helper_arguments = arguments(&mut system, fd, &[b"/bin/pwd"]);
         assert_eq!(
             run(&mut system, &helper_arguments),

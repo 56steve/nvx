@@ -50,16 +50,29 @@ fn encode(execution: &GuestExecPayload, cwd_entered: bool) -> Result<Vec<u8>, Er
     if execution.inherit_default_env {
         flags |= EXEC_INHERIT_DEFAULT_ENV;
     }
-    let environment = execution.environment.as_deref().unwrap_or_default();
+    encode_fields(
+        flags,
+        cwd.unwrap_or_default(),
+        execution.environment.as_deref().unwrap_or_default(),
+    )
+}
+
+/// Lays out the private helper configuration format with `flags`, the working directory `cwd`,
+/// empty without one, and the `environment` entries: the little-endian flags, entry count, and
+/// working-directory length, then the working directory, then each entry after its
+/// little-endian length. Tests also lay out configurations that [`encode`] never produces.
+pub(super) fn encode_fields(
+    flags: u16,
+    cwd: &[u8],
+    environment: &[Vec<u8>],
+) -> Result<Vec<u8>, Errno> {
     let count = u16::try_from(environment.len()).map_err(|_| Errno::EOVERFLOW)?;
-    let cwd_len = u32::try_from(cwd.map_or(0, <[u8]>::len)).map_err(|_| Errno::EOVERFLOW)?;
+    let cwd_len = u32::try_from(cwd.len()).map_err(|_| Errno::EOVERFLOW)?;
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&flags.to_le_bytes());
     bytes.extend_from_slice(&count.to_le_bytes());
     bytes.extend_from_slice(&cwd_len.to_le_bytes());
-    if let Some(cwd) = cwd {
-        bytes.extend_from_slice(cwd);
-    }
+    bytes.extend_from_slice(cwd);
     for entry in environment {
         let length = u32::try_from(entry.len()).map_err(|_| Errno::EOVERFLOW)?;
         bytes.extend_from_slice(&length.to_le_bytes());
@@ -119,10 +132,20 @@ pub(crate) fn read(descriptor: &FileDescriptor) -> Result<HelperConfig, Errno> {
     })
 }
 
+/// Returns a descriptor of a file that holds `bytes`, from which [`read`] reads a configuration
+/// as it reads a sealed one.
 #[cfg(test)]
-mod tests {
+pub(super) fn file_with(bytes: &[u8]) -> FileDescriptor {
     use std::io::{Seek, Write};
 
+    let mut file = tempfile::tempfile().unwrap();
+    file.write_all(bytes).unwrap();
+    file.rewind().unwrap();
+    FileDescriptor::from_owned(file.into())
+}
+
+#[cfg(test)]
+mod tests {
     use super::*;
 
     fn execution() -> GuestExecPayload {
@@ -133,13 +156,6 @@ mod tests {
             environment: Some(vec![b"EMPTY=".to_vec(), b"VALUE=space = value".to_vec()]),
             inherit_default_env: false,
         }
-    }
-
-    fn file_with(bytes: &[u8]) -> FileDescriptor {
-        let mut file = tempfile::tempfile().unwrap();
-        file.write_all(bytes).unwrap();
-        file.rewind().unwrap();
-        FileDescriptor::from_owned(file.into())
     }
 
     #[test]
@@ -178,40 +194,13 @@ mod tests {
     #[test]
     fn helper_defensively_rejects_unknown_flags_and_malformed_environment() {
         for bytes in [
-            {
-                let mut bytes = Vec::new();
-                bytes.extend_from_slice(&0x4000u16.to_le_bytes());
-                bytes.extend_from_slice(&0u16.to_le_bytes());
-                bytes.extend_from_slice(&0u32.to_le_bytes());
-                bytes
-            },
-            {
-                let mut bytes = Vec::new();
-                bytes.extend_from_slice(&EXEC_ENVIRONMENT_PRESENT.to_le_bytes());
-                bytes.extend_from_slice(&1u16.to_le_bytes());
-                bytes.extend_from_slice(&0u32.to_le_bytes());
-                bytes.extend_from_slice(&9u32.to_le_bytes());
-                bytes.extend_from_slice(b"NO_EQUALS");
-                bytes
-            },
-            {
-                let mut bytes = Vec::new();
-                bytes.extend_from_slice(&EXEC_ENVIRONMENT_PRESENT.to_le_bytes());
-                bytes.extend_from_slice(&1u16.to_le_bytes());
-                bytes.extend_from_slice(&0u32.to_le_bytes());
-                bytes.extend_from_slice(&6u32.to_le_bytes());
-                bytes.extend_from_slice(b"=value");
-                bytes
-            },
-            {
-                let mut bytes = Vec::new();
-                bytes.extend_from_slice(&EXEC_CWD_ENTERED.to_le_bytes());
-                bytes.extend_from_slice(&0u16.to_le_bytes());
-                bytes.extend_from_slice(&1u32.to_le_bytes());
-                bytes.push(b'/');
-                bytes
-            },
-        ] {
+            encode_fields(0x4000, b"", &[]),
+            encode_fields(EXEC_ENVIRONMENT_PRESENT, b"", &[b"NO_EQUALS".to_vec()]),
+            encode_fields(EXEC_ENVIRONMENT_PRESENT, b"", &[b"=value".to_vec()]),
+            encode_fields(EXEC_CWD_ENTERED, b"/", &[]),
+        ]
+        .map(Result::unwrap)
+        {
             let descriptor = file_with(&bytes);
             assert!(read(&descriptor).is_err(), "{bytes:?}");
         }
