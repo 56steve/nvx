@@ -21,6 +21,9 @@ pub mod frame;
 #[cfg(all(feature = "guest", target_os = "linux"))]
 pub mod guest;
 
+/// Command that starts the guest agent on the runtime adapter's standard streams.
+pub const GUEST_SERVE_COMMAND: &str = "serve";
+
 /// Describes the runtime contract that this build speaks: the control contract revision, and the
 /// versions of the microVM ABI, the NVXS records, and the NVXC frames.
 pub fn contract() -> String {

@@ -19,9 +19,12 @@ fn main() -> ExitCode {
             println!("runtime-adapter-guest: {}", runtime_adapter::contract());
             ExitCode::SUCCESS
         }
-        [command] if command == "serve" => serve(),
+        [command] if command == runtime_adapter::GUEST_SERVE_COMMAND => serve(),
         _ => {
-            eprintln!("usage: runtime-adapter-guest [serve]");
+            eprintln!(
+                "usage: runtime-adapter-guest [{}]",
+                runtime_adapter::GUEST_SERVE_COMMAND
+            );
             ExitCode::from(2)
         }
     }

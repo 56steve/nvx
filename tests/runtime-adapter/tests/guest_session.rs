@@ -644,7 +644,7 @@ fn start_binary() -> (Broker, Child) {
     let (broker, guest) = UnixStream::pair().unwrap();
     let output = guest.try_clone().unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_runtime-adapter-guest"))
-        .arg("serve")
+        .arg(runtime_adapter::GUEST_SERVE_COMMAND)
         .stdin(Stdio::from(OwnedFd::from(guest)))
         .stdout(Stdio::from(OwnedFd::from(output)))
         .stderr(Stdio::piped())
