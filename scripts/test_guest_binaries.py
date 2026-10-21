@@ -5,10 +5,11 @@ import contextlib
 import io
 import json
 import os
+import re
 import sys
 import tempfile
 import unittest
-from collections.abc import Generator
+from collections.abc import Generator, Sequence
 from pathlib import Path
 from typing import cast
 from unittest.mock import MagicMock, patch
@@ -44,9 +45,30 @@ def _contents(directory: Path) -> dict[str, bytes]:
     return {path.name: path.read_bytes() for path in directory.iterdir()}
 
 
+def _write_dep_info(directory: Path, names: list[str], sources: Sequence[Path]) -> None:
+    """Write the dep-info rule that Cargo writes beside each executable."""
+
+    def escape(path: Path) -> str:
+        return os.fspath(path).replace(" ", "\\ ")
+
+    prerequisites = "".join(f" {escape(path)}" for path in sources)
+    for name in names:
+        (directory / f"{name}.d").write_text(
+            f"{escape(directory / name)}:{prerequisites}\n", encoding="utf-8"
+        )
+
+
 @contextlib.contextmanager
-def _fake_guest_build() -> Generator[MagicMock]:
-    """Stand for Cargo, which writes each binary's name as its contents."""
+def _fake_guest_build(
+    sources: Sequence[Path] = (
+        BuildConstants.REPO_ROOT / "nvx-rs" / "build.rs",
+        BuildConstants.REPO_ROOT / "nvx-rs" / "src" / "lib.rs",
+    ),
+) -> Generator[MagicMock]:
+    """Stand for Cargo, which writes each binary's name as its contents.
+
+    The dep-info beside each binary lists ``sources``.
+    """
 
     def run_cargo(
         command: list[str | os.PathLike[str]],
@@ -61,10 +83,14 @@ def _fake_guest_build() -> Generator[MagicMock]:
             / GuestRustBuildConstants.PROFILE
         )
         destination.mkdir(parents=True, exist_ok=True)
-        for index, value in enumerate(rendered):
-            if value == "--bin":
-                name = rendered[index + 1]
-                (destination / name).write_bytes(name.encode())
+        names = [
+            rendered[index + 1]
+            for index, value in enumerate(rendered)
+            if value == "--bin"
+        ]
+        for name in names:
+            (destination / name).write_bytes(name.encode())
+        _write_dep_info(destination, names, sources)
 
     cargo = MagicMock(side_effect=run_cargo)
     with (
@@ -245,6 +271,14 @@ class GuestBinaryBuildTests(unittest.TestCase):
                 ]
                 for name in names:
                     (destination / name).write_bytes(name.encode())
+                # A file that the build generates in its own target directory
+                # derives from the inputs that the dep-info lists.
+                generated = destination / "build" / "nvx-0" / "out" / "generated.rs"
+                _write_dep_info(
+                    destination,
+                    names,
+                    (crate / "build.rs", source / "lib.rs", generated),
+                )
 
             cargo_home = root / "cargo-home"
             with (
@@ -343,6 +377,143 @@ class GuestBinaryBuildTests(unittest.TestCase):
             )
             self.assertTrue(stale.exists())
             self.assertFalse(any(root.glob(".artifacts.work-*")))
+
+    def test_build_refuses_inputs_that_the_source_identity_omits(self):
+        # The guest image cache keys end with the source identity, so a file that
+        # the build reads outside it could change the executables without
+        # changing the keys.
+        crate = BuildConstants.REPO_ROOT / "nvx-rs"
+        with tempfile.TemporaryDirectory() as outside_directory:
+            outside = Path(outside_directory).resolve() / "outside.rs"
+            outside.write_text("pub fn outside() {}\n", encoding="utf-8")
+            for case, dependency, message in (
+                (
+                    "file in the checkout",
+                    crate / "artifacts.json",
+                    "source identity omits.*: nvx-rs/artifacts.json$",
+                ),
+                (
+                    "directory in the checkout",
+                    crate / "tests" / "fixtures",
+                    "source identity omits.*nvx-rs/tests/fixtures/cli.json",
+                ),
+                (
+                    "file outside the checkout",
+                    outside,
+                    f"source identity omits.*: {re.escape(outside.as_posix())}$",
+                ),
+                (
+                    "missing file",
+                    crate / "src" / "missing.rs",
+                    "source identity omits.*: nvx-rs/src/missing.rs$",
+                ),
+                ("relative path", Path("src") / "lib.rs", "lists a relative path"),
+            ):
+                with (
+                    self.subTest(case),
+                    tempfile.TemporaryDirectory(
+                        prefix=".test-guest-binary-omitted-",
+                        dir=BuildConstants.REPO_ROOT,
+                    ) as temporary,
+                ):
+                    root = Path(temporary)
+                    output = root / "output"
+                    with (
+                        _fake_guest_build((crate / "src" / "lib.rs", dependency)),
+                        self.assertRaisesRegex(guest_binaries.ScriptError, message),
+                    ):
+                        guest_binaries.build_guest_binaries(output)
+                    self.assertFalse(output.exists())
+                    self.assertFalse(any(root.glob(".output.work-*")))
+
+    def test_build_requires_the_dep_info_of_every_executable(self):
+        with tempfile.TemporaryDirectory(
+            prefix=".test-guest-binary-dep-info-",
+            dir=BuildConstants.REPO_ROOT,
+        ) as temporary:
+            output = Path(temporary) / "output"
+            with _fake_guest_build() as cargo:
+                built = cargo.side_effect
+
+                def run_cargo(
+                    command: list[str | os.PathLike[str]],
+                    *,
+                    cwd: Path,
+                    env: dict[str, str],
+                ) -> None:
+                    built(command, cwd=cwd, env=env)
+                    (
+                        Path(env["CARGO_TARGET_DIR"])
+                        / GuestRustBuildConstants.TARGET
+                        / GuestRustBuildConstants.PROFILE
+                        / "nvx-time.d"
+                    ).unlink()
+
+                cargo.side_effect = run_cargo
+                with self.assertRaisesRegex(
+                    guest_binaries.ScriptError,
+                    "Cargo dep-info of Rust guest binary nvx-time not found",
+                ):
+                    guest_binaries.build_guest_binaries(output)
+            self.assertFalse(output.exists())
+
+    def test_build_refuses_an_empty_watched_directory(self):
+        # Cargo reruns the build script when a file appears in a directory that
+        # it watches, so an empty one could later hold an input that leaves the
+        # source identity, and the guest image cache keys, as they are.
+        with tempfile.TemporaryDirectory(
+            prefix=".test-guest-binary-empty-",
+            dir=BuildConstants.REPO_ROOT,
+        ) as temporary:
+            root = Path(temporary)
+            for path in (
+                *GuestRustBuildConstants.SOURCE_FILES,
+                Path("nvx-rs") / "src" / "lib.rs",
+            ):
+                (root / path).parent.mkdir(parents=True, exist_ok=True)
+                (root / path).write_text(f"{path.name}\n", encoding="utf-8")
+            watched = root / "nvx-rs" / "src" / "guest" / "watched"
+            watched.mkdir(parents=True)
+            target = root / "target"
+            outputs = (
+                target
+                / GuestRustBuildConstants.TARGET
+                / GuestRustBuildConstants.PROFILE
+            )
+            outputs.mkdir(parents=True)
+            _write_dep_info(
+                outputs,
+                list(GuestRustBuildConstants.BINARIES),
+                (root / "nvx-rs" / "src" / "lib.rs", watched),
+            )
+            with patch.object(BuildConstants, "REPO_ROOT", root):
+                with self.assertRaisesRegex(
+                    guest_binaries.ScriptError,
+                    "source identity omits.*: nvx-rs/src/guest/watched$",
+                ):
+                    guest_binaries._check_guest_build_inputs(target)
+                # Once the directory holds a file that the identity covers, it
+                # passes.
+                (watched / "module.rs").write_text("pub fn f() {}\n", encoding="utf-8")
+                guest_binaries._check_guest_build_inputs(target)
+
+    def test_dep_info_lists_every_escaped_prerequisite(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            dep_info = Path(temporary) / "nvx-exit.d"
+            dep_info.write_text(
+                "/out/nvx\\ exit: /repo/a\\ b.rs /repo/c.rs \\\n  /repo/d.rs\n"
+                "\n"
+                "# env-dep:CARGO_PKG_NAME=nvx\n"
+                "/repo/c.rs:\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                guest_binaries._dep_info_paths(dep_info),
+                ("/repo/a b.rs", "/repo/c.rs", "/repo/d.rs"),
+            )
+            dep_info.write_text("/out/nvx-exit /repo/a.rs\n", encoding="utf-8")
+            with self.assertRaisesRegex(guest_binaries.ScriptError, "malformed"):
+                guest_binaries._dep_info_paths(dep_info)
 
     def test_output_must_not_overlap_sources_or_their_ancestors(self):
         with tempfile.TemporaryDirectory(

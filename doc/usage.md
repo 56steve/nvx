@@ -234,8 +234,15 @@ The Linux-only build command checks the exact `rust-toolchain.toml` pin and
 builds the nine Rust guest executables for `x86_64-unknown-linux-musl` with one
 `cargo build` of the `guest` profile, a fresh target directory, Cargo's locked
 mode, incremental compilation disabled, inherited Cargo profile overrides
-removed, remapped source paths, and no linker build IDs. It runs the static-ELF
-check and writes `manifest.json` with the source and executable SHA-256 digests.
+removed, remapped source paths, and no linker build IDs. It then fails unless
+the source identity, which
+[`guest-binary-source-identity`](#guest-binary-source-identity) prints and the
+guest image cache keys end with, covers every file that Cargo's dep-info lists
+for the executables: each source file that rustc read, including the targets of
+`include_str!` and `include_bytes!`, and each path that the build script
+watches. Files that the build generates in its own target directory are exempt.
+It runs the static-ELF check and writes `manifest.json` with the source and
+executable SHA-256 digests.
 It updates the output of an earlier build in place, adding `nvx-managed-agent`,
 `nvx-ingress`, `nvx-time`, and `nvx-time-probe` when that build's manifest does
 not record them and removing the retired `nvx-port-io` executable when that

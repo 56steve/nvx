@@ -119,6 +119,83 @@ def _cargo_environment(target_directory: Path) -> dict[str, str]:
     return environment
 
 
+def _dep_info_paths(dep_info: Path) -> tuple[str, ...]:
+    """Return the prerequisites that a Cargo dep-info file lists.
+
+    Cargo writes one Makefile rule per artifact and escapes each space in a path
+    with a backslash.
+    """
+    contents = dep_info.read_text(encoding="utf-8").replace("\\\n", " ")
+    paths: list[str] = []
+    for line in contents.splitlines():
+        tokens = [
+            token.replace("\\ ", " ") for token in re.findall(r"(?:\\ |\S)+", line)
+        ]
+        if not tokens or tokens[0].startswith("#"):
+            continue
+        if not tokens[0].endswith(":"):
+            raise ScriptError(f"Cargo dep-info is malformed: {dep_info}")
+        paths.extend(tokens[1:])
+    return tuple(paths)
+
+
+def _check_guest_build_inputs(target_directory: Path) -> None:
+    """Fail unless the source identity covers every file that the build read.
+
+    Cargo's dep-info for each executable lists every source file of the crate
+    that rustc read, the targets of ``include_str!`` and ``include_bytes!``
+    included, and every path that the build script watches. A file under the
+    build's own target directory, such as one in ``OUT_DIR``, derives from those.
+    Every file of a watched directory must be covered, and an empty one fails,
+    because a file added to it later could change the build without changing
+    the identity.
+    """
+    root = BuildConstants.REPO_ROOT.resolve()
+    target_directory = target_directory.resolve()
+    identity = {path.resolve() for path in guest_binary_source_files()}
+    outputs = (
+        target_directory
+        / GuestRustBuildConstants.TARGET
+        / GuestRustBuildConstants.PROFILE
+    )
+    omitted: set[str] = set()
+    for binary in GuestRustBuildConstants.BINARIES:
+        dep_info = require_file(
+            outputs / f"{binary}.d", f"Cargo dep-info of Rust guest binary {binary}"
+        )
+        for dependency in _dep_info_paths(dep_info):
+            path = Path(dependency)
+            if not path.is_absolute():
+                raise ScriptError(
+                    f"Cargo dep-info of Rust guest binary {binary} lists a relative "
+                    f"path: {dependency}"
+                )
+            path = path.resolve()
+            if path.is_relative_to(target_directory):
+                continue
+            files = (
+                [entry for entry in path.rglob("*") if entry.is_file()]
+                if path.is_dir()
+                else []
+            )
+            # The identity holds files only, so it never covers an empty
+            # directory or a missing path.
+            omitted.update(
+                file.relative_to(root).as_posix()
+                if file.is_relative_to(root)
+                else file.as_posix()
+                for file in files or [path]
+                if file not in identity
+            )
+    if omitted:
+        raise ScriptError(
+            "Rust guest binary build depends on files that its source identity "
+            "omits, so the guest image cache keys would miss changes to them; "
+            "GuestRustBuildConstants in scripts/nvx_tools/build_constants.py must "
+            "cover: " + ", ".join(sorted(omitted))
+        )
+
+
 def _guest_cargo_arguments() -> list[str]:
     """Return the Cargo arguments that select the canonical guest build."""
     return [
@@ -366,6 +443,7 @@ def build_guest_binaries(output: Path) -> GuestBinaryBuildResult:
             cwd=GuestRustBuildConstants.DIRECTORY,
             env=environment,
         )
+        _check_guest_build_inputs(target)
 
         built_directory = (
             target / GuestRustBuildConstants.TARGET / GuestRustBuildConstants.PROFILE
