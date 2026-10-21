@@ -1071,17 +1071,41 @@ def _guest_release_inputs(
     ):
         artifact = artifact_path(artifact_name)
         document = _read_json_object(manifest, f"{artifact_name} manifest")
-        if (
-            document.get("format") != UbuntuBuildConstants.PACKAGE_MANIFEST_VERSION
-            or document.get("guest") != UbuntuBuildConstants.GUEST_NAME
-            or document.get("artifact") != artifact.name
-            or document.get("artifact_sha256") != sha256_file(artifact)
-            or document.get("input_sha256") != expected_input_sha256
-        ):
+        mismatches = _manifest_mismatches(
+            document,
+            {
+                "format": UbuntuBuildConstants.PACKAGE_MANIFEST_VERSION,
+                "guest": UbuntuBuildConstants.GUEST_NAME,
+                "artifact": artifact.name,
+                "artifact_sha256": sha256_file(artifact),
+                "input_sha256": expected_input_sha256,
+            },
+        )
+        if mismatches:
             raise ScriptError(
-                f"Ubuntu artifact manifest does not match {artifact_name}"
+                f"Ubuntu artifact manifest does not match {artifact_name}: "
+                f"{manifest.name} differs in {', '.join(mismatches)}"
             )
     return guest_names, alpine_manifests, ubuntu_manifests, azurelinux_manifests
+
+
+def _manifest_mismatches(
+    document: dict[str, object],
+    expected: dict[str, object],
+) -> list[str]:
+    """Describe each field of ``document`` that differs from ``expected``."""
+    mismatches: list[str] = []
+    for field, value in expected.items():
+        if field not in document:
+            recorded = "missing"
+        elif document[field] == value:
+            continue
+        else:
+            recorded = json.dumps(document[field])
+        mismatches.append(
+            f"{field} (manifest {recorded}, expected {json.dumps(value)})"
+        )
+    return mismatches
 
 
 def _read_json_object(path: Path, description: str) -> dict[str, object]:
