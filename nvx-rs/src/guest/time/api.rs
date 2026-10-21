@@ -43,8 +43,8 @@ const REPORT_ONLY_TOKEN: &[u8] = b"nvx_time_abi=report-only";
 /// write access to `/run/nvx`. It takes the permission for the ports only for each of its port
 /// transactions, on the calling thread, and returns only once the thread holds none of it, or
 /// fails with [`TimeError::PortRelease`], after which the thread must start neither a thread
-/// nor a process, which would inherit the permission. No call waits for a child that it did not
-/// start.
+/// nor a process, which would inherit the permission; [`Command`](crate::guest::spawn::Command)
+/// refuses to start one from it. No call waits for a child that it did not start.
 ///
 /// A violation of the time ABI is reported by a violation event on the console, in the kernel
 /// log, and on OpenVMM's debug console. In enforcing mode, the event stops the VM, so the call
@@ -950,7 +950,8 @@ pub enum TimeError {
     /// `CAP_SYS_RAWIO`.
     PortAccess(io::Error),
     /// The kernel did not revoke the calling thread's permission for OpenVMM's ports. The
-    /// thread may still hold some of it, and must start neither a thread nor a process.
+    /// thread may still hold some of it, and must start neither a thread nor a process, which
+    /// [`Command`](crate::guest::spawn::Command) refuses to start from it.
     PortRelease(io::Error),
     /// The lock that serializes the transactions of port B's window failed.
     PortLock(io::Error),
