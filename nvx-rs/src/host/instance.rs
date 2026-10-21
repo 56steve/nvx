@@ -965,6 +965,7 @@ mod tests {
     use std::thread;
 
     use super::*;
+    use crate::host::test_support::released;
 
     /// A process ID that fits every platform's type and that no process has.
     const GONE_PID: u32 = 0x7fff_fff0;
@@ -1137,7 +1138,11 @@ mod tests {
         let contender = OpenOptions::new().write(true).open(&path).unwrap();
         assert!(contender.try_lock().is_err());
         drop(guard);
-        contender.try_lock().unwrap();
+        assert!(released(|| match contender.try_lock() {
+            Ok(()) => true,
+            Err(std::fs::TryLockError::WouldBlock) => false,
+            Err(error) => panic!("{error}"),
+        }));
         drop(contender);
         // A waiter takes the lock once the holder releases it.
         let guard = lock(&path).unwrap();

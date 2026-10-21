@@ -340,7 +340,7 @@ fn a_managed_guest_runs_request_scoped_workloads_until_it_stops() {
     let log = File::create(output_dir.join("managed-lifecycle.log")).unwrap();
     let capability = generate_capability().unwrap();
     // OpenVMM reads its capability as soon as it starts, so its input already holds the
-    // capability and its end, as `nvx::host::process::spawn` prepares it.
+    // capability and its end, as `nvx::host::supervisor::spawn` prepares it.
     let (input, mut writer) = io::pipe().unwrap();
     writer.write_all(&capability).unwrap();
     drop(writer);

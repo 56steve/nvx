@@ -49,12 +49,15 @@
 //! 3. Once the VM is ready, [`Launch::commit`] replaces the journal with the runtime record. A
 //!    launch that fails ends with [`Launch::abandon`].
 //!
+//! [`supervisor::launch`](super::supervisor::launch) runs these steps. A caller that runs them
+//! itself does so as follows:
+//!
 //! ```no_run
 //! use std::time::{Duration, Instant};
 //!
 //! use nvx::host::launch::LaunchSpec;
-//! use nvx::host::process;
 //! use nvx::host::store::{RuntimeIdentity, SandboxStore};
+//! use nvx::host::supervisor::{self, VmmCommand};
 //! use nvx::protocol::CAPABILITY_LEN;
 //!
 //! fn launch(
@@ -67,12 +70,13 @@
 //!     locked.recover()?;
 //!     let mut launch = locked.begin_launch(runtime, capability)?;
 //!     let arguments = spec.openvmm_arguments(launch.endpoint(), &store.outcome_path())?;
+//!     let command = VmmCommand::new(&spec.openvmm, arguments, store.dir());
 //!     let log = launch.take_log()?;
-//!     let child = process::spawn(&spec.openvmm, false, &arguments, capability, log, store.dir())?;
+//!     let child = supervisor::spawn(&command, capability, log)?;
 //!     launch.record_process(&child)?;
 //!     // Wait until the VM is ready, then commit, or else abandon the launch.
 //!     launch.commit()?;
-//!     process::detach_child(child);
+//!     child.detach();
 //!     Ok(())
 //! }
 //! ```
@@ -107,6 +111,11 @@
 //! endpoint. The claim relies on the VMM keeping its standard output and error until it exits, as
 //! OpenVMM does, and on the directory being on a local file system.
 //!
+//! On Linux, a process that another thread spawns while the log is open, such as another
+//! sandbox's VMM, also holds the claim, from its fork until it executes its program, which closes
+//! its copy. Recovery therefore checks a held claim again for up to a second before it concludes
+//! that a process of the launch may still run.
+//!
 //! # Recovery
 //!
 //! A caller that dies during a launch leaves its journal, and [`LockedStore::recover`] ends the
@@ -131,8 +140,9 @@
 //!   exited once the claim is released; until then, a process of the launch may still run, and
 //!   recovery is indeterminate.
 //!
-//! The runtime record of a committed launch names its running VM, and reattaching to that VM
-//! belongs to its supervisor.
+//! The runtime record of a committed launch names its running VM, and
+//! [`supervisor::reattach`](super::supervisor::reattach) holds that VM again after its
+//! orchestrator restarts.
 
 mod files;
 mod identity;
@@ -196,8 +206,24 @@ pub const FILE_NAMES: [&str; 8] = [
     OUTCOME_NAME,
 ];
 
-/// Interval at which a lock with a deadline is tried again.
+/// Interval at which a lock that another holder has is tried again: the sandbox's lock, by a
+/// caller that waits for it until a deadline, and a launch's claim on its log, by a recovery that
+/// waits for the claim's release. A release is noticed at most this late.
 const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(25);
+
+/// How long recovery waits for a held claim on a launch's log to be released before it concludes
+/// that a process of the launch may still run.
+///
+/// On Linux, a process holds a copy of each descriptor of its parent from its fork until it
+/// executes its program. A spawn by another thread of the process that holds the log, such as
+/// the launch of another sandbox's VMM, therefore holds the claim for that moment, which lasted
+/// about 5 ms on a busy host; a second leaves a wide margin for a more heavily loaded one.
+///
+/// Recovery, and the abandon of a failed launch, wait only while they find the claim held: a
+/// launch that succeeds and a stop never check it. A claim that stays held is still reported held
+/// when the wait ends, so the wait can delay them by up to a second, but never makes them end a
+/// launch that may still run.
+const CLAIM_RELEASE_WAIT: Duration = Duration::from_secs(1);
 
 /// Returns `dir` as an absolute path, which a relative one names from the current directory.
 fn absolute(dir: PathBuf) -> Result<PathBuf> {
@@ -517,15 +543,32 @@ impl LockedStore {
 
     /// Returns whether a process still holds the claim of the launch of `journal` on its log, or
     /// why that cannot be determined.
+    ///
+    /// A held claim is checked again at every [`LOCK_RETRY_INTERVAL`] until [`CLAIM_RELEASE_WAIT`]
+    /// passes, so that a process that another thread spawned while the log was open, which holds
+    /// the claim only until it executes its program, is not taken for a process of the launch.
     fn claim_held(&self, journal: &LaunchJournal) -> std::result::Result<bool, String> {
         let path = self.log_path();
         let identity = journal.log().identity;
-        platform::log_claim_held(&path, (identity.device, identity.index)).map_err(|error| {
-            format!(
-                "its claim on the log {} cannot be checked: {error}",
-                path.display()
-            )
-        })
+        let deadline = Instant::now() + CLAIM_RELEASE_WAIT;
+        loop {
+            match platform::log_claim_held(&path, (identity.device, identity.index)) {
+                Ok(true) => {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return Ok(true);
+                    }
+                    thread::sleep(left.min(LOCK_RETRY_INTERVAL));
+                }
+                Ok(false) => return Ok(false),
+                Err(error) => {
+                    return Err(format!(
+                        "its claim on the log {} cannot be checked: {error}",
+                        path.display()
+                    ));
+                }
+            }
+        }
     }
 
     /// Ends a launch through the recorded `reference` to its VMM, which `open`, [`Process::open`]
@@ -662,7 +705,7 @@ impl Launch<'_> {
     }
 
     /// Takes the claimed log, which the caller passes to the VMM as its standard output and
-    /// error, as [`spawn`](super::process::spawn) does with its `log`, once.
+    /// error, as [`spawn`](super::supervisor::spawn) does with its `log`, once.
     ///
     /// The launch keeps no copy of the log, so the claim lasts as long as the processes that hold
     /// it.
@@ -717,10 +760,9 @@ impl Launch<'_> {
     /// nothing of it runs.
     ///
     /// A caller that still holds the VMM's [`Launched`] process releases it as usual. If the
-    /// launch never recorded that process, the caller ends it with
-    /// [`kill_child`](super::process::kill_child) first: an unrecorded VMM that serves no
-    /// endpoint yet holds the log's claim, so the launch would end as
-    /// [`Recovery::Indeterminate`].
+    /// launch never recorded that process, the caller ends it with [`Launched::kill_and_wait`]
+    /// first: an unrecorded VMM that serves no endpoint yet holds the log's claim, so the launch
+    /// would end as [`Recovery::Indeterminate`].
     pub fn abandon(mut self) -> Result<Recovery> {
         // A log that no VMM received holds no claim once it closes.
         drop(self.log.take());

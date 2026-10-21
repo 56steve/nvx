@@ -1,6 +1,6 @@
 use std::fs::{self, DirBuilder, File, OpenOptions, Permissions, TryLockError};
 use std::io::{self, Read};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsFd, AsRawFd, RawFd};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -9,6 +9,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use super::Transport;
+use crate::host::supervisor::Inherited;
 use crate::host::sys::{self, Errno, PidFd};
 use crate::hypervisor::Hypervisor;
 
@@ -240,10 +241,47 @@ pub(crate) fn boot_id() -> io::Result<[u8; 16]> {
     })
 }
 
-/// Starts the command in a new session so it outlives the caller and its terminal, and with no
-/// descriptor of the caller beyond the standard streams that the command sets up.
-pub(crate) fn detach(command: &mut Command, _breakaway_from_job: bool) {
-    sys::detach(command);
+/// Starts the command in a new session so it outlives the caller and its terminal, with the
+/// descriptors `inherit` under their numbers in the caller, and no other descriptor of the caller
+/// beyond the standard streams that the command sets up.
+///
+/// Only the new process clears the close-on-exec flag of the descriptors in `inherit`, so no
+/// process that another thread spawns meanwhile inherits them. Fails with
+/// [`io::ErrorKind::InvalidInput`] for a descriptor of a standard stream, 0 to 2, which the
+/// command's own standard streams replace in the new process, and for a descriptor that is not
+/// close-on-exec in the caller, which any process that the caller spawns would inherit.
+pub(crate) fn detach(command: &mut Command, inherit: &[Inherited<'_>]) -> io::Result<()> {
+    use nix::fcntl::{FcntlArg, FdFlag, fcntl};
+
+    let mut descriptors: Vec<RawFd> = Vec::with_capacity(inherit.len());
+    for inherited in inherit {
+        let descriptor = inherited.as_fd().as_raw_fd();
+        if descriptor <= sys::LAST_STANDARD_STREAM {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "descriptor {descriptor} cannot be inherited: the VMM's own standard streams \
+                     replace descriptors 0 to {}",
+                    sys::LAST_STANDARD_STREAM
+                ),
+            ));
+        }
+        let flags = FdFlag::from_bits_retain(fcntl(inherited.as_fd(), FcntlArg::F_GETFD)?);
+        if !flags.contains(FdFlag::FD_CLOEXEC) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "descriptor {descriptor} cannot be inherited by the VMM alone: it is not \
+                     close-on-exec, so any process that this process spawns inherits it"
+                ),
+            ));
+        }
+        if !descriptors.contains(&descriptor) {
+            descriptors.push(descriptor);
+        }
+    }
+    sys::detach(command, descriptors);
+    Ok(())
 }
 
 /// Checks that the hypervisor device is present and accessible.

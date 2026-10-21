@@ -9,6 +9,7 @@ use super::*;
 use crate::ErrorKind;
 use crate::contract;
 use crate::host::process::{BootId, ProcessRef};
+use crate::host::test_support::released;
 
 /// A launch capability.
 const CAPABILITY: [u8; CAPABILITY_LEN] = [7; CAPABILITY_LEN];
@@ -291,7 +292,11 @@ fn the_lock_excludes_other_holders() {
     // A deadline that has passed still tries once.
     assert!(store.lock(Some(Instant::now())).is_err());
     drop(held);
-    drop(store.lock(Some(Instant::now())).unwrap());
+    assert!(released(|| match store.lock(Some(Instant::now())) {
+        Ok(_) => true,
+        Err(error) if error.kind() == ErrorKind::TimedOut => false,
+        Err(error) => panic!("{error}"),
+    }));
 
     // A waiter without a deadline takes the lock once its holder releases it.
     let held = store.lock(None).unwrap();
@@ -558,7 +563,8 @@ fn a_launch_writes_its_marker_before_its_vmm_runs() {
     drop(log);
     assert!(platform::log_claim_held(&store.log_path(), identity).unwrap());
     drop(copy);
-    assert!(!platform::log_claim_held(&store.log_path(), identity).unwrap());
+    let free = || !platform::log_claim_held(&store.log_path(), identity).unwrap();
+    assert!(released(free));
     // A log that is not the claimed file proves nothing.
     assert!(platform::log_claim_held(&store.log_path(), previous_log).is_err());
 

@@ -5,6 +5,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use super::Transport;
+use crate::host::supervisor::Inherited;
 use crate::hypervisor::Hypervisor;
 
 #[cfg(all(feature = "cli", unix))]
@@ -105,7 +106,15 @@ pub(crate) fn private_file_problem(_file: &File) -> io::Result<Option<String>> {
     Err(unsupported())
 }
 
-pub(crate) fn detach(_command: &mut Command, _breakaway_from_job: bool) {}
+/// Leaves the command as it is, unless it should inherit descriptors: this host cannot restrict
+/// what the command inherits, and fails with [`io::ErrorKind::Unsupported`] instead.
+pub(crate) fn detach(_command: &mut Command, inherit: &[Inherited<'_>]) -> io::Result<()> {
+    if inherit.is_empty() {
+        Ok(())
+    } else {
+        Err(unsupported())
+    }
+}
 
 pub(crate) fn probe_hypervisor(_hypervisor: Hypervisor) -> Result<(), String> {
     Err(unsupported().to_string())
