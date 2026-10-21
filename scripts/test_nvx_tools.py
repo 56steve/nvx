@@ -259,10 +259,13 @@ def _write_release_fixture(
     binary = openvmm_dir / "target" / "release" / binary_name
     revision = "0bc357bbcf3a654b63dfb51f1103c5751bf3d31f"
     guest_names = ReleaseBuildConstants.GUEST_ARTIFACT_NAMES
+    # The guest artifacts' inputs, and the sources of the nvx-rs executable that
+    # the release ships, whose host side no guest artifact reads.
     source_files = (
         set(build._initramfs_source_files())
         | set(ubuntu.customization_files())
         | set(azurelinux.input_files())
+        | set(nvx_rs.source_files())
     )
     for source in source_files:
         destination = root / source.relative_to(BuildConstants.REPO_ROOT)
@@ -4235,6 +4238,11 @@ class CiConfigurationTests(unittest.TestCase):
             (("aci_edge_sandboxes/src/lib.rs",), (True, True, False, False)),
             (("nvx-rs/src/lib.rs",), (True, True, False, True)),
             (("nvx-rs/Cargo.lock",), (True, True, False, True)),
+            (("nvx-rs/src/guest/exit.rs",), (True, True, False, True)),
+            (("nvx-rs/src/bin/nvx-time.rs",), (True, True, False, True)),
+            (("nvx-rs/src/host/cli/args.rs",), (True, True, False, False)),
+            (("nvx-rs/src/bin/nvx-rs.rs",), (True, True, False, False)),
+            (("nvx-rs/tests/cli.rs",), (True, True, False, False)),
             (("tests/runtime-adapter/src/lib.rs",), (True, True, False, False)),
             (("scripts/nvx_tools/microvm_tests.py",), (True, True, False, False)),
             (
@@ -4420,7 +4428,19 @@ class CiConfigurationTests(unittest.TestCase):
             set(guest_inputs),
             {"KERNEL", "DEBUG_KERNEL", "ALPINE", "UBUNTU", "AZURELINUX"},
         )
+        # The Alpine key also ends with the source identity of the Rust guest
+        # binaries, whose every file is an input of the image too.
+        self.assertIn(
+            'echo "alpine=alpine-image-v2-${ALPINE_VERSION}-${ALPINE_INPUT_HASH}'
+            '-${rust_source_identity}"',
+            guest_action,
+        )
+        guest_binary_inputs = {
+            path.relative_to(BuildConstants.REPO_ROOT).as_posix()
+            for path in guest_binaries.guest_binary_source_files()
+        }
         vmm_inputs |= guest_inputs["KERNEL"] | guest_inputs["ALPINE"]
+        vmm_inputs |= guest_binary_inputs
         test_inputs = vmm_inputs.union(*guest_inputs.values()) | {
             ".github/workflows/run-nvx-microvm-tests.yml",
             ".github/workflows/build-openvmm-binary.yml",
@@ -4447,6 +4467,149 @@ class CiConfigurationTests(unittest.TestCase):
             for path in sorted(inputs):
                 with self.subTest(pattern=pattern.pattern, path=path):
                     self.assertIsNotNone(pattern.match(path))
+
+    def test_only_guest_binary_inputs_rebuild_guests_and_run_vmm_tests(self):
+        # The guest images carry only the Rust guest binaries of nvx-rs, so a
+        # change to a file that their build reads rebuilds every guest image and
+        # runs the OpenVMM VMM tests, which boot the Alpine image, and no other
+        # nvx-rs change does either. The NVX microVM tests run the nvx-rs CLI, so
+        # every nvx-rs change runs them.
+        root = BuildConstants.REPO_ROOT
+        identity = {
+            path.relative_to(root).as_posix()
+            for path in guest_binaries.guest_binary_source_files()
+        }
+        crate: set[str] = set()
+        for directory, names, files in os.walk(root / "nvx-rs"):
+            if Path(directory) == root / "nvx-rs":
+                names[:] = [name for name in names if name != "target"]
+            crate.update(
+                (Path(directory) / name).relative_to(root).as_posix() for name in files
+            )
+        self.assertLessEqual({"nvx-rs/src/host/mod.rs", "nvx-rs/src/lib.rs"}, crate)
+        for path in sorted(crate | identity):
+            with self.subTest(path=path):
+                self.assertIsNotNone(ci.CI_TEST_INPUT_PATHS.match(path))
+                if path in identity:
+                    self.assertIsNotNone(ci.OPENVMM_VMM_TEST_INPUT_PATHS.match(path))
+                else:
+                    self.assertIsNone(ci.OPENVMM_VMM_TEST_INPUT_PATHS.match(path))
+        # A new module counts unless it belongs to the host side or the tests,
+        # and a file beside an input doesn't.
+        for path, selected in (
+            ("nvx-rs/src/added.rs", True),
+            ("nvx-rs/src/guest/added/mod.rs", True),
+            ("nvx-rs/.cargo/config.toml", True),
+            ("nvx-rs/src/host/added.rs", False),
+            ("nvx-rs/src/protocol/added/tests.rs", False),
+            ("nvx-rs/Cargo.toml.orig", False),
+            ("nvx-rs/src/bin/nvx-time.rs.orig", False),
+        ):
+            with self.subTest(path=path):
+                self.assertIsNotNone(ci.CI_TEST_INPUT_PATHS.match(path))
+                self.assertEqual(
+                    ci.OPENVMM_VMM_TEST_INPUT_PATHS.match(path) is not None, selected
+                )
+
+        # The guest image keys hash no nvx-rs file and end with the identity.
+        action = (
+            root / ".github" / "actions" / "build-guest-artifacts" / "action.yml"
+        ).read_text(encoding="utf-8")
+        image_patterns = [
+            re.compile(
+                "".join(
+                    ".*"
+                    if part == "**"
+                    else "[^/]*"
+                    if part == "*"
+                    else re.escape(part)
+                    for part in re.split(r"(\*\*|\*)", pattern)
+                )
+            )
+            for match in re.finditer(
+                r"^\s+(ALPINE|UBUNTU|AZURELINUX)_INPUT_HASH: "
+                r"\$\{\{ hashFiles\((.+)\) \}\}$",
+                action,
+                re.MULTILINE,
+            )
+            for pattern in re.findall(r"'([^']+)'", match.group(2))
+        ]
+        self.assertTrue(image_patterns)
+        for path in sorted(crate):
+            with self.subTest(hashed=path):
+                self.assertFalse(
+                    any(pattern.fullmatch(path) for pattern in image_patterns)
+                )
+        for key in ("alpine", "ubuntu", "ubuntu-distro", "azurelinux"):
+            with self.subTest(key=key):
+                line = next(
+                    line.strip()
+                    for line in action.splitlines()
+                    if line.strip().startswith(f'echo "{key}=')
+                )
+                self.assertTrue(line.endswith('-${rust_source_identity}"'))
+
+        host_side = (
+            "nvx-rs/src/host/cli/args.rs",
+            "nvx-rs/src/host/mod.rs",
+            "nvx-rs/src/testing/fake_openvmm.rs",
+            "nvx-rs/src/bin/nvx-rs.rs",
+            "nvx-rs/src/bin/nvx-fake-openvmm.rs",
+            "nvx-rs/src/protocol/nvxs/tests/host.rs",
+            "nvx-rs/src/guest/managed_agent/loopback.rs",
+            "nvx-rs/tests/guest_tools.rs",
+            "nvx-rs/artifacts.json",
+        )
+        guest_side = (
+            "nvx-rs/Cargo.toml",
+            "nvx-rs/Cargo.lock",
+            "nvx-rs/build.rs",
+            "nvx-rs/src/lib.rs",
+            "nvx-rs/src/protocol/nvxs/host.rs",
+            "nvx-rs/src/guest/time/checks.rs",
+            "nvx-rs/src/bin/nvx-managed-agent.rs",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            # A checkout that holds only the identity's files and the changed
+            # ones has the identity of this one.
+            checkout = Path(temporary)
+            for path in (*identity, *host_side):
+                destination = checkout / path
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(root / path, destination)
+            original = guest_binaries.guest_binary_source_sha256(checkout)
+            self.assertEqual(original, guest_binaries.guest_binary_source_sha256())
+            for paths, guest in (
+                *(((path,), False) for path in host_side),
+                (host_side, False),
+                *(((path,), True) for path in guest_side),
+                (("nvx-rs/src/host/mod.rs", "nvx-rs/src/guest/mod.rs"), True),
+            ):
+                for event_name in ("pull_request", "push"):
+                    with self.subTest(changed=paths, event_name=event_name):
+                        changes = ci.classify_ci_changes(event_name, paths)
+                        self.assertEqual(
+                            changes, ci.CiChanges(True, True, False, guest)
+                        )
+                        expected = ci.required_ci_expected_results(
+                            event_name, same_repository=True, changes=changes
+                        )
+                        for job in ci.REQUIRED_CI_MICROVM_TEST_JOBS:
+                            self.assertEqual(expected[job], "success", job)
+                        self.assertEqual(
+                            expected["openvmm-vmm-tests"],
+                            "success" if guest else "skipped",
+                        )
+                with self.subTest(changed=paths):
+                    contents = {path: (checkout / path).read_bytes() for path in paths}
+                    for path, data in contents.items():
+                        (checkout / path).write_bytes(data + b"\n// changed\n")
+                    self.assertEqual(
+                        guest_binaries.guest_binary_source_sha256(checkout) != original,
+                        guest,
+                    )
+                    for path, data in contents.items():
+                        (checkout / path).write_bytes(data)
 
     def test_guest_cache_keys_hash_the_docker_build_context_filter(self):
         # Docker excludes files by .dockerignore before COPY, so a change to that
@@ -10395,11 +10558,16 @@ class BuildTests(unittest.TestCase):
         )
         patterns = cache_input.split("'")[1::2]
         self.assertIn("scripts/nvx_tools/azurelinux.py", patterns)
+        # The key ends with the source identity of the Rust guest binaries,
+        # which covers the files that their build reads.
+        self.assertIn('-${AZURELINUX_INPUT_HASH}-${rust_source_identity}"', action)
+        identity = set(guest_binaries.guest_binary_source_files())
         for path in azurelinux.input_files():
             relative = path.relative_to(BuildConstants.REPO_ROOT).as_posix()
             with self.subTest(path=relative):
                 self.assertTrue(
-                    any(
+                    path in identity
+                    or any(
                         relative == pattern
                         or (
                             pattern.endswith("/**")
@@ -10511,9 +10679,10 @@ class BuildTests(unittest.TestCase):
             self.assertIn("'scripts/nvx_tools/guests.py'", assignment)
             self.assertIn("'scripts/nvx_tools/elf.py'", assignment)
             self.assertIn("'scripts/nvx_tools/guest_binaries.py'", assignment)
-            self.assertIn("'nvx-rs/**'", assignment)
-            self.assertIn("'!nvx-rs/target/**'", assignment)
-            self.assertIn("'rust-toolchain.toml'", assignment)
+            # The Rust guest source identity at the end of each key covers the
+            # files of nvx-rs that the guest build reads, and the toolchain pin.
+            self.assertNotIn("nvx-rs", assignment)
+            self.assertNotIn("rust-toolchain.toml", assignment)
         for prefix in (
             "alpine-image",
             "ubuntu-initramfs",

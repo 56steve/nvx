@@ -13,6 +13,7 @@ from pathlib import Path
 
 from .build_constants import (
     AlpineBuildConstants,
+    GuestRustBuildConstants,
     KernelBuildConstants,
     OpenVMMBuildConstants,
     ZstdBuildConstants,
@@ -132,8 +133,11 @@ OPENVMM_UNIT_TEST_INPUT_PATHS = re.compile(
 )
 # The OpenVMM VMM tests also boot the NVX kernel and Alpine initramfs, so they
 # add the inputs of those artifacts' cache keys and of the job that builds them.
+# Of nvx-rs, the Alpine key covers only the files that the guest binaries' build
+# reads, through their source identity, so a change to its host side or tests
+# leaves the VMM tests out.
 OPENVMM_VMM_TEST_INPUT_PATHS = re.compile(
-    r"^(openvmm($|/)|nvx-rs/|rust-toolchain\.toml$|scripts/setup/|"
+    r"^(openvmm($|/)|rust-toolchain\.toml$|scripts/setup/|"
     r"\.github/workflows/ci\.yml$|"
     r"\.github/actions/(build-guest-artifacts|checkout-openvmm|sccache|"
     r"setup-curl|validate-runner)/|"
@@ -141,7 +145,8 @@ OPENVMM_VMM_TEST_INPUT_PATHS = re.compile(
     r"scripts/nvx_tools/"
     r"(__init__|build|build_config|build_constants|ci|common|elf|"
     r"guest_binaries|guests)\.py$|"
-    r"SOURCE-MANIFEST\.json$|docker/Dockerfile$|\.dockerignore$|kernel/|guest/(alpine|common)/)"
+    r"SOURCE-MANIFEST\.json$|docker/Dockerfile$|\.dockerignore$|kernel/|guest/(alpine|common)/|"
+    rf"(?:{GuestRustBuildConstants.SOURCE_PATTERN.pattern})$)"
 )
 
 

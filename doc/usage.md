@@ -147,12 +147,21 @@ python3 scripts/nvx.py guest-binary-source-identity [--root PATH]
 ```
 
 Prints the source digest that guest package manifests record for the Rust guest
-binaries: a digest of the relative path and content of every file under
-`nvx-rs/src/`, the crate's manifest, lockfile, and build script,
-`rust-toolchain.toml`, and the `build_constants.py` and `guest_binaries.py`
-build modules. The guest build appends it to the Alpine, Ubuntu, and Azure
-Linux cache keys, because `hashFiles` hashes contents only: moving a module
-into its own `mod.rs` changes the key even when no bytes change.
+binaries: a digest of the relative path and content of every file that their
+build reads. Those are the crate's manifest, lockfile, and build script, its
+Cargo configuration under `nvx-rs/.cargo/`, every file under `nvx-rs/src/`
+except the host side and the test modules, `rust-toolchain.toml`, and the
+`build_constants.py` and `guest_binaries.py` build modules. The host side is
+the `host` and `testing` modules and the `nvx-rs` and `nvx-fake-openvmm`
+binaries; the test modules are the `tests.rs` files, the `tests` directories,
+and the managed agent's `loopback` harness. `GuestRustBuildConstants` in
+`scripts/nvx_tools/build_constants.py` defines the set, and
+[`build-guest-binaries`](#build-guest-binaries) fails when Cargo's dep-info
+lists a file outside it. The Alpine, Ubuntu, and Azure Linux cache keys end
+with the digest and hash no other file of `nvx-rs`, so a change to the
+crate's host side or tests rebuilds no guest image. Because the digest covers
+paths, and `hashFiles` hashes contents only, moving a module into its own
+`mod.rs` changes the keys even when no bytes change.
 
 ### `classify-ci-changes`
 
@@ -234,8 +243,15 @@ The Linux-only build command checks the exact `rust-toolchain.toml` pin and
 builds the nine Rust guest executables for `x86_64-unknown-linux-musl` with one
 `cargo build` of the `guest` profile, a fresh target directory, Cargo's locked
 mode, incremental compilation disabled, inherited Cargo profile overrides
-removed, remapped source paths, and no linker build IDs. It runs the static-ELF
-check and writes `manifest.json` with the source and executable SHA-256 digests.
+removed, remapped source paths, and no linker build IDs. It then fails unless
+the source identity, which
+[`guest-binary-source-identity`](#guest-binary-source-identity) prints and the
+guest image cache keys end with, covers every file that Cargo's dep-info lists
+for the executables: each source file that rustc read, including the targets of
+`include_str!` and `include_bytes!`, and each path that the build script
+watches. Files that the build generates in its own target directory are exempt.
+It runs the static-ELF check and writes `manifest.json` with the source and
+executable SHA-256 digests.
 It updates the output of an earlier build in place, adding `nvx-managed-agent`,
 `nvx-ingress`, `nvx-time`, and `nvx-time-probe` when that build's manifest does
 not record them and removing the retired `nvx-port-io` executable when that
