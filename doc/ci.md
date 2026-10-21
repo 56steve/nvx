@@ -18,9 +18,11 @@ history comes from (see
 guest artifacts and uses the Linux-direct kernel and Alpine initramfs to
 exercise OpenVMM's Linux MP-table lifecycle, TTRPC, and snapshot contracts on
 each backend. `openvmm-unit-tests` runs the OpenVMM unit and documentation
-tests once per operating system, on an MSHV runner and a WHP runner. The tests
-that need `/dev/kvm` or `/dev/mshv` are ignored, so the KVM and MSHV runners
-used to run the same 4,820 tests; CI selects MSHV for that Linux leg.
+tests once per operating system, on a GitHub-hosted Ubuntu runner and a WHP
+runner. The tests that need `/dev/kvm` or `/dev/mshv` are ignored, so the KVM
+and MSHV runners used to run the same 4,820 tests, and the Linux leg needs no
+hypervisor runner; see
+[Job graph and runner capacity](#job-graph-and-runner-capacity).
 Failed `openvmm-vmm-tests` jobs upload Petri's `test_results` directory,
 including guest and VMM logs, screenshots, and watchdog inspection data.
 These seven-day artifacts are named
@@ -436,7 +438,7 @@ request and selects every suite for a full run (see
 `artifacts` and `debug-kernel` restore or build the guest artifacts on
 GitHub-hosted runners, the three `build-openvmm-*` producers restore or build
 OpenVMM on a KVM, an MSHV, and a WHP runner, and `openvmm-unit-tests` starts on
-an MSHV and a WHP runner. `openvmm-vmm-tests` waits for `artifacts`. Each
+a GitHub-hosted and a WHP runner. `openvmm-vmm-tests` waits for `artifacts`. Each
 microVM test and platform job waits for `artifacts`, its OpenVMM producer, and
 the NVX CLI job of its operating system, and the debug-kernel jobs also wait
 for `debug-kernel`. `Performance regression gate`, `Publish development
@@ -486,6 +488,25 @@ MSHV non-benchmark waits stayed near zero. The WHP pool has since grown to
 eight general runners, more than the five that served these jobs before the
 split. A change that adds a job or a shard needs general runners to run it in
 parallel; otherwise it only queues.
+
+The OpenVMM unit tests need no hypervisor. In October 2026 (#697), on
+GitHub-hosted runners, which have four vCPUs and keep no sccache, the Linux
+suite took 12 to 18 minutes from scratch on four runners, against 6.5 on an
+MSHV runner, and the Windows suite took 32 minutes from scratch and 21 with a
+warm sccache, against 15 on a WHP runner. Every hosted run passed the same
+5,294 Linux or 4,933 Windows tests as the self-hosted runners. The Linux leg
+therefore runs on `ubuntu-latest`: even at its slowest, it would have finished
+before the rest of the run in each of the 208 successful runs that ran the
+suite from October 8 to 21, and it leaves about 900 MSHV runner-minutes a week,
+about 15% of that pool's busy time, to the jobs that need a hypervisor. It
+installs the pinned Rust release and cargo-nextest, keeps Cargo's home in the
+job's temporary directory, as the self-hosted runners do, and skips
+`validate-runner` and sccache, which only they have. The Windows leg stays on
+WHP: a GitHub-hosted runner would have delayed 69% of the runs that ran it, and
+still 13% with a warm sccache, which would take over 2 GiB of the repository's
+10 GB Actions cache, already full. Larger GitHub-hosted runners, which public
+repositories pay for, or a self-hosted Windows runner without a hypervisor
+would cost about as much as another general WHP runner.
 
 ## Change classification
 
