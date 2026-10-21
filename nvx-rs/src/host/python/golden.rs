@@ -74,7 +74,7 @@ pub(crate) struct Mismatches {
 
 impl Mismatches {
     /// Starts checking a section.
-    pub(crate) fn new(section: &str) -> Self {
+    fn new(section: &str) -> Self {
         Self {
             section: section.to_owned(),
             checked: 0,
@@ -93,7 +93,7 @@ impl Mismatches {
     }
 
     /// Fails with the mismatches, if any.
-    pub(crate) fn finish(self) {
+    fn finish(self) {
         assert!(self.checked > 0, "{} checked no cases", self.section);
         assert!(
             self.found.is_empty(),
@@ -109,6 +109,38 @@ impl Mismatches {
                 .join("\n")
         );
     }
+}
+
+/// Checks every case of a fixture's `section` with `check_case`, which compares the port's values
+/// with Python's through [`Mismatches::check`], then fails with the cases on which they differ.
+pub(crate) fn check_section(
+    fixture: &Value,
+    section: &str,
+    mut check_case: impl FnMut(&mut Mismatches, &Value),
+) {
+    let mut mismatches = Mismatches::new(section);
+    for case in cases(fixture, section) {
+        check_case(&mut mismatches, case);
+    }
+    mismatches.finish();
+}
+
+/// Checks that a section fails with the cases on which the port and Python differ.
+#[test]
+#[should_panic(expected = "1 of 2 letters cases differ from Python")]
+fn sections_fail_with_the_cases_that_differ() {
+    let fixture = json!({"letters": [{"text": "a"}, {"text": "b"}]});
+    check_section(&fixture, "letters", |mismatches, case| {
+        mismatches.check(case, "a", text(case, "text"));
+    });
+}
+
+/// Checks that a section fails when it compares nothing.
+#[test]
+#[should_panic(expected = "letters checked no cases")]
+fn sections_that_check_nothing_fail() {
+    let fixture = json!({"letters": [{"text": "a"}]});
+    check_section(&fixture, "letters", |_, _| {});
 }
 
 /// Returns the ranges of code points from `start` that satisfy `predicate`, as the generator
@@ -147,8 +179,7 @@ fn unicode_tables_match_python() {
 #[test]
 fn strings_integers_and_uuids_match_python() {
     let fixture = fixture("python.json");
-    let mut mismatches = Mismatches::new("strings");
-    for case in cases(&fixture, "strings") {
+    check_section(&fixture, "strings", |mismatches, case| {
         let value = text(case, "text");
         mismatches.check(case, text(case, "repr"), repr(value).as_str());
         mismatches.check(
@@ -170,15 +201,13 @@ fn strings_integers_and_uuids_match_python() {
             .map(|int| int.to_string())
             .map_err(|error| error.message(value));
         mismatches.check(case, expected, actual);
-    }
-    mismatches.finish();
+    });
 }
 
 #[test]
 fn pure_paths_match_pathlib() {
     let fixture = fixture("python.json");
-    let mut mismatches = Mismatches::new("paths");
-    for case in cases(&fixture, "paths") {
+    check_section(&fixture, "paths", |mismatches, case| {
         let path = PurePath::new(flavor(case), text(case, "text"));
         let parents: Vec<String> = path
             .parents()
@@ -201,33 +230,26 @@ fn pure_paths_match_pathlib() {
                 parents,
             ),
         );
-    }
-    mismatches.finish();
+    });
 
-    let mut mismatches = Mismatches::new("joins");
-    for case in cases(&fixture, "joins") {
+    check_section(&fixture, "joins", |mismatches, case| {
         let path = PurePath::new(flavor(case), text(case, "left")).join(text(case, "right"));
         mismatches.check(case, text(case, "str"), path.as_str());
-    }
-    mismatches.finish();
+    });
 
-    let mut mismatches = Mismatches::new("equality");
-    for case in cases(&fixture, "equality") {
+    check_section(&fixture, "equality", |mismatches, case| {
         let left = PurePath::new(Flavor::Windows, text(case, "left"));
         let right = PurePath::new(Flavor::Windows, text(case, "right"));
         mismatches.check(case, case["equal"].as_bool().unwrap(), left == right);
-    }
-    mismatches.finish();
+    });
 
-    let mut mismatches = Mismatches::new("normpath");
-    for case in cases(&fixture, "normpath") {
+    check_section(&fixture, "normpath", |mismatches, case| {
         mismatches.check(
             case,
             text(case, "normpath"),
             windows_normpath(text(case, "text")).as_str(),
         );
-    }
-    mismatches.finish();
+    });
 }
 
 /// Returns a string in the generator's tagged form.
@@ -281,8 +303,7 @@ fn tagged(document: &Document, id: NodeId) -> Value {
 #[test]
 fn json_documents_decode_as_python_decodes_them() {
     let fixture = fixture("python.json");
-    let mut mismatches = Mismatches::new("json");
-    for case in cases(&fixture, "json") {
+    check_section(&fixture, "json", |mismatches, case| {
         let expected = if let Some(value) = case.get("value") {
             Ok(value.clone())
         } else if let Some(message) = case.get("decode_error") {
@@ -299,16 +320,13 @@ fn json_documents_decode_as_python_decodes_them() {
             Err(ReadError::Hook(error)) => Err(("value", error.message(source))),
         };
         mismatches.check(case, expected, actual);
-    }
-    mismatches.finish();
+    });
 
-    let mut mismatches = Mismatches::new("utf8");
-    for case in cases(&fixture, "utf8") {
+    check_section(&fixture, "utf8", |mismatches, case| {
         mismatches.check(
             case,
             case["error"].as_str().map(str::to_owned),
             decode_utf8(&hex(text(case, "bytes"))).err(),
         );
-    }
-    mismatches.finish();
+    });
 }
