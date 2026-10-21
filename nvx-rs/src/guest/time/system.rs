@@ -104,6 +104,8 @@ const SUPPRESSED_DETECTORS: [(&CStr, i64); 3] = [
 
 /// The priority prefix of an event that the program writes to the kernel log: `KERN_CRIT`.
 const KERNEL_LOG_PRIORITY: &[u8] = b"<2>";
+/// The priority prefix of a diagnostic that the program writes to the kernel log: `KERN_ERR`.
+const DIAGNOSTIC_PRIORITY: &[u8] = b"<3>";
 
 /// Number of host samples considered when selecting the narrowest.
 const SAMPLE_ATTEMPTS: usize = 3;
@@ -264,6 +266,17 @@ impl<'a> Runtime<'a> {
         self.ops.open_ports()
     }
 
+    /// Writes `error`, the failure of a transaction's end, to the kernel log, such as
+    /// `nvx-time: ioperm revoke: Cannot allocate memory`, where nothing else reports it: after an
+    /// event's write to OpenVMM's debug console, and in the time daemon, whose standard streams
+    /// are on the null device. Until a later transaction revokes the permission, the thread
+    /// starts nothing, as [`fork_process`] checks.
+    pub(crate) fn log_release_failure(&self, error: PortError) {
+        let record = format!("nvx-time: {error}\n");
+        self.ops
+            .write_kernel_log(&[DIAGNOSTIC_PRIORITY, record.as_bytes()].concat());
+    }
+
     /// Emits one serialized violation record to every ABI destination.
     pub(crate) fn emit_event(
         &self,
@@ -302,9 +315,11 @@ impl<'a> Runtime<'a> {
             for byte in line.bytes() {
                 ports.write_u8(Port::PortbData, byte);
             }
-            // A failure keeps the thread from starting anything, as `fork_process` checks, and
-            // the event goes on.
-            let _ = ports.release();
+            // The event goes on after a failure, which keeps the thread from starting anything,
+            // as `fork_process` checks.
+            if let Err(error) = ports.release() {
+                self.log_release_failure(error);
+            }
         }
         let separator: &[u8] = if self.async_output.load(Ordering::Relaxed) {
             b"\n"
@@ -955,6 +970,29 @@ pub(crate) mod tests {
         assert!(!ops.kernel_log.lock().unwrap().is_empty());
         assert!(ops.output.lock().unwrap().is_empty());
         assert_eq!(sys::check_released(), Ok(()));
+    }
+
+    #[test]
+    fn an_event_logs_a_failed_revocation_after_its_debug_console_write() {
+        let mut ops = FakeOps::new([]);
+        ops.revoke_error = Some(Errno::ENOMEM);
+        let runtime = Runtime::new(&ops, true);
+        runtime.repair_failure(ViolationCode::RepairSuppression, b"cannot restore");
+        let line = ops.console.lock().unwrap().clone();
+        let port: Vec<_> = line.iter().map(|&byte| (Port::PortbData, byte)).collect();
+        assert_eq!(*ops.output.lock().unwrap(), port);
+        let diagnostic = format!("nvx-time: ioperm revoke: {}\n", Errno::ENOMEM.desc());
+        assert_eq!(
+            *ops.kernel_log.lock().unwrap(),
+            [
+                KERNEL_LOG_PRIORITY,
+                &line,
+                DIAGNOSTIC_PRIORITY,
+                diagnostic.as_bytes()
+            ]
+            .concat()
+        );
+        assert_eq!(sys::check_released(), Err(PortError::Revoke(Errno::ENOMEM)));
     }
 
     #[test]

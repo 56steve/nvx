@@ -785,25 +785,27 @@ fn cmd_sample(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> Result<(), CommandError> {
-    let ports = runtime
-        .open_ports()
-        .map_err(|error| port_failure(err, error))?;
-    let status = ports.read_u8(Port::PortbStatus);
-    if status & PORTB_TIME_WINDOW == 0 {
-        report(
-            err,
-            &[format!("nvx-time: portb status 0x{status:02x} has no time window\n").as_bytes()],
-        );
-        return Err(CommandError::Operation);
-    }
     let sample = {
+        let ports = runtime
+            .open_ports()
+            .map_err(|error| port_failure(err, error))?;
+        let status = ports.read_u8(Port::PortbStatus);
+        if status & PORTB_TIME_WINDOW == 0 {
+            report(
+                err,
+                &[
+                    format!("nvx-time: portb status 0x{status:02x} has no time window\n")
+                        .as_bytes(),
+                ],
+            );
+            return Err(CommandError::Operation);
+        }
         let _lock = system::lock_portb().map_err(|detail| {
             report(err, &[b"nvx-time: ", &detail, b"\n"]);
             CommandError::Operation
         })?;
         system::take_sample(&ports)
     };
-    drop(ports);
     let sample = sample.map_err(|error| {
         report(err, &[format!("nvx-time: {error}\n").as_bytes()]);
         CommandError::Operation
@@ -823,23 +825,23 @@ fn cmd_generation_id(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> Result<(), CommandError> {
-    let ports = runtime
-        .open_ports()
-        .map_err(|error| port_failure(err, error))?;
-    if ports.read_u8(Port::PortbStatus) & PORTB_GENERATION_ID_AVAILABLE == 0 {
-        report(err, &[b"nvx-time: the VM generation ID is unavailable\n"]);
-        return Err(CommandError::Operation);
-    }
-    let mut id = [0_u8; GENERATION_ID_SIZE];
-    {
+    let id = {
+        let ports = runtime
+            .open_ports()
+            .map_err(|error| port_failure(err, error))?;
+        if ports.read_u8(Port::PortbStatus) & PORTB_GENERATION_ID_AVAILABLE == 0 {
+            report(err, &[b"nvx-time: the VM generation ID is unavailable\n"]);
+            return Err(CommandError::Operation);
+        }
         let _lock = system::lock_portb().map_err(|detail| {
             report(err, &[b"nvx-time: ", &detail, b"\n"]);
             CommandError::Operation
         })?;
+        let mut id = [0_u8; GENERATION_ID_SIZE];
         ports.write_u8(Port::PortbStatus, SELECT_GENERATION_ID);
         portb_read(&ports, Port::PortbData, &mut id);
-    }
-    drop(ports);
+        id
+    };
     let mut text = decoders::format_hex(&id).into_bytes();
     text.push(b'\n');
     let _ = out.write_all(&text);

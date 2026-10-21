@@ -769,13 +769,13 @@ fn test_port_probe(arguments: &[&[u8]]) -> Result<(), CommandError> {
         .into_iter()
         .find(|(probed, _)| probed.to_bytes() == name)
         .ok_or(CommandError::Usage)?;
-    let ports = if grant {
+    // The probe holds the permission that it takes until it returns.
+    let _ports = if grant {
         Some(PortAccess::request().map_err(|_| CommandError::Operation)?)
     } else {
         None
     };
     sys::probe_port(port);
-    drop(ports);
     Ok(())
 }
 

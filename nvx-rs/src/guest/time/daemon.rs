@@ -21,7 +21,7 @@ use super::{DEFERRED_START_NS, IDLE_BOUND_NS, NSEC_PER_MSEC, NSEC_PER_SEC, NSEC_
 use crate::guest::kernel_text::KmsgRecord;
 use crate::guest::sys::{
     self, ChildStatus, Errno, FileDescriptor, ForkResult, Mode, Pollable, Port, PortAccess,
-    ProcessId, Signal, SignalDescriptor, Timer, kernel,
+    PortError, ProcessId, Signal, SignalDescriptor, Timer, kernel,
 };
 
 /// Maximum accepted polling bracket width.
@@ -293,6 +293,10 @@ fn discipline_poll(runtime: &Runtime<'_>, daemon: &mut Daemon) {
                 }
             }
             Err(SampleError::Generation { .. }) => return,
+            // Nothing else would report it, and the daemon goes on without the sample.
+            Err(SampleError::Ports(error @ PortError::Revoke(_))) => {
+                runtime.log_release_failure(error);
+            }
             Ok((SampleResult::Wide, _))
             | Err(SampleError::Ports(_) | SampleError::NoTimeWindow(_) | SampleError::Invalid(_)) =>
                 {}
@@ -836,7 +840,6 @@ pub(crate) fn empty_restore_timing() -> RestoreTiming {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::guest::sys::PortError;
     use crate::guest::time::system::tests::FakeOps;
 
     #[test]
