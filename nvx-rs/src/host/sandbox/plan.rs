@@ -368,8 +368,10 @@ impl SandboxPlan {
     ///
     /// The user's command line may hold no NUL and no `nvx_*` or `virtfs_*` token, which the
     /// profile and OpenVMM own. The command line, the bootstrap tokens that OpenVMM appends for
-    /// the shares, and a NUL must fit in [`SANDBOX_COMMAND_LINE_MAX_SIZE`] bytes. Fails with
-    /// [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported).
+    /// the shares, and a NUL must fit in [`SANDBOX_COMMAND_LINE_MAX_SIZE`] bytes. The guest must
+    /// then read the plan's root from the command line: one that [`RootLayout::parse`] refuses
+    /// fails too, as when the user's command line adds a virtio-mmio device at the scratch base
+    /// beside a RAM upper. Fails with [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported).
     pub fn kernel_command_line(&self, user_command_line: &str) -> Result<String> {
         if user_command_line.contains('\0') {
             return Err(refused("kernel command line contains an embedded NUL"));
@@ -426,6 +428,12 @@ impl SandboxPlan {
                  --mount shares or use shorter targets and arguments",
             ));
         }
+        let layout = RootLayout::parse(command_line.as_bytes()).map_err(|error| {
+            refused(format!(
+                "sandbox kernel command line conflicts with the boot tokens of its root: {error}"
+            ))
+        })?;
+        debug_assert_eq!(layout, Some(self.layout()));
         Ok(command_line)
     }
 }

@@ -179,6 +179,44 @@ fn the_guest_reads_the_root_of_every_plan_from_its_command_line() {
 }
 
 #[test]
+fn plans_refuse_the_command_lines_that_the_guest_refuses() {
+    // The user's command line may add a virtio-mmio device, which the guest reads as the kernel
+    // does: one at the scratch base conflicts with a RAM upper.
+    let conflict = "sandbox kernel command line conflicts with the boot tokens of its root: a RAM \
+                    upper takes no scratch block device, but the command line adds a virtio-mmio \
+                    device at 0xd0006000";
+    for image in images() {
+        let plan = plan(image, SandboxUpper::RAM, SandboxSettings::default());
+        for user in [
+            "virtio_mmio.device=0x1000@0xd0006000:11",
+            "quiet virtio-mmio.device=4K@0xd0006000:11:3",
+            "\"virtio_mmio.device=0x1000@0xd0006000:11\"",
+            "virtio_mmio.device=\"0x1000@ 0xd0006000:11\"",
+            "virtio_mmio.device=0x1000@3489685504:11",
+        ] {
+            let error = plan.kernel_command_line(user).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::Unsupported, "{user}");
+            assert_eq!(error.to_string(), conflict, "{user}");
+        }
+        for user in [
+            // The driver refuses these values, so the kernel adds no device from them.
+            "virtio_mmio.device=0x1000@0xd0006000:0",
+            "virtio_mmio.device=0x1000@0xd0006000",
+            // A device elsewhere, and a token that the kernel reads inside another value.
+            "virtio_mmio.device=0x1000@0xd0007000:3",
+            "x=\"y virtio_mmio.device=0x1000@0xd0006000:11\"",
+        ] {
+            let command_line = plan.kernel_command_line(user).unwrap();
+            assert_eq!(
+                RootLayout::parse(command_line.as_bytes()),
+                Ok(Some(plan.layout())),
+                "{user}"
+            );
+        }
+    }
+}
+
+#[test]
 fn the_longest_boot_tokens_fit_the_command_line_budget_to_the_byte() {
     // The tokens of an identified EROFS image over scratch are the longest: they take the most
     // of the budget, which every other plan keeps the rest of.
