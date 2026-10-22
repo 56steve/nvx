@@ -15,6 +15,9 @@
 //! - [`GuestFeatures`]: the control features that a guest image advertises.
 //! - The kernel command-line tokens through which the host configures the guest agent at boot,
 //!   such as [`MAPS_TOKEN`].
+//! - [`cmdline`]: the kernel command line as Linux reads it, for the readers that need the
+//!   kernel's view of it: the parameters into which the kernel splits it, and the virtio-mmio
+//!   devices, of any type, that its `virtio_mmio.device` parameters describe.
 //! - [`root`]: the boot tokens of a layered root, which name its image's format and identity and
 //!   its upper, with the host's renderer and the guest's parser.
 //! - [`nvxs`]: the NVXS session without I/O: validated records, incremental parsing, and the
@@ -28,6 +31,7 @@ use std::fmt;
 
 mod app;
 mod boot;
+pub mod cmdline;
 mod exec;
 mod features;
 mod maps;

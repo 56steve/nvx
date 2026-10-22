@@ -1,0 +1,271 @@
+//! The kernel command line as Linux reads it: the parameters into which the kernel splits it, and
+//! the virtio-mmio devices that its `virtio_mmio.device` parameters describe.
+//!
+//! A reader that splits a command line by rules of its own may find parameters that the kernel
+//! never sees, or miss ones that it applies: the kernel splits at more bytes than ASCII
+//! whitespace, honors double quotes, and stops at `--`. This module reads a command line by the
+//! rules of Linux 6.18, the kernel of NVX's guests, for the readers that need the kernel's view of
+//! it:
+//!
+//! - [`parameters`] splits a command line as the kernel's `parse_args` and `next_arg` split it,
+//!   at the bytes that [`is_space`] accepts, and [`Parameter::is_named`] compares a parameter's
+//!   name as `parameq` does.
+//! - [`VirtioMmioDevice::parse`] reads the value of a `virtio_mmio.device` parameter as the
+//!   virtio-mmio driver's `vm_cmdline_set` reads it, for a device of any type, and
+//!   [`virtio_mmio_devices`] reads those of every such parameter of a command line.
+//!
+//! Like the rest of [`protocol`](super), it needs nothing outside the standard library, so the
+//! host, the guest, and test doubles share it.
+
+use std::iter::FusedIterator;
+
+/// The name of the kernel parameter that adds a virtio-mmio device.
+pub const VIRTIO_MMIO_DEVICE: &str = "virtio_mmio.device";
+
+/// Returns whether the kernel takes `byte` for whitespace, as its `isspace` does: the space, tab,
+/// newline, vertical tab, form feed, carriage return, and Latin-1's no-break space, 0xa0.
+pub const fn is_space(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r' | 0xa0)
+}
+
+/// A parameter of a kernel command line, as the kernel splits the command line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Parameter<'a> {
+    /// The name: the parameter's text up to its first `=` after its first byte, or all of it.
+    pub name: &'a [u8],
+    /// The value: the text after that `=`, or `None` if the parameter has none.
+    pub value: Option<&'a [u8]>,
+}
+
+impl Parameter<'_> {
+    /// Returns whether the parameter is named `name`, as the kernel's `parameq` compares names:
+    /// byte for byte, except that a dash and an underscore match each other.
+    pub fn is_named(&self, name: &str) -> bool {
+        let fold = |byte: u8| if byte == b'-' { b'_' } else { byte };
+        self.name.len() == name.len()
+            && self
+                .name
+                .iter()
+                .zip(name.bytes())
+                .all(|(&byte, expected)| fold(byte) == fold(expected))
+    }
+}
+
+/// Returns the parameters of `command_line`, in order, as the kernel's `parse_args` and
+/// `next_arg` split it.
+///
+/// A parameter ends at whitespace, which [`is_space`] tells, outside double quotes, which it may
+/// open anywhere to hold whitespace. The kernel drops a quote that starts the parameter or its
+/// value, and then a quote that ends the parameter. The name ends at the first `=` after the
+/// parameter's first byte, and a parameter without one has no value. The kernel stops at a NUL,
+/// and at a `--` without a value, after which it leaves the rest of the command line to init.
+pub fn parameters(command_line: &[u8]) -> Parameters<'_> {
+    let end = command_line
+        .iter()
+        .position(|&byte| byte == 0)
+        .unwrap_or(command_line.len());
+    Parameters {
+        rest: &command_line[..end],
+    }
+}
+
+/// The parameters of a kernel command line, in order, which [`parameters`] returns.
+#[derive(Clone, Debug)]
+pub struct Parameters<'a> {
+    /// The text that the kernel has yet to split, which is empty once it stopped.
+    rest: &'a [u8],
+}
+
+impl<'a> Iterator for Parameters<'a> {
+    type Item = Parameter<'a>;
+
+    fn next(&mut self) -> Option<Parameter<'a>> {
+        let start = self
+            .rest
+            .iter()
+            .position(|&byte| !is_space(byte))
+            .unwrap_or(self.rest.len());
+        self.rest = &self.rest[start..];
+        let quoted = *self.rest.first()? == b'"';
+        let text = if quoted { &self.rest[1..] } else { self.rest };
+        let mut in_quote = quoted;
+        let mut equals = None;
+        let mut length = 0;
+        while let Some(&byte) = text.get(length) {
+            if is_space(byte) && !in_quote {
+                break;
+            }
+            if equals.is_none() && byte == b'=' && length > 0 {
+                equals = Some(length);
+            }
+            if byte == b'"' {
+                in_quote = !in_quote;
+            }
+            length += 1;
+        }
+        let parameter = &text[..length];
+        self.rest = &text[length..];
+        let closing = parameter.last() == Some(&b'"');
+        let Some(equals) = equals else {
+            let name = if quoted && closing {
+                &parameter[..length - 1]
+            } else {
+                parameter
+            };
+            if name == b"--" {
+                self.rest = &[];
+                return None;
+            }
+            return Some(Parameter { name, value: None });
+        };
+        let value = &parameter[equals + 1..];
+        let value = match value.strip_prefix(b"\"") {
+            Some(value) if closing => &value[..value.len().saturating_sub(1)],
+            Some(value) => value,
+            // The parameter's closing quote ends its value.
+            None if quoted && closing => &value[..value.len() - 1],
+            None => value,
+        };
+        Some(Parameter {
+            name: &parameter[..equals],
+            value: Some(value),
+        })
+    }
+}
+
+impl FusedIterator for Parameters<'_> {}
+
+/// A virtio-mmio device that a `virtio_mmio.device` parameter describes, `SIZE@BASE:IRQ[:ID]`,
+/// whatever the type of the device.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct VirtioMmioDevice {
+    /// The size of the device's MMIO region, in bytes.
+    pub size: u64,
+    /// The base address of the device's MMIO region.
+    pub base: u64,
+    /// The device's interrupt, which is never 0.
+    pub irq: u32,
+    /// The number of the device's platform device, `virtio-mmio.ID`, if the value gives one; the
+    /// kernel numbers a device without one after the device before it.
+    pub id: Option<i32>,
+}
+
+impl VirtioMmioDevice {
+    /// Reads the device that the value of a `virtio_mmio.device` parameter describes, as the
+    /// virtio-mmio driver's `vm_cmdline_set` reads it, or returns `None` if the driver refuses the
+    /// value.
+    ///
+    /// The driver reads SIZE as `memparse` does, an integer with an optional suffix, `K`, `M`,
+    /// `G`, `T`, `P`, or `E` in either case, which it takes even without digits. The rest of the
+    /// value must then be what `sscanf` reads with `@%lli:%u%n:%d%n`, to its end: `@`; BASE, after
+    /// any whitespace, with an optional minus sign that negates it at 64 bits; `:`; IRQ, a decimal
+    /// integer after any whitespace, which keeps its low 32 bits and must not be 0; and, if more
+    /// follows, `:` and ID, a decimal integer after any whitespace, with an optional minus sign,
+    /// which keeps its low 32 bits. SIZE and BASE take C's prefixes, hexadecimal after `0x` or `0X`
+    /// and a hexadecimal digit and octal after any other leading `0`, and every integer wraps at
+    /// 64 bits.
+    ///
+    /// The kernel may still fail to add a device whose value the driver reads, if it cannot claim
+    /// the device's region: one that is empty, one past the physical address space, or one that
+    /// conflicts with another resource.
+    pub fn parse(value: &[u8]) -> Option<Self> {
+        let (size, length) = integer(value, 0);
+        let rest = &value[length..];
+        let (shift, rest) = match rest.first() {
+            Some(b'K' | b'k') => (10, &rest[1..]),
+            Some(b'M' | b'm') => (20, &rest[1..]),
+            Some(b'G' | b'g') => (30, &rest[1..]),
+            Some(b'T' | b't') => (40, &rest[1..]),
+            Some(b'P' | b'p') => (50, &rest[1..]),
+            Some(b'E' | b'e') => (60, &rest[1..]),
+            _ => (0, rest),
+        };
+        let (base, rest) = scan_integer(rest.strip_prefix(b"@")?, 0, true)?;
+        let (irq, rest) = scan_integer(rest.strip_prefix(b":")?, 10, false)?;
+        let id = match rest {
+            [] => None,
+            [b':', id @ ..] => match scan_integer(id, 10, true)? {
+                (id, []) => Some(id),
+                _ => return None,
+            },
+            _ => return None,
+        };
+        // The driver stores IRQ in an `unsigned int` and ID in an `int`, which keep the low 32
+        // bits of the integers that `sscanf` reads.
+        let irq = irq as u32;
+        (irq != 0).then_some(Self {
+            size: size << shift,
+            base,
+            irq,
+            id: id.map(|id| id as i32),
+        })
+    }
+}
+
+/// Returns the virtio-mmio devices that the `virtio_mmio.device` parameters of `command_line`
+/// describe, in order, as [`parameters`] finds the parameters and [`VirtioMmioDevice::parse`]
+/// reads their values. A parameter without a value, or with one that the driver refuses,
+/// describes no device.
+pub fn virtio_mmio_devices(command_line: &[u8]) -> impl Iterator<Item = VirtioMmioDevice> {
+    parameters(command_line)
+        .filter(|parameter| parameter.is_named(VIRTIO_MMIO_DEVICE))
+        .filter_map(|parameter| parameter.value.and_then(VirtioMmioDevice::parse))
+}
+
+/// Reads an integer conversion of the kernel's `sscanf` at the start of `text`, `%i` with `base`
+/// 0, or `%u` or `%d` with `base` 10: after any whitespace and, if `signed`, an optional minus
+/// sign, the integer that [`integer`] reads, which must start with a decimal digit and which the
+/// sign negates at 64 bits. Returns the integer and the rest of `text`, or `None` if no integer
+/// starts it.
+fn scan_integer(text: &[u8], base: u32, signed: bool) -> Option<(u64, &[u8])> {
+    let start = text
+        .iter()
+        .position(|&byte| !is_space(byte))
+        .unwrap_or(text.len());
+    let text = &text[start..];
+    let (negative, digits) = match text {
+        [b'-', digits @ ..] if signed => (true, digits),
+        _ => (false, text),
+    };
+    if !digits.first().is_some_and(u8::is_ascii_digit) {
+        return None;
+    }
+    let (integer, length) = integer(digits, base);
+    let integer = if negative {
+        integer.wrapping_neg()
+    } else {
+        integer
+    };
+    Some((integer, &digits[length..]))
+}
+
+/// Reads the integer that starts `text` as the kernel's `simple_strtoull` reads it in `base`, 10,
+/// or 0, which picks the base from C's prefixes: hexadecimal after `0x` or `0X` and a hexadecimal
+/// digit, octal after any other leading `0`, and decimal otherwise. The integer wraps at 64 bits.
+/// Returns the integer and the length of its text, which is 0 if `text` starts with no digit.
+fn integer(text: &[u8], base: u32) -> (u64, usize) {
+    let (radix, start) = if base != 0 {
+        (base, 0)
+    } else {
+        match text {
+            [b'0', b'x' | b'X', digit, ..] if digit.is_ascii_hexdigit() => (16, 2),
+            [b'0', ..] => (8, 0),
+            _ => (10, 0),
+        }
+    };
+    let mut integer = 0_u64;
+    let mut end = start;
+    while let Some(digit) = text
+        .get(end)
+        .and_then(|&byte| char::from(byte).to_digit(radix))
+    {
+        integer = integer
+            .wrapping_mul(u64::from(radix))
+            .wrapping_add(u64::from(digit));
+        end += 1;
+    }
+    (integer, end)
+}
+
+#[cfg(test)]
+mod tests;
