@@ -6,9 +6,13 @@
 //! it bind-mounts host mappings below the roots that it names.
 //!
 //! Each other module holds one program, and the crate's binary of the same name runs its `main`.
-//! The libraries need none of NVX's control protocol, managed agent, or workload identity, and
-//! NVX's managed agent applies its host mapping table and starts, collects, and settles its
-//! workloads through them.
+//! Two of them also offer their steps as typed calls, which any guest init or agent runs in its
+//! own process and their programs run on: on x86-64, `time`'s `TimeAbi` runs the time ABI's
+//! cold-boot step, capture, and restore finish, and [`reseed`] reseeds the kernel's random number
+//! generator with a restore's fresh entropy, which starts with the new [`GenerationId`]. The
+//! libraries need none of NVX's control protocol, managed agent, or workload identity, and NVX's
+//! managed agent applies its host mapping table and starts, collects, and settles its workloads
+//! through them.
 //!
 //! The programs keep the command lines, exit statuses, and output of the C programs that they
 //! replace, except that numeric arguments are plain decimal, with a `-` sign where `nvx-time`'s
@@ -58,6 +62,7 @@
 #![deny(unsafe_code)]
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
+mod generation;
 mod parse;
 mod status;
 #[allow(unsafe_code)]
@@ -65,6 +70,8 @@ mod sys;
 
 #[cfg(target_arch = "x86_64")]
 mod kernel_text;
+
+pub use generation::GenerationId;
 
 pub mod cgroup;
 pub mod console_pending;

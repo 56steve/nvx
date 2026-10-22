@@ -278,12 +278,20 @@ impl PreparedChild {
     /// Forks the child, which runs its launch stages and then its program, and returns its
     /// process ID and the reader of its launch report.
     ///
+    /// On x86-64, it fails with `EPERM`, before it forks, while the calling thread may still
+    /// hold the permission for OpenVMM's I/O ports that a time call could not revoke, which the
+    /// child would inherit.
+    ///
     /// The parent closes its copies of the child's descriptors once the child exists. This
     /// function is safe because every pointer and descriptor that the child uses belongs to this
     /// value or to this frame, which the child's copied stack keeps, and the child path never
     /// returns into Rust. `fork` may occur in a multithreaded process: the child makes only
     /// direct async-signal-safe system calls over storage allocated before the fork.
     pub(crate) fn spawn(mut self) -> Result<(ProcessId, FileDescriptor), Errno> {
+        #[cfg(target_arch = "x86_64")]
+        if super::check_released().is_err() {
+            return Err(Errno::EPERM);
+        }
         let mut argument_pointers: Vec<*const c_char> = self
             .arguments
             .iter()

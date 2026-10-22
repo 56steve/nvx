@@ -557,6 +557,31 @@ mod tests {
         }
 
         #[test]
+        fn a_thread_that_may_hold_the_permission_spawns_no_command() {
+            use crate::guest::spawn::Command;
+            use crate::guest::sys::{self, ChildStatus};
+
+            let command = || Command::new(c"/bin/true".to_owned(), vec![c"true".to_owned()]);
+            let refusal = |command: Command| command.spawn().unwrap_err().raw_os_error();
+            let backend = FakePermission::default();
+            let access = PortAccess::with_backend(&backend).unwrap();
+            assert_eq!(refusal(command()), Some(Errno::EPERM as i32));
+            backend.fail_revocations(Some(Errno::ENOMEM));
+            assert_eq!(access.release(), Err(PortError::Revoke(Errno::ENOMEM)));
+            assert_eq!(refusal(command()), Some(Errno::EPERM as i32));
+            // A later transaction revokes the permission, and the thread starts a command again.
+            backend.fail_revocations(None);
+            PortAccess::with_backend(&backend)
+                .unwrap()
+                .release()
+                .unwrap();
+            let spawned = command().spawn().unwrap();
+            let process = spawned.process();
+            assert_eq!(spawned.into_report().wait().unwrap(), None);
+            assert_eq!(sys::wait(process), Some(ChildStatus::Exited(0)));
+        }
+
+        #[test]
         fn dropping_a_transaction_revokes_it_and_records_a_failure() {
             let backend = FakePermission::default();
             drop(PortAccess::with_backend(&backend).unwrap());

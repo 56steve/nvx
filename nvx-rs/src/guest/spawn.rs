@@ -310,7 +310,10 @@ impl Command {
     ///
     /// The call returns once it has forked the child, before the child's launch stages finish;
     /// the child's [`LaunchReport`] tells how they end. It fails without a child if the command
-    /// is invalid, or if a resource that the child needs cannot be allocated or opened.
+    /// is invalid, or if a resource that the child needs cannot be allocated or opened. On
+    /// x86-64, it also fails, with `PermissionDenied`, while the calling thread may still hold
+    /// the permission for OpenVMM's I/O ports that a time call could not revoke, as
+    /// `TimeError::PortRelease` reports, because the child would inherit it.
     pub fn spawn(self) -> io::Result<Spawned> {
         let (process, report) = PreparedChild::new(self.spec)?.spawn()?;
         Ok(Spawned {
