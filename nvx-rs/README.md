@@ -28,6 +28,8 @@ nvx-rs/
 │   │                kernel command-line tokens; no dependencies, shared by the host and the guest
 │   ├── contract.rs  control-contract versions and release-manifest compatibility
 │   ├── net/         CIDR parsing and subtraction, and hostname and guest-network forms
+│   ├── uuid.rs      UUIDs in their canonical text and in GPT's layout; no dependencies, shared
+│   │                by the host and the guest
 │   ├── hypervisor.rs
 │   ├── error.rs     nvx::Error and its ErrorKind
 │   ├── host/        feature `host` (default): artifacts, launch, network and egress policy files,
@@ -52,9 +54,12 @@ nvx-rs/
 | Module | Contents |
 | --- | --- |
 | `nvx::protocol` | The codec of the control console: `NVXS` outer records, `NVXC` application frames, the `EXEC` payload that the host encodes and the guest agent decodes, the `MAPS` payloads of the host mapping table, `GuestFeatures`, and the `nvx_maps=` and `nvx_workload_account=create` tokens. Golden byte fixtures pin every record independently of the codec, which the host and the fake OpenVMM share |
+| `nvx::protocol::cmdline` | The kernel command line as Linux 6.18 reads it, for the readers that need the kernel's view of it: `parameters` splits it into `Parameter`s as `parse_args` and `next_arg` do, at the bytes that `is_space` accepts, with double quotes, up to a NUL or `--`, and `Parameter::is_named` compares names as `parameq` does, with dashes and underscores alike. `VirtioMmioDevice::parse` reads a `virtio_mmio.device` value, `SIZE@BASE:IRQ[:ID]`, as the virtio-mmio driver reads it, for a device of any type, and `virtio_mmio_devices` reads every such parameter of a command line |
 | `nvx::protocol::nvxs` | The NVXS session, independent of `NVXC` and of any other application protocol: `RecordType`, `Record`, `encode_record`, and `RecordParser`, which parses records incrementally across partial reads with buffers bounded by one record; `HostSession` and `GuestSession`, the state machines of the host's and the guest's roles, which validate every record's type, identity, and sequence number, and the guest's receive window and credits, without I/O. An application message may span DATA records, and the application's own framing reassembles it |
+| `nvx::protocol::root` | The boot tokens of a layered root, which the host renders and guests parse by the same rules: a `RootLayout` is a `RootImage` on the `distro` block device, an EROFS filesystem or a GPT disk with the `nvx::uuid::Uuid` that the guest expects of it, if any, over a `RootUpper`, the ext4 scratch disk or RAM. `RootLayout::tokens` renders `nvx_layer=distro,0xd0003000,FORMAT[:IDENTITY]` and `nvx_scratch=0xd0006000,ext4` or `nvx_overlay_upper=ramfs`, and `RootLayout::parse` reads them from a kernel command line, and refuses malformed, repeated, and conflicting tokens and the earlier form without a format, with no fallback that probes the devices. It reads the virtio-mmio devices of the command line with `nvx::protocol::cmdline`, to refuse a RAM upper beside one at the scratch base. `tests/fixtures/root-tokens.json` holds its cases, which the tests of the guest's shell init replay too |
 | `nvx::contract` | The OpenVMM microVM ABI, broker protocol, and control-contract revision that the crate speaks, and `manifest_is_compatible` for a release's `SOURCE-MANIFEST.json` |
 | `nvx::net` | `Cidr`: IPv4 and IPv6 networks and their subtraction; `is_valid_hostname` and `is_valid_guest_network`, the forms of a VM's hostname and guest address |
+| `nvx::uuid` | `Uuid`: a UUID, such as the GUID of a GPT disk or partition or the UUID of a filesystem, in the order of its canonical text, the one text that it displays and parses: 32 lowercase hexadecimal digits in groups of 8, 4, 4, 4, and 12, joined by hyphens. `from_bytes_le` and `to_bytes_le` convert the layout in which GPT and other EFI GUIDs store their first three groups little-endian. It has no dependencies, so the host and the guest share it |
 | `nvx::Hypervisor` | KVM, MSHV, or WHP, with its serde form behind the `serde` feature |
 | `nvx::host::artifacts` | `Artifacts` (also `nvx::Artifacts`): the OpenVMM executable, guest kernel, and Alpine initramfs, from a release, a repository checkout, the environment, a directory next to the executable, or the bundle. `ArtifactDir` and `Guest`: every artifact of the guests that `nvx.py` runs, the OpenVMM executable, the kernel, the Alpine, Ubuntu, and Azure Linux initramfs images and their package manifests, and the Ubuntu distro layer and its manifest, in a checkout's `build/` and `openvmm/target/release/` or a release's `guest/` and `bin/`, checked in the order and with the messages of `nvx.py`. `ArtifactPaths` lists them all and serializes as JSON |
 | `nvx::host::launch` | `LaunchSpec` and OpenVMM's command line: the managed lifecycle, the `WorkloadIdentity`, the 1024-byte kernel command line, its reserved parameters, the 32,767-character limit of a Windows command line, and `LaunchSpec::check`, which every command line applies to the memory size, the non-root identity, the hostname, the guest network, and the kernel parameters |
@@ -68,7 +73,7 @@ nvx-rs/
 | `nvx::host::supervisor` | The supervisor of a sandbox's VMM, beneath the CLI, `Instance`, and external orchestrators, which keep the configuration, the authorization, and the application protocol. `launch` runs the store's launch steps under the sandbox's lock: it writes the journal's marker, spawns OpenVMM with the claimed log, records its `ProcessRef` right after, and returns a `Starting` launch that the caller commits once the VMM serves its control endpoint, or abandons. A launch that fails never leaves an unrecorded VMM running. `VmmCommand::inherit` lists the descriptors (Linux) or handles (Windows) that the VMM inherits under their numbers, besides its standard streams, and it inherits nothing else of the caller's: on Linux, they must be close-on-exec, a flag that only the VMM's own process clears; on Windows, they join the VMM's explicit handle list. `Vmm::stop` runs one graceful step of the caller's and waits for the VMM's exit event until a deadline, and takes a bounded forced step through the VMM's verified identity only on request. `reattach` recovers an interrupted launch, and holds the recorded VMM again after the orchestrator restarts within the same host boot: `Live`, `Mismatched` with another runtime identity, `Exited`, or `Indeterminate` |
 | `nvx::host::seal` | `FileSeal`: what the host reports about an open file from its metadata alone, without reading it: the platform scheme, the device or volume serial number, the file ID, the kind, the length, the modification time, and on Linux the change time, with a versioned serde form. A seal detects accidental change, not tampering; see [Distro bindings](#distro-bindings) |
 | `nvx::host::session`, `platform`, `report` | The authenticated control session, which carries NVX's control protocol, `NVXC`, one frame per DATA record of a `HostConnection`; Linux and Windows primitives; and OpenVMM's outcome report |
-| `nvx::host::sandbox` | The launch profile of `nvx.py sandbox`, ported from the one that `scripts/nvx_tools/sandbox.py` held: `SandboxLaunch`, with the EROFS distro `SandboxLayer`, the one layer that a sandbox takes, the ext4 scratch disk, the entrypoint, arguments, hostname, workload identity, and resource limits, and its `--microvm-sandbox-block` and `--microvm-workload-identity` arguments and kernel command line, within the 1024-byte budget that OpenVMM leaves it. `mount`: `SandboxMount` live shares of host directories and files, their guest targets and the reserved ones, their access policies and owner, the aggregate of several shares, and the checks of their host paths. `options`: the checks that `nvx.py sandbox` and `nvx.py run` apply to their options: the attribution of `--mount-deny`, `--mount-allow`, and `--mount-write` to shares, the systemd entrypoint check and the explicit verification of the distro layer, the targets of `nvx.py run` shares, and the managed exec environment; see [Python parity](#python-parity). `distro`: the `DistroBinding` of a distro layer, which explicit verification makes or a staging caller imports, and its check from metadata alone, which returns the layer open; see [Distro bindings](#distro-bindings) |
+| `nvx::host::sandbox` | The launch profile of `nvx.py sandbox`, ported from the one that `scripts/nvx_tools/sandbox.py` held: `SandboxLaunch`, with the EROFS distro `SandboxLayer`, the one layer that a sandbox takes, the ext4 scratch disk, the entrypoint, arguments, hostname, workload identity, and resource limits, and the `SandboxPlan` that it makes of them. `plan`: `SandboxPlan`, the typed plan of a cold layered launch, which is persistable in a versioned serde form: one read-only `distro` block device, an EROFS filesystem or a GPT disk with the identity that the guest expects of it, if any, an upper, the ext4 scratch disk or RAM, and the launch settings. A plan knows only the `distro` and `scratch` `BlockRole`s, and gives, for every combination, its `--microvm-sandbox-block` and `--microvm-workload-identity` arguments, with no scratch block device for a RAM upper, and its kernel command line, with the boot tokens of `nvx::protocol::root`, within the 1024-byte budget that OpenVMM leaves it, refusing one whose root tokens the guest's parser refuses. `mount`: `SandboxMount` live shares of host directories and files, their guest targets and the reserved ones, their access policies and owner, the aggregate of several shares, and the checks of their host paths. `options`: the checks that `nvx.py sandbox` and `nvx.py run` apply to their options: the attribution of `--mount-deny`, `--mount-allow`, and `--mount-write` to shares, the systemd entrypoint check and the explicit verification of the distro layer, the targets of `nvx.py run` shares, and the managed exec environment; see [Python parity](#python-parity). `distro`: the `DistroBinding` of a distro layer, which explicit verification makes or a staging caller imports, and its check from metadata alone, which returns the layer open; see [Distro bindings](#distro-bindings) |
 | `nvx::testing::fake_openvmm` | A fake OpenVMM that serves the control console and runs scripted workloads without a VM, for direct launches and for the managed and one-shot sandboxes of `nvx-rs sandbox` and `nvx.py sandbox` |
 | `nvx::host::cli` | Feature `cli`: the `nvx-rs` executable; see [The nvx-rs CLI](#the-nvx-rs-cli) |
 | `nvx::guest` | The programs that run in Linux guests; see [Guest binaries](#guest-binaries) |
@@ -187,7 +192,10 @@ path, as it records every path, with the binding of the layer there, under
 another name, `start` checks the manifest beside the link's target, so
 `provision` verifies the layer there as well, and it records only a binding
 that the check accepts there. `start` checks the binding before it launches
-OpenVMM, and holds the checked layer until the start ends. A configuration
+OpenVMM, and holds the checked layer until the start ends. `run` and `start`
+plan the launch with the image format and the identity that the binding
+records, which name an EROFS layer, and launch it over a scratch disk, the one
+layered root that the guest's shell init assembles. A configuration
 without a binding, as `nvx.py` wrote, fails with `sandbox configuration has no
 distro binding`, and a stale binding with what changed, such as `LAYER changed
 after its distro binding was made: its length differs`; both add `deprovision
@@ -421,6 +429,10 @@ guest agents of NVX advertise bits 0, 2, and 4 in sandbox mode.
   without a console window, as `nvx::host::supervisor` starts it.
 - `exec` refuses more than 1 MiB of workload output, which the guest agent
   never forwards.
+- The `nvx_layer` token of the kernel command line names the image format of
+  the distro layer, as in `nvx_layer=distro,0xd0003000,erofs:UUID`, and the
+  guest refuses the form without a format that `nvx.py` wrote; see
+  `nvx::protocol::root`.
 
 ### Test hooks
 
@@ -452,6 +464,8 @@ the refusals of the lifecycle operations. Each step records the exit status,
 standard output and error, and the state files, with the root, process IDs, and
 random identifiers as placeholders, and the devices, file IDs, and times of the
 distro binding, which `config.json` has recorded since the recording, as well.
+Their kernel command lines name the image format of the distro layer, which
+the launch profile has rendered since the recording too.
 Its `posix` and `windows` sections were
 recorded on each kind of host, where the script also played every scenario with
 `nvx-rs`, and each lifecycle with the Python implementation and `nvx-rs` taking
@@ -471,9 +485,9 @@ these scenarios are its reference.
 | `guest` | The `guest` module and the guest binaries; see [Guest binaries](#guest-binaries) |
 
 Without default features, the crate has only `protocol`, `contract`, `net`,
-`Hypervisor`, and `Error`, and depends on nothing but `serde` when `serde` is
-enabled and `nix` and `getrandom` when `guest` is; `aci_edge_sandboxes_model`
-uses it that way.
+`uuid`, `Hypervisor`, and `Error`, and depends on nothing but `serde` when
+`serde` is enabled and `nix` and `getrandom` when `guest` is;
+`aci_edge_sandboxes_model` uses it that way.
 
 ## Example
 

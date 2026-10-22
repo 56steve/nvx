@@ -646,9 +646,8 @@ fn deserialize_mounts(
 /// against the host.
 ///
 /// A missing field, or a value of the wrong type, fails as `sandbox configuration is malformed`,
-/// as does a layer whose role is none of `distro`, `runtime`, and `custom`, which Python would
-/// accept and then leave out of the launch. A configuration whose format is not the one that its
-/// shares need fails as `sandbox configuration format does not match its mounts`.
+/// as does a layer whose role is not `distro`. A configuration whose format is not the one that
+/// its shares need fails as `sandbox configuration format does not match its mounts`.
 pub(crate) fn deserialize_launch(document: &Document) -> Result<SandboxLaunch> {
     let malformed = || Exit::error("sandbox configuration is malformed");
     let launch = (|| -> std::result::Result<SandboxLaunch, Malformed> {

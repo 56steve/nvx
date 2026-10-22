@@ -41,7 +41,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::layer::{LayerRole, SandboxLayer};
+use super::layer::SandboxLayer;
 use super::mount::os_error;
 use super::refused;
 use crate::error::{Error, Result};
@@ -211,9 +211,9 @@ impl DistroBinding {
     /// metadata of either changed while it read them. The binding holds the seals that the files
     /// had, and [`PolicyVerdict::ACCEPTED`].
     ///
-    /// Fails with [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported) for a layer of another
-    /// role, a path without a name, and a manifest that it refuses, which a digest that does not
-    /// match fails before the packages do; with
+    /// Fails with [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported) for a path without a
+    /// name and a manifest that it refuses, which a digest that does not match fails before the
+    /// packages do; with
     /// [`ErrorKind::Unavailable`](crate::ErrorKind::Unavailable) for a layer that is not a regular
     /// file; and with [`ErrorKind::Io`](crate::ErrorKind::Io) if the layer cannot be read or sealed,
     /// or changed while it was read.
@@ -228,7 +228,7 @@ impl DistroBinding {
     /// `verdict`. A caller that imports a binding vouches for the layer and its manifest as
     /// [`verify`](Self::verify) would; it must therefore be authorized to stage layers, which
     /// NVX leaves to it. Fails with
-    /// [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported) for a layer of another role, with
+    /// [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported) for a path without a name, with
     /// [`ErrorKind::Unavailable`](crate::ErrorKind::Unavailable) if the layer or its manifest is
     /// not a regular file, and with [`ErrorKind::Io`](crate::ErrorKind::Io) if either cannot be
     /// opened or sealed, as for a manifest path whose lookup fails for another reason than a
@@ -252,8 +252,8 @@ impl DistroBinding {
     ///
     /// Fails with [`ErrorKind::Unavailable`](crate::ErrorKind::Unavailable) for a stale binding,
     /// one that names another layer, and a missing layer; with
-    /// [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported) for a layer of another role and a
-    /// verdict that rejects the layer; and with [`ErrorKind::Io`](crate::ErrorKind::Io) if a file
+    /// [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported) for a verdict that rejects the
+    /// layer and a path without a name; and with [`ErrorKind::Io`](crate::ErrorKind::Io) if a file
     /// cannot be opened or sealed.
     pub fn check(&self, layer: &SandboxLayer, policy_revision: u32) -> Result<CheckedDistro> {
         self.check_with(layer, policy_revision, Access::GUARDED)
@@ -308,7 +308,6 @@ impl DistroBinding {
         policy_revision: u32,
         access: Access<'_>,
     ) -> Result<CheckedDistro> {
-        require_distro(layer)?;
         let path = layer.pure_path();
         let stale =
             |detail: String| Error::unavailable(format!("the distro binding of {path} {detail}"));
@@ -383,7 +382,6 @@ impl DistroBinding {
 
 /// Implements [`DistroBinding::verify`], reaching files through `access`.
 pub(crate) fn verify_with(layer: &SandboxLayer, access: Access<'_>) -> Result<DistroBinding> {
-    require_distro(layer)?;
     let path = layer.pure_path();
     let manifest = manifest_path(path)?;
     if !fs::exists(manifest.as_path()) {
@@ -468,24 +466,11 @@ pub(crate) fn import_with(
     verdict: PolicyVerdict,
     access: Access<'_>,
 ) -> Result<DistroBinding> {
-    require_distro(layer)?;
     let path = layer.pure_path();
     let manifest = manifest_path(path)?;
     let image = seal_regular(path, access, &layer_description(layer))?;
     let manifest = seal_if_present(&manifest, access, "sandbox distro manifest")?;
     Ok(DistroBinding::new(layer, image, manifest, verdict))
-}
-
-/// Refuses a layer of another role than the distro.
-fn require_distro(layer: &SandboxLayer) -> Result<()> {
-    if layer.role() == LayerRole::Distro {
-        Ok(())
-    } else {
-        Err(refused(format!(
-            "only the distro layer has a distro binding, not the {} layer",
-            layer.role()
-        )))
-    }
 }
 
 /// Returns how messages name the image of `layer`: `distro EROFS layer`.

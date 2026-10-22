@@ -12,6 +12,9 @@
 //!   NVX releases with them.
 //! - [`net`]: IP networks in CIDR notation and their subtraction, and the forms of a VM's
 //!   hostname and guest network address.
+//! - [`uuid`]: UUIDs, such as the GUIDs of a GPT disk, in their canonical text, the one form that
+//!   NVX writes and reads, and in the layout in which GPT stores them. It has no dependencies, so
+//!   the host and the guest share it.
 //! - [`Hypervisor`]: the hypervisors that run the VMs.
 //! - [`host`] (feature `host`): artifact discovery, the OpenVMM command line, the lowering of
 //!   network and filesystem policies, the host's NVXS connection, control sessions, process and
@@ -92,6 +95,7 @@ mod error;
 mod hypervisor;
 pub mod net;
 pub mod protocol;
+pub mod uuid;
 
 #[cfg(all(feature = "guest", target_os = "linux"))]
 pub mod guest;

@@ -20,7 +20,6 @@ use super::options::{
 };
 use super::*;
 use crate::host::python::golden::{check_section, fixture, flavor, hex, text, texts};
-use crate::host::python::uuid::parse_uuid;
 
 /// Returns the message of a result's error, or `None` if it succeeded.
 fn error<T>(result: &Result<T>) -> Option<String> {
@@ -74,23 +73,6 @@ fn outcome(case: &Value, key: &str) -> std::result::Result<Value, String> {
         Some(Value::String(message)) => Err(message.clone()),
         _ => Ok(case[key].clone()),
     }
-}
-
-/// Returns the layer of a launch's recorded `--layer` value.
-///
-/// The generator recorded launches of every role, and a sandbox now takes only the distro layer
-/// (microsoft/nvx#556), which `--layer` alone accepts. A layer of a retired role is therefore the
-/// one that the configuration of a sandbox provisioned before then names, which the launch
-/// refuses, as the records of those launches say.
-fn recorded_layer(flavor: Flavor, value: &str) -> SandboxLayer {
-    SandboxLayer::parse_in(flavor, value).unwrap_or_else(|_| {
-        let [role, path, uuid] = value.split(',').collect::<Vec<_>>()[..] else {
-            panic!("the generator records launches whose layers parse: {value}");
-        };
-        let role = LayerRole::from_name(role).expect("a retired role");
-        let uuid = parse_uuid(uuid).expect("the UUID of a recorded layer");
-        SandboxLayer::new_in(flavor, role, path, uuid)
-    })
 }
 
 #[test]
@@ -182,6 +164,11 @@ fn mounts_lower_to_the_arguments_that_python_gives() {
     });
 }
 
+/// The records postdate the Python launch profile in two respects. They hold only launches of the
+/// distro layer, the one layer that a sandbox takes. And the distro layer's token names the image
+/// format, `erofs:`, before its UUID: the user command lines of the launches that fill the budget
+/// exactly, or pass it by one byte, are six bytes shorter than recorded, the length of that
+/// format, so that they keep their place at the boundary.
 #[test]
 fn launches_give_the_arguments_and_command_lines_that_python_gives() {
     let fixture = fixture("sandbox.json");
@@ -189,7 +176,10 @@ fn launches_give_the_arguments_and_command_lines_that_python_gives() {
         let flavor = flavor(case);
         let layers = texts(case, "layers")
             .iter()
-            .map(|value| recorded_layer(flavor, value))
+            .map(|value| {
+                SandboxLayer::parse_in(flavor, value)
+                    .expect("the generator records launches whose layers parse")
+            })
             .collect();
         let mounts = case["mounts"]
             .as_array()
@@ -220,8 +210,12 @@ fn launches_give_the_arguments_and_command_lines_that_python_gives() {
         };
         let actual = SandboxLaunch::new_in(flavor, layers, text(case, "scratch"), settings)
             .and_then(|launch| {
-                let arguments = launch.openvmm_arguments_with(&cwd(&fixture, flavor))?;
-                let command_line = launch.kernel_command_line(text(case, "command_line"));
+                let arguments = launch
+                    .plan()
+                    .openvmm_arguments_with(&cwd(&fixture, flavor))?;
+                let command_line = launch
+                    .plan()
+                    .kernel_command_line(text(case, "command_line"));
                 Ok(json!([
                     arguments,
                     command_line.as_ref().ok(),
