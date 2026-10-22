@@ -11,43 +11,28 @@ use crate::host::python::uuid::parse_uuid;
 
 /// The role of a read-only layer of `nvx.py sandbox`.
 ///
-/// A sandbox takes exactly one layer, the distro layer (microsoft/nvx#556), which its plan
-/// attaches as the `distro` [`BlockRole`](super::BlockRole). The retired roles remain so that the
-/// configuration of a sandbox provisioned before then still reads, and fails as no launch accepts
-/// them.
+/// A sandbox takes exactly one layer, the distro layer, which its plan attaches as the `distro`
+/// [`BlockRole`](super::BlockRole).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum LayerRole {
     /// The distribution, the only layer of a sandbox.
     Distro,
-    /// A retired role: a language runtime over the distribution.
-    Runtime,
-    /// A retired role: the workload's own files, on top.
-    Custom,
 }
 
 /// The layer roles that `--layer` accepts and that a launch holds: `LAYER_ROLES`.
 pub const LAYER_ROLES: [LayerRole; 1] = [LayerRole::Distro];
 
-/// Every role that a configuration may name, the retired ones included.
-pub(crate) const KNOWN_LAYER_ROLES: [LayerRole; 3] =
-    [LayerRole::Distro, LayerRole::Runtime, LayerRole::Custom];
-
 impl LayerRole {
-    /// Returns the role's name: `distro`, or a retired `runtime` or `custom`.
+    /// Returns the role's name: `distro`.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Distro => "distro",
-            Self::Runtime => "runtime",
-            Self::Custom => "custom",
         }
     }
 
-    /// Returns the role that `name` names, if any, a retired one included, as a configuration
-    /// may name it; [`SandboxLayer::parse`] accepts only the [`LAYER_ROLES`].
+    /// Returns the role that `name` names, if any, one of the [`LAYER_ROLES`].
     pub fn from_name(name: &str) -> Option<Self> {
-        KNOWN_LAYER_ROLES
-            .into_iter()
-            .find(|role| role.as_str() == name)
+        LAYER_ROLES.into_iter().find(|role| role.as_str() == name)
     }
 }
 
@@ -105,8 +90,7 @@ impl SandboxLayer {
         let [role, path, uuid] = fields[..] else {
             return Err(refused("--layer must be ROLE,PATH,EROFS_UUID"));
         };
-        let Some(role) = LayerRole::from_name(role).filter(|role| LAYER_ROLES.contains(role))
-        else {
+        let Some(role) = LayerRole::from_name(role) else {
             let choices: Vec<&str> = LAYER_ROLES.iter().map(|role| role.as_str()).collect();
             return Err(refused(format!(
                 "unsupported layer role {}; choose {}",
@@ -176,20 +160,15 @@ mod tests {
 
     #[test]
     fn layer_parser_rejects_invalid_role_and_uuid() {
-        assert_eq!(
-            message("unknown,layer.erofs,11111111-1111-1111-1111-111111111111"),
-            "unsupported layer role 'unknown'; choose distro"
-        );
-        // The retired roles name no layer that a sandbox takes (microsoft/nvx#556), though a
-        // configuration may still name them.
-        for role in ["runtime", "custom"] {
+        assert_eq!(LayerRole::from_name("distro"), Some(LayerRole::Distro));
+        for role in ["unknown", "runtime", "custom", "Distro", ""] {
             assert_eq!(
                 message(&format!(
                     "{role},layer.erofs,22222222-2222-2222-2222-222222222222"
                 )),
                 format!("unsupported layer role '{role}'; choose distro")
             );
-            assert_eq!(LayerRole::from_name(role).unwrap().as_str(), role);
+            assert_eq!(LayerRole::from_name(role), None, "{role}");
         }
         assert_eq!(
             message("distro,layer.erofs,not-a-uuid"),

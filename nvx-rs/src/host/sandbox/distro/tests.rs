@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use super::*;
 use crate::ErrorKind;
+use crate::host::sandbox::LayerRole;
 use crate::host::seal::{open_metadata_only, open_read};
 
 /// The UUID of the staged layers.
@@ -648,26 +649,4 @@ fn a_manifest_path_whose_lookup_fails_is_no_absent_manifest_for_a_binding() {
     binding
         .check_with(&layer, DISTRO_POLICY_REVISION, METADATA_ONLY)
         .unwrap();
-}
-
-#[test]
-fn only_the_distro_layer_has_a_binding() {
-    let staged = Staged::new(false);
-    let binding = DistroBinding::verify(&staged.layer()).unwrap();
-    for role in [LayerRole::Runtime, LayerRole::Custom] {
-        let layer = SandboxLayer::new(role, staged.image().to_str().unwrap(), UUID);
-        let refused = (
-            ErrorKind::Unsupported,
-            format!("only the distro layer has a distro binding, not the {role} layer"),
-        );
-        assert_eq!(failure(DistroBinding::verify(&layer)), refused);
-        assert_eq!(
-            failure(DistroBinding::import(&layer, PolicyVerdict::ACCEPTED)),
-            refused
-        );
-        assert_eq!(
-            failure(binding.check(&layer, DISTRO_POLICY_REVISION)),
-            refused
-        );
-    }
 }

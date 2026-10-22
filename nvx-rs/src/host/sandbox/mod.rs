@@ -12,7 +12,7 @@
 //!   kernel command line, [`kernel_command_line`](SandboxPlan::kernel_command_line), whose boot
 //!   tokens [`protocol::root`](crate::protocol::root) defines.
 //! - [`SandboxLayer`]: the EROFS distro layer of `nvx.py sandbox`, `ROLE,PATH,EROFS_UUID`, the
-//!   one [`LayerRole`] that a sandbox takes (microsoft/nvx#556).
+//!   one [`LayerRole`] that a sandbox takes.
 //! - [`SandboxMount`]: a live share of a host directory or regular file at a guest target, with
 //!   its access mode, owner, and access-policy paths; [`mount`] holds the rules of guest targets,
 //!   the aggregate of several shares, and the checks of host paths.
@@ -258,10 +258,9 @@ fn validate_settings(settings: &SandboxSettings) -> Result<()> {
 /// its settings, which it plans as an EROFS distro layer over the scratch image.
 ///
 /// Its layers are keyed by the role of each `--layer` value, of which a launch takes only the
-/// distro layer; a configuration that a sandbox recorded may name a retired role, which it
-/// refuses. [`plan`](Self::plan) returns its [`SandboxPlan`], which renders its OpenVMM arguments
-/// and kernel command line, and [`bound_plan`](Self::bound_plan) the plan with the image that the
-/// binding of its distro layer records.
+/// distro layer. [`plan`](Self::plan) returns its [`SandboxPlan`], which renders its OpenVMM
+/// arguments and kernel command line, and [`bound_plan`](Self::bound_plan) the plan with the image
+/// that the binding of its distro layer records.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SandboxLaunch {
     /// The read-only layers, in the order given: the distro layer alone.
@@ -294,8 +293,7 @@ impl SandboxLaunch {
         scratch: &str,
         settings: SandboxSettings,
     ) -> Result<Self> {
-        // A configuration may name a retired role, so the duplicates are those of every role.
-        let mut duplicates: Vec<&str> = layer::KNOWN_LAYER_ROLES
+        let mut duplicates: Vec<&str> = LAYER_ROLES
             .iter()
             .filter(|&&role| layers.iter().filter(|layer| layer.role() == role).count() > 1)
             .map(|role| role.as_str())

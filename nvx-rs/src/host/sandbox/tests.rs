@@ -170,36 +170,6 @@ fn launch_settings_are_checked_in_python_order() {
         )),
         "duplicate sandbox layer role(s): distro"
     );
-    // The configuration of a sandbox provisioned before microsoft/nvx#556 may name the retired
-    // roles, which no launch accepts, alone or beside the distro layer.
-    let retired = |role| SandboxLayer::new(role, "r.erofs", "22222222-2222-2222-2222-222222222222");
-    for role in [LayerRole::Runtime, LayerRole::Custom] {
-        for layers in [vec![retired(role)], vec![distro(), retired(role)]] {
-            assert_eq!(
-                message(SandboxLaunch::new(
-                    layers,
-                    "s.ext4",
-                    SandboxSettings::default()
-                )),
-                "a sandbox requires exactly one read-only distro layer"
-            );
-        }
-    }
-    // Duplicates come first, and name every repeated role.
-    assert_eq!(
-        message(SandboxLaunch::new(
-            vec![
-                retired(LayerRole::Custom),
-                distro(),
-                retired(LayerRole::Custom),
-                retired(LayerRole::Runtime),
-                retired(LayerRole::Runtime),
-            ],
-            "s.ext4",
-            SandboxSettings::default()
-        )),
-        "duplicate sandbox layer role(s): custom, runtime"
-    );
     // The entrypoint is checked before the hostname.
     for entrypoint in ["bin/sh", "/bin/s h", "/bin/sh\x1c"] {
         let settings = SandboxSettings {

@@ -552,14 +552,14 @@ fn start_requires_the_guest_features_of_layered_sandboxes() {
 }
 
 #[test]
-fn a_sandbox_of_a_retired_layer_role_does_not_start() {
-    // An older nvx.py provisioned sandboxes with runtime and custom layers, which a sandbox no
-    // longer takes (microsoft/nvx#556): their configuration still reads, and the launch refuses
-    // it before OpenVMM starts.
+fn a_sandbox_whose_configuration_names_another_layer_role_does_not_start() {
+    // A sandbox takes only the distro layer, so a configuration whose layers name another role is
+    // malformed: the start refuses it before OpenVMM starts, and deprovision, which reads no
+    // layers, still removes the sandbox.
     let root = populated_root();
-    let output = run(&root, &provision(&root, "retired", ""));
+    let output = run(&root, &provision(&root, "other-role", ""));
     assert!(output.status.success(), "{}", text(&output.stderr));
-    let config = root.path.join("retired").join("config.json");
+    let config = root.path.join("other-role").join("config.json");
     let mut document: Value = serde_json::from_str(&fs::read_to_string(&config).unwrap()).unwrap();
     document["layers"]
         .as_array_mut()
@@ -570,14 +570,14 @@ fn a_sandbox_of_a_retired_layer_role_does_not_start() {
             "uuid": "22222222-2222-2222-2222-222222222222",
         }));
     fs::write(&config, serde_json::to_string_pretty(&document).unwrap()).unwrap();
-    let output = run(&root, &lifecycle("start", &root, "retired"));
+    let output = run(&root, &lifecycle("start", &root, "other-role"));
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(
         text(&output.stderr),
-        "error: a sandbox requires exactly one read-only distro layer\n"
+        "error: sandbox configuration is malformed\n"
     );
-    assert!(!root.path.join("retired").join("runtime.json").exists());
-    let output = run(&root, &lifecycle("deprovision", &root, "retired"));
+    assert!(!root.path.join("other-role").join("runtime.json").exists());
+    let output = run(&root, &lifecycle("deprovision", &root, "other-role"));
     assert!(output.status.success(), "{}", text(&output.stderr));
 }
 
