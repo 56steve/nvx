@@ -326,8 +326,13 @@ pub(crate) fn try_wait(process: ProcessId) -> Result<Option<ChildStatus>, Errno>
 }
 
 /// Sends `SIGKILL` to the process group led by `process`.
-pub(crate) fn kill_process_group(process: ProcessId) {
-    let _ = kill(Pid::from_raw(-process.0.as_raw()), Signal::SIGKILL);
+pub(crate) fn kill_process_group(process: ProcessId) -> Result<(), Errno> {
+    kill(Pid::from_raw(-process.0.as_raw()), Signal::SIGKILL)
+}
+
+/// Sends `SIGKILL` to `process` alone.
+pub(crate) fn kill_process(process: ProcessId) -> Result<(), Errno> {
+    kill(process.0, Signal::SIGKILL)
 }
 
 /// One child that a wait names, which is all that it may collect.
@@ -473,6 +478,36 @@ pub(crate) fn has_exited(process: ProcessId) -> Result<bool, Errno> {
     })?;
     // SAFETY: successful `waitid` initialized the Linux `siginfo_t` child-event union.
     Ok(unsafe { information.si_pid() } == process.0.as_raw())
+}
+
+/// Sends `SIGKILL` through `pidfd` to the process to which it refers or, with `process_group`, to
+/// every process of the process group that the process leads, since Linux 6.9.
+///
+/// A pidfd names its process, and the group that the process leads, whatever later takes their
+/// IDs: the signal to the process fails with `ESRCH` once a collector has taken the process's
+/// status, and the signal to the group fails with `ESRCH` once no process of the group is left,
+/// even after a collector took the status of the process that led it. A kernel that cannot
+/// signal a group through a pidfd, before Linux 6.9, fails with `EINVAL`.
+///
+/// libc's `syscall` is used because neither `nix` nor musl wraps `pidfd_send_signal`.
+pub(crate) fn kill_through_pidfd(pidfd: BorrowedFd<'_>, process_group: bool) -> Result<(), Errno> {
+    let flags = if process_group {
+        nix::libc::PIDFD_SIGNAL_PROCESS_GROUP
+    } else {
+        0
+    };
+    // SAFETY: `pidfd_send_signal` reads its integer arguments, and a null `siginfo_t` pointer
+    // asks the kernel for the details of a signal that `kill` sends.
+    Errno::result(unsafe {
+        nix::libc::syscall(
+            nix::libc::SYS_pidfd_send_signal,
+            pidfd.as_raw_fd(),
+            nix::libc::SIGKILL,
+            std::ptr::null::<nix::libc::siginfo_t>(),
+            flags,
+        )
+    })
+    .map(drop)
 }
 
 /// Replaces the process image with `path` and `arguments`, and with `environment`, or without
@@ -681,6 +716,54 @@ mod tests {
         assert_eq!(
             take_inherited_descriptor(c"2147483647").unwrap_err(),
             Errno::EBADF
+        );
+    }
+
+    #[test]
+    fn a_signal_through_a_pidfd_fails_once_the_status_is_collected() {
+        let mut child = std::process::Command::new("/bin/true").spawn().unwrap();
+        let process = ProcessId::from_child(&child);
+        let pidfd = open_pidfd(process).unwrap();
+        while !has_exited(process).unwrap() {
+            std::thread::yield_now();
+        }
+        // The child has ended, but it is unreaped until its status is collected.
+        assert_eq!(kill_through_pidfd(pidfd.borrowed(), false), Ok(()));
+        assert!(child.wait().unwrap().success());
+        assert_eq!(
+            kill_through_pidfd(pidfd.borrowed(), false),
+            Err(Errno::ESRCH)
+        );
+    }
+
+    #[test]
+    fn a_group_signal_through_a_pidfd_reaches_the_group_once_its_leader_is_collected() {
+        use std::io::BufRead;
+        use std::os::unix::process::CommandExt;
+
+        // The leader leaves a member in its process group, and tells its ID.
+        let mut leader = std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 30 </dev/null >/dev/null 2>&1 & echo $!"])
+            .process_group(0)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pidfd = open_pidfd(ProcessId::from_child(&leader)).unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(leader.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let member = ProcessId::from_positive(line.trim().parse().unwrap()).unwrap();
+        let member_pidfd = open_pidfd(member).unwrap();
+        assert!(leader.wait().unwrap().success());
+        match kill_through_pidfd(pidfd.borrowed(), true) {
+            // A kernel before Linux 6.9 cannot signal a group through a pidfd.
+            Err(Errno::EINVAL) => kill_process(member).unwrap(),
+            signalled => signalled.unwrap(),
+        }
+        assert_eq!(
+            crate::guest::sys::readable_or_hung_up(&[member_pidfd.borrowed()], 20_000).unwrap(),
+            [true]
         );
     }
 }
