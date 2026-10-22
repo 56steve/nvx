@@ -196,7 +196,7 @@ def _query_development_release(
     )
     if result.returncode == 0:
         return _parse_release(result.stdout)
-    if not result.timed_out and result.output.strip().lower() == "release not found":
+    if _is_release_lookup_failure(result):
         return None
     raise _command_error(f"querying development release {tag}", result)
 
@@ -330,6 +330,16 @@ def _is_transient_upload_failure(result: _GitHubCommandResult) -> bool:
     return result.timed_out or _TRANSIENT_UPLOAD_ERROR.search(result.output) is not None
 
 
+def _is_release_lookup_failure(result: _GitHubCommandResult) -> bool:
+    """Match gh's bare `release not found` for a failed draft lookup.
+
+    gh reports every failed lookup of a draft release as `release not found`,
+    whether the lookup failed transiently (5xx, network error, or the draft
+    not being visible yet) or permanently. Callers decide which case applies.
+    """
+    return not result.timed_out and result.output.strip().lower() == "release not found"
+
+
 def _upload_failure_reason(result: _GitHubCommandResult) -> str:
     if result.timed_out:
         return "command timed out"
@@ -418,7 +428,14 @@ def _upload_expected_asset(
             _delete_development_release_asset(repository, tag, local.name)
 
         reason = _upload_failure_reason(result)
-        retryable = result.returncode == 0 or _is_transient_upload_failure(result)
+        # gh reports any failed lookup of a draft as "release not found"; the
+        # observation just above found the draft without the asset, so the
+        # failure is a transient lookup race and retrying is safe here.
+        retryable = (
+            result.returncode == 0
+            or _is_transient_upload_failure(result)
+            or _is_release_lookup_failure(result)
+        )
         if not retryable:
             raise _command_error(f"uploading release asset {local.name}", result)
         if attempt == attempts:
