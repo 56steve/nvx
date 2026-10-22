@@ -61,8 +61,9 @@ use crate::host::python::builtins::{repr, split, strip};
 use crate::host::python::fs;
 use crate::host::python::path::{Flavor, PurePath};
 use crate::protocol::root::{
-    DISTRO_MMIO_BASE, ImageFormat, RootImage, RootLayout, RootUpper, SCRATCH_MMIO_BASE, Uuid,
+    DISTRO_MMIO_BASE, ImageFormat, RootImage, RootLayout, RootUpper, SCRATCH_MMIO_BASE,
 };
+use crate::uuid::Uuid;
 
 /// The version of the serde form of [`SandboxPlan`] that this build writes and reads.
 pub const PLAN_VERSION: u32 = 1;

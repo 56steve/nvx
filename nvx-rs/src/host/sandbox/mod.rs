@@ -56,7 +56,8 @@ use crate::host::python::builtins::{is_space, repr};
 use crate::host::python::fs;
 use crate::host::python::path::{Flavor, PurePath};
 use crate::net::is_valid_hostname;
-use crate::protocol::root::{RootImage, Uuid};
+use crate::protocol::root::RootImage;
+use crate::uuid::Uuid;
 
 /// The largest value the guest cgroup v2 `memory.max` parser can store.
 const MEMORY_MAX_LIMIT: u64 = u64::MAX;

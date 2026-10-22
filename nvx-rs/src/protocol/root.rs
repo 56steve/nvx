@@ -21,9 +21,9 @@
 //! assemble.
 
 use std::fmt;
-use std::str::FromStr;
 
 use super::{ProtocolError, cmdline, violation};
+use crate::uuid::Uuid;
 
 /// The MMIO base of the `distro` block device, which holds a layered root's image.
 pub const DISTRO_MMIO_BASE: u64 = 0xd000_3000;
@@ -53,87 +53,6 @@ const RAM_UPPER: &str = "ramfs";
 const DISTRO_ROLE: &str = "distro";
 /// The filesystem of the scratch block device.
 const SCRATCH_FILESYSTEM: &str = "ext4";
-/// The offsets of the hyphens in the canonical text of a UUID.
-const UUID_HYPHENS: [usize; 4] = [8, 13, 18, 23];
-/// The length of the canonical text of a UUID.
-const UUID_TEXT_LEN: usize = 36;
-
-/// A UUID, such as a GPT GUID, in its canonical text: 32 lowercase hexadecimal digits in groups
-/// of 8, 4, 4, 4, and 12, joined by hyphens, as in `0123abcd-4567-89ef-0123-456789abcdef`.
-///
-/// Its bytes are those of its digits, in the order of the text. GPT stores the first three groups
-/// of a GUID little-endian, so the bytes that a disk stores differ from these.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct Uuid([u8; 16]);
-
-impl Uuid {
-    /// Returns the UUID whose bytes, in the order of its text, are `bytes`.
-    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
-        Self(bytes)
-    }
-
-    /// Returns the UUID's bytes, in the order of its text.
-    pub const fn as_bytes(&self) -> &[u8; 16] {
-        &self.0
-    }
-
-    /// Parses the canonical text of a UUID, and no other form: not uppercase digits, braces, a
-    /// prefix, or other groups.
-    pub fn parse(text: impl AsRef<[u8]>) -> Option<Self> {
-        let text = text.as_ref();
-        if text.len() != UUID_TEXT_LEN || UUID_HYPHENS.iter().any(|&offset| text[offset] != b'-') {
-            return None;
-        }
-        let mut digits = text
-            .iter()
-            .enumerate()
-            .filter(|(offset, _)| !UUID_HYPHENS.contains(offset))
-            .map(|(_, &digit)| match digit {
-                b'0'..=b'9' => Some(digit - b'0'),
-                b'a'..=b'f' => Some(digit - b'a' + 10),
-                _ => None,
-            });
-        let mut bytes = [0; 16];
-        for byte in &mut bytes {
-            let high = digits.next()??;
-            let low = digits.next()??;
-            *byte = (high << 4) | low;
-        }
-        Some(Self(bytes))
-    }
-}
-
-impl fmt::Display for Uuid {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for (index, byte) in self.0.iter().enumerate() {
-            if matches!(index, 4 | 6 | 8 | 10) {
-                formatter.write_str("-")?;
-            }
-            write!(formatter, "{byte:02x}")?;
-        }
-        Ok(())
-    }
-}
-
-impl fmt::Debug for Uuid {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "Uuid({self})")
-    }
-}
-
-impl FromStr for Uuid {
-    type Err = ProtocolError;
-
-    /// Parses the canonical text of a UUID, as [`Uuid::parse`] does.
-    fn from_str(text: &str) -> Result<Self, Self::Err> {
-        Self::parse(text).ok_or_else(|| {
-            violation(format!(
-                "'{}' is not a UUID in its canonical text",
-                text.escape_default()
-            ))
-        })
-    }
-}
 
 /// The format of a layered root's image, which its token names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

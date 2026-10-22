@@ -7,7 +7,8 @@ use super::{PLAN_VERSION, SandboxDistro, SandboxPlan, SandboxUpper};
 use crate::host::python::builtins::{Int, repr};
 use crate::host::sandbox::SandboxSettings;
 use crate::host::sandbox::mount::{MountAccess, MountKind, MountOwner, MountPolicy, SandboxMount};
-use crate::protocol::root::{ImageFormat, RootImage, Uuid};
+use crate::protocol::root::{ImageFormat, RootImage};
+use crate::uuid::Uuid;
 
 /// The serde form of a [`SandboxPlan`].
 #[derive(Serialize, Deserialize)]
