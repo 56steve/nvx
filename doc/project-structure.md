@@ -8,7 +8,7 @@ are build products or caches and are not part of the tracked source tree. The
 
 | Path | Purpose |
 | --- | --- |
-| `.github/workflows` | CI, release verification, adversarial campaign, and Copilot environment workflows |
+| `.github/workflows` | CI, nightly failure report, release verification, adversarial campaign, and Copilot environment workflows |
 | `.github/actions` | Reusable local CI actions |
 | `.github/skills` | Copilot agent skills for common development workflows |
 | `.github/agents` | Bounded Copilot strategist definitions |
@@ -47,6 +47,7 @@ nvx/
 |   |   |-- ci.yml               Main build, test, benchmark, and release workflow
 |   |   |-- copilot-code-review.yml Copilot code review environment
 |   |   |-- copilot-setup-steps.yml Copilot cloud agent environment
+|   |   |-- nightly-ci-report.yml Report of failed nightly CI runs
 |   |   |-- run-nvx-microvm-tests.yml Reusable NVX microVM test job
 |   |   |-- run-platform.yml     Reusable platform benchmark and package job
 |   |   `-- specula-release.yml  Specula verification of published releases
@@ -139,6 +140,7 @@ nvx/
 |   |   |-- managed_exec_tests.py Managed workload environment, directory, and timeout tests
 |   |   |-- microvm_test_scripts/ Guest workloads for the microVM tests
 |   |   |-- microvm_tests.py     NVX microVM correctness tests
+|   |   |-- nightly_ci.py        Nightly CI failure report
 |   |   |-- nvx_rs.py            Finds, builds, and runs nvx-rs, to which nvx.py delegates
 |   |   |-- openvmm_process.py   Foreground OpenVMM process control for tests
 |   |   |-- performance.py       CI performance collection, persistence, and gates
@@ -190,9 +192,10 @@ defines the main CI pipeline and its job-level orchestration. It calls three
 reusable workflows: `build-openvmm-binary.yml` builds OpenVMM for one target,
 `run-nvx-microvm-tests.yml` runs the NVX microVM tests on one backend, and
 `run-platform.yml` benchmarks one platform and, on `dev` pushes, packages its
-release. The other workflows run adversarial campaigns, verify published
-releases with Specula, and prepare the Copilot cloud agent and code review
-environments. See [Continuous integration](ci.md) for the jobs and gates.
+release. The other workflows report failed nightly CI runs, run adversarial
+campaigns, verify published releases with Specula, and prepare the Copilot
+cloud agent and code review environments. See
+[Continuous integration](ci.md) for the jobs and gates.
 
 The `actions/` directory contains the reusable implementations for validation,
 artifact builds, benchmarks, packaging, releases, and performance history

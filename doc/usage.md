@@ -81,6 +81,7 @@ stale build never ships or runs unnoticed.
 | `kernel-patch-identity` | Print the digest of the kernel patch paths and contents that keys the kernel cache. |
 | `guest-binary-source-identity` | Print the digest of the Rust guest binary source paths and contents that keys the guest image caches. |
 | `check-required-ci` | Validate required GitHub Actions job results. |
+| `report-nightly-ci` | Open, update, or close the report of failed nightly CI runs. |
 | `check-static-elf` | Check that executables are static ELF files without an interpreter or an executable stack. |
 | `test-openvmm-unit` | Run the OpenVMM workspace unit and documentation tests. |
 | `test-openvmm` | Run OpenVMM Petri VMM tests. |
@@ -211,6 +212,33 @@ enabled by the event, repository, and suite flags, and `skipped` for jobs that
 are not enabled; mismatches are reported as errors and cause a nonzero exit.
 As in CI, a job that uses the guest artifacts or the OpenVMM binaries is
 enabled only when the flags enable the jobs that build them too.
+
+### `report-nightly-ci`
+
+```text
+python3 scripts/nvx.py report-nightly-ci
+    --repository OWNER/REPOSITORY
+    --run-id ID
+    [--run-attempt N]
+    [--assignee LOGIN]...
+    [--label NAME]...
+    [--summary PATH]
+    [--dry-run]
+```
+
+Reports a completed scheduled run of the CI workflow, by default its latest
+attempt, in the repository's nightly failure report: a failing run opens or
+updates the report, and a passing run closes it, as
+[Nightly failure reports](ci.md#nightly-failure-reports) describes. The command
+prints what it did. It reads a token from `GH_TOKEN` or `GITHUB_TOKEN`, which
+must be able to read the run's jobs, logs, and check annotations, and to read
+and write issues. A new report is assigned to every `--assignee` and names
+them as its triage owners, and carries every `--label` that exists in the
+repository; the command never creates a label. `--summary` appends the report
+to a Markdown file, such as `$GITHUB_STEP_SUMMARY`. `--dry-run` prints the
+changes that the command would make, with their Markdown, and makes none; it
+accepts a run of any event, so that a past failure can preview its report,
+and, for a public repository, needs a token only for the job logs.
 
 ### `check-static-elf`
 
